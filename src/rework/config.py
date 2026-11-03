@@ -27,6 +27,12 @@ class Config:
     checkpoints_db: str  # sqlite path for role checkpoints (postgres shares db in M4)
     poll_interval_s: float = 0.5
     concurrency: int = 1  # sqlite deployments stay at 1 (docs/design.md)
+    git_author_name: str = "rework"  # agent commit identity; per-deployment via env
+    git_author_email: str = "rework@rework.local"
+
+    @property
+    def git_author(self) -> tuple[str, str]:
+        return (self.git_author_name, self.git_author_email)
 
     @property
     def is_postgres(self) -> bool:
@@ -35,10 +41,16 @@ class Config:
     @classmethod
     def from_env(cls) -> Config:
         db = os.environ.get("REWORK_DB", _default_db())
+        author_name = os.environ.get("REWORK_GIT_AUTHOR_NAME", "rework")
+        author_email = os.environ.get("REWORK_GIT_AUTHOR_EMAIL", "rework@rework.local")
         if db.startswith(("postgresql://", "postgres://")):
             # single source of truth: state and checkpoints share the database
             return cls(
-                db=db, checkpoints_db=db, concurrency=int(os.environ.get("REWORK_CONCURRENCY", "4"))
+                db=db,
+                checkpoints_db=db,
+                concurrency=int(os.environ.get("REWORK_CONCURRENCY", "4")),
+                git_author_name=author_name,
+                git_author_email=author_email,
             )
         state_dir = Path(db).expanduser().parent
         checkpoints = os.environ.get(
@@ -48,6 +60,8 @@ class Config:
             db=db,
             checkpoints_db=checkpoints,
             concurrency=int(os.environ.get("REWORK_CONCURRENCY", "1")),
+            git_author_name=author_name,
+            git_author_email=author_email,
         )
 
 

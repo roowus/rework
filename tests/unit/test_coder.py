@@ -3,6 +3,7 @@ and the fully mechanical handoff (commit + diff vs the recorded base)."""
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -151,6 +152,19 @@ async def test_coder_edits_in_worktree_and_hands_off_diff(coder_ctx: RoleBuildCt
     # reached the tool transcript)
     tool_outputs = [m["content"] for m in final["messages"] if m.get("role") == "tool"]
     assert any("passed" in out for out in tool_outputs)
+
+    # the mechanical commit carries the configured agent identity
+    log_proc = await asyncio.create_subprocess_exec(
+        "git",
+        "log",
+        "--format=%an <%ae>",
+        "-1",
+        cwd=str(final["worktree"]),
+        stdout=asyncio.subprocess.PIPE,
+    )
+    out, _ = await log_proc.communicate()
+    author = out.decode().strip()
+    assert author == "rework <rework@rework.local>"
 
 
 async def test_coder_requires_git_repo(tmp_path: Path) -> None:

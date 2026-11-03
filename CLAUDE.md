@@ -20,6 +20,12 @@ uv run mypy src              # type check (kernel/ is strict)
 Test against Postgres: `REWORK_TEST_POSTGRES=postgresql://... uv run pytest tests/` (the
 store conformance suite parametrizes over both backends; Postgres tests skip without the var).
 
+Per-instance env (all optional): `REWORK_DB` (sqlite path or postgres URL),
+`REWORK_CHECKPOINTS_DB`, `REWORK_CONCURRENCY`, `REWORK_MODELS` (catalog json path or
+inline), `REWORK_GIT_AUTHOR_NAME` / `REWORK_GIT_AUTHOR_EMAIL` (agent commit identity,
+defaults `rework <rework@rework.local>`; the owner's deployment uses
+`rework@rework.rewis`).
+
 ## Working agreements
 
 - **Always be committing.** Commit green work as you go, unprompted. Pushing and PRs

@@ -66,8 +66,9 @@ class CoderSpec(RoleSpec):
         " with real test runs, hands off a mechanical diff."
     )
     goal = (
-        "Implement the task and prove it works: run the tests, report exactly"
-        " what passed and what failed, and leave nothing claimed but unverified."
+        "Fulfill the task completely and make the code work reliably and well:"
+        " implement it properly, prove it with real test runs, and report"
+        " exactly what passed and what failed."
     )
     default_model = "flash"
     context_manifest: ClassVar[set[str]] = {"brief", "investigation", "requested_scope"}
@@ -136,7 +137,7 @@ class CoderSpec(RoleSpec):
             wt = Path(state["worktree"])
             await stage_all(wt)
             message = f"{state['objective']}\n\nrework run: {ctx.run.id}"
-            sha = await git_commit(wt, message)
+            sha = await git_commit(wt, message, author=ctx.git_author)
             diff = await diff_base(wt, base=state.get("base_sha"))
             artifact = {
                 "kind": "coder_handoff",

@@ -75,6 +75,7 @@ class RunSupervisor:
         catalog: ModelCatalog,
         make_checkpointer: CheckpointerFactory,
         workroot: Path,
+        git_author: tuple[str, str] = ("rework", "rework@rework.local"),
     ) -> None:
         self._mission = mission
         self._store = store
@@ -83,6 +84,7 @@ class RunSupervisor:
         self._catalog = catalog
         self._make_checkpointer = make_checkpointer
         self._workroot = workroot
+        self._git_author = git_author
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self._closers: list[Callable[[], Awaitable[None]]] = []
         self._ctxs: dict[str, RoleBuildCtx] = {}
@@ -100,6 +102,7 @@ class RunSupervisor:
             gates=GateManager(self._store, self._bus),
             budget=spec.budget,
             workdir=self._workroot / run.id.replace(":", "_"),
+            git_author=self._git_author,
         )
         graph = spec.build_graph(ctx)
         checkpointer, close = await self._make_checkpointer(run.id)
@@ -247,6 +250,7 @@ class MissionRunner:
         make_checkpointer: CheckpointerFactory,
         workroot: Path,
         poll_interval_s: float = 0.25,
+        git_author: tuple[str, str] = ("rework", "rework@rework.local"),
     ) -> None:
         self._store = store
         self._bus = bus
@@ -255,6 +259,7 @@ class MissionRunner:
         self._make_checkpointer = make_checkpointer
         self._workroot = workroot
         self._poll = poll_interval_s
+        self._git_author = git_author
         self._gates = GateManager(store, bus)
         self.mission_id = mission_id
         self._supervisor: RunSupervisor | None = None
@@ -274,6 +279,7 @@ class MissionRunner:
             self._catalog,
             self._make_checkpointer,
             self._workroot,
+            self._git_author,
         )
         try:
             await self._run_steps(mission)

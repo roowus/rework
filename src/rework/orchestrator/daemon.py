@@ -116,6 +116,7 @@ class Daemon:
                     self._make_checkpointer,
                     self._workroot,
                     poll_interval_s=self._config.poll_interval_s,
+                    git_author=self._config.git_author,
                 )
                 await runner.run()
 

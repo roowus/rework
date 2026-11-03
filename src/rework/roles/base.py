@@ -69,6 +69,7 @@ class RoleBuildCtx(BaseModel):
     gates: GateManager
     budget: Budget
     workdir: Path  # per-run workspace (path-jailing is the v1 isolation line)
+    git_author: tuple[str, str] = ("rework", "rework@rework.local")  # commit identity
 
     @property
     def model_ref(self) -> dict[str, Any]:
