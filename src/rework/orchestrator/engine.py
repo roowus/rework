@@ -192,9 +192,13 @@ class RunSupervisor:
         self.tasks[run.id] = asyncio.create_task(self._execute(run, resume))
 
     async def resume_with_decision(self, run: Run, decision: Any) -> None:
-        """Resume a halted run with a gate/escalation decision."""
-        if run.id in self.tasks and not self.tasks[run.id].done():
-            self.tasks.pop(run.id)  # defensive; halted tasks always end
+        """Resume a halted run with a gate/escalation decision. Idempotent: the
+        pump loop can re-enter _handle_halted while a resume task is still
+        starting (its run row stays HALTED_ESCALATED until it flips RUNNING),
+        so a live task for this run means a resume is already in flight."""
+        existing = self.tasks.get(run.id)
+        if existing is not None and not existing.done():
+            return
         self.tasks[run.id] = asyncio.create_task(self._execute_resume(run, decision))
 
     async def _execute_resume(self, run: Run, decision: Any) -> None:

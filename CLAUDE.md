@@ -26,8 +26,11 @@ store conformance suite parametrizes over both backends; Postgres tests skip wit
   still require asking the user first.
 - **Docs follow code.** Every feature commit updates what it touches: README quickstart,
   `docs/design.md`, a new ADR per significant decision. Docs are never deferred cleanup.
-- **Every work chunk ends with something the user can verify**: an exact command to run
-  or an observable behavior to watch. If a chunk has nothing user-visible, re-slice it.
+- **Division of verification.** Claude verifies objective behavior itself: tests,
+  commands, live process demos (including kill/restart), against Postgres too. The
+  owner verifies subjective feel: design, workflow quality, whether a role's output
+  is actually useful, using demo-able moments (example problems they can run). Build
+  those moments when subjective judgment matters; never ask the owner to run tests.
 - **Per-role design sessions.** Before finalizing a builtin role's `build_graph()`, run a
   dedicated design Q&A with the user; they have per-role graph preferences.
 

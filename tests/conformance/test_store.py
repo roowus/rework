@@ -6,6 +6,8 @@ swap freely behind the seam (docs/adr/0001).
 
 from __future__ import annotations
 
+import asyncio
+
 from rework.kernel.state.records import (
     BudgetState,
     Charge,
@@ -150,3 +152,12 @@ async def test_leader_lock(store: StateStore) -> None:
     assert await store.heartbeat_lock("daemon-1") is True
     await store.release_lock("daemon-1")
     assert await store.acquire_lock("daemon-2") is True
+
+
+async def test_leader_lock_stale_takeover(store: StateStore) -> None:
+    """A SIGKILLed daemon cannot clean up; its lock must go stale quickly so a
+    restart can take over (daemon passes a small stale_after_s, ADR 0002)."""
+    assert await store.acquire_lock("dead-daemon", stale_after_s=0.05) is True
+    await asyncio.sleep(0.15)  # heartbeat would have kept it alive; it didn't
+    assert await store.acquire_lock("fresh-daemon", stale_after_s=0.05) is True
+    assert await store.heartbeat_lock("dead-daemon") is False

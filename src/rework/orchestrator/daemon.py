@@ -9,6 +9,7 @@ then PENDING missions start normally.
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -21,6 +22,8 @@ from rework.kernel.state.records import EventRecord, EventType, MissionStatus
 from rework.kernel.state.store import StateStore
 from rework.orchestrator.engine import CheckpointerFactory, MissionRunner
 from rework.roles.registry import RoleRegistry
+
+log = logging.getLogger("rework.daemon")
 
 
 class DaemonLocked(Exception):
@@ -69,10 +72,13 @@ class Daemon:
         self._owner = f"daemon-{uuid.uuid4().hex[:8]}"
 
     async def run_forever(self) -> None:
-        if not await self._store.acquire_lock(self._owner):
+        # staleness must be a small multiple of the heartbeat period, or a
+        # SIGKILLed daemon (no cleanup, fresh heartbeat) blocks restarts
+        stale_after = max(self._config.poll_interval_s * 10, 5.0)
+        if not await self._store.acquire_lock(self._owner, stale_after_s=stale_after):
             raise DaemonLocked(
-                "another daemon holds this database's lock "
-                "(heartbeat fresh); refusing to double-run missions"
+                f"another daemon holds this database's lock "
+                f"(heartbeat fresh within {stale_after:.0f}s); refusing to double-run"
             )
         try:
             await self._recover()
@@ -87,10 +93,12 @@ class Daemon:
     async def _recover(self) -> None:
         for status in (MissionStatus.RUNNING, MissionStatus.AWAITING_GATE):
             for mission in await self._store.list_missions(status=status, limit=100):
+                log.info("recovering mission %s (%s)", mission.id, status.value)
                 await self._spawn_runner(mission.id)
 
     async def _pickup_pending(self) -> None:
         for mission in await self._store.list_missions(status=MissionStatus.PENDING, limit=10):
+            log.info("picking up pending mission %s", mission.id)
             await self._spawn_runner(mission.id)
 
     async def _spawn_runner(self, mission_id: str) -> None:

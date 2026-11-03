@@ -178,7 +178,10 @@ def attach(mission_id: str, follow: bool = True) -> None:
 @app.command()
 def serve() -> None:
     """Run the headless daemon (one per database; leader-locked)."""
+    import logging
     from pathlib import Path
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
     from rework.config import Config, load_catalog, open_store_from_config
 
