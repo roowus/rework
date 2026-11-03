@@ -104,6 +104,8 @@ class RunSupervisor:
     async def _build_graph(self, run: Run) -> Any:
         spec = self._registry.get(run.role)
         entry = self._catalog.resolve(str(run.model_ref.get("id") or spec.default_model))
+        workdir = self._workroot / run.id.replace(":", "_")
+        workdir.mkdir(parents=True, exist_ok=True)  # roles assume their workspace exists
         ctx = RoleBuildCtx(
             run=run,
             mission=self._mission,
@@ -113,7 +115,7 @@ class RunSupervisor:
             bus=self._bus,
             gates=GateManager(self._store, self._bus),
             budget=spec.budget,
-            workdir=self._workroot / run.id.replace(":", "_"),
+            workdir=workdir,
             git_author=self._git_author,
         )
         graph = spec.build_graph(ctx)

@@ -55,7 +55,7 @@ node_modules/
 dist/
 build/
 *.egg-info/
-.DS_Store/
+.DS_Store
 """
 
 
