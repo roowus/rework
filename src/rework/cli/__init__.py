@@ -256,41 +256,42 @@ def _render_artifact(role: str, artifact: dict[str, Any]) -> list[str]:
 
 def _md_findings(findings: list[dict[str, Any]]) -> list[str]:
     if not findings:
-        return ["_No findings (clean)._"]
+        return ["_None. Explicitly clean, not silence._"]
     lines: list[str] = [
-        "| severity | verdict | conf | finding |",
-        "|---|---|---|---|",
+        "| # | severity | verdict | conf | finding |",
+        "|---|---|---|---|---|",
     ]
-    for f in findings:
+    for i, f in enumerate(findings, 1):
         lines.append(
-            f"| {f.get('severity')} | {f.get('verdict')} | {f.get('confidence')}"
+            f"| F{i} | {f.get('severity')} | {f.get('verdict')} | {f.get('confidence')}"
             f" | {f.get('title')} |"
         )
     lines.append("")
-    for f in findings:
-        lines.append(f"**{f.get('title')}**")
+    for i, f in enumerate(findings, 1):
+        lines.append(f"#### F{i}: {f.get('title')}")
         lines.append("")
         lines.append(str(f.get("detail", "")))
         lines.append("")
         evidence = f.get("evidence") or []
         if evidence:
-            lines.append("Evidence: " + " · ".join(f"`{e}`" for e in evidence))
-        lines.append("")
+            lines.append("**Evidence:**")
+            lines.append("")
+            for e in evidence:
+                lines.append(f"- `{e}`")
+            lines.append("")
     return lines
 
 
 def _md_blockers(blockers: list[dict[str, Any]]) -> list[str]:
     if not blockers:
         return []
-    lines = ["## Blockers (need an answer)", ""]
-    for b in blockers:
-        lines.append(f"> **Q:** {b.get('question')}")
-        lines.append(">")
-        lines.append(f"> options: {' / '.join(b.get('options', []))}")
-        lines.append(">")
-        lines.append(f"> **recommendation:** {b.get('recommendation')}")
-        lines.append(">")
-        lines.append(f"> _why it cannot self-answer: {b.get('why_cannot_answer')}_")
+    lines: list[str] = []
+    for i, b in enumerate(blockers, 1):
+        lines.append(f"### Blocker {i}: {b.get('question')}")
+        lines.append("")
+        lines.append(f"- **options:** {' / '.join(b.get('options', []))}")
+        lines.append(f"- **recommendation:** {b.get('recommendation')}")
+        lines.append(f"- **why it cannot self-answer:** {b.get('why_cannot_answer')}")
         lines.append("")
     return lines
 
@@ -310,17 +311,38 @@ def _md_run_stats(stats: dict[str, Any]) -> list[str]:
     ]
 
 
-def _render_md(runs: list[Any], spend: Any, mission: Any) -> str:
+def _render_md(runs: list[tuple[Any, dict[str, Any]]], spend: Any, mission: Any) -> str:
+    wall_clock = max(0.0, mission.updated_at - mission.created_at)
     out = [
         f"# mission {mission.id}  [{mission.status.value}]",
         "",
         f"**Objective:** {mission.objective}",
         "",
+        "## At a glance",
+        "",
+        "| step | role | attempt | status | calls | cost (est) | elapsed |",
+        "|---|---|---|---|---|---|---|",
     ]
-    for run in runs:
+    total_calls = 0
+    for run, artifact in runs:
+        stats = artifact.get("run_stats", {})
+        calls = stats.get("model_calls", 0)
+        total_calls += calls
+        out.append(
+            f"| {run.step} | {run.role} | {run.attempt} | {run.status.value} | {calls}"
+            f" | ${stats.get('cost_usd', 0.0):.4f} | {stats.get('elapsed_seconds', 0.0):.1f}s |"
+        )
+    out += [
+        f"| **total** | | | | **{total_calls}** | **${spend.spent_usd:.4f}**"
+        f" | **{_fmt_duration(wall_clock)}** |",
+        "",
+        f"tokens: {spend.input_tokens:,} in / {spend.output_tokens:,} out"
+        f" (cached {spend.cached_tokens:,})",
+        "",
+    ]
+    for run, artifact in runs:
         out.append(f"## {run.step} ({run.role}) attempt {run.attempt}: {run.status.value}")
         out.append("")
-        artifact = dict(run.artifact or {})
         if not artifact:
             out.append("_no artifact_")
             out.append("")
@@ -396,15 +418,28 @@ def _render_md(runs: list[Any], spend: Any, mission: Any) -> str:
         out.extend(_md_blockers(artifact.get("blockers", [])))
         stats = artifact.get("run_stats")
         if stats:
+            out.append("### Run stats (mechanical, from the ledger)")
+            out.append("")
             out.extend(_md_run_stats(stats))
     out.append("## Mission total")
     out.append("")
     out.append(
         f"**${spend.spent_usd:.4f}**  ·  {spend.input_tokens:,} in /"
         f" {spend.output_tokens:,} out  ·  cached {spend.cached_tokens:,}"
+        f"  ·  wall clock {_fmt_duration(wall_clock)}"
     )
     out.append("")
     return "\n".join(out)
+
+
+def _fmt_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, sec = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m {sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m {sec:02d}s"
 
 
 @app.command()
@@ -445,9 +480,7 @@ def report(
 
                 path = _Path(out) if out else DEFAULT_STATE_DIR / "reports" / f"{mission_id}.md"
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(
-                    _render_md([r for r, _ in prepared], spend, mission), encoding="utf-8"
-                )
+                path.write_text(_render_md(prepared, spend, mission), encoding="utf-8")
                 typer.echo(f"report written: {path}")
                 for run, artifact in prepared:
                     status_line = (
@@ -477,9 +510,11 @@ def report(
                 for line in _render_artifact(run.role, artifact):
                     typer.echo(line)
                 typer.echo()
+            wall_clock = _fmt_duration(max(0.0, mission.updated_at - mission.created_at))
             typer.echo(
                 f"mission total: ${spend.spent_usd:.4f}  {spend.input_tokens:,} in /"
                 f" {spend.output_tokens:,} out  (cached {spend.cached_tokens:,})"
+                f"  wall clock {wall_clock}"
             )
         finally:
             await store.aclose()
