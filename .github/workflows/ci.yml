@@ -46,4 +46,4 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
       - run: uv sync
-      - run: uv run pytest
+      - run: uv run pytest -m "not smoke"

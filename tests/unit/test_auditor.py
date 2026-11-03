@@ -20,8 +20,8 @@ from rework.kernel.llm.catalog import ModelCatalog, ModelEntry
 from rework.kernel.llm.types import ChatResult, ToolCall, Usage
 from rework.kernel.state.records import Mission, Run, run_id
 from rework.kernel.state.sqlite import SqliteStore, open_sqlite
+from rework.nodes.report_sections import mechanical_verdict
 from rework.roles.base import RoleBuildCtx
-from rework.roles.builtin.auditor import mechanical_verdict
 from rework.roles.registry import autodiscover
 
 # -- the mechanical verdict mapping --------------------------------------------

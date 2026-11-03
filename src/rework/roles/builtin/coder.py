@@ -145,6 +145,7 @@ class CoderSpec(RoleSpec):
                 "commit": sha,
                 "base_sha": state.get("base_sha"),
                 "summary": state.get("final_text") or "",
+                "worktree": str(wt),
                 "diff": diff[:100_000],
             }
             await ctx.bus.publish(

@@ -280,3 +280,14 @@ def build_report_schema(sections: list[ReportSection]) -> dict[str, Any]:
         "required": required,
         "additionalProperties": False,
     }
+
+
+def mechanical_verdict(audit_artifact: dict[str, Any]) -> str:
+    """The truss verdict mapping, applied mechanically: any critical finding
+    -> request changes; any high -> approve with fixes; else approve."""
+    severities = {str(f.get("severity", "")).lower() for f in audit_artifact.get("findings", [])}
+    if "critical" in severities:
+        return "request changes"
+    if "high" in severities:
+        return "approve with fixes"
+    return "approve"

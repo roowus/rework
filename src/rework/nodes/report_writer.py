@@ -33,6 +33,7 @@ def make_report_writer_node(
     run_id: str,
     sections: list[ReportSection],
     temperature: float | None = None,
+    goal: str = "",
 ) -> ReportWriterNode:
     entry = catalog.resolve(catalog_id)
     schema = build_report_schema(sections)
@@ -42,7 +43,8 @@ def make_report_writer_node(
             ChatRequest(
                 model=entry.model,
                 system=(
-                    "You are the report-writer stage of an agent pipeline. You do"
+                    (f"ROLE GOAL: {goal}\n\n" if goal else "")
+                    + "You are the report-writer stage of an agent pipeline. You do"
                     " not investigate: everything you need is in the transcript."
                     " Emit ONLY the JSON artifact matching the schema: no prose"
                     " outside it. Where evidence is missing, use the blockers/"

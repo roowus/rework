@@ -27,7 +27,7 @@ from langgraph.types import Command
 from rework.kernel.events.bus import EventBus
 from rework.kernel.gates import GateManager
 from rework.kernel.llm.adapters import build_provider
-from rework.kernel.llm.catalog import ModelCatalog
+from rework.kernel.llm.catalog import ModelCatalog, ModelProvider
 from rework.kernel.state.records import (
     EventRecord,
     EventType,
@@ -42,6 +42,7 @@ from rework.kernel.state.records import (
     run_id as make_run_id,
 )
 from rework.kernel.state.store import StateStore
+from rework.nodes.report_sections import mechanical_verdict
 from rework.roles.base import RoleBuildCtx
 from rework.roles.registry import RoleRegistry
 
@@ -63,6 +64,15 @@ def _terminal(run: Run) -> bool:
     return run.status in {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.ABORTED}
 
 
+def _json_dump(value: Any) -> str:
+    import json
+
+    try:
+        return json.dumps(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+
 class RunSupervisor:
     """Owns the live asyncio tasks for one mission's runs."""
 
@@ -76,6 +86,7 @@ class RunSupervisor:
         make_checkpointer: CheckpointerFactory,
         workroot: Path,
         git_author: tuple[str, str] = ("rework", "rework@rework.local"),
+        provider: ModelProvider | None = None,
     ) -> None:
         self._mission = mission
         self._store = store
@@ -85,6 +96,7 @@ class RunSupervisor:
         self._make_checkpointer = make_checkpointer
         self._workroot = workroot
         self._git_author = git_author
+        self._provider = provider  # test/di override; None = build from catalog
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self._closers: list[Callable[[], Awaitable[None]]] = []
         self._ctxs: dict[str, RoleBuildCtx] = {}
@@ -96,7 +108,7 @@ class RunSupervisor:
             run=run,
             mission=self._mission,
             catalog=self._catalog,
-            provider=build_provider(entry),
+            provider=self._provider or build_provider(entry),
             store=self._store,
             bus=self._bus,
             gates=GateManager(self._store, self._bus),
@@ -251,6 +263,7 @@ class MissionRunner:
         workroot: Path,
         poll_interval_s: float = 0.25,
         git_author: tuple[str, str] = ("rework", "rework@rework.local"),
+        provider: ModelProvider | None = None,
     ) -> None:
         self._store = store
         self._bus = bus
@@ -260,6 +273,7 @@ class MissionRunner:
         self._workroot = workroot
         self._poll = poll_interval_s
         self._git_author = git_author
+        self._provider = provider
         self._gates = GateManager(store, bus)
         self.mission_id = mission_id
         self._supervisor: RunSupervisor | None = None
@@ -280,6 +294,7 @@ class MissionRunner:
             self._make_checkpointer,
             self._workroot,
             self._git_author,
+            self._provider,
         )
         try:
             await self._run_steps(mission)
@@ -287,42 +302,159 @@ class MissionRunner:
             await self._supervisor.aclose()
 
     async def _run_steps(self, mission: Mission) -> None:
-        for step in _plan_steps(mission):
+        steps = list(_plan_steps(mission))
+        results: dict[str, Run] = {}  # step_name -> latest terminal run
+        audit_rounds: dict[str, int] = {}
+        last_audit_artifact: dict[str, Any] | None = None
+        index = 0
+        while index < len(steps):
+            step = steps[index]
+            step_name = str(step.get("step") or step["role"])
             runs = await self._dispatch_step(mission, step)
             await self._pump_until_terminal(runs)
+            fresh = await self._store.get_run(runs[-1].id)
+            if fresh is not None:
+                results[step_name] = fresh
+            if step.get("on_request_changes") and fresh is not None:
+                last_audit_artifact = fresh.artifact
+
+            # routing rule: an audit that requests changes sends the revise
+            # target back for another attempt, then re-audits (max_rounds cap)
+            rule = step.get("on_request_changes")
+            if rule and fresh is not None and fresh.artifact:
+                verdict = mechanical_verdict(fresh.artifact)
+                rounds = audit_rounds.get(step_name, 1)
+                if verdict == "request changes" and rounds < int(rule.get("max_rounds", 2)):
+                    audit_rounds[step_name] = rounds + 1
+                    revise_name = str(rule.get("revise") or "")
+                    revise_spec = next(
+                        (s for s in steps if str(s.get("step") or s["role"]) == revise_name),
+                        None,
+                    )
+                    if revise_spec is not None:
+                        steps[index + 1 : index + 1] = [
+                            {
+                                **revise_spec,
+                                "context": {
+                                    **(revise_spec.get("context") or {}),
+                                    "investigation": _json_dump(fresh.artifact.get("findings")),
+                                    "prior_audit": _json_dump(fresh.artifact),
+                                    "_revision": rounds + 1,
+                                },
+                            },
+                            {
+                                **step,
+                                "context": {
+                                    **step.get("context", {}),
+                                    "_revision": rounds + 1,
+                                    "prior_dispositions": _json_dump(fresh.artifact),
+                                },
+                            },
+                        ]
+            index += 1
+
+        # ship gate: the plan's final human decision before synthesis
+        gates_spec = (mission.plan or {}).get("gates") or []
+        ship_decision: bool | None = None
+        if "ship" in gates_spec:
+            verdict = mechanical_verdict(last_audit_artifact) if last_audit_artifact else "approve"
+            gate = await self._gates.request(
+                mission.id,
+                kind=GateKind.SHIP,
+                question=f"Ship the mission result? audit verdict: {verdict}",
+            )
+            await self._bus.publish(
+                EventRecord(
+                    mission_id=mission.id,
+                    type=EventType.INFO,
+                    payload={"note": f"ship gate {gate.id} open (verdict: {verdict})"},
+                )
+            )
+            await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
+            while True:
+                if not await self._store.list_open_gates(mission.id):
+                    break
+                await asyncio.sleep(self._poll)
+            ship_decision = await self._gate_decision(mission.id, gate.id)
+
         runs = await self._store.list_runs(mission.id)
         artifacts = {f"{r.role}:{r.step}": r.artifact for r in runs if r.artifact is not None}
         failed = [r for r in runs if r.status == RunStatus.FAILED]
-        result = {"artifacts": artifacts}
-        status = MissionStatus.FAILED if failed else MissionStatus.DONE
+        result: dict[str, Any] = {"artifacts": artifacts}
+        if ship_decision is False:
+            status = MissionStatus.CANCELLED
+            result["ship"] = "rejected at ship gate"
+        elif failed:
+            status = MissionStatus.FAILED
+        else:
+            status = MissionStatus.DONE
         await self._store.update_mission(mission.id, status=status, result=result)
         event = EventType.MISSION_DONE if status == MissionStatus.DONE else EventType.MISSION_FAILED
         await self._bus.publish(
             EventRecord(mission_id=mission.id, type=event, payload={"runs": len(runs)})
         )
 
+    async def _gate_decision(self, mission_id: str, gate_id: str) -> bool:
+        """Read a decided gate's outcome from the event log (store truth)."""
+        events = await self._store.events_since(0, mission_id=mission_id, limit=5000)
+        for event in reversed(events):
+            if event.type == EventType.GATE_DECIDED and event.payload.get("gate_id") == gate_id:
+                return bool(event.payload.get("approved"))
+        return False
+
     async def _dispatch_step(self, mission: Mission, step: dict[str, Any]) -> list[Run]:
         role = str(step["role"])
         step_name = str(step.get("step") or role)
         attempts = await self._store.list_runs(mission.id)
         prior = [r for r in attempts if r.step == step_name and r.role == role]
-        if prior:
-            # recovery: step already dispatched; restart crashed/never-started runs
+        if prior and prior[-1].status in {
+            RunStatus.INTENT,
+            RunStatus.RUNNING,
+            RunStatus.HALTED_ESCALATED,
+        }:
+            # recovery: this step's latest attempt is still in flight
             assert self._supervisor is not None
             for run in prior:
                 await self._supervisor.ensure_started(run)
-            return prior
+            return [prior[-1]]
+        attempt = len(prior) + 1
         run = Run(
-            id=make_run_id(mission.id, step_name, role, 1),
+            id=make_run_id(mission.id, step_name, role, attempt),
             mission_id=mission.id,
             role=role,
             step=step_name,
-            context=dict(step.get("context") or {}),
+            attempt=attempt,
+            context=await self._resolve_context(mission, step),
+            model_ref={"id": str(step["model"])} if step.get("model") else {},
         )
         created = await self._store.create_run(run)
         assert self._supervisor is not None
         await self._supervisor.ensure_started(created)
         return [created]
+
+    async def _resolve_context(self, mission: Mission, step: dict[str, Any]) -> dict[str, Any]:
+        """Static step context plus wiring: context_from pulls a prior step's
+        artifact (or one of its fields) into this run's context. This is the
+        orchestrator's inter-role policy in M2 form: mechanical, declarative,
+        diff-only where the plan says so. Precedence: wiring fills first,
+        static context overrides, so revision-injected context (audit findings
+        handed to a revision attempt) survives the wiring."""
+        context: dict[str, Any] = {}
+        wiring = step.get("context_from") or {}
+        for key, source in wiring.items():
+            src_step = str(source.get("step") or "")
+            field = source.get("field")
+            candidates = [
+                r
+                for r in await self._store.list_runs(mission.id)
+                if r.step == src_step and r.artifact is not None
+            ]
+            if not candidates:
+                continue
+            artifact = candidates[-1].artifact or {}
+            context[key] = artifact.get(field) if field else artifact
+        context.update(step.get("context") or {})
+        return context
 
     async def _pump_until_terminal(self, runs: list[Run]) -> None:
         while True:

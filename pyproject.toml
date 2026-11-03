@@ -76,7 +76,6 @@ disallow_incomplete_defs = true
 testpaths = ["tests"]
 asyncio_mode = "auto"
 markers = [
-    "smoke: spends real money on real providers (excluded from CI, run manually)",
+    "smoke: spends real money on real providers (self-skips without REWORK_SMOKE=1)",
     "contract: live provider calls that skip without credentials",
 ]
-addopts = "-m 'not smoke'"

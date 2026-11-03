@@ -17,6 +17,7 @@ from rework.kernel.state.store import StateStore
 
 if TYPE_CHECKING:
     from rework.kernel.llm.catalog import ModelCatalog
+    from rework.kernel.llm.types import ChatRequest, ChatResult
 
 BACKENDS: list[str] = ["sqlite"]
 if os.environ.get("REWORK_TEST_POSTGRES"):
@@ -54,6 +55,29 @@ def role_catalog() -> ModelCatalog:
             ModelEntry(id="fake", provider="fake", model="fake-1"),
         ]
     )
+
+
+class ScriptedProvider:
+    """Routes canned responses by substring of the system prompt (the GOAL
+    line), so one provider plays every role in a multi-role mission test."""
+
+    name = "scripted"
+
+    def __init__(self) -> None:
+        self._queues: dict[str, list[ChatResult]] = {}
+        self.requests: list[ChatRequest] = []
+
+    def route(self, key: str, responses: list[ChatResult]) -> None:
+        self._queues.setdefault(key, []).extend(responses)
+
+    async def complete(self, request: ChatRequest) -> ChatResult:
+        self.requests.append(request)
+        for key, queue in self._queues.items():
+            if key in (request.system or ""):
+                if not queue:
+                    raise AssertionError(f"script exhausted for route {key!r}")
+                return queue.pop(0)
+        raise AssertionError("no script matched this system prompt")
 
 
 async def _make_store(backend: str, tmp_path: Path) -> StateStore:

@@ -33,9 +33,90 @@ def version() -> None:
     typer.echo(f"rework {__version__}")
 
 
+PLAN_FIX: dict = {
+    "steps": [
+        {
+            "step": "investigate",
+            "role": "investigator",
+            "model": "flash",
+            "context": {
+                "brief": "$OBJECTIVE",
+                "depth": "quick",
+                "requested_sections": [
+                    "summary",
+                    "findings",
+                    "suggested_fix",
+                    "proposed_tests",
+                    "blockers",
+                ],
+            },
+        },
+        {
+            "step": "code",
+            "role": "coder",
+            "model": "flash",
+            "context": {"brief": "$OBJECTIVE"},
+            "context_from": {"investigation": {"step": "investigate"}},
+        },
+        {
+            "step": "audit",
+            "role": "auditor",
+            "model": "pro",
+            "context": {"brief": "$OBJECTIVE"},
+            "context_from": {
+                "diff": {"step": "code", "field": "diff"},
+                "worktree_path": {"step": "code", "field": "worktree"},
+                "investigation": {"step": "investigate"},
+            },
+            "on_request_changes": {"revise": "code", "max_rounds": 2},
+        },
+    ],
+    "gates": ["ship"],
+}
+
+
+def _prepare_repo(repo_arg: str, mission_id: str) -> str:
+    """A git repo is used in place; a plain directory is copied into the
+    state workspace and git-initialized, so missions stay self-contained
+    and the example repos are never mutated."""
+    import shutil as _shutil
+    import subprocess as _sp
+    from pathlib import Path as _Path
+
+    src = _Path(repo_arg).expanduser().resolve()
+    if not src.is_dir():
+        raise typer.BadParameter(f"repo not found: {src}")
+    if (src / ".git").exists():
+        return str(src)
+    from rework.config import DEFAULT_STATE_DIR
+
+    dest = DEFAULT_STATE_DIR / "work" / mission_id / "repo"
+    if dest.exists():
+        _shutil.rmtree(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _shutil.copytree(
+        src,
+        dest,
+        ignore=_shutil.ignore_patterns(".git", "__pycache__", "*.pyc", ".venv", "node_modules"),
+    )
+
+    def _git(*args: str) -> None:
+        _sp.run(["git", *args], cwd=dest, check=True, capture_output=True)
+
+    _git("init", "-b", "main")
+    _git("add", "-A")
+    _git("-c", "user.name=rework", "-c", "user.email=rework@rework.local", "commit", "-m", "init")
+    return str(dest)
+
+
 @app.command()
-def new(objective: str, repo: str | None = None) -> None:
-    """Create a mission; the daemon picks it up."""
+def new(
+    objective: str,
+    repo: str | None = None,
+    plan: str = typer.Option("echo", help="echo | fix"),
+) -> None:
+    """Create a mission; the daemon picks it up. `--plan fix` runs the
+    investigate -> code -> audit pipeline with a ship gate."""
 
     async def go() -> str:
         from rework.config import Config, open_store_from_config
@@ -47,17 +128,31 @@ def new(objective: str, repo: str | None = None) -> None:
             new_id,
         )
 
+        mission_id = new_id("m")
+        repo_path = _prepare_repo(repo, mission_id) if repo else None
         store = await open_store_from_config(Config.from_env())
         try:
             bus = InProcessEventBus(store)
+            plan_spec: dict | None = None
+            if plan == "fix":
+                if not repo_path:
+                    raise typer.BadParameter("--plan fix requires --repo")
+                import json as _json
+
+                plan_spec = _json.loads(_json.dumps(PLAN_FIX).replace("$OBJECTIVE", objective))
             mission = await store.create_mission(
-                Mission(id=new_id("m"), objective=objective, repo_path=repo)
+                Mission(
+                    id=mission_id,
+                    objective=objective,
+                    repo_path=repo_path,
+                    plan=plan_spec,
+                )
             )
             await bus.publish(
                 EventRecord(
                     mission_id=mission.id,
                     type=EventType.MISSION_CREATED,
-                    payload={"objective": objective},
+                    payload={"objective": objective, "plan": plan},
                 )
             )
             return mission.id

@@ -113,6 +113,7 @@ class InvestigatorSpec(RoleSpec):
             mission_id=ctx.mission.id,
             run_id=ctx.run.id,
             sections=sections,
+            goal=self.goal,
         )
 
         graph = StateGraph(InvestigatorState)

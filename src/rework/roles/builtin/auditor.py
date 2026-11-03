@@ -16,7 +16,11 @@ from typing import TYPE_CHECKING, Any, ClassVar, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from rework.kernel.state.records import EventRecord, EventType
-from rework.nodes.report_sections import ASSEMBLY_AUDIT, resolve_sections
+from rework.nodes.report_sections import (
+    ASSEMBLY_AUDIT,
+    mechanical_verdict,
+    resolve_sections,
+)
 from rework.nodes.report_writer import make_report_writer_node
 from rework.nodes.toolloop import make_toolloop_node
 from rework.nodes.tools import LocalExecutor
@@ -25,16 +29,7 @@ from rework.roles.base import RoleBuildCtx, RoleSpec
 if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
 
-
-def mechanical_verdict(audit_artifact: dict[str, Any]) -> str:
-    """The truss verdict mapping, applied mechanically: any critical finding
-    -> request changes; any high -> approve with fixes; else approve."""
-    severities = {str(f.get("severity", "")).lower() for f in audit_artifact.get("findings", [])}
-    if "critical" in severities:
-        return "request changes"
-    if "high" in severities:
-        return "approve with fixes"
-    return "approve"
+__all__ = ["AuditorSpec", "mechanical_verdict"]
 
 
 class AuditorState(TypedDict, total=False):
@@ -139,6 +134,7 @@ class AuditorSpec(RoleSpec):
             mission_id=ctx.mission.id,
             run_id=ctx.run.id,
             sections=sections,
+            goal=self.goal,
         )
 
         graph = StateGraph(AuditorState)
