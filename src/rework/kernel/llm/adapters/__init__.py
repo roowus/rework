@@ -23,6 +23,8 @@ def build_provider(entry: ModelEntry, extra: dict[str, Any] | None = None) -> Mo
     """Build the adapter an entry names. Keys come from the entry's api_key_env or
     provider defaults (ANTHROPIC_API_KEY / OPENAI_API_KEY). extra carries env-independent
     credentials (e.g. per-endpoint keys for openai-compatible providers)."""
+    if entry.provider == "fake":
+        return FakeProvider()
     if entry.provider == "anthropic":
         key = os.environ.get(entry.api_key_env or "ANTHROPIC_API_KEY")
         return AnthropicProvider(api_key=key)
