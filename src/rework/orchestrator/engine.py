@@ -382,9 +382,18 @@ class MissionRunner:
                 await asyncio.sleep(self._poll)
             ship_decision = await self._gate_decision(mission.id, gate.id)
 
-        runs = await self._store.list_runs(mission.id)
+        await self._synthesize(mission.id, ship_decision)
+
+    async def _synthesize(self, mission_id: str, ship_decision: bool | None) -> None:
+        runs = await self._store.list_runs(mission_id)
         artifacts = {f"{r.role}:{r.step}": r.artifact for r in runs if r.artifact is not None}
-        failed = [r for r in runs if r.status == RunStatus.FAILED]
+        # mission outcome counts only the LATEST attempt per step: a failed
+        # attempt that a later retry superseded must not fail the mission
+        # (found live: mission 2's 503-dead investigator was retried green)
+        latest: dict[tuple[str, str], Run] = {}
+        for r in runs:  # list_runs is created_at-ordered
+            latest[(r.step, r.role)] = r
+        failed = [r for r in latest.values() if r.status == RunStatus.FAILED]
         result: dict[str, Any] = {"artifacts": artifacts}
         if ship_decision is False:
             status = MissionStatus.CANCELLED
@@ -393,10 +402,10 @@ class MissionRunner:
             status = MissionStatus.FAILED
         else:
             status = MissionStatus.DONE
-        await self._store.update_mission(mission.id, status=status, result=result)
+        await self._store.update_mission(mission_id, status=status, result=result)
         event = EventType.MISSION_DONE if status == MissionStatus.DONE else EventType.MISSION_FAILED
         await self._bus.publish(
-            EventRecord(mission_id=mission.id, type=event, payload={"runs": len(runs)})
+            EventRecord(mission_id=mission_id, type=event, payload={"runs": len(runs)})
         )
 
     async def _gate_decision(self, mission_id: str, gate_id: str) -> bool:
