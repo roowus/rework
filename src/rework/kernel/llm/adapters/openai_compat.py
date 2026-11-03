@@ -94,14 +94,17 @@ def translate_response(data: Any) -> ChatResult:
 
 
 class OpenAICompatProvider:
-    """Works with any /chat/completions endpoint via base_url."""
+    """Works with any /chat/completions endpoint via base_url. Client timeout
+    180s: a silently-dropped upstream must surface as APITimeoutError (which
+    RetryingProvider treats as transient), not hang for the SDK default of
+    10 minutes. SDK-level retries stay off; RetryingProvider owns retries."""
 
     name = "openai-compatible"
 
     def __init__(self, api_key: str, base_url: str | None = None, name: str | None = None) -> None:
         from openai import AsyncOpenAI
 
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url, timeout=180.0, max_retries=0)
         if name:
             self.name = name
 

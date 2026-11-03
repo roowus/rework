@@ -102,7 +102,11 @@ class AnthropicProvider:
     def __init__(self, api_key: str | None = None) -> None:
         from anthropic import AsyncAnthropic
 
-        self._client = AsyncAnthropic(api_key=api_key) if api_key else AsyncAnthropic()
+        self._client = (
+            AsyncAnthropic(api_key=api_key, timeout=180.0, max_retries=0)
+            if api_key
+            else AsyncAnthropic(timeout=180.0, max_retries=0)
+        )
 
     async def complete(self, request: ChatRequest) -> ChatResult:
         payload = translate_request(request)
