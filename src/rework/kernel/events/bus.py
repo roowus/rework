@@ -1,4 +1,4 @@
-"""EventBus — typed events, in-process fan-out, write-through to the store.
+"""EventBus: typed events, in-process fan-out, write-through to the store.
 
 The bus is a latency optimization, never the source of truth (CLAUDE.md rule 3):
 every publish is persisted by the store, and consumers can always re-derive from
@@ -37,7 +37,7 @@ class InProcessEventBus:
         persisted = await self._store.append_event(event)
         for q in self._subscribers:
             # non-blocking: a slow consumer never stalls the publisher. A dropped
-            # event is recoverable — the store is the source of truth (events_since).
+            # event is recoverable; the store is the source of truth (events_since).
             with contextlib.suppress(asyncio.QueueFull):
                 q.put_nowait(persisted)
         return persisted

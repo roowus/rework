@@ -1,4 +1,4 @@
-"""SQLite StateStore — demo/test-grade backend.
+"""SQLite StateStore: demo/test-grade backend.
 
 One aiosqlite connection, WAL on, mission concurrency 1 expected (docs/design.md).
 Postgres is the deployment backend; both must pass tests/conformance/test_store.py.
@@ -229,7 +229,7 @@ class SqliteStore:
 
     # -- runs -----------------------------------------------------------------
     async def create_run(self, run: Run) -> Run:
-        """Idempotent on run.id — re-dispatch after a crash returns the stored row."""
+        """Idempotent on run.id: re-dispatch after a crash returns the stored row."""
         await self._db.execute(
             "INSERT OR IGNORE INTO runs (id, mission_id, role, step, attempt, status,"
             " model_ref, context, artifact, escalation, redirect, created_at, updated_at)"

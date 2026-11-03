@@ -1,4 +1,4 @@
-"""Budget ledger — accounting exact, enforcement approximate.
+"""Budget ledger: accounting exact, enforcement approximate.
 
 Parallel role calls charge concurrently, so a soft cap can be overshot between
 check and charge; that is accepted by design (docs/design.md#kernel). The guard

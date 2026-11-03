@@ -1,4 +1,4 @@
-# rework — design (living document)
+# rework design (living document)
 
 This is the living architecture doc. Update it in the same commit as the code it
 describes. Decision history lives in `docs/adr/`.
@@ -6,8 +6,8 @@ describes. Decision history lives in `docs/adr/`.
 ## What rework is
 
 A portable, deployable multi-agent workflow engine. An **orchestrator** (hand-built
-LangGraph supervisor) plans and supervises **roles** — each a purpose-tuned LangGraph
-workflow defined as a code-first `RoleSpec` — to execute **missions**. A compounding
+LangGraph supervisor) plans and supervises **roles**, each a purpose-tuned LangGraph
+workflow defined as a code-first `RoleSpec`. Roles execute **missions**. A compounding
 **Library** of skills/tools/reports/memories crosses projects and harnesses. Runs as one
 headless process on a laptop or VPS; missions persist and are attachable from any machine
 sharing the state database.
@@ -36,17 +36,17 @@ sharing the state database.
 
 Everything else is written against these protocols:
 
-- **StateStore** (`kernel/state/`) — missions, runs, gates, events, ledger, telemetry.
+- **StateStore** (`kernel/state/`): missions, runs, gates, events, ledger, telemetry.
   Two implementations (Postgres default, SQLite fallback/demo/tests), one conformance
   suite parametrized over both. LangGraph checkpointers hang off the same database.
-- **EventBus** (`kernel/events/`) — typed events (ROLE_SPAWNED, PROGRESS, ESCALATED,
+- **EventBus** (`kernel/events/`): typed events (ROLE_SPAWNED, PROGRESS, ESCALATED,
   GATE_OPENED, DONE, …), in-process asyncio fan-out, write-through to the store.
-- **ModelCatalog** (`kernel/llm/`) — provider/model entries with tier, cost, caps; three
+- **ModelCatalog** (`kernel/llm/`): provider/model entries with tier, cost, caps; three
   adapters: Anthropic, OpenAI, generic OpenAI-compatible (covers DeepInfra/z.ai/DeepSeek
   via config). Promotion moves a run up a tier within the same provider by default.
-- **BudgetLedger** (`kernel/budget/`) — single persisted writer; enforcement approximate
+- **BudgetLedger** (`kernel/budget/`): single persisted writer; enforcement approximate
   (overage tolerated, enforced at next guard), accounting exact.
-- **GateManager** (`kernel/gates.py`) — human approval gates: request half (interrupt +
+- **GateManager** (`kernel/gates.py`): human approval gates: request half (interrupt +
   AWAITING_GATE row), resolve half (`rework approve <gate-id>` from any machine sharing
   the DB).
 
@@ -62,10 +62,10 @@ The engine (`orchestrator/engine.py`) is the heart: MissionRunner streams the gr
 materializes interrupts as gate rows, waits on store-derived wake conditions, resumes with
 `Command(resume=...)`. RunSupervisor reconciles INTENT rows into live role asyncio tasks.
 The daemon runs one runner per mission under a semaphore, holds a leader lock, and runs a
-boot recovery pass (reopen missions, re-enumerate runs, pick up gates decided while down —
+boot recovery pass (reopen missions, re-enumerate runs, pick up gates decided while down,
 before the first astream call).
 
-Roles are NOT subgraphs of the orchestrator checkpoint — each Run is an independent
+Roles are NOT subgraphs of the orchestrator checkpoint; each Run is an independent
 asyncio task with its own checkpointer thread. Parallelism = N run rows for one step.
 
 ### Roles
@@ -73,14 +73,14 @@ asyncio task with its own checkpointer thread. Parallelism = N run rows for one 
 Code-first `RoleSpec` subclasses; a registry auto-discovers role modules; standard
 assemblies (`roles/assembly.py`) compose the shared node library (tool-loop agent,
 deep-agents node, gate node, report-writer, git/shell tools, escalate node). Escalation to
-the orchestrator is a typed envelope — `{kind: blocked|needs_model|needs_tool|
-needs_context|question, detail}` — runtime policies act on the kind mechanically; the
+the orchestrator is a typed envelope `{kind: blocked|needs_model|needs_tool|
+needs_context|question, detail}`: runtime policies act on the kind mechanically; the
 orchestrator LLM reads the detail.
 
 ### The Library
 
-Items (skills/tools/reports/memories) live as files in a dedicated git repo — canonical
-on the VPS, mirrored to GitHub — indexed in Postgres with rich metadata and provenance.
+Items (skills/tools/reports/memories) live as files in a dedicated git repo (canonical
+on the VPS, mirrored to GitHub), indexed in Postgres with rich metadata and provenance.
 Two-tier memory: project-local namespaces + a global catalog with origin info. Retrieval:
 metadata search now, pgvector semantic (hybrid ranking) at scale, one `search()` interface.
 Curation is tiered: skills/memories/reports auto-accept; tools always human-gated;

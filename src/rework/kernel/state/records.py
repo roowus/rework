@@ -1,7 +1,7 @@
 """Domain records persisted by the StateStore.
 
 Timestamps are float epoch seconds (recoverable wait deadlines are epoch-based by
-design — docs/adr/0001). Run ids are deterministic: `mission:step:role:attempt`
+design; see docs/adr/0001). Run ids are deterministic: `mission:step:role:attempt`
 (idempotent create_run is the crash-recovery backbone).
 """
 
@@ -24,7 +24,7 @@ def new_id(prefix: str) -> str:
 
 
 def run_id(mission_id: str, step: str, role: str, attempt: int) -> str:
-    """Deterministic run id — create_run is idempotent on this value."""
+    """Deterministic run id: create_run is idempotent on this value."""
     return f"{mission_id}:{step}:{role}:{attempt}"
 
 
@@ -124,7 +124,7 @@ class EventRecord(BaseModel):
 
 
 class Charge(BaseModel):
-    """One model call's cost — the ledger's atomic entry (accounting exact,
+    """One model call's cost: the ledger's atomic entry (accounting exact,
     enforcement approximate: see docs/design.md#kernel)."""
 
     mission_id: str | None = None

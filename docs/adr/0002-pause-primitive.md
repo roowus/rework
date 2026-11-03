@@ -1,4 +1,4 @@
-# ADR 0002: One pause primitive — gates and escalations share interrupt mechanics
+# ADR 0002: One pause primitive (gates and escalations share interrupt mechanics)
 
 ## Status
 
@@ -15,7 +15,7 @@ on resume, so side effects before the interrupt duplicate.
 Gates and escalations use the same pause mechanics: interrupt is the FIRST side effect of
 the pausing node (only sanctioned wrappers: `GateManager.request`, the escalate node); the
 decision is persisted in a store row that is the single source of truth; resume happens
-with `Command(resume=decision)` read from that row — including decisions made while the
+with `Command(resume=decision)` read from that row, including decisions made while the
 daemon was down (boot recovery consults open rows before the first astream call).
 
 ## Consequences

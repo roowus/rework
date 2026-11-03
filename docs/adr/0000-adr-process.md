@@ -18,6 +18,6 @@ Significant decisions get one markdown file here, numbered sequentially:
 - **Decision**: what we chose
 - **Consequences**: what this costs and buys, including rejected alternatives
 
-An ADR is written in the same commit as the code that enacts it (see CLAUDE.md —
+An ADR is written in the same commit as the code that enacts it (see CLAUDE.md,
 docs follow code). Superseding replaces, never edits: the old ADR keeps its status
 updated with a pointer.

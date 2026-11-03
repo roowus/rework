@@ -1,9 +1,9 @@
-"""GateManager — human approval gates.
+"""GateManager: human approval gates.
 
 Two halves: the engine side (`request`) creates the gate row and returns it so the
-pausing node can `interrupt()` immediately after (interrupt FIRST side effect —
+pausing node can `interrupt()` immediately after (interrupt FIRST side effect;
 CLAUDE.md rule 1; the row write is idempotent-ish bookkeeping that precedes it);
-the client side (`decide`) is what `rework approve` calls — from any machine
+the client side (`decide`) is what `rework approve` calls, from any machine
 sharing the database. The gate row is the single source of truth: the engine
 resumes from the row, never from memory, so decisions made while the daemon was
 down are honored (boot recovery reads open gates before the first astream).

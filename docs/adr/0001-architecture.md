@@ -18,14 +18,14 @@ models with promotion, human gates, cross-device missions, and a compounding lib
    langgraph-supervisor library, not the Claude Agent SDK) because check-ins, typed
    escalations, model promotion and gates are first-class nodes with custom semantics.
 2. **Roles are code-first `RoleSpec` subclasses**, each building a LangGraph graph from a
-   shared node library — rejecting declarative YAML (GitHub-Actions rigidity: new behavior
+   shared node library, rejecting declarative YAML (GitHub-Actions rigidity: new behavior
    would require engine surgery) and a hybrid knobs layer (the knobs already live as typed
    RoleSpec fields).
 3. **Roles are not orchestrator subgraphs.** Each run is an independent asyncio task with
    its own checkpointer thread; the orchestrator dispatches SpawnIntents that the engine
    reconciles into tasks. This keeps join semantics simple and crash recovery enumerable
    from run rows.
-4. **Escalation is a typed envelope** `{kind, detail}` — machine-actable kinds
+4. **Escalation is a typed envelope** `{kind, detail}`: machine-actable kinds
    (blocked/needs_model/needs_tool/needs_context/question) with prose detail, after
    Anthropic's structured-returns philosophy.
 5. **Own model catalog + three thin adapters** (Anthropic, OpenAI, generic
@@ -37,7 +37,7 @@ models with promotion, human gates, cross-device missions, and a compounding lib
 
 ## Consequences
 
-- More core code than library-based supervision — repaid by exact semantics (promotion
+- More core code than library-based supervision, repaid by exact semantics (promotion
   mid-run, rate-limited escalation policies, resumable gates from any machine).
 - SQLite mode is demo/test-grade (concurrency 1, WAL); Postgres is the real deployment.
 - Promotion defaults to same-provider (cross-provider breaks on Anthropic content-block

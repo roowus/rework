@@ -21,7 +21,7 @@ app = typer.Typer(
 
 @app.callback()
 def root() -> None:
-    """rework — see `rework --help` for commands."""
+    """rework: see `rework --help` for commands."""
 
 
 @app.command()

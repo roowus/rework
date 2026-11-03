@@ -1,4 +1,4 @@
-"""Postgres StateStore — the deployment backend.
+"""Postgres StateStore: the deployment backend.
 
 Same contract as SqliteStore; both must pass tests/conformance/test_store.py.
 Checkpointer tables (langgraph-checkpoint-postgres) live in the same database
@@ -255,7 +255,7 @@ class PostgresStore:
 
     # -- runs -----------------------------------------------------------------
     async def create_run(self, run: Run) -> Run:
-        """Idempotent on run.id — re-dispatch after a crash returns the stored row."""
+        """Idempotent on run.id: re-dispatch after a crash returns the stored row."""
         await self._conn.execute(
             "INSERT INTO runs (id, mission_id, role, step, attempt, status, model_ref,"
             " context, artifact, escalation, redirect, created_at, updated_at)"

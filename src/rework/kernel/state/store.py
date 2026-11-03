@@ -1,4 +1,4 @@
-"""StateStore — the seam everything else in rework is written against.
+"""StateStore: the seam everything else in rework is written against.
 
 Two implementations (sqlite: demo/test-grade; postgres: deployment-grade) must both
 pass tests/conformance/test_store.py. The store is the single source of truth:

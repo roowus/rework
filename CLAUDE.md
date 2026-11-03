@@ -1,4 +1,4 @@
-# CLAUDE.md — rework
+# CLAUDE.md: rework
 
 rework is a portable multi-agent workflow engine: a LangGraph **orchestrator** supervises
 **roles** (each a purpose-tuned LangGraph workflow defined as a `RoleSpec` subclass) to
@@ -12,7 +12,7 @@ via MCP). Full design: `docs/design.md`; decisions: `docs/adr/`.
 uv sync                      # install (dev group included); uv.lock is the exact pin set
 uv run rework --help         # the CLI
 uv run pytest                # unit + integration (SQLite), smoke excluded by default
-uv run pytest -m smoke       # real-money tests — run manually only
+uv run pytest -m smoke       # real-money tests, run manually only
 uv run ruff check .          # lint
 uv run mypy src              # type check (kernel/ is strict)
 ```
@@ -29,7 +29,7 @@ store conformance suite parametrizes over both backends; Postgres tests skip wit
 - **Every work chunk ends with something the user can verify**: an exact command to run
   or an observable behavior to watch. If a chunk has nothing user-visible, re-slice it.
 - **Per-role design sessions.** Before finalizing a builtin role's `build_graph()`, run a
-  dedicated design Q&A with the user — they have per-role graph preferences.
+  dedicated design Q&A with the user; they have per-role graph preferences.
 
 ## Hard rules (architecture invariants)
 
@@ -39,7 +39,7 @@ store conformance suite parametrizes over both backends; Postgres tests skip wit
 2. No blocking calls inside async nodes: async SDKs only, subprocesses via
    `asyncio.create_subprocess_exec`. (Linted via ruff `ASYNC` rules.)
 3. The store is the source of truth. In-process events/queues are latency optimizations
-   only — every monitor/daemon decision re-derives from store rows.
+   only; every monitor/daemon decision re-derives from store rows.
 4. Run ids are deterministic: `(mission_id, step, role, attempt)`; `create_run` is
    idempotent. Recovery re-enumerates from the runs table.
 5. Wait deadlines live in graph state (epoch seconds), never derived from process uptime.
@@ -50,16 +50,16 @@ store conformance suite parametrizes over both backends; Postgres tests skip wit
 ## Dogfooding (self-hosting) rules
 
 rework improves itself: from M3 on, rework issues get worked as rework missions. Missions
-targeting this very repo ALWAYS run the SHIP gate — an agent never merges its own PR; the
+targeting this very repo ALWAYS run the SHIP gate: an agent never merges its own PR; the
 human does. Agents push branches; main is PR-only (branch protection from M4).
 
 ## Repo map
 
-- `src/rework/kernel/` — seams everything else is written against: StateStore (sqlite +
+- `src/rework/kernel/`: seams everything else is written against: StateStore (sqlite +
   postgres), EventBus, ModelCatalog + provider adapters, BudgetLedger, GateManager
-- `src/rework/orchestrator/` — supervisor graph, engine (MissionRunner/RunSupervisor/recovery), daemon
-- `src/rework/roles/` — RoleSpec base, registry, standard assemblies, builtin roles
-- `src/rework/nodes/` — node library (llm, toolloop, tools, git, handoff, escalate)
-- `src/rework/library/` — the Library (model, store, search, curation, memory, MCP server)
-- `src/rework/evals/` — eval harness (tasks, graders, score history)
-- `src/rework/cli/` — typer CLI: serve/new/ls/attach/approve/status/roles/eval/library
+- `src/rework/orchestrator/`: supervisor graph, engine (MissionRunner/RunSupervisor/recovery), daemon
+- `src/rework/roles/`: RoleSpec base, registry, standard assemblies, builtin roles
+- `src/rework/nodes/`: node library (llm, toolloop, tools, git, handoff, escalate)
+- `src/rework/library/`: the Library (model, store, search, curation, memory, MCP server)
+- `src/rework/evals/`: eval harness (tasks, graders, score history)
+- `src/rework/cli/`: typer CLI: serve/new/ls/attach/approve/status/roles/eval/library
