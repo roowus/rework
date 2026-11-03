@@ -10,7 +10,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from pydantic import BaseModel, Field
 
@@ -84,10 +84,14 @@ class RoleSpec(ABC):
 
     name: str = ""
     description: str = ""
+    goal: str = ""  # the line that anchors every prompt for this role (ADR 0003)
     default_model: str = ""  # catalog id
     tools: ToolPack = ToolPack()
     escalation: EscalationPolicy = EscalationPolicy()
     budget: Budget = Budget()
+    # what this role can consume in its task context; the orchestrator picks
+    # per mission which keys to actually hand over (ADR 0003 decision 5)
+    context_manifest: ClassVar[set[str]] = set()
 
     @abstractmethod
     def build_graph(self, ctx: RoleBuildCtx) -> CompiledStateGraph:

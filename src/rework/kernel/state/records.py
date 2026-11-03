@@ -32,6 +32,7 @@ class MissionStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     AWAITING_GATE = "awaiting_gate"
+    ON_HOLD = "on_hold"  # user pause or burn-gate (ADR 0003)
     DONE = "done"
     FAILED = "failed"
     CANCELLED = "cancelled"
