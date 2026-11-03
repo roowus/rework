@@ -7,7 +7,7 @@ in-process queues and caches are latency optimizations only (CLAUDE.md rule 3).
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from rework.kernel.state.records import (
     BudgetState,
@@ -23,8 +23,10 @@ from rework.kernel.state.records import (
 )
 
 
+@runtime_checkable
 class StateStore(Protocol):
-    """Async persistence for missions, runs, gates, events, charges, leader lock."""
+    """Async persistence for missions, runs, gates, events, charges, leader lock.
+    runtime_checkable so pydantic can validate RoleBuildCtx.store by instance."""
 
     async def aclose(self) -> None: ...
 

@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from rework.kernel.state.records import EventRecord
 from rework.kernel.state.store import StateStore
 
 
+@runtime_checkable
 class EventBus(Protocol):
     async def publish(self, event: EventRecord) -> EventRecord: ...
 

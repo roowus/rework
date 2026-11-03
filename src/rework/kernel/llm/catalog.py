@@ -6,7 +6,7 @@ tiers within the same provider (cross-provider promotion is config-gated, ADR 00
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
@@ -34,8 +34,10 @@ class ModelEntry(BaseModel):
         return (input_tokens * self.cost_in_per_mtok + output_tokens * self.cost_out_per_mtok) / 1e6
 
 
+@runtime_checkable
 class ModelProvider(Protocol):
-    """One adapter per wire format. name matches ModelEntry.provider."""
+    """One adapter per wire format. name matches ModelEntry.provider.
+    runtime_checkable so pydantic can validate RoleBuildCtx.provider by instance."""
 
     name: str
 
