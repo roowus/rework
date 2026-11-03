@@ -18,6 +18,7 @@ dependencies = [
     "langgraph-checkpoint-sqlite>=2.0",
     # state stores
     "psycopg[binary,pool]>=3.1",
+    "aiosqlite>=0.20",
     # model providers
     "anthropic>=0.40",
     "openai>=1.50",
