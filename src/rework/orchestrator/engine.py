@@ -412,16 +412,20 @@ class MissionRunner:
         step_name = str(step.get("step") or role)
         attempts = await self._store.list_runs(mission.id)
         prior = [r for r in attempts if r.step == step_name and r.role == role]
-        if prior and prior[-1].status in {
-            RunStatus.INTENT,
-            RunStatus.RUNNING,
-            RunStatus.HALTED_ESCALATED,
-        }:
-            # recovery: this step's latest attempt is still in flight
-            assert self._supervisor is not None
-            for run in prior:
-                await self._supervisor.ensure_started(run)
-            return [prior[-1]]
+        if prior and "_revision" not in (step.get("context") or {}):
+            if prior[-1].status == RunStatus.COMPLETED:
+                # recovery: this step already produced its artifact; keep it
+                return [prior[-1]]
+            if prior[-1].status in {
+                RunStatus.INTENT,
+                RunStatus.RUNNING,
+                RunStatus.HALTED_ESCALATED,
+            }:
+                # recovery: this step's latest attempt is still in flight
+                assert self._supervisor is not None
+                for run in prior:
+                    await self._supervisor.ensure_started(run)
+                return [prior[-1]]
         attempt = len(prior) + 1
         run = Run(
             id=make_run_id(mission.id, step_name, role, attempt),
