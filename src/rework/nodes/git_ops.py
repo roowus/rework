@@ -33,6 +33,13 @@ async def has_repo(path: Path) -> bool:
     return code == 0
 
 
+def _has_entries(path: Path) -> bool:
+    try:
+        return any(path.iterdir())
+    except OSError:
+        return False
+
+
 async def make_worktree(repo: Path, worktree_path: Path, branch: str) -> Path:
     """Isolated checkout sharing the repo's history. Branch is created if new,
     reused if it already exists (idempotent dispatch/recovery)."""
@@ -41,6 +48,29 @@ async def make_worktree(repo: Path, worktree_path: Path, branch: str) -> Path:
     if code != 0:
         raise RuntimeError(f"git worktree add failed: {out}")
     return worktree_path
+
+
+async def ensure_worktree(repo: Path, worktree_path: Path, branch: str) -> tuple[Path, str]:
+    """Create-or-reuse. Returns (worktree, base_sha). The base sha is the branch
+    point on first creation; callers persist it (run context) so a resumed run
+    diffs against the same base it started with."""
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    has_entries = await asyncio.to_thread(_has_entries, worktree_path)
+    if has_entries:
+        code, cur = await _run(worktree_path, "rev-parse", "--abbrev-ref", "HEAD")
+        if code == 0 and cur.strip() == branch:
+            code, sha = await _run(worktree_path, "rev-parse", "HEAD")
+            if code != 0:
+                raise RuntimeError(f"git rev-parse failed: {sha}")
+            return worktree_path, sha
+        raise RuntimeError(f"{worktree_path} exists but is not worktree branch {branch}")
+    code, out = await _run(repo, "worktree", "add", "-B", branch, str(worktree_path))
+    if code != 0:
+        raise RuntimeError(f"git worktree add failed: {out}")
+    code, sha = await _run(worktree_path, "rev-parse", "HEAD")
+    if code != 0:
+        raise RuntimeError(f"git rev-parse failed: {sha}")
+    return worktree_path, sha
 
 
 async def remove_worktree(repo: Path, worktree_path: Path, force: bool = False) -> None:
@@ -62,9 +92,23 @@ async def stage_all(worktree: Path) -> str:
     return out
 
 
-async def commit(worktree: Path, message: str) -> str | None:
-    """Returns the commit sha, or None when there was nothing to commit."""
-    code, out = await _run(worktree, "commit", "-m", message)
+async def commit(
+    worktree: Path,
+    message: str,
+    author: tuple[str, str] = ("rework", "rework@rework.local"),
+) -> str | None:
+    """Returns the commit sha, or None when there was nothing to commit.
+    Explicit agent identity: runs on machines with no git config (CI runners)."""
+    code, out = await _run(
+        worktree,
+        "-c",
+        f"user.name={author[0]}",
+        "-c",
+        f"user.email={author[1]}",
+        "commit",
+        "-m",
+        message,
+    )
     if code != 0:
         if "nothing to commit" in out:
             return None
@@ -75,14 +119,21 @@ async def commit(worktree: Path, message: str) -> str | None:
     return sha
 
 
-async def diff_base(worktree: Path, base: str = "HEAD~1") -> str:
-    """The run's changes. Default base is the worktree's own first parent:
-    per-run branches start at the repo head, so HEAD~1 isolates this run's
-    work once it has committed. Falls back to the full branch diff vs main."""
-    code, out = await _run(worktree, "diff", base)
-    if code == 0 and out:
-        return out
-    code, out = await _run(worktree, "diff", f"main...{await current_branch(worktree)}")
+async def diff_base(worktree: Path, base: str | None = None) -> str:
+    """The run's changes. With a recorded base sha: everything committed since
+    that point (stable across resumes). Without one: merge-base diff against
+    main, falling back to HEAD~1."""
+    if base is not None:
+        code, out = await _run(worktree, "diff", base)
+        if code == 0:
+            return out
+    for base_branch in ("main", "master"):
+        code, out = await _run(
+            worktree, "diff", f"{base_branch}...{await current_branch(worktree)}"
+        )
+        if code == 0:
+            return out
+    code, out = await _run(worktree, "diff", "HEAD~1")
     return out
 
 

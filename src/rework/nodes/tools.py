@@ -60,6 +60,33 @@ class ToolExecutor(Protocol):
     def specs(self, allowed: set[str] | None = None) -> list[ToolSpec]: ...
 
 
+class LazyExecutor:
+    """Executor that binds its jail target at prepare time. The coder's
+    worktree is created by its prepare node, but the loop node is wired at
+    build_graph time; this wrapper forwards to a LocalExecutor once attached."""
+
+    def __init__(self, fallback_specs: list[ToolSpec] | None = None) -> None:
+        self._inner: LocalExecutor | None = None
+        self._fallback = fallback_specs or list(BUILTIN_TOOLS)
+
+    def attach(self, workdir: Path) -> None:
+        self._inner = LocalExecutor(workdir)
+
+    @property
+    def attached(self) -> bool:
+        return self._inner is not None
+
+    async def execute(self, name: str, args: dict[str, Any]) -> str:
+        if self._inner is None:
+            raise RuntimeError("LazyExecutor used before attach()")
+        return await self._inner.execute(name, args)
+
+    def specs(self, allowed: set[str] | None = None) -> list[ToolSpec]:
+        if self._inner is None:
+            return [s for s in self._fallback if allowed is None or s.name in allowed]
+        return self._inner.specs(allowed)
+
+
 class LocalExecutor:
     """Path-jailed local tools. Every path arg is resolved against the workdir
     and rejected if it escapes (symlinks included)."""

@@ -15,7 +15,6 @@ from rework.kernel.budget.ledger import Budget
 from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.gates import GateManager
 from rework.kernel.llm.adapters.fake import FakeProvider
-from rework.kernel.llm.catalog import ModelCatalog, ModelEntry
 from rework.kernel.state.records import Mission, Run, run_id
 from rework.kernel.state.sqlite import SqliteStore, open_sqlite
 from rework.roles.base import RoleBuildCtx, RoleSpec
@@ -40,19 +39,19 @@ def test_unknown_role_names_known() -> None:
 async def echo_ctx(tmp_path: Path) -> AsyncIterator[RoleBuildCtx]:
     """Build ctx with an owned store; the aiosqlite thread is non-daemon, so a
     leaked connection hangs interpreter exit (found the hard way)."""
+    from conftest import make_git_repo, role_catalog
+
+    repo = make_git_repo(tmp_path)
     store: SqliteStore = await open_sqlite(str(tmp_path / "roles.sqlite3"))
     try:
         bus = InProcessEventBus(store)
-        mission = await store.create_mission(Mission(id="m1", objective="say hello"))
+        mission = await store.create_mission(
+            Mission(id="m1", objective="say hello", repo_path=str(repo))
+        )
         run = await store.create_run(
             Run(id=run_id("m1", "echo", "echo", 1), mission_id="m1", role="echo", step="echo")
         )
-        catalog = ModelCatalog(
-            [
-                ModelEntry(id="fake", provider="fake", model="fake-1"),
-                ModelEntry(id="flash", provider="fake", model="fake-flash"),
-            ]
-        )
+        catalog = role_catalog()
         yield RoleBuildCtx(
             run=run,
             mission=mission,

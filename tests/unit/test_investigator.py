@@ -16,7 +16,6 @@ from rework.kernel.budget.ledger import Budget
 from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.gates import GateManager
 from rework.kernel.llm.adapters.fake import FakeProvider
-from rework.kernel.llm.catalog import ModelCatalog, ModelEntry
 from rework.kernel.llm.types import ChatResult, ToolCall, Usage
 from rework.kernel.state.records import Mission, Run, run_id
 from rework.kernel.state.sqlite import SqliteStore, open_sqlite
@@ -27,11 +26,16 @@ from rework.roles.registry import autodiscover
 @pytest.fixture
 async def inv_ctx(tmp_path: Path) -> AsyncIterator[RoleBuildCtx]:
     """Workspace with a planted bug; requested_sections set on the run."""
+    from conftest import make_git_repo, role_catalog
+
     (tmp_path / "app.py").write_text("def greet(name):\n    return f'hello {name.upper()}'\n")
+    repo = make_git_repo(tmp_path)
     store: SqliteStore = await open_sqlite(str(tmp_path / "inv.sqlite3"))
     try:
         bus = InProcessEventBus(store)
-        mission = await store.create_mission(Mission(id="mi", objective="find the crash"))
+        mission = await store.create_mission(
+            Mission(id="mi", objective="find the crash", repo_path=str(repo))
+        )
         run = await store.create_run(
             Run(
                 id=run_id("mi", "investigate", "investigator", 1),
@@ -45,12 +49,7 @@ async def inv_ctx(tmp_path: Path) -> AsyncIterator[RoleBuildCtx]:
                 },
             )
         )
-        catalog = ModelCatalog(
-            [
-                ModelEntry(id="flash", provider="fake", model="fake-flash"),
-                ModelEntry(id="fake", provider="fake", model="fake-1"),
-            ]
-        )
+        catalog = role_catalog()
         yield RoleBuildCtx(
             run=run,
             mission=mission,
