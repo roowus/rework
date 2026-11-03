@@ -32,6 +32,7 @@ from rework.kernel.state.records import (
     EventRecord,
     EventType,
     GateKind,
+    GateStatus,
     Mission,
     MissionStatus,
     Run,
@@ -409,12 +410,15 @@ class MissionRunner:
         )
 
     async def _gate_decision(self, mission_id: str, gate_id: str) -> bool:
-        """Read a decided gate's outcome from the event log (store truth)."""
-        events = await self._store.events_since(0, mission_id=mission_id, limit=5000)
-        for event in reversed(events):
-            if event.type == EventType.GATE_DECIDED and event.payload.get("gate_id") == gate_id:
-                return bool(event.payload.get("approved"))
-        return False
+        """Read the decision from the gate ROW (the source of truth). The
+        row-update and its event commit separately, so the event log can lag
+        the empty-open-gates check by a beat; polling the row closes that race
+        (found as a rare CI-only 'ship rejected despite approval')."""
+        while True:
+            gate = await self._store.get_gate(gate_id)
+            if gate is not None and gate.status != GateStatus.OPEN:
+                return gate.status == GateStatus.APPROVED
+            await asyncio.sleep(self._poll)
 
     async def _dispatch_step(self, mission: Mission, step: dict[str, Any]) -> list[Run]:
         role = str(step["role"])
