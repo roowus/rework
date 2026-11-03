@@ -107,7 +107,8 @@ execution per role behind the `ToolExecutor` protocol.
 |---|---|---|
 | M0 | Scaffold + CI (`uv sync && uv run pytest && uv run rework --help` green) | ✅ done |
 | M1 | Kernel seams + engine + Echo stub role + CLI + crash-recovery demo | ✅ done (LLM plan/check-in nodes land in M2's supervisor graph) |
-| M2 | Vertical slice: investigator→coder→auditor on toyrepo; first self-hosted docs-PR | planned |
+| M2 | Vertical slice: investigator→coder→auditor on toyrepo; first self-hosted docs-PR | ✅ code done (fix plan + veto routing + ship gate + smoke test); remaining: first real-model mission run + self-hosted docs-PR |
+| M2.5 | Real-repo effectiveness run on a live project (polystats), owner-driven | next after M2 closes |
 | M3 | Robustness (recovery paths, promotions, budget E2E, concurrency) + eval harness v1 | planned |
 | M4 | rewvis deploy (systemd, Postgres, deploy key, branch protection) + cross-device | planned |
 | M5 | Library v1 (git store, curation, MCP server, role integration) | planned |
