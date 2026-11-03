@@ -432,9 +432,7 @@ class SqliteStore:
 
     # -- leader lock ----------------------------------------------------------------------
     async def acquire_lock(self, owner: str, stale_after_s: float = 60.0) -> bool:
-        row = await self._fetch_one(
-            "SELECT owner, heartbeat_at FROM daemon_lock WHERE id = 1", ()
-        )
+        row = await self._fetch_one("SELECT owner, heartbeat_at FROM daemon_lock WHERE id = 1", ())
         if (
             row is not None
             and row["owner"] != owner

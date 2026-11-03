@@ -27,9 +27,12 @@ async def _make_store(backend: str, tmp_path: Path) -> StateStore:
 
         return await open_sqlite(str(tmp_path / "test.sqlite3"))
     if backend == "postgres":
-        from rework.kernel.state.postgres import open_postgres
+        from rework.kernel.state.postgres import PostgresStore, open_postgres
 
-        return await open_postgres(_TEST_PG_URL)
+        store = await open_postgres(_TEST_PG_URL)
+        assert isinstance(store, PostgresStore)
+        await store.reset_for_tests()  # shared dev database — isolate every test
+        return store
     raise ValueError(f"unknown backend {backend}")
 
 
