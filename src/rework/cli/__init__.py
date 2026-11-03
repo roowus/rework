@@ -254,10 +254,168 @@ def _render_artifact(role: str, artifact: dict[str, Any]) -> list[str]:
     return out
 
 
+def _md_findings(findings: list[dict[str, Any]]) -> list[str]:
+    if not findings:
+        return ["_No findings (clean)._"]
+    lines: list[str] = [
+        "| severity | verdict | conf | finding |",
+        "|---|---|---|---|",
+    ]
+    for f in findings:
+        lines.append(
+            f"| {f.get('severity')} | {f.get('verdict')} | {f.get('confidence')}"
+            f" | {f.get('title')} |"
+        )
+    lines.append("")
+    for f in findings:
+        lines.append(f"**{f.get('title')}**")
+        lines.append("")
+        lines.append(str(f.get("detail", "")))
+        lines.append("")
+        evidence = f.get("evidence") or []
+        if evidence:
+            lines.append("Evidence: " + " · ".join(f"`{e}`" for e in evidence))
+        lines.append("")
+    return lines
+
+
+def _md_blockers(blockers: list[dict[str, Any]]) -> list[str]:
+    if not blockers:
+        return []
+    lines = ["## Blockers (need an answer)", ""]
+    for b in blockers:
+        lines.append(f"> **Q:** {b.get('question')}")
+        lines.append(">")
+        lines.append(f"> options: {' / '.join(b.get('options', []))}")
+        lines.append(">")
+        lines.append(f"> **recommendation:** {b.get('recommendation')}")
+        lines.append(">")
+        lines.append(f"> _why it cannot self-answer: {b.get('why_cannot_answer')}_")
+        lines.append("")
+    return lines
+
+
+def _md_run_stats(stats: dict[str, Any]) -> list[str]:
+    return [
+        "## Run stats (mechanical, from the ledger)",
+        "",
+        "| model calls | input | output | cached | cost (est) | elapsed |",
+        "|---|---|---|---|---|---|",
+        f"| {stats.get('model_calls', 0)} | {stats.get('input_tokens', 0):,}"
+        f" | {stats.get('output_tokens', 0):,} | {stats.get('cached_tokens', 0):,}"
+        f" | ${stats.get('cost_usd', 0.0):.4f} | {stats.get('elapsed_seconds', 0.0):.1f}s |",
+        "",
+        f"models: {', '.join(stats.get('models', ['?']))}",
+        "",
+    ]
+
+
+def _render_md(runs: list[Any], spend: Any, mission: Any) -> str:
+    out = [
+        f"# mission {mission.id}  [{mission.status.value}]",
+        "",
+        f"**Objective:** {mission.objective}",
+        "",
+    ]
+    for run in runs:
+        out.append(f"## {run.step} ({run.role}) attempt {run.attempt}: {run.status.value}")
+        out.append("")
+        artifact = dict(run.artifact or {})
+        if not artifact:
+            out.append("_no artifact_")
+            out.append("")
+            continue
+        role = run.role
+        if role == "investigator":
+            out.append("### Summary")
+            out.append("")
+            out.append(str(artifact.get("summary", "")))
+            out.append("")
+            out.append("### Findings")
+            out.append("")
+            out.extend(_md_findings(artifact.get("findings", [])))
+            if artifact.get("suggested_fix"):
+                out.append("### Suggested fix")
+                out.append("")
+                out.append(str(artifact.get("suggested_fix")))
+                out.append("")
+            tests = artifact.get("proposed_tests", [])
+            if tests:
+                out.append("### Proposed tests")
+                out.append("")
+                for t in tests:
+                    out.append(f"- **{t.get('name')}:** {t.get('exercises')}")
+                out.append("")
+            ruled = artifact.get("ruled_out", [])
+            if ruled:
+                out.append("### Ruled out")
+                out.append("")
+                for r in ruled:
+                    out.append(f"- **{r.get('area')}:** {r.get('evidence')}")
+                out.append("")
+        elif role == "coder":
+            out.append("### Handoff")
+            out.append("")
+            out.append(f"- branch: `{artifact.get('branch')}`")
+            out.append(f"- commit: `{artifact.get('commit')}`")
+            out.append("")
+            out.append("### Summary (coder's own words)")
+            out.append("")
+            out.append(str(artifact.get("summary", "")))
+            out.append("")
+            out.append("### Diff (mechanical)")
+            out.append("")
+            out.append("```diff")
+            out.append(str(artifact.get("diff", "")))
+            out.append("```")
+            out.append("")
+        elif role == "auditor":
+            out.append("### Summary")
+            out.append("")
+            out.append(str(artifact.get("summary", "")))
+            out.append("")
+            out.append("### Findings")
+            out.append("")
+            out.extend(_md_findings(artifact.get("findings", [])))
+            sa = artifact.get("standing_assessments")
+            if sa:
+                out.append("### Standing assessments")
+                out.append("")
+                for k, v in sa.items():
+                    out.append(f"- **{k}:** {v}")
+                out.append("")
+            dispositions = artifact.get("dispositions", [])
+            if dispositions:
+                out.append("### Dispositions")
+                out.append("")
+                for d in dispositions:
+                    out.append(
+                        f"- `{d.get('finding_id')}` **{d.get('action')}** — {d.get('reason')}"
+                    )
+                out.append("")
+        out.extend(_md_blockers(artifact.get("blockers", [])))
+        stats = artifact.get("run_stats")
+        if stats:
+            out.extend(_md_run_stats(stats))
+    out.append("## Mission total")
+    out.append("")
+    out.append(
+        f"**${spend.spent_usd:.4f}**  ·  {spend.input_tokens:,} in /"
+        f" {spend.output_tokens:,} out  ·  cached {spend.cached_tokens:,}"
+    )
+    out.append("")
+    return "\n".join(out)
+
+
 @app.command()
-def report(mission_id: str) -> None:
+def report(
+    mission_id: str,
+    md: bool = typer.Option(False, "--md", help="write a markdown file and open-friendly output"),
+    out: str | None = typer.Option(None, "--out", help="markdown output path (implies --md)"),
+) -> None:
     """Render a mission's reports readably: each role's artifact plus the
-    mechanical run-stats section (tokens, cache, cost, time)."""
+    mechanical run-stats section (tokens, cache, cost, time). --md writes
+    a markdown file (default ~/.rework/reports/<mission-id>.md)."""
 
     async def go() -> None:
         from rework.config import Config, open_store_from_config
@@ -268,27 +426,57 @@ def report(mission_id: str) -> None:
             if mission is None:
                 typer.secho(f"no such mission: {mission_id}", fg=typer.colors.RED)
                 raise typer.Exit(1)
+            runs = await store.list_runs(mission_id)
+            prepared: list[tuple[Any, dict[str, Any]]] = []
+            for run in runs:
+                artifact = dict(run.artifact or {})
+                if artifact and "run_stats" not in artifact:
+                    # artifacts written before run_stats existed get live stats
+                    from rework.nodes.run_stats import attach_run_stats
+
+                    artifact = await attach_run_stats(store, run.id, artifact)
+                prepared.append((run, artifact))
+            spend = await store.mission_spend(mission_id)
+
+            if md or out:
+                from pathlib import Path as _Path
+
+                from rework.config import DEFAULT_STATE_DIR
+
+                path = _Path(out) if out else DEFAULT_STATE_DIR / "reports" / f"{mission_id}.md"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    _render_md([r for r, _ in prepared], spend, mission), encoding="utf-8"
+                )
+                typer.echo(f"report written: {path}")
+                for run, artifact in prepared:
+                    status_line = (
+                        f"{run.step} ({run.role}) attempt {run.attempt}: {run.status.value}"
+                    )
+                    stats = (artifact or {}).get("run_stats", {})
+                    typer.echo(
+                        f"  {status_line}  {stats.get('model_calls', 0)} calls,"
+                        f" ${stats.get('cost_usd', 0.0):.4f}"
+                    )
+                typer.echo(
+                    f"mission total: ${spend.spent_usd:.4f}  {spend.input_tokens:,} in /"
+                    f" {spend.output_tokens:,} out  (cached {spend.cached_tokens:,})"
+                )
+                return
+
             typer.echo(f"mission {mission.id}  [{mission.status.value}]")
             typer.echo(f"objective: {mission.objective}")
             if mission.result:
                 typer.echo(f"result: {json.dumps(mission.result)[:200]}")
             typer.echo()
-            runs = await store.list_runs(mission_id)
-            for run in runs:
+            for run, artifact in prepared:
                 typer.echo(f"--- {run.step} ({run.role}) attempt {run.attempt}: {run.status.value}")
-                artifact = run.artifact
                 if not artifact:
                     typer.echo("  (no artifact)")
                     continue
-                if "run_stats" not in artifact:
-                    # artifacts written before run_stats existed get live stats
-                    from rework.nodes.run_stats import attach_run_stats
-
-                    artifact = await attach_run_stats(store, run.id, dict(artifact))
                 for line in _render_artifact(run.role, artifact):
                     typer.echo(line)
                 typer.echo()
-            spend = await store.mission_spend(mission_id)
             typer.echo(
                 f"mission total: ${spend.spent_usd:.4f}  {spend.input_tokens:,} in /"
                 f" {spend.output_tokens:,} out  (cached {spend.cached_tokens:,})"
