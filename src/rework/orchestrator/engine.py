@@ -311,6 +311,7 @@ class MissionRunner:
             mission_id=mission.id,
             role=role,
             step=step_name,
+            context=dict(step.get("context") or {}),
         )
         created = await self._store.create_run(run)
         assert self._supervisor is not None

@@ -47,7 +47,12 @@ async def echo_ctx(tmp_path: Path) -> AsyncIterator[RoleBuildCtx]:
         run = await store.create_run(
             Run(id=run_id("m1", "echo", "echo", 1), mission_id="m1", role="echo", step="echo")
         )
-        catalog = ModelCatalog([ModelEntry(id="fake", provider="fake", model="fake-1")])
+        catalog = ModelCatalog(
+            [
+                ModelEntry(id="fake", provider="fake", model="fake-1"),
+                ModelEntry(id="flash", provider="fake", model="fake-flash"),
+            ]
+        )
         yield RoleBuildCtx(
             run=run,
             mission=mission,

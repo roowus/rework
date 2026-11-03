@@ -1,0 +1,32 @@
+[
+  {
+    "id": "flash",
+    "provider": "openai-compatible",
+    "model": "glm-4.5-flash",
+    "tier": 1,
+    "base_url": "https://api.z.ai/api/coding/paas/v4",
+    "api_key_env": "ZAI_API_KEY",
+    "cost_in_per_mtok": 0.2,
+    "cost_out_per_mtok": 1.1,
+    "context_window": 200000,
+    "max_output": 8192
+  },
+  {
+    "id": "pro",
+    "provider": "openai-compatible",
+    "model": "glm-4.6",
+    "tier": 2,
+    "base_url": "https://api.z.ai/api/coding/paas/v4",
+    "api_key_env": "ZAI_API_KEY",
+    "cost_in_per_mtok": 0.6,
+    "cost_out_per_mtok": 2.2
+  },
+  {
+    "id": "haiku",
+    "provider": "anthropic",
+    "model": "claude-haiku-4-5",
+    "tier": 1,
+    "cost_in_per_mtok": 1.0,
+    "cost_out_per_mtok": 5.0
+  }
+]
