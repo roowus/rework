@@ -19,10 +19,11 @@ LLM PR auditor with a proven report format).
    it work reliably; auditor: find issues before they reach production). The
    goal anchors every prompt for that role.
 2. **Graph shapes.** Investigator: mechanical repo-map node, free agentic tool
-   loop (depth-scaled budget), rigid report-writer. Coder: free loop in a
-   per-run git worktree + branch, rigid handoff node, self-checked tests.
-   Auditor: one general evaluator (domain variants only if performance shows
-   the need), tool-equipped, two-phase interaction.
+   loop (a depth *hint* tunes thoroughness guidance; turn counts are not
+   hardcoded, the budget ledger is the enforcement), rigid report-writer.
+   Coder: free loop in a per-run git worktree + branch, rigid handoff node,
+   self-checked tests. Auditor: one general evaluator (domain variants only if
+   performance shows the need), tool-equipped, two-phase interaction.
 3. **Contracts from the workflow lineage.** Honest states (blocked is a
    correct outcome), the red-green test record, the disposition protocol
    (fixed/refuted/out-of-scope/accepted/deferred; silence is not an option),
@@ -47,10 +48,11 @@ LLM PR auditor with a proven report format).
    guidance) comes later via the Library.
 6. **Loop protocol.** Orchestrator-routed (coder to auditor to investigator
    back to coder, whatever the plan needs) until decided-done, a structured
-   blocker needs a human, or the user holds the mission. Findings already
-   dispositioned stay closed unless new evidence (the no-re-raise rule).
-   Budget/time burn-gates that auto-hold a mission land with M3 budget
-   enforcement.
+   blocker needs a human, or the mission is held. ON_HOLD is a general
+   mission state reachable from any role's escalation or the user at any
+   time; budget/time burn-gates that auto-hold are one more trigger,
+   landing with M3. Findings already dispositioned stay closed unless new
+   evidence (the no-re-raise rule).
 
 ## Consequences
 
