@@ -1,0 +1,80 @@
+[project]
+name = "rework"
+version = "0.1.0"
+description = "Portable multi-agent role-based workflow engine: an orchestrator supervising LangGraph roles, with a compounding cross-harness library"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "roowus" }]
+requires-python = ">=3.12"
+dependencies = [
+    # CLI
+    "typer>=0.12",
+    # core data model
+    "pydantic>=2.7",
+    # graph runtime (exact versions frozen in uv.lock; graph-compile canary guards drift)
+    "langgraph>=1.0,<2",
+    "langgraph-checkpoint>=2.0",
+    "langgraph-checkpoint-postgres>=2.0",
+    "langgraph-checkpoint-sqlite>=2.0",
+    # state stores
+    "psycopg[binary,pool]>=3.1",
+    # model providers
+    "anthropic>=0.40",
+    "openai>=1.50",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+rework = "rework.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rework"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",       # pycodestyle / pyflakes
+    "I",                 # import sorting
+    "UP",                # pyupgrade
+    "B",                 # bugbear
+    "ASYNC",             # async correctness — rule 8 of the gotcha list
+    "RUF",
+]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+# langgraph/langchain ship partial types
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "rework.kernel.*"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "smoke: spends real money on real providers — excluded from CI, run manually",
+]
+addopts = "-m 'not smoke'"

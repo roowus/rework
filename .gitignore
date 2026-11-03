@@ -1,0 +1,24 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+
+# tooling
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+uv.lock~
+
+# local state — never commit instance data
+*.sqlite3
+*.sqlite3-*
+.rework/
+.env
+
+# editors / os
+.DS_Store
+.idea/
+.vscode/
