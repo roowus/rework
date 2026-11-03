@@ -106,11 +106,14 @@ class RunSupervisor:
         entry = self._catalog.resolve(str(run.model_ref.get("id") or spec.default_model))
         workdir = self._workroot / run.id.replace(":", "_")
         workdir.mkdir(parents=True, exist_ok=True)  # roles assume their workspace exists
+        from rework.kernel.llm.adapters.retry import with_retries
+
+        base_provider = self._provider or build_provider(entry)
         ctx = RoleBuildCtx(
             run=run,
             mission=self._mission,
             catalog=self._catalog,
-            provider=self._provider or build_provider(entry),
+            provider=base_provider if self._provider else with_retries(base_provider),
             store=self._store,
             bus=self._bus,
             gates=GateManager(self._store, self._bus),
