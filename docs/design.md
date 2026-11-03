@@ -112,5 +112,6 @@ execution per role behind the `ToolExecutor` protocol.
 | M3 | Robustness (recovery paths, promotions, budget E2E, concurrency) + eval harness v1 | planned |
 | M4 | rewvis deploy (systemd, Postgres, deploy key, branch protection) + cross-device | planned |
 | M5 | Library v1 (git store, curation, MCP server, role integration) | planned |
+| M5.5 | Complaints inbox (ADR 0004): agents file typed feedback on the workflow; clustering opens issues when complaints stack | planned |
 | M6 | Semantic search + external ingest pipeline + eval-in-CI | planned |
 | M7+ | Container sandboxing, dashboard, real event transport, more roles | stubbed |
