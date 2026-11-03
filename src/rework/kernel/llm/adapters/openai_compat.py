@@ -82,12 +82,15 @@ def translate_response(data: Any) -> ChatResult:
         for tc in message.get("tool_calls") or []
     ]
     usage = data.get("usage", {})
+    details = usage.get("prompt_tokens_details") or {}
+    cached = details.get("cached_tokens", 0) or 0
     return ChatResult(
         text=message.get("content") or "",
         tool_calls=tool_calls,
         usage=Usage(
             input_tokens=usage.get("prompt_tokens", 0),
             output_tokens=usage.get("completion_tokens", 0),
+            cached_tokens=int(cached),
         ),
         stop_reason="tool_calls" if tool_calls else "end_turn",
     )

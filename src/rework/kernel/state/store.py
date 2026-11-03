@@ -96,6 +96,11 @@ class StateStore(Protocol):
 
     async def mission_spend(self, mission_id: str) -> BudgetState: ...
 
+    async def run_charges(self, run_id: str) -> list[Charge]:
+        """Per-run charge rows, oldest first: feeds the mechanical run_stats
+        section stamped onto every report artifact."""
+        ...
+
     # -- leader lock (one daemon per database; postgres gains an advisory lock in M3) --
     async def acquire_lock(self, owner: str, stale_after_s: float = 60.0) -> bool: ...
 

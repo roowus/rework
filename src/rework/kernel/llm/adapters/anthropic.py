@@ -85,12 +85,14 @@ def translate_response(data: Any) -> ChatResult:
                 ToolCall(id=block["id"], name=block["name"], arguments=block.get("input") or {})
             )
     usage = data.get("usage", {})
+    cached = usage.get("cache_read_input_tokens", 0) or 0
     return ChatResult(
         text="".join(text_parts),
         tool_calls=tool_calls,
         usage=Usage(
             input_tokens=usage.get("input_tokens", 0),
             output_tokens=usage.get("output_tokens", 0),
+            cached_tokens=int(cached),
         ),
         stop_reason=_STOP_MAP.get(data.get("stop_reason", "end_turn"), "end_turn"),
     )

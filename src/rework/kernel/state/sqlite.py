@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS charges (
     model TEXT NOT NULL,
     input_tokens INTEGER NOT NULL,
     output_tokens INTEGER NOT NULL,
+    cached_tokens INTEGER NOT NULL DEFAULT 0,
     cost_usd REAL NOT NULL,
     ts REAL NOT NULL
 );
@@ -408,27 +409,52 @@ class SqliteStore:
     async def charge(self, charge: Charge) -> None:
         await self._db.execute(
             "INSERT INTO charges (mission_id, run_id, model, input_tokens, output_tokens,"
-            " cost_usd, ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            " cached_tokens, cost_usd, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 charge.mission_id,
                 charge.run_id,
                 charge.model,
                 charge.input_tokens,
                 charge.output_tokens,
+                charge.cached_tokens,
                 charge.cost_usd,
                 charge.ts,
             ),
         )
         await self._db.commit()
 
+    async def run_charges(self, run_id: str) -> list[Charge]:
+        rows = await self._fetch_all(
+            "SELECT * FROM charges WHERE run_id = ? ORDER BY ts", (run_id,)
+        )
+        return [
+            Charge(
+                mission_id=r["mission_id"],
+                run_id=r["run_id"],
+                model=r["model"],
+                input_tokens=r["input_tokens"],
+                output_tokens=r["output_tokens"],
+                cached_tokens=r["cached_tokens"],
+                cost_usd=r["cost_usd"],
+                ts=r["ts"],
+            )
+            for r in rows
+        ]
+
     async def mission_spend(self, mission_id: str) -> BudgetState:
         row = await self._fetch_one(
             "SELECT COALESCE(SUM(input_tokens), 0) AS i, COALESCE(SUM(output_tokens), 0) AS o,"
-            " COALESCE(SUM(cost_usd), 0.0) AS c FROM charges WHERE mission_id = ?",
+            " COALESCE(SUM(cached_tokens), 0) AS ch, COALESCE(SUM(cost_usd), 0.0) AS c"
+            " FROM charges WHERE mission_id = ?",
             (mission_id,),
         )
         assert row is not None
-        return BudgetState(input_tokens=row["i"], output_tokens=row["o"], spent_usd=row["c"])
+        return BudgetState(
+            input_tokens=row["i"],
+            output_tokens=row["o"],
+            cached_tokens=row["ch"],
+            spent_usd=row["c"],
+        )
 
     # -- leader lock ----------------------------------------------------------------------
     async def acquire_lock(self, owner: str, stale_after_s: float = 60.0) -> bool:
@@ -466,5 +492,10 @@ async def open_sqlite(path: str) -> SqliteStore:
     await db.execute("PRAGMA journal_mode = WAL")
     await db.execute("PRAGMA foreign_keys = ON")
     await db.executescript(_DDL)
+    # migrations for databases created before a column existed
+    cols = await db.execute("PRAGMA table_info(charges)")
+    names = {row[1] for row in await cols.fetchall()}
+    if "cached_tokens" not in names:
+        await db.execute("ALTER TABLE charges ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0")
     await db.commit()
     return SqliteStore(db)

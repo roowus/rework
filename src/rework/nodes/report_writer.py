@@ -121,6 +121,8 @@ def make_report_writer_node(
                 "artifact": None,
                 "artifact_error": f"report failed validation twice: {err}",
             }
-        return {"artifact": artifact}
+        from rework.nodes.run_stats import attach_run_stats
+
+        return {"artifact": await attach_run_stats(store, run_id, artifact)}
 
     return node

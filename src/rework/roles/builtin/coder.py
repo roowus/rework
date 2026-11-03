@@ -148,6 +148,9 @@ class CoderSpec(RoleSpec):
                 "worktree": str(wt),
                 "diff": diff[:100_000],
             }
+            from rework.nodes.run_stats import attach_run_stats
+
+            artifact = await attach_run_stats(ctx.store, ctx.run.id, artifact)
             await ctx.bus.publish(
                 EventRecord(
                     mission_id=ctx.mission.id,

@@ -133,6 +133,7 @@ class Charge(BaseModel):
     model: str
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_tokens: int = 0
     cost_usd: float = 0.0
     ts: float = Field(default_factory=now)
 
@@ -147,6 +148,7 @@ class BudgetState(BaseModel):
     spent_usd: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_tokens: int = 0
 
 
 class BudgetExceeded(Exception):

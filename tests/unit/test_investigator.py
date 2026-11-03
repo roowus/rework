@@ -141,8 +141,12 @@ async def test_report_writer_retry_on_bad_json(inv_ctx: RoleBuildCtx) -> None:
     graph.checkpointer = InMemorySaver()
     config: dict[str, Any] = {"configurable": {"thread_id": "t-retry"}}
     final = await graph.ainvoke({"objective": "retry path"}, config=config)
-    assert final["artifact"] == {"summary": "ok", "findings": [], "blockers": []}
-    assert len(fake.requests) == 2  # one retry after the rejection
+    artifact = final["artifact"]
+    assert artifact["summary"] == "ok"
+    assert artifact["findings"] == []
+    assert artifact["blockers"] == []
+    assert artifact["run_stats"]["model_calls"] == 2  # one retry after the rejection
+    assert len(fake.requests) == 2
 
 
 async def test_compile_canary_covers_all_builtin_roles(inv_ctx: RoleBuildCtx) -> None:

@@ -5,7 +5,9 @@ the database (that is the cross-device design, docs/design.md)."""
 from __future__ import annotations
 
 import asyncio
+import json
 import time
+from typing import Any
 
 import typer
 
@@ -160,6 +162,141 @@ def new(
             await store.aclose()
 
     typer.echo(asyncio.run(go()))
+
+
+def _fmt_run_stats(stats: dict[str, Any]) -> list[str]:
+    lines = [
+        "run stats (mechanical, from the ledger):",
+        f"  model calls: {stats.get('model_calls', 0)}"
+        f"  models: {', '.join(stats.get('models', ['?']))}",
+        f"  tokens: {stats.get('input_tokens', 0):,} in /"
+        f" {stats.get('output_tokens', 0):,} out"
+        f"  (cached: {stats.get('cached_tokens', 0):,})",
+        f"  cost: ${stats.get('cost_usd', 0.0):.4f} (catalog estimate)"
+        f"  elapsed: {stats.get('elapsed_seconds', 0.0):.1f}s",
+    ]
+    return lines
+
+
+def _render_artifact(role: str, artifact: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    if role == "investigator":
+        out.append("SUMMARY")
+        out.append(f"  {artifact.get('summary', '')}")
+        findings = artifact.get("findings", [])
+        if findings:
+            out.append("FINDINGS")
+            for f in findings:
+                out.append(
+                    f"  [{f.get('severity')}/{f.get('verdict')} conf {f.get('confidence')}]"
+                    f" {f.get('title')}"
+                )
+                out.append(f"    {f.get('detail')}")
+                out.append(f"    evidence: {f.get('evidence')}")
+        fix = artifact.get("suggested_fix")
+        if fix:
+            out.append("SUGGESTED FIX")
+            out.append(f"  {fix}")
+        tests = artifact.get("proposed_tests", [])
+        if tests:
+            out.append("PROPOSED TESTS")
+            for t in tests:
+                out.append(f"  {t.get('name')}: {t.get('exercises')}")
+        ruled = artifact.get("ruled_out", [])
+        if ruled:
+            out.append("RULED OUT")
+            for r in ruled:
+                out.append(f"  {r.get('area')}: {r.get('evidence')}")
+    elif role == "coder":
+        out.append("HANDOFF")
+        out.append(f"  branch: {artifact.get('branch')}")
+        out.append(f"  commit: {artifact.get('commit')}")
+        out.append("SUMMARY (coder's own words)")
+        out.append(f"  {artifact.get('summary', '')}")
+        out.append("DIFF (mechanical)")
+        for line in str(artifact.get("diff", "")).splitlines()[:60]:
+            out.append(f"  {line}")
+    elif role == "auditor":
+        out.append("SUMMARY")
+        out.append(f"  {artifact.get('summary', '')}")
+        findings = artifact.get("findings", [])
+        if findings:
+            out.append("FINDINGS")
+            for f in findings:
+                out.append(
+                    f"  [{f.get('severity')}/{f.get('verdict')}] {f.get('title')}"
+                    f"  ({', '.join(f.get('evidence', [])) or 'no file evidence'})"
+                )
+                out.append(f"    {f.get('detail')}")
+        else:
+            out.append("FINDINGS: none (clean audit)")
+        sa = artifact.get("standing_assessments")
+        if sa:
+            out.append("STANDING ASSESSMENTS")
+            for k, v in sa.items():
+                out.append(f"  {k}: {v}")
+        dispositions = artifact.get("dispositions", [])
+        if dispositions:
+            out.append("DISPOSITIONS")
+            for d in dispositions:
+                out.append(f"  {d.get('finding_id')}: {d.get('action')} | {d.get('reason')}")
+    blockers = artifact.get("blockers", [])
+    if blockers:
+        out.append("BLOCKERS (needs an answer)")
+        for b in blockers:
+            out.append(f"  Q: {b.get('question')}")
+            out.append(f"     options: {b.get('options')}")
+            out.append(f"     recommendation: {b.get('recommendation')}")
+    stats = artifact.get("run_stats")
+    if stats:
+        out.append("")
+        out.extend(_fmt_run_stats(stats))
+    return out
+
+
+@app.command()
+def report(mission_id: str) -> None:
+    """Render a mission's reports readably: each role's artifact plus the
+    mechanical run-stats section (tokens, cache, cost, time)."""
+
+    async def go() -> None:
+        from rework.config import Config, open_store_from_config
+
+        store = await open_store_from_config(Config.from_env())
+        try:
+            mission = await store.get_mission(mission_id)
+            if mission is None:
+                typer.secho(f"no such mission: {mission_id}", fg=typer.colors.RED)
+                raise typer.Exit(1)
+            typer.echo(f"mission {mission.id}  [{mission.status.value}]")
+            typer.echo(f"objective: {mission.objective}")
+            if mission.result:
+                typer.echo(f"result: {json.dumps(mission.result)[:200]}")
+            typer.echo()
+            runs = await store.list_runs(mission_id)
+            for run in runs:
+                typer.echo(f"--- {run.step} ({run.role}) attempt {run.attempt}: {run.status.value}")
+                artifact = run.artifact
+                if not artifact:
+                    typer.echo("  (no artifact)")
+                    continue
+                if "run_stats" not in artifact:
+                    # artifacts written before run_stats existed get live stats
+                    from rework.nodes.run_stats import attach_run_stats
+
+                    artifact = await attach_run_stats(store, run.id, dict(artifact))
+                for line in _render_artifact(run.role, artifact):
+                    typer.echo(line)
+                typer.echo()
+            spend = await store.mission_spend(mission_id)
+            typer.echo(
+                f"mission total: ${spend.spent_usd:.4f}  {spend.input_tokens:,} in /"
+                f" {spend.output_tokens:,} out  (cached {spend.cached_tokens:,})"
+            )
+        finally:
+            await store.aclose()
+
+    asyncio.run(go())
 
 
 @app.command()

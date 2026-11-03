@@ -28,6 +28,7 @@ class ToolCall(BaseModel):
 class Usage(BaseModel):
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_tokens: int = 0  # prompt tokens served from cache (0 when unknown)
 
 
 class ChatRequest(BaseModel):
