@@ -2,7 +2,11 @@
 
 ## Status
 
-Proposed (design from the owner, 2026-11-03; slots after M3, building on the Library)
+Partially accepted and landed (2026-11-03, M3 early): the complaints table
+(both stores), the `file_complaint` role tool (ComplaintAwareExecutor, wired
+into all three builtin roles), and the `rework complaints` CLI inbox are live,
+with conformance + end-to-end slice tests. The clustering-to-GitHub-issue
+policy and Library integration remain proposed (M5, per the original plan).
 
 ## Context
 

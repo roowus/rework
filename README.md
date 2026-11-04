@@ -17,10 +17,12 @@ any MCP client can mount the same library.
 
 ## Status
 
-Milestone **M2 in progress**: all engine machinery + all four builtin roles
-(echo, investigator, coder, auditor) + the `fix` plan pipeline
-(investigate -> code -> audit -> ship gate) are live; the first real-model
-mission is one catalog config away (see Quickstart).
+Milestone **M3 in progress**: M2 shipped (all four builtin roles, the `fix` and
+`fix-pr` pipelines, first self-hosted PR merged). M3 adds escalation policies
+(needs_model auto-promotion, human gates for the rest), the burn-gate
+(budget cap puts the mission ON_HOLD), an atomic leader lock, the eval harness
+(`rework eval run` + score history), and the complaints inbox (ADR 0004: agents
+file typed feedback on the workflow itself with the `file_complaint` tool).
 
 ## Quickstart
 
@@ -47,6 +49,19 @@ The mission investigates `examples/toyrepo`, fixes the planted bug on its own
 branch inside an isolated worktree, audits the diff, then stops and waits for
 your approval. The agent commits sign as `rework <rework@rework.local>` unless
 you set `REWORK_GIT_AUTHOR_NAME` / `REWORK_GIT_AUTHOR_EMAIL`.
+
+## Eval + complaints
+
+```bash
+uv run rework eval run                 # run every builtin eval task, graded mechanically
+uv run rework eval history             # score history (the hill-climb record)
+uv run rework complaints               # the inbox: agent feedback on the workflow
+```
+
+Eval tasks copy their fixture repo (never mutate it), grade rung 1 (mission
+done + diff present + pytest green on the final worktree), and record one
+history row per run. Complaints are fire-and-forget: a role calls
+`file_complaint` mid-mission and keeps working; nothing pauses.
 
 ## Design
 

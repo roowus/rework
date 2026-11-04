@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from pathlib import Path
 from typing import Any
 
 import typer
@@ -807,6 +808,82 @@ def serve() -> None:
             raise typer.Exit(1) from exc
 
     asyncio.run(go())
+
+
+eval_app = typer.Typer(no_args_is_help=True, add_completion=False, help="Eval harness v1.")
+app.add_typer(eval_app, name="eval")
+
+
+@eval_app.command("run")
+def eval_run(
+    task: str | None = typer.Argument(None, help="task id (default: every builtin task)"),
+) -> None:
+    """Run an eval task end-to-end in this process and grade it (rung 1:
+    mechanical). Cost is real when the catalog points at real models."""
+
+    async def go() -> list[tuple[str, bool, str, str]]:
+        from rework.config import Config, load_catalog, open_store_from_config
+        from rework.evals.harness import builtin_tasks, run_task
+        from rework.orchestrator.daemon import sqlite_checkpointer_factory
+        from rework.roles.registry import autodiscover
+
+        config = Config.from_env()
+        store = await open_store_from_config(config)
+        try:
+            registry = autodiscover()
+            tasks = builtin_tasks()
+            if task:
+                tasks = [t for t in tasks if t.id == task]
+                if not tasks:
+                    raise typer.BadParameter(f"no such task: {task}")
+            workroot = Path(config.db).expanduser().parent / "eval-work"  # noqa: ASYNC240
+            checkpointer = sqlite_checkpointer_factory(config.checkpoints_db)
+            rows = []
+            for t in tasks:
+                score = await run_task(t, store, registry, load_catalog(), checkpointer, workroot)
+                rows.append(
+                    (t.id, score.passed, f"${score.cost_usd:.4f}", f"{score.elapsed_s:.1f}s")
+                )
+            return rows
+        finally:
+            await store.aclose()
+
+    rows = asyncio.run(go())
+    for tid, passed, cost, elapsed in rows:
+        typer.secho(
+            f"{'PASS' if passed else 'FAIL'}  {tid}  {cost}  {elapsed}",
+            fg=typer.colors.GREEN if passed else typer.colors.RED,
+        )
+    typer.echo("history: rework eval history")
+
+
+@eval_app.command("history")
+def eval_history(task: str | None = typer.Argument(None)) -> None:
+    """Score history for a task (or all tasks), oldest first."""
+
+    async def go() -> list[dict[str, Any]]:
+        from rework.config import Config, open_store_from_config
+        from rework.evals.harness import score_history
+
+        store = await open_store_from_config(Config.from_env())
+        try:
+            return await score_history(store, task)
+        finally:
+            await store.aclose()
+
+    scores = asyncio.run(go())
+    if not scores:
+        typer.echo("no eval history yet")
+        return
+    for s in scores:
+        mark = "PASS" if s.get("passed") else "FAIL"
+        grade = s.get("grade") or {}
+        typer.echo(
+            f"{s.get('mission', '?'):<44} {mark}"
+            f"  tests={grade.get('tests_pass')}  diff={grade.get('diff_present')}"
+            f"  audit={grade.get('audit_verdict')}"
+            f"  ${s.get('cost_usd', 0.0):.4f}"
+        )
 
 
 def main() -> None:

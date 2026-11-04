@@ -77,6 +77,15 @@ the orchestrator is a typed envelope `{kind: blocked|needs_model|needs_tool|
 needs_context|question, detail}`: runtime policies act on the kind mechanically; the
 orchestrator LLM reads the detail.
 
+Escalation policies (engine, M3): `needs_model` promotes within the provider (catalog
+tier order) and resumes the role with no human; when the catalog is exhausted the run
+falls through to a gate tracked by id (decisions are read from gate ROWS, and a resume
+already in flight is never re-gated). Every other kind opens a gate for the human.
+The burn-gate is plan-level: `plan.budget.max_usd` exceeded puts the mission ON_HOLD
+with a continue/abort gate; approving doubles the cap and resumes, rejecting cancels.
+Steps that FAIL get exactly one in-mission retry (the 429-storm lesson) before the
+plan moves on; synthesis counts only the latest attempt per step.
+
 ### The Library
 
 Items (skills/tools/reports/memories) live as files in a dedicated git repo (canonical
@@ -107,11 +116,11 @@ execution per role behind the `ToolExecutor` protocol.
 |---|---|---|
 | M0 | Scaffold + CI (`uv sync && uv run pytest && uv run rework --help` green) | ✅ done |
 | M1 | Kernel seams + engine + Echo stub role + CLI + crash-recovery demo | ✅ done (LLM plan/check-in nodes land in M2's supervisor graph) |
-| M2 | Vertical slice: investigator→coder→auditor on toyrepo; first self-hosted docs-PR | ✅ code done (fix plan + veto routing + ship gate + smoke test); remaining: first real-model mission run + self-hosted docs-PR |
-| M2.5 | Real-repo effectiveness run on a live project (polystats), owner-driven | next after M2 closes |
-| M3 | Robustness (recovery paths, promotions, budget E2E, concurrency) + eval harness v1 | planned |
+| M2 | Vertical slice: investigator→coder→auditor on toyrepo; first self-hosted docs-PR | ✅ done (PR #1 self-hosted, merged) |
+| M2.5 | Real-repo effectiveness run on a live project (polystats), owner-driven | waiting until the workflow is competent |
+| M3 | Robustness (escalation policies, burn-gate, lock hardening, concurrency) + eval harness v1 + complaints table (ADR 0004 early) | in progress (chunk 1 + most of chunk 2 done) |
 | M4 | rewvis deploy (systemd, Postgres, deploy key, branch protection) + cross-device | planned |
 | M5 | Library v1 (git store, curation, MCP server, role integration) | planned |
-| M5.5 | Complaints inbox (ADR 0004): agents file typed feedback on the workflow; clustering opens issues when complaints stack | planned |
+| M5.5 | Complaints clustering → GitHub issues (table + tool landed early in M3, ADR 0004) | planned |
 | M6 | Semantic search + external ingest pipeline + eval-in-CI | planned |
 | M7+ | Container sandboxing, dashboard, real event transport, more roles | stubbed |

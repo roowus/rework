@@ -172,7 +172,22 @@ AUDIT_VETO = json.dumps(
 )
 
 
+CALC_FIXED = (
+    "def add(a, b):\n"
+    "    return a + b\n"
+    "\n"
+    "def mul(a, b):\n"
+    "    result = 0\n"
+    "    for _ in range(abs(int(b))):\n"
+    "        result = add(result, a)\n"
+    "    return result if b >= 0 else -result\n"
+)
+
+
 def _coder_script(final_summary: str) -> list[ChatResult]:
+    # the command writes the WHOLE file: the eval grader re-runs pytest on the
+    # worktree mechanically, and a fix that drops mul() must fail it (it did)
+    heredoc_cmd = "cat > calc.py << 'REWORK_EOF'\n" + CALC_FIXED + "REWORK_EOF"
     return [
         ChatResult(
             text="fixing",
@@ -180,9 +195,7 @@ def _coder_script(final_summary: str) -> list[ChatResult]:
                 ToolCall(
                     id="c1",
                     name="run_command",
-                    arguments={
-                        "command": "printf 'def add(a, b):\\n    return a + b\\n' > calc.py"
-                    },
+                    arguments={"command": heredoc_cmd},
                 )
             ],
             usage=Usage(input_tokens=10, output_tokens=5),
