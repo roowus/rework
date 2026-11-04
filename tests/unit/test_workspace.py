@@ -38,11 +38,16 @@ def test_pack_stage_roundtrip(tmp_path: Path) -> None:
 
     assert (staged / "notes.md").read_text() == "# notes\n"
     assert (staged / "docs" / "spec.txt").exists()
-    # exclusions survive the round trip: no .git, no bytecode junk
-    assert not (staged / ".git").exists()
+    # the uploaded junk is gone, but the daemon git-initialized the stage:
+    # the coder's worktree stage requires a repo (ADR 0005 parity with
+    # _prepare_repo). Only .git survives (a fresh one), nothing from the pack
     assert not (staged / "__pycache__").exists()
     assert not (staged / "junk.pyc").exists()
     assert staged.parent.name.startswith("ws-")
+    import subprocess as _sp
+
+    log = _sp.run(["git", "log", "--oneline"], cwd=staged, capture_output=True, text=True)
+    assert "init" in log.stdout
 
 
 def test_pack_skips_excluded_dirs(tmp_path: Path) -> None:

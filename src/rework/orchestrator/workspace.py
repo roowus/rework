@@ -66,13 +66,32 @@ def pack_directory(src: Path) -> bytes:
 
 
 def stage_bundle(workroot: Path, data: bytes, name: str | None = None) -> Path:
-    """Extract an uploaded bundle under workroot/workspaces/<id> and return the
-    staged path (the daemon writes it onto the mission). Sync; to_thread wraps."""
+    """Extract an uploaded bundle under workroot/workspaces/<id>, git-init it
+    (the coder's worktree stage needs a repo, mirroring the local
+    _prepare_repo), and return the staged path. Sync; to_thread wraps."""
+    import subprocess as _sp
+
     ws_id = f"ws-{uuid.uuid4().hex[:12]}"
     dest = workroot / "workspaces" / ws_id / (name or "repo")
     dest.mkdir(parents=True, exist_ok=True)
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
         tar.extractall(dest, filter="data")  # py3.12 filter blocks path traversal
+
+    def _git(*args: str) -> None:
+        _sp.run(["git", *args], cwd=dest, check=True, capture_output=True)
+
+    _git("init", "-b", "main")
+    _git("add", "-A")
+    _git(
+        "-c",
+        "user.name=rework",
+        "-c",
+        "user.email=rework@rework.local",
+        "commit",
+        "-m",
+        "init",
+        "--allow-empty",
+    )  # empty folder still stages a repo
     return dest
 
 
