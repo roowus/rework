@@ -11,6 +11,9 @@ import asyncio
 from rework.kernel.state.records import (
     BudgetState,
     Charge,
+    Complaint,
+    ComplaintKind,
+    ComplaintStatus,
     EventRecord,
     EventType,
     Gate,
@@ -161,3 +164,46 @@ async def test_leader_lock_stale_takeover(store: StateStore) -> None:
     await asyncio.sleep(0.15)  # heartbeat would have kept it alive; it didn't
     assert await store.acquire_lock("fresh-daemon", stale_after_s=0.05) is True
     assert await store.heartbeat_lock("dead-daemon") is False
+
+
+async def test_leader_lock_concurrent_acquire(store: StateStore) -> None:
+    """The old acquire was read-then-write: two daemons could both pass the
+    stale check and both win. The atomic upsert admits exactly one."""
+    results = await asyncio.gather(
+        *[store.acquire_lock(f"daemon-{i}", stale_after_s=60.0) for i in range(8)]
+    )
+    assert sum(results) == 1
+    # and the winner keeps it against further contenders
+    assert await store.acquire_lock("latecomer", stale_after_s=60.0) is False
+
+
+async def test_complaints_roundtrip(store: StateStore) -> None:
+    """ADR 0004: complaints are typed, fire-and-forget feedback in the store."""
+    c = Complaint(
+        kind=ComplaintKind.NEEDED_INFO,
+        source_mission_id="m1",
+        source_run_id="m1:audit:auditor:1",
+        source_role="auditor",
+        summary="audit lacked the test output",
+        detail="could not judge coverage without the pytest run",
+        evidence=["handoff diff had no test log"],
+        suggestion="attach run_stats + test output to the coder handoff",
+    )
+    filed = await store.file_complaint(c)
+    assert filed.id == c.id
+
+    got = await store.get_complaint(c.id)
+    assert got is not None
+    assert got.kind == ComplaintKind.NEEDED_INFO
+    assert got.evidence == ["handoff diff had no test log"]
+    assert got.status == ComplaintStatus.OPEN
+
+    # filters
+    assert len(await store.list_complaints(status=ComplaintStatus.OPEN)) == 1
+    assert len(await store.list_complaints(kind=ComplaintKind.TOOL_MISSING)) == 0
+
+    # lifecycle: open -> triaged -> resolved with the fixing commit noted
+    await store.update_complaint(c.id, status=ComplaintStatus.TRIAGED)
+    assert len(await store.list_complaints(status=ComplaintStatus.OPEN)) == 0
+    resolved = await store.update_complaint(c.id, status=ComplaintStatus.RESOLVED)
+    assert resolved is not None and resolved.status == ComplaintStatus.RESOLVED

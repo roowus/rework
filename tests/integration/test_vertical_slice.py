@@ -27,6 +27,7 @@ from conftest import (
 from rework.cli import PLAN_FIX
 from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.gates import GateManager
+from rework.kernel.llm.types import ChatResult, ToolCall, Usage
 from rework.kernel.state.records import Mission, MissionStatus
 from rework.kernel.state.sqlite import SqliteStore, open_sqlite
 from rework.orchestrator.engine import MissionRunner
@@ -170,3 +171,59 @@ async def test_vertical_slice_veto_triggers_revision(slice_world: dict[str, Any]
     )
     mission = await store.get_mission(slice_world["mission"].id)
     assert mission is not None and mission.status == MissionStatus.DONE
+
+
+async def test_role_files_complaint_mid_run(slice_world: dict[str, Any]) -> None:
+    """ADR 0004 early landing: a role's file_complaint tool call lands a typed
+    complaint row in the store, fire-and-forget, without pausing the mission."""
+    store: SqliteStore = slice_world["store"]
+    provider: ScriptedProvider = slice_world["provider"]
+
+    # investigator complains about a missing tool, then reports as usual
+    script = _investigator_script()
+    script.insert(
+        0,
+        ChatResult(
+            text="I keep wanting a search tool",
+            tool_calls=[
+                ToolCall(
+                    id="cp1",
+                    name="file_complaint",
+                    arguments={
+                        "kind": "tool_missing",
+                        "summary": "no search tool in the workspace",
+                        "detail": "kept grepping by hand; a search tool would help",
+                        "evidence": ["3 manual grep commands in this session"],
+                        "suggestion": "add a search tool to the builtin pack",
+                    },
+                )
+            ],
+            usage=Usage(input_tokens=10, output_tokens=5),
+            stop_reason="tool_calls",
+        ),
+    )
+    provider.route("Investigate any brief", script)
+    provider.route("Fulfill the task", _coder_script("tests pass: 2/1 green, add fixed"))
+    provider.route("Find issues", _auditor_script(AUDIT_CLEAN))
+
+    runner = _runner(slice_world)
+    task = asyncio.create_task(runner.run())
+    for _ in range(200):
+        gates = await store.list_open_gates(slice_world["mission"].id)
+        if gates:
+            await GateManager(store, InProcessEventBus(store)).decide(gates[0].id, approved=True)
+            break
+        await asyncio.sleep(0.1)
+    await asyncio.wait_for(task, timeout=30)
+
+    # the mission still completed (fire-and-forget) and the complaint landed
+    mission = await store.get_mission(slice_world["mission"].id)
+    assert mission is not None and mission.status == MissionStatus.DONE
+    complaints = await store.list_complaints()
+    assert len(complaints) == 1
+    c = complaints[0]
+    assert c.kind.value == "tool_missing"
+    assert c.source_role == "investigator"
+    assert c.source_mission_id == slice_world["mission"].id
+    assert c.evidence == ["3 manual grep commands in this session"]
+    assert c.status.value == "open"

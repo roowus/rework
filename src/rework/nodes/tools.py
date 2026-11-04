@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from rework.kernel.llm.types import ToolSpec
+from rework.kernel.state.records import Complaint, ComplaintKind
+from rework.kernel.state.store import StateStore
 
 # tools every role gets; RoleSpec.tool_pack narrows via `allowed`
 BUILTIN_TOOLS: list[ToolSpec] = [
@@ -49,6 +51,30 @@ BUILTIN_TOOLS: list[ToolSpec] = [
         },
     ),
 ]
+
+COMPLAINT_SPEC = ToolSpec(
+    name="file_complaint",
+    description=(
+        "File feedback on the WORKFLOW ITSELF (not the task): a tool you lacked,"
+        " information the audit needed, a prompt that forced rework. Fire-and-forget,"
+        " never pauses the mission. Args: {kind, summary, detail?, evidence?, suggestion?}"
+        " - kind: workflow_gripe|needed_info|tool_missing|prompt_issue|bug_verified|process_issue"
+    ),
+    input_schema={
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": [k.value for k in ComplaintKind],
+            },
+            "summary": {"type": "string"},
+            "detail": {"type": "string"},
+            "evidence": {"type": "array", "items": {"type": "string"}},
+            "suggestion": {"type": "string"},
+        },
+        "required": ["kind", "summary"],
+    },
+)
 
 
 class ToolExecutor(Protocol):
@@ -156,3 +182,51 @@ class LocalExecutor:
         if allowed is None:
             return list(all_specs)
         return [s for s in all_specs if s.name in allowed]
+
+
+class ComplaintAwareExecutor:
+    """Wraps any ToolExecutor and answers `file_complaint` from the store
+    (ADR 0004: typed, fire-and-forget feedback on the workflow itself).
+    Everything else delegates untouched, so the jail (or the Docker sandbox,
+    later) keeps doing the isolating."""
+
+    def __init__(
+        self,
+        inner: ToolExecutor,
+        store: StateStore,
+        mission_id: str,
+        run_id: str,
+        role: str,
+    ) -> None:
+        self._inner = inner
+        self._store = store
+        self._mission_id = mission_id
+        self._run_id = run_id
+        self._role = role
+
+    async def execute(self, name: str, args: dict[str, Any]) -> str:
+        if name == "file_complaint":
+            try:
+                complaint = Complaint(
+                    kind=ComplaintKind(str(args.get("kind") or "")),
+                    source_mission_id=self._mission_id,
+                    source_run_id=self._run_id,
+                    source_role=self._role,
+                    summary=str(args.get("summary") or "")[:500],
+                    detail=str(args.get("detail") or ""),
+                    evidence=[str(e) for e in (args.get("evidence") or [])][:20],
+                    suggestion=str(args.get("suggestion") or ""),
+                )
+            except ValueError:
+                return "error: kind must be one of " + ", ".join(k.value for k in ComplaintKind)
+            if not complaint.summary:
+                return "error: summary is required"
+            await self._store.file_complaint(complaint)
+            return f"complaint filed: {complaint.id}"
+        return await self._inner.execute(name, args)
+
+    def specs(self, allowed: set[str] | None = None) -> list[ToolSpec]:
+        base = self._inner.specs(allowed)
+        if allowed is not None and "file_complaint" not in allowed:
+            return base
+        return [*base, COMPLAINT_SPEC]

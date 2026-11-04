@@ -18,7 +18,7 @@ from rework.nodes.repo_map import build_repo_map
 from rework.nodes.report_sections import resolve_sections
 from rework.nodes.report_writer import make_report_writer_node
 from rework.nodes.toolloop import make_toolloop_node
-from rework.nodes.tools import LocalExecutor
+from rework.nodes.tools import ComplaintAwareExecutor, LocalExecutor
 from rework.roles.base import RoleBuildCtx, RoleSpec
 
 if TYPE_CHECKING:
@@ -97,7 +97,13 @@ class InvestigatorSpec(RoleSpec):
             provider=ctx.provider,
             catalog=ctx.catalog,
             catalog_id=catalog_id,
-            executor=LocalExecutor(ctx.workdir),
+            executor=ComplaintAwareExecutor(
+                LocalExecutor(ctx.workdir),
+                ctx.store,
+                ctx.mission.id,
+                ctx.run.id,
+                self.name,
+            ),
             system_prompt=system_prompt,
             store=ctx.store,
             mission_id=ctx.mission.id,

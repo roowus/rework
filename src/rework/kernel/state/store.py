@@ -12,6 +12,9 @@ from typing import Any, Protocol, runtime_checkable
 from rework.kernel.state.records import (
     BudgetState,
     Charge,
+    Complaint,
+    ComplaintKind,
+    ComplaintStatus,
     EventRecord,
     EventType,
     Gate,
@@ -101,12 +104,26 @@ class StateStore(Protocol):
         section stamped onto every report artifact."""
         ...
 
-    # -- leader lock (one daemon per database; postgres gains an advisory lock in M3) --
+    # -- leader lock (one daemon per database; atomic-upsert hardened in M3) --
     async def acquire_lock(self, owner: str, stale_after_s: float = 60.0) -> bool: ...
 
     async def heartbeat_lock(self, owner: str) -> bool: ...
 
     async def release_lock(self, owner: str) -> None: ...
+
+    # -- complaints inbox (ADR 0004; table + tool landed early, clustering at M5) --
+    async def file_complaint(self, complaint: Complaint) -> Complaint: ...
+
+    async def list_complaints(
+        self,
+        status: ComplaintStatus | None = None,
+        kind: ComplaintKind | None = None,
+        limit: int = 100,
+    ) -> list[Complaint]: ...
+
+    async def update_complaint(
+        self, complaint_id: str, *, status: ComplaintStatus | None = None
+    ) -> Complaint | None: ...
 
 
 def gate_is_open(gate: Gate) -> bool:

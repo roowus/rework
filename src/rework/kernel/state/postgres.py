@@ -17,6 +17,9 @@ from psycopg.rows import DictRow
 from rework.kernel.state.records import (
     BudgetState,
     Charge,
+    Complaint,
+    ComplaintKind,
+    ComplaintStatus,
     EventRecord,
     EventType,
     Gate,
@@ -104,9 +107,25 @@ _DDL = [
         heartbeat_at DOUBLE PRECISION NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS complaints (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        source_mission_id TEXT,
+        source_run_id TEXT,
+        source_role TEXT,
+        summary TEXT NOT NULL,
+        detail TEXT NOT NULL DEFAULT '',
+        evidence TEXT NOT NULL DEFAULT '[]',
+        suggestion TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL,
+        created_at DOUBLE PRECISION NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_complaints_status ON complaints(status)",
 ]
 
-_TABLES = ["events", "charges", "gates", "runs", "missions", "daemon_lock"]
+_TABLES = ["events", "charges", "gates", "runs", "missions", "daemon_lock", "complaints"]
 
 
 def _j(value: dict[str, Any] | None) -> str | None:
@@ -488,22 +507,20 @@ class PostgresStore:
             spent_usd=row["c"],
         )
 
-    # -- leader lock (row-based; advisory lock hardening lands M3) ------------------------
+    # -- leader lock (atomic upsert: the read-then-write version let two daemons
+    # both pass the stale check and both win; M3 hardening) ------------------------------
     async def acquire_lock(self, owner: str, stale_after_s: float = 60.0) -> bool:
-        row = await self._fetch_one("SELECT owner, heartbeat_at FROM daemon_lock WHERE id = 1", ())
-        if (
-            row is not None
-            and row["owner"] != owner
-            and row["heartbeat_at"] > (time.time() - stale_after_s)
-        ):
-            return False  # live foreign lock
-        await self._conn.execute(
+        now = time.time()
+        cur = await self._conn.execute(
             "INSERT INTO daemon_lock (id, owner, heartbeat_at) VALUES (1, %s, %s)"
-            " ON CONFLICT (id) DO UPDATE SET owner = %s, heartbeat_at = %s",
-            (owner, time.time(), owner, time.time()),
+            " ON CONFLICT (id) DO UPDATE SET"
+            " owner = EXCLUDED.owner, heartbeat_at = EXCLUDED.heartbeat_at"
+            " WHERE daemon_lock.owner = EXCLUDED.owner"
+            "    OR daemon_lock.heartbeat_at <= %s",
+            (owner, now, now - stale_after_s),
         )
         await self._conn.commit()
-        return True
+        return cur.rowcount > 0
 
     async def heartbeat_lock(self, owner: str) -> bool:
         cur = await self._conn.execute(
@@ -516,6 +533,83 @@ class PostgresStore:
     async def release_lock(self, owner: str) -> None:
         await self._conn.execute("DELETE FROM daemon_lock WHERE id = 1 AND owner = %s", (owner,))
         await self._conn.commit()
+
+    # -- complaints inbox (ADR 0004) ------------------------------------------------
+    async def file_complaint(self, complaint: Complaint) -> Complaint:
+        await self._conn.execute(
+            "INSERT INTO complaints"
+            " (id, kind, source_mission_id, source_run_id, source_role, summary, detail,"
+            "  evidence, suggestion, status, created_at)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            " ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status",
+            (
+                complaint.id,
+                complaint.kind.value,
+                complaint.source_mission_id,
+                complaint.source_run_id,
+                complaint.source_role,
+                complaint.summary,
+                complaint.detail,
+                json.dumps(complaint.evidence),
+                complaint.suggestion,
+                complaint.status.value,
+                complaint.created_at,
+            ),
+        )
+        await self._conn.commit()
+        return complaint
+
+    async def list_complaints(
+        self,
+        status: ComplaintStatus | None = None,
+        kind: ComplaintKind | None = None,
+        limit: int = 100,
+    ) -> list[Complaint]:
+        sql = "SELECT * FROM complaints"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            clauses.append("status = %s")
+            params.append(status.value)
+        if kind is not None:
+            clauses.append("kind = %s")
+            params.append(kind.value)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC LIMIT %s"
+        params.append(limit)
+        return [self._complaint(row) for row in await self._fetch_all(sql, tuple(params))]
+
+    async def update_complaint(
+        self, complaint_id: str, *, status: ComplaintStatus | None = None
+    ) -> Complaint | None:
+        if status is None:
+            return await self.get_complaint(complaint_id)
+        await self._conn.execute(
+            "UPDATE complaints SET status = %s WHERE id = %s", (status.value, complaint_id)
+        )
+        await self._conn.commit()
+        return await self.get_complaint(complaint_id)
+
+    async def get_complaint(self, complaint_id: str) -> Complaint | None:
+        row = await self._fetch_one("SELECT * FROM complaints WHERE id = %s", (complaint_id,))
+        return self._complaint(row) if row is not None else None
+
+    @staticmethod
+    def _complaint(row: DictRow) -> Complaint:
+        return Complaint(
+            id=row["id"],
+            kind=ComplaintKind(row["kind"]),
+            source_mission_id=row["source_mission_id"],
+            source_run_id=row["source_run_id"],
+            source_role=row["source_role"],
+            summary=row["summary"],
+            detail=row["detail"],
+            evidence=json.loads(row["evidence"]),
+            suggestion=row["suggestion"],
+            status=ComplaintStatus(row["status"]),
+            created_at=row["created_at"],
+        )
 
 
 async def open_postgres(url: str) -> PostgresStore:

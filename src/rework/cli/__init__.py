@@ -661,6 +661,49 @@ def gates(mission_id: str | None = None) -> None:
 
 
 @app.command()
+def complaints(
+    status: str | None = typer.Option(
+        None, help="filter: open|triaged|issue_open|resolved|wontfix"
+    ),
+    kind: str | None = typer.Option(
+        None,
+        help=(
+            "filter: workflow_gripe|needed_info|tool_missing"
+            "|prompt_issue|bug_verified|process_issue"
+        ),
+    ),
+    limit: int = 30,
+) -> None:
+    """The complaints inbox: agent feedback on the workflow itself (ADR 0004)."""
+
+    async def go() -> list[tuple[str, str, str, str]]:
+        from rework.config import Config, open_store_from_config
+        from rework.kernel.state.records import ComplaintKind, ComplaintStatus
+
+        store = await open_store_from_config(Config.from_env())
+        try:
+            rows = await store.list_complaints(
+                status=ComplaintStatus(status) if status else None,
+                kind=ComplaintKind(kind) if kind else None,
+                limit=limit,
+            )
+            return [(c.id, c.kind.value, c.source_role or "?", c.summary) for c in rows]
+        finally:
+            await store.aclose()
+
+    try:
+        rows = asyncio.run(go())
+    except ValueError as exc:
+        typer.secho(f"bad filter: {exc}", fg=typer.colors.RED)
+        raise typer.Exit(1) from None
+    if not rows:
+        typer.echo("no complaints")
+        return
+    for cid, ckind, role, summary in rows:
+        typer.echo(f"{cid}  [{ckind}]  {role}:  {summary}")
+
+
+@app.command()
 def approve(
     gate_id: str,
     note: str | None = None,

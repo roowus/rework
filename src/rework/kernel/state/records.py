@@ -138,6 +138,40 @@ class Charge(BaseModel):
     ts: float = Field(default_factory=now)
 
 
+class ComplaintKind(StrEnum):
+    WORKFLOW_GRIPE = "workflow_gripe"  # the workflow itself made this harder
+    NEEDED_INFO = "needed_info"  # a role lacked information it needed
+    TOOL_MISSING = "tool_missing"  # a tool the role needed does not exist
+    PROMPT_ISSUE = "prompt_issue"  # a prompt forced rework or confusion
+    BUG_VERIFIED = "bug_verified"  # agent found + verified a bug in rework itself
+    PROCESS_ISSUE = "process_issue"  # the division of labor misfired
+
+
+class ComplaintStatus(StrEnum):
+    OPEN = "open"
+    TRIAGED = "triaged"
+    ISSUE_OPEN = "issue_open"  # clustered into a GitHub issue
+    RESOLVED = "resolved"  # fixed; fixing commit recorded
+    WONTFIX = "wontfix"
+
+
+class Complaint(BaseModel):
+    """Agent feedback on the workflow itself: typed, evidenced, fire-and-forget
+    (ADR 0004). Unlike an escalation, filing one never pauses a mission."""
+
+    id: str = Field(default_factory=lambda: new_id("c"))
+    kind: ComplaintKind
+    source_mission_id: str | None = None
+    source_run_id: str | None = None
+    source_role: str | None = None
+    summary: str
+    detail: str = ""
+    evidence: list[str] = Field(default_factory=list)
+    suggestion: str = ""
+    status: ComplaintStatus = ComplaintStatus.OPEN
+    created_at: float = Field(default_factory=now)
+
+
 class Budget(BaseModel):
     max_usd: float | None = None
     max_input_tokens: int | None = None

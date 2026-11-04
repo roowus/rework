@@ -24,7 +24,7 @@ from rework.nodes.git_ops import (
     stage_all,
 )
 from rework.nodes.toolloop import make_toolloop_node
-from rework.nodes.tools import LazyExecutor
+from rework.nodes.tools import ComplaintAwareExecutor, LazyExecutor
 from rework.roles.base import RoleBuildCtx, RoleSpec
 
 if TYPE_CHECKING:
@@ -165,7 +165,9 @@ class CoderSpec(RoleSpec):
             provider=ctx.provider,
             catalog=ctx.catalog,
             catalog_id=catalog_id,
-            executor=executor,
+            executor=ComplaintAwareExecutor(
+                executor, ctx.store, ctx.mission.id, ctx.run.id, self.name
+            ),
             system_prompt=system_prompt,
             store=ctx.store,
             mission_id=ctx.mission.id,
