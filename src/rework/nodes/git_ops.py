@@ -33,6 +33,31 @@ async def has_repo(path: Path) -> bool:
     return code == 0
 
 
+async def clone_origin(url: str, dest: Path, timeout_s: float = 300.0) -> Path:
+    """Git transport (ADR 0005): the daemon clones a mission's repo from its
+    origin so the row carries a path that is real on THIS machine. Credentials
+    come from the host's git config (gh auth setup-git on the owner's
+    deployments)."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "clone",
+        url,
+        str(dest),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+    except TimeoutError:
+        proc.terminate()
+        raise RuntimeError(f"git clone {url} timed out") from None
+    if proc.returncode != 0:
+        detail = out.decode(errors="replace").strip()
+        raise RuntimeError(f"git clone {url} failed: {detail[:400]}")
+    return dest
+
+
 def _has_entries(path: Path) -> bool:
     try:
         return any(path.iterdir())

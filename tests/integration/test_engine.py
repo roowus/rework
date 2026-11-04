@@ -239,3 +239,46 @@ async def _mission_is(store: SqliteStore, mission_id: str, status: MissionStatus
 async def _run_status_is(store: SqliteStore, mission_id: str, status: str) -> bool:
     runs = await store.list_runs(mission_id)
     return any(r.status.value == status for r in runs)
+
+
+async def test_git_transport_clones_from_origin(world: dict, tmp_path: Path) -> None:
+    """ADR 0005 git transport: a mission carrying only repo_origin gets its
+    repo cloned by the daemon at run start, and the row then points at a path
+    that is real on the daemon's machine."""
+    from conftest import make_git_repo
+
+    store: SqliteStore = world["store"]
+    src = make_git_repo(tmp_path)
+    mission = await store.create_mission(
+        Mission(id=new_id("m"), objective="echo this", repo_origin=f"file://{src}")
+    )
+    runner = make_runner(world, mission.id)
+    run_task = asyncio.create_task(runner.run())
+
+    # the clone must happen BEFORE the role spawns: by the time the gate is
+    # open, repo_path already points at the daemon-side clone
+    expected = world["workroot"] / "missions" / mission.id / "repo"
+    await _wait_for(
+        lambda: _mission_is(store, mission.id, MissionStatus.AWAITING_GATE),
+        what="gate after clone",
+    )
+    fresh = await store.get_mission(mission.id)
+    assert fresh is not None
+    assert fresh.repo_path == str(expected)
+    assert (expected / ".git").is_dir()
+
+    # approve the echo gate like a second-machine owner, then let it finish
+    second: SqliteStore = await open_sqlite(world["db_path"])
+    try:
+        gates = GateManager(second, InProcessEventBus(second))
+        open_gates = await gates.open_gates(mission.id)
+        assert len(open_gates) == 1
+        await gates.decide(open_gates[0].id, approved=True)
+    finally:
+        await second.aclose()
+    await asyncio.wait_for(run_task, timeout=15)
+
+    # idempotent across restarts: a fresh runner reuses the clone, no re-clone
+    assert await store.get_mission(mission.id) is not None
+    again = world["workroot"] / "missions" / mission.id / "repo"
+    assert (again / ".git").is_dir()

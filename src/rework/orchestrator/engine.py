@@ -308,6 +308,7 @@ class MissionRunner:
             raise ValueError(f"mission {self.mission_id} not found")
         self._plan = mission.plan
         self._workroot.mkdir(parents=True, exist_ok=True)
+        mission = await self._ensure_repo(mission)
         if mission.status == MissionStatus.PENDING:
             await self._store.update_mission(mission.id, status=MissionStatus.RUNNING)
         self._supervisor = RunSupervisor(
@@ -325,6 +326,32 @@ class MissionRunner:
             await self._run_steps(mission)
         finally:
             await self._supervisor.aclose()
+
+    async def _ensure_repo(self, mission: Mission) -> Mission:
+        """Git transport (ADR 0005): a repo_origin with no path means the
+        daemon clones from origin itself, and the row then carries a path that
+        is real on this machine. Idempotent across restarts: an existing clone
+        is reused, and the row update persists so recovery skips the clone."""
+        if not mission.repo_origin or mission.repo_path:
+            return mission
+        from rework.nodes.git_ops import clone_origin
+
+        dest = self._workroot / "missions" / mission.id / "repo"
+
+        def _clone_ready() -> bool:
+            return (dest / ".git").is_dir()
+
+        if not await asyncio.to_thread(_clone_ready):
+            await clone_origin(mission.repo_origin, dest)
+            await self._bus.publish(
+                EventRecord(
+                    mission_id=mission.id,
+                    type=EventType.PROGRESS,
+                    payload={"note": f"cloned {mission.repo_origin} (git transport)"},
+                )
+            )
+        updated = await self._store.update_mission(mission.id, repo_path=str(dest))
+        return updated or mission
 
     async def _run_steps(self, mission: Mission) -> None:
         steps = list(_plan_steps(mission))

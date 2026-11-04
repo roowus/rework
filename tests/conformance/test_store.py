@@ -40,11 +40,16 @@ async def test_mission_roundtrip(store: StateStore) -> None:
     assert got.status == MissionStatus.PENDING
 
     updated = await store.update_mission(
-        m.id, status=MissionStatus.RUNNING, plan={"steps": [{"role": "investigator"}]}
+        m.id,
+        status=MissionStatus.RUNNING,
+        plan={"steps": [{"role": "investigator"}]},
+        repo_path="/staged/on/daemon",
     )
     assert updated is not None
     assert updated.status == MissionStatus.RUNNING
     assert updated.plan == {"steps": [{"role": "investigator"}]}
+    # the daemon records where IT staged/cloned the repo (ADR 0005)
+    assert updated.repo_path == "/staged/on/daemon"
 
     assert await store.get_mission("missing") is None
 

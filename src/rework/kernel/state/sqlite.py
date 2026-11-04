@@ -233,6 +233,7 @@ class SqliteStore:
         status: MissionStatus | None = None,
         plan: dict[str, Any] | None = None,
         result: dict[str, Any] | None = None,
+        repo_path: str | None = None,
     ) -> Mission | None:
         sets: list[str] = []
         params: list[Any] = []
@@ -245,6 +246,9 @@ class SqliteStore:
         if result is not None:
             sets.append("result = ?")
             params.append(_j(result))
+        if repo_path is not None:
+            sets.append("repo_path = ?")
+            params.append(repo_path)
         if not sets:
             return await self.get_mission(mission_id)
         sets.append("updated_at = ?")

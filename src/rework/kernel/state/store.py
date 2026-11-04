@@ -46,6 +46,7 @@ class StateStore(Protocol):
         status: MissionStatus | None = None,
         plan: dict[str, Any] | None = None,
         result: dict[str, Any] | None = None,
+        repo_path: str | None = None,
     ) -> Mission | None: ...
 
     async def list_missions(
