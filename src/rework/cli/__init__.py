@@ -836,6 +836,7 @@ def serve() -> None:
             DaemonLocked,
             checkpointer_factory_for,
         )
+        from rework.orchestrator.workspace import default_bind, start_workspace_server
         from rework.roles.registry import autodiscover
 
         store = await open_store_from_config(config)
@@ -849,11 +850,23 @@ def serve() -> None:
             workroot=workroot,
             config=config,
         )
+        # the workspace API rides the daemon's event loop (ADR 0005); binding
+        # is localhost by default, tailnet-only when REWORK_HTTP_HOST points at
+        # a tailnet IP
+        host, port = default_bind()
+        server = await start_workspace_server(store, workroot, host, port)
+        typer.secho(
+            f"workspace API on http://{host}:{port} (tailnet-only when the host "
+            "is a tailnet IP)",
+            fg=typer.colors.CYAN,
+        )
         try:
             await daemon.run_forever()
         except DaemonLocked as exc:
             typer.secho(str(exc), fg=typer.colors.RED)
             raise typer.Exit(1) from exc
+        finally:
+            await server.cleanup()
 
     asyncio.run(go())
 
