@@ -16,6 +16,7 @@ from rework.nodes.report_sections import (
     ASSEMBLY_AUDIT,
     build_report_prompt,
     build_report_schema,
+    resolve_order,
     resolve_sections,
 )
 from rework.nodes.toolloop import make_toolloop_node
@@ -102,8 +103,33 @@ def test_schema_and_prompt_build() -> None:
     schema = build_report_schema(sections)
     assert schema["required"] == ["summary", "findings"]
     assert "findings" in schema["properties"]
+    assert "sections_order" in schema["properties"]  # optional, model-chosen
     prompt = build_report_prompt(sections)
     assert "Findings" in prompt and "Summary" in prompt
+    assert "sections_order" in prompt  # the ordering instruction is in the ask
+
+
+def test_resolve_order_mechanical_sanitation() -> None:
+    """Model-chosen order is honored only for produced sections; junk, dupes,
+    and unproduced keys are dropped, missing-but-produced appended in assembly
+    order (found as the clutter complaint: the renderer needs a fixed rule)."""
+    sections = resolve_sections(["summary", "findings", "blockers"])
+    artifact = {"summary": "s", "findings": [], "blockers": [{"question": "q"}]}
+    assert resolve_order(
+        {**artifact, "sections_order": ["findings", "summary", "blockers"]}, sections
+    ) == ["findings", "summary", "blockers"]
+    # unknown + duplicate keys dropped, missing-but-produced appended
+    assert resolve_order(
+        {**artifact, "sections_order": ["nope", "findings", "findings"]}, sections
+    ) == ["findings", "summary", "blockers"]
+    # absent order: assembly order over produced sections
+    assert resolve_order(artifact, sections) == ["summary", "findings", "blockers"]
+    # an empty findings list still counts as produced (explicitly clean)
+    assert resolve_order({**artifact, "sections_order": ["summary"]}, sections) == [
+        "summary",
+        "findings",
+        "blockers",
+    ]
 
 
 # -- toolloop + report-writer chain --------------------------------------------------

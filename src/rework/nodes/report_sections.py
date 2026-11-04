@@ -283,9 +283,20 @@ def resolve_sections(requested: list[str] | None) -> list[ReportSection]:
     return [SECTION_REGISTRY[k] for k in SECTION_REGISTRY if k in set(requested)]
 
 
+ORDER_KEY = "sections_order"
+
+_ORDER_PROMPT = (
+    f'You also choose the PRESENTATION ORDER: set "{ORDER_KEY}" to the keys'
+    " above, ordered the way a reader should meet them. Lead with what answers"
+    " 'what happened and what should I do'; put reference material (ruled-out"
+    " ground, classifications, coverage warnings) last. Use exactly the keys"
+    " you produced, each once."
+)
+
+
 def build_report_prompt(sections: list[ReportSection]) -> str:
     parts = [f"## {s.title}\n{s.prompt_fragment}" for s in sections]
-    return "\n\n".join(parts)
+    return "\n\n".join(parts) + "\n\n## " + "Presentation order\n" + _ORDER_PROMPT
 
 
 def build_report_schema(sections: list[ReportSection]) -> dict[str, Any]:
@@ -294,12 +305,35 @@ def build_report_schema(sections: list[ReportSection]) -> dict[str, Any]:
     for s in sections:
         properties.update(s.schema_slice)
         required.extend(s.required_fields)
+    properties[ORDER_KEY] = {
+        "type": "array",
+        "items": {"type": "string", "enum": [s.key for s in sections]},
+    }
     return {
         "type": "object",
         "properties": properties,
         "required": required,
         "additionalProperties": False,
     }
+
+
+def resolve_order(artifact: dict[str, Any], sections: list[ReportSection]) -> list[str]:
+    """The artifact's presentation order: the model's sections_order when it
+    lists produced sections, else the assembly order. Mechanical sanitizer:
+    unknown keys dropped, duplicates collapsed, missing-but-present sections
+    appended, run_stats never ordered (it is stamped, not authored)."""
+    produced = [s.key for s in sections if artifact.get(s.key) is not None]
+    order = artifact.get(ORDER_KEY)
+    if isinstance(order, list):
+        seen: set[str] = set()
+        clean: list[str] = []
+        for key in order:
+            if isinstance(key, str) and key in produced and key not in seen:
+                clean.append(key)
+                seen.add(key)
+        clean += [k for k in produced if k not in seen]
+        return clean
+    return produced
 
 
 def mechanical_verdict(audit_artifact: dict[str, Any]) -> str:

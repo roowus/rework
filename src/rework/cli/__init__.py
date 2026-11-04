@@ -264,31 +264,123 @@ def _render_artifact(role: str, artifact: dict[str, Any]) -> list[str]:
 
 
 def _md_findings(findings: list[dict[str, Any]]) -> list[str]:
+    """Findings as severity-grouped narrative blocks (the truss shape the
+    owner picked): one render per finding, no parallel table repeating the
+    same titles (the clutter complaint)."""
     if not findings:
         return ["_None. Explicitly clean, not silence._"]
-    lines: list[str] = [
-        "| # | severity | verdict | conf | finding |",
-        "|---|---|---|---|---|",
-    ]
+    lines: list[str] = []
+    groups: dict[str, list[tuple[int, dict[str, Any]]]] = {
+        "Critical": [],
+        "Important": [],
+        "Minor": [],
+    }
     for i, f in enumerate(findings, 1):
-        lines.append(
-            f"| F{i} | {f.get('severity')} | {f.get('verdict')} | {f.get('confidence')}"
-            f" | {f.get('title')} |"
-        )
-    lines.append("")
-    for i, f in enumerate(findings, 1):
-        lines.append(f"#### F{i}: {f.get('title')}")
+        groups[_truss_group(str(f.get("severity", "low")))].append((i, f))
+    for label in ("Critical", "Important", "Minor"):
+        group = groups[label]
+        if not group:
+            continue
+        lines.append(f"**{label}**")
         lines.append("")
-        lines.append(str(f.get("detail", "")))
-        lines.append("")
-        evidence = f.get("evidence") or []
-        if evidence:
-            lines.append("**Evidence:**")
+        for i, f in group:
+            meta = f" ({f.get('verdict')}, conf {f.get('confidence')})"
+            lines.append(f"**F{i}. {f.get('title')}**{meta}")
             lines.append("")
-            for e in evidence:
-                lines.append(f"- `{e}`")
+            lines.append(str(f.get("detail", "")))
             lines.append("")
+            evidence = f.get("evidence") or []
+            if evidence:
+                lines.append("Evidence: " + " · ".join(f"`{e}`" for e in evidence))
+                lines.append("")
     return lines
+
+
+def _md_section(key: str, artifact: dict[str, Any]) -> list[str]:
+    """One report section rendered to md. Keys mirror SECTION_REGISTRY; the
+    caller decides WHICH sections and in what order (the artifact's
+    sections_order, else the role assembly)."""
+    out: list[str] = []
+    if key == "summary":
+        out.append(str(artifact.get("summary", "")))
+        out.append("")
+        return out
+    if key == "findings":
+        out.extend(_md_findings(artifact.get("findings", [])))
+        return out
+    if key == "suggested_fix":
+        out.append(str(artifact.get("suggested_fix", "")))
+        out.append("")
+        return out
+    if key == "proposed_tests":
+        for t in artifact.get("proposed_tests", []):
+            out.append(f"- **{t.get('name')}:** {t.get('exercises')}")
+        out.append("")
+        return out
+    if key == "ruled_out":
+        for r in artifact.get("ruled_out", []):
+            out.append(f"- **{r.get('area')}:** {r.get('evidence')}")
+        out.append("")
+        return out
+    if key == "classification":
+        c = artifact.get("classification") or {}
+        out.append(f"- **complexity:** {c.get('complexity', '?')}")
+        out.append(f"- **priority:** {c.get('priority', '?')}")
+        if c.get("why"):
+            out.append(f"- **why:** {c.get('why')}")
+        out.append("")
+        return out
+    if key == "standing_assessments":
+        for k, v in (artifact.get("standing_assessments") or {}).items():
+            out.append(f"**{k}:** {v}")
+            out.append("")
+        return out
+    if key == "warnings":
+        for w in artifact.get("warnings", []):
+            out.append(f"- {w}")
+        out.append("")
+        return out
+    if key == "dispositions":
+        for d in artifact.get("dispositions", []):
+            out.append(f"- `{d.get('finding_id')}` **{d.get('action')}** — {d.get('reason')}")
+        out.append("")
+        return out
+    if key == "blockers":
+        for i, b in enumerate(artifact.get("blockers", []), 1):
+            out.append(f"**Blocker {i}: {b.get('question')}**")
+            out.append("")
+            out.append(f"- options: {' / '.join(b.get('options', []))}")
+            out.append(f"- recommendation: {b.get('recommendation')}")
+            out.append(f"- why it cannot self-answer: {b.get('why_cannot_answer')}")
+            out.append("")
+        return out
+    return out
+
+
+# presentation order per role when the artifact carries no sections_order
+_ROLE_DEFAULT_ORDER: dict[str, tuple[str, ...]] = {
+    "investigator": (
+        "summary",
+        "findings",
+        "suggested_fix",
+        "proposed_tests",
+        "ruled_out",
+        "blockers",
+    ),
+    "auditor": ("summary", "findings", "standing_assessments", "warnings", "blockers"),
+}
+_SECTION_TITLES = {
+    "summary": "Summary",
+    "findings": "Findings",
+    "suggested_fix": "Suggested fix",
+    "proposed_tests": "Proposed tests",
+    "ruled_out": "Ruled out",
+    "classification": "Classification",
+    "standing_assessments": "Standing assessments",
+    "warnings": "Warnings (coverage limits)",
+    "dispositions": "Dispositions",
+    "blockers": "Blockers (need an answer)",
+}
 
 
 def _md_blockers(blockers: list[dict[str, Any]]) -> list[str]:
@@ -338,9 +430,9 @@ def _truss_group(severity: str) -> str:
 
 def _md_audit_truss(artifact: dict[str, Any], stats: dict[str, Any], run: Any) -> list[str]:
     """The auditor section, laid out like the owner's truss pr-audit report:
-    header line, context paragraph, findings grouped by severity as numbered
-    narrative blocks, assessments, warnings, machine-readable block. The
-    truss report is the format reference (ADR 0003); the artifact is ours."""
+    header line, context paragraph, then the model's sections_order (else the
+    audit assembly): findings grouped by severity as numbered narrative blocks,
+    assessments, warnings, dispositions, blockers, machine-readable block."""
     out: list[str] = []
     models = ", ".join(stats.get("models", ["?"]))
     head = str(artifact.get("head") or stats.get("commit") or "")
@@ -353,69 +445,24 @@ def _md_audit_truss(artifact: dict[str, Any], stats: dict[str, Any], run: Any) -
         out.append(summary)
         out.append("")
 
-    # findings grouped by severity, numbered B1.. down the review
-    findings = artifact.get("findings", [])
-    groups: dict[str, list[tuple[int, dict[str, Any]]]] = {
-        "Critical": [],
-        "Important": [],
-        "Minor": [],
-    }
-    for i, f in enumerate(findings, 1):
-        groups[_truss_group(str(f.get("severity", "low")))].append((i, f))
-    if not findings:
-        out.append("Findings: none. Explicitly clean, not silence.")
-        out.append("")
-    for label in ("Critical", "Important", "Minor"):
-        group = groups[label]
-        if not group:
-            continue
-        out.append(f"**{label}**")
-        out.append("")
-        for i, f in group:
-            loc = f.get("file") or ""
-            if f.get("line"):
-                loc += f":{f['line']}"
-            where = f" — `{loc}`" if loc else ""
-            out.append(f"**B{i}. {f.get('title')}**{where}")
-            out.append("")
-            out.append(str(f.get("detail", "")))
-            out.append("")
-            evidence = f.get("evidence") or []
-            if evidence:
-                out.append("Evidence: " + " · ".join(f"`{e}`" for e in evidence))
-                out.append("")
+    from rework.nodes.report_sections import SECTION_REGISTRY, resolve_order
 
-    sa = artifact.get("standing_assessments")
-    if sa:
-        out.append("### Assessments")
-        out.append("")
-        for k, v in sa.items():
-            out.append(f"**{k}:** {v}")
-            out.append("")
+    assembly = ("summary", "findings", "standing_assessments", "warnings", "blockers")
+    sections = [SECTION_REGISTRY[k] for k in assembly]
+    order = [k for k in resolve_order(artifact, sections) if k != "summary"]
 
-    warnings = artifact.get("warnings", [])
-    if warnings:
-        out.append("### Warnings (coverage limits)")
+    for key in order:
+        out.append(f"### {_SECTION_TITLES.get(key, key)}")
         out.append("")
-        for w in warnings:
-            out.append(f"- {w}")
-        out.append("")
-
-    dispositions = artifact.get("dispositions", [])
-    if dispositions:
-        out.append("### Dispositions")
-        out.append("")
-        for d in dispositions:
-            out.append(f"- `{d.get('finding_id')}` **{d.get('action')}** — {d.get('reason')}")
-        out.append("")
+        out.extend(_md_section(key, artifact))
 
     # machine-readable block: the same audit as data; must agree with the prose
     machine: dict[str, Any] = {
         "version": 1,
         "head": head,
         "verdict": mechanical_verdict(artifact),
-        "findings": findings,
-        "warnings": warnings,
+        "findings": artifact.get("findings", []),
+        "warnings": artifact.get("warnings", []),
     }
     out.append("### Machine-readable block")
     out.append("")
@@ -469,34 +516,7 @@ def _render_md(runs: list[tuple[Any, dict[str, Any]]], spend: Any, mission: Any)
             out.append("")
             continue
         role = run.role
-        if role == "investigator":
-            out.append("### Summary")
-            out.append("")
-            out.append(str(artifact.get("summary", "")))
-            out.append("")
-            out.append("### Findings")
-            out.append("")
-            out.extend(_md_findings(artifact.get("findings", [])))
-            if artifact.get("suggested_fix"):
-                out.append("### Suggested fix")
-                out.append("")
-                out.append(str(artifact.get("suggested_fix")))
-                out.append("")
-            tests = artifact.get("proposed_tests", [])
-            if tests:
-                out.append("### Proposed tests")
-                out.append("")
-                for t in tests:
-                    out.append(f"- **{t.get('name')}:** {t.get('exercises')}")
-                out.append("")
-            ruled = artifact.get("ruled_out", [])
-            if ruled:
-                out.append("### Ruled out")
-                out.append("")
-                for r in ruled:
-                    out.append(f"- **{r.get('area')}:** {r.get('evidence')}")
-                out.append("")
-        elif role == "coder":
+        if role == "coder":
             out.append("### Handoff")
             out.append("")
             out.append(f"- branch: `{artifact.get('branch')}`")
@@ -512,11 +532,32 @@ def _render_md(runs: list[tuple[Any, dict[str, Any]]], spend: Any, mission: Any)
             out.append(str(artifact.get("diff", "")))
             out.append("```")
             out.append("")
-        elif role == "auditor":
+            stats = artifact.get("run_stats")
+            if stats:
+                out.append("### Run stats (mechanical, from the ledger)")
+                out.append("")
+                out.extend(_md_run_stats(stats))
+            continue
+        if role == "auditor":
             out.extend(_md_audit_truss(artifact, stats=artifact.get("run_stats", {}), run=run))
-        out.extend(_md_blockers(artifact.get("blockers", [])))
+            continue
+        # report roles: the model chose the section set AND the order (its
+        # sections_order), sanitized against the role's default assembly
+        from rework.nodes.report_sections import (
+            SECTION_REGISTRY,
+            resolve_order,
+        )
+
+        sections = [
+            SECTION_REGISTRY[k] for k in _ROLE_DEFAULT_ORDER.get(role, ()) if k in SECTION_REGISTRY
+        ]
+        order = resolve_order(artifact, sections)
+        for key in order:
+            out.append(f"### {_SECTION_TITLES.get(key, key)}")
+            out.append("")
+            out.extend(_md_section(key, artifact))
         stats = artifact.get("run_stats")
-        if stats and role != "auditor":
+        if stats:
             out.append("### Run stats (mechanical, from the ledger)")
             out.append("")
             out.extend(_md_run_stats(stats))

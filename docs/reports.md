@@ -39,13 +39,25 @@ the owner's examples of permanently forced content.
   warnings, blockers
 - custom: pass any key list in the plan's `requested_sections`
 
+## Presentation order (model-chosen, mechanically sanitized)
+
+The report writer also asks the producing model for `sections_order`: the keys it
+produced, in the order a reader should meet them (lead with what happened and what
+to do; reference material last). The renderer honors it after mechanical
+sanitation (`resolve_order`): unknown keys dropped, duplicates collapsed,
+produced-but-unlisted sections appended in assembly order, and run_stats never
+ordered (it is stamped at the end, not authored). Artifacts without the field
+render in assembly order. Findings always render once, as severity-grouped
+narrative blocks (truss shape): no parallel table repeating the same titles.
+
 ## Named formats vs sections
 
 The truss audit report is the audit default assembly expressed in a specific order
-(findings table, then standing assessments, then warnings, then machine block).
-The section list is the architecture; the truss layout is one rendering of it.
-Rendering lives in `rework report` / `rework report --md` and the PR body builder
-(`orchestrator/engine.py::_pr_body`), all mechanical consumers of the same artifact.
+(context paragraph, findings grouped by severity, standing assessments, warnings,
+machine block). The section list is the architecture; the truss layout is one
+rendering of it. Rendering lives in `rework report` / `rework report --md` and the
+PR body builder (`orchestrator/engine.py::_pr_body`), all mechanical consumers of
+the same artifact.
 
 ## Lineage and rules
 
