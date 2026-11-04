@@ -405,52 +405,56 @@ class MissionRunner:
                         ]
             index += 1
 
-        # ship gate: the plan's final human decision before synthesis
+        # ship gate: the plan's final human decision before synthesis. An
+        # existing row (open or decided) is REUSED: a restart after the owner
+        # already decided must not open a duplicate gate (chaos-test finding)
         gates_spec = (mission.plan or {}).get("gates") or []
         ship_decision: bool | None = None
         if "ship" in gates_spec:
-            verdict = mechanical_verdict(last_audit_artifact) if last_audit_artifact else "approve"
-            gate = await self._gates.request(
-                mission.id,
-                kind=GateKind.SHIP,
-                question=f"Ship the mission result? audit verdict: {verdict}",
-            )
-            await self._bus.publish(
-                EventRecord(
-                    mission_id=mission.id,
-                    type=EventType.INFO,
-                    payload={"note": f"ship gate {gate.id} open (verdict: {verdict})"},
+            gate = await self._latest_gate_of_kind(GateKind.SHIP)
+            if gate is None:
+                verdict = (
+                    mechanical_verdict(last_audit_artifact) if last_audit_artifact else "approve"
                 )
-            )
-            await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
-            while True:
-                if not await self._store.list_open_gates(mission.id):
-                    break
-                await asyncio.sleep(self._poll)
+                gate = await self._gates.request(
+                    mission.id,
+                    kind=GateKind.SHIP,
+                    question=f"Ship the mission result? audit verdict: {verdict}",
+                )
+                await self._bus.publish(
+                    EventRecord(
+                        mission_id=mission.id,
+                        type=EventType.INFO,
+                        payload={"note": f"ship gate {gate.id} open (verdict: {verdict})"},
+                    )
+                )
+            if gate.status == GateStatus.OPEN:
+                await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
             ship_decision = await self._gate_decision(mission.id, gate.id)
 
         # open_pr gate: human approves publishing the branch as a PR, then the
         # push + PR creation are mechanical (agents never merge; ADR 0003)
         pr_url: str | None = None
         if "open_pr" in gates_spec:
-            verdict = mechanical_verdict(last_audit_artifact) if last_audit_artifact else "approve"
-            gate = await self._gates.request(
-                mission.id,
-                kind=GateKind.OPEN_PR,
-                question=(f"Open a pull request for this change? audit verdict: {verdict}"),
-            )
-            await self._bus.publish(
-                EventRecord(
-                    mission_id=mission.id,
-                    type=EventType.INFO,
-                    payload={"note": f"open_pr gate {gate.id} open (verdict: {verdict})"},
+            gate = await self._latest_gate_of_kind(GateKind.OPEN_PR)
+            if gate is None:
+                verdict = (
+                    mechanical_verdict(last_audit_artifact) if last_audit_artifact else "approve"
                 )
-            )
-            await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
-            while True:
-                if not await self._store.list_open_gates(mission.id):
-                    break
-                await asyncio.sleep(self._poll)
+                gate = await self._gates.request(
+                    mission.id,
+                    kind=GateKind.OPEN_PR,
+                    question=(f"Open a pull request for this change? audit verdict: {verdict}"),
+                )
+                await self._bus.publish(
+                    EventRecord(
+                        mission_id=mission.id,
+                        type=EventType.INFO,
+                        payload={"note": f"open_pr gate {gate.id} open (verdict: {verdict})"},
+                    )
+                )
+            if gate.status == GateStatus.OPEN:
+                await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
             pr_approved = await self._gate_decision(mission.id, gate.id)
             if pr_approved:
                 pr_url = await self._create_pr(mission, results)
@@ -558,7 +562,14 @@ class MissionRunner:
         pr_url = getattr(self, "_pr_url", None)
         if pr_url:
             result["pr_url"] = pr_url
-        if ship_decision is False:
+        current = await self._store.get_mission(mission_id)
+        if current is not None and current.status == MissionStatus.CANCELLED:
+            # the burn gate (or an owner cancel) already set the verdict while
+            # steps were mid-flight; synthesis attaches artifacts but must not
+            # resurrect a cancelled mission as DONE (chaos-test finding)
+            status = MissionStatus.CANCELLED
+            result = {**(current.result or {}), **result}
+        elif ship_decision is False:
             status = MissionStatus.CANCELLED
             result["ship"] = "rejected at ship gate"
         elif failed:
@@ -599,6 +610,25 @@ class MissionRunner:
                 # recovery: this step's latest attempt is still in flight
                 assert self._supervisor is not None
                 for run in prior:
+                    if run.status == RunStatus.HALTED_ESCALATED:
+                        gate = await self._latest_gate_for_run(run)
+                        if gate is not None and gate.status == GateStatus.APPROVED:
+                            # decided while the engine was down: resume with
+                            # the row's decision (a plain resume would re-fire
+                            # the interrupt and open a duplicate gate)
+                            await self._supervisor.resume_with_decision(run, True)
+                            continue
+                        if gate is not None and gate.status == GateStatus.REJECTED:
+                            await self._store.update_run(run.id, status=RunStatus.ABORTED)
+                            await self._bus.publish(
+                                EventRecord(
+                                    mission_id=self.mission_id,
+                                    run_id=run.id,
+                                    type=EventType.CANCELLED,
+                                    payload={"reason": "gate rejected while engine was down"},
+                                )
+                            )
+                            continue
                     await self._supervisor.ensure_started(run)
                 return [prior[-1]]
         attempt = len(prior) + 1
@@ -804,6 +834,38 @@ class MissionRunner:
         for gate_id in reversed(gate_ids):
             gate = await self._store.get_gate(str(gate_id))
             if gate is not None and gate.status == GateStatus.OPEN:
+                return gate
+        return None
+
+    async def _latest_gate_for_run(self, run: Run) -> Any:
+        """The run's most recent gate ROW, any status. Recovery uses this to
+        apply a decision made while the engine was down: resuming the parked
+        graph plain would re-fire the interrupt and open a duplicate gate."""
+        events = await self._store.events_since(0, mission_id=self.mission_id, limit=5000)
+        gate_ids = [
+            e.payload.get("gate_id")
+            for e in events
+            if e.type == EventType.INFO and e.payload.get("for_run") == run.id
+        ]
+        for gate_id in reversed(gate_ids):
+            gate = await self._store.get_gate(str(gate_id))
+            if gate is not None:
+                return gate
+        return None
+
+    async def _latest_gate_of_kind(self, kind: GateKind) -> Any:
+        """The mission's most recent gate of this kind, any status (ship and
+        open_pr recovery: a restart must read the EXISTING gate, not open a
+        duplicate for a decision the owner already made)."""
+        events = await self._store.events_since(0, mission_id=self.mission_id, limit=5000)
+        gate_ids = [
+            e.payload.get("gate_id")
+            for e in events
+            if e.type == EventType.GATE_OPENED and e.payload.get("kind") == kind.value
+        ]
+        for gate_id in reversed(gate_ids):
+            gate = await self._store.get_gate(str(gate_id))
+            if gate is not None:
                 return gate
         return None
 
