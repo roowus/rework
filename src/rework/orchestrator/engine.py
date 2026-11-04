@@ -383,7 +383,73 @@ class MissionRunner:
                 await asyncio.sleep(self._poll)
             ship_decision = await self._gate_decision(mission.id, gate.id)
 
+        # open_pr gate: human approves publishing the branch as a PR, then the
+        # push + PR creation are mechanical (agents never merge; ADR 0003)
+        pr_url: str | None = None
+        if "open_pr" in gates_spec:
+            verdict = mechanical_verdict(last_audit_artifact) if last_audit_artifact else "approve"
+            gate = await self._gates.request(
+                mission.id,
+                kind=GateKind.OPEN_PR,
+                question=(f"Open a pull request for this change? audit verdict: {verdict}"),
+            )
+            await self._bus.publish(
+                EventRecord(
+                    mission_id=mission.id,
+                    type=EventType.INFO,
+                    payload={"note": f"open_pr gate {gate.id} open (verdict: {verdict})"},
+                )
+            )
+            await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
+            while True:
+                if not await self._store.list_open_gates(mission.id):
+                    break
+                await asyncio.sleep(self._poll)
+            pr_approved = await self._gate_decision(mission.id, gate.id)
+            if pr_approved:
+                pr_url = await self._create_pr(mission, results)
+
+        self._pr_url = pr_url
         await self._synthesize(mission.id, ship_decision)
+
+    async def _create_pr(self, mission: Mission, results: dict[str, Run]) -> str | None:
+        """Push the coder's branch and open a PR. Mechanical: title/body from
+        the brief + audit verdict; the human does the merging."""
+        from rework.nodes.gh import pr_create
+        from rework.nodes.git_ops import push_branch
+
+        coder_run = results.get("code")
+        if coder_run is None or coder_run.artifact is None:
+            await self._bus.publish(
+                EventRecord(
+                    mission_id=mission.id,
+                    type=EventType.INFO,
+                    payload={"error": "open_pr approved but no coder artifact to publish"},
+                )
+            )
+            return None
+        branch = str(coder_run.artifact.get("branch") or "")
+        worktree = Path(str(coder_run.artifact.get("worktree") or mission.repo_path or "."))
+        summary = str(coder_run.artifact.get("summary") or "")
+        verdict = "see audit artifact"
+        title = f"rework: {mission.objective}"
+        body = (
+            f"Produced by rework mission `{mission.id}`.\n\n"
+            f"## What changed\n\n{summary[:4000]}\n\n"
+            f"## Audit\n\nVerdict at gate time: {verdict}. Full report:"
+            f" `rework report {mission.id}`.\n\n"
+            f"_Agent-authored, human-merged (rework dogfooding rules)._"
+        )
+        await push_branch(worktree, branch)
+        url = await pr_create(worktree, head=branch, title=title, body=body)
+        await self._bus.publish(
+            EventRecord(
+                mission_id=mission.id,
+                type=EventType.INFO,
+                payload={"note": f"PR opened: {url}"},
+            )
+        )
+        return url
 
     async def _synthesize(self, mission_id: str, ship_decision: bool | None) -> None:
         runs = await self._store.list_runs(mission_id)
@@ -396,6 +462,9 @@ class MissionRunner:
             latest[(r.step, r.role)] = r
         failed = [r for r in latest.values() if r.status == RunStatus.FAILED]
         result: dict[str, Any] = {"artifacts": artifacts}
+        pr_url = getattr(self, "_pr_url", None)
+        if pr_url:
+            result["pr_url"] = pr_url
         if ship_decision is False:
             status = MissionStatus.CANCELLED
             result["ship"] = "rejected at ship gate"

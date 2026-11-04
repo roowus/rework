@@ -144,6 +144,14 @@ async def current_branch(worktree: Path) -> str:
     return out
 
 
+async def push_branch(worktree: Path, branch: str) -> None:
+    """Push the run's branch to origin. For self-hosting: agents push
+    branches, humans merge (CLAUDE.md dogfooding rules)."""
+    code, out = await _run(worktree, "push", "-u", "origin", branch, timeout_s=120.0)
+    if code != 0:
+        raise RuntimeError(f"git push failed: {out}")
+
+
 async def head_sha(worktree: Path) -> str | None:
     code, out = await _run(worktree, "rev-parse", "HEAD")
     return out if code == 0 else None

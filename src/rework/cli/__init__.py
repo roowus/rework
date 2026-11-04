@@ -76,6 +76,11 @@ PLAN_FIX: dict = {
     "gates": ["ship"],
 }
 
+PLAN_FIX_PR: dict = {
+    "steps": PLAN_FIX["steps"],
+    "gates": ["open_pr"],
+}
+
 
 def _prepare_repo(repo_arg: str, mission_id: str) -> str:
     """A git repo is used in place; a plain directory is copied into the
@@ -115,10 +120,11 @@ def _prepare_repo(repo_arg: str, mission_id: str) -> str:
 def new(
     objective: str,
     repo: str | None = None,
-    plan: str = typer.Option("echo", help="echo | fix"),
+    plan: str = typer.Option("echo", help="echo | fix | fix-pr"),
 ) -> None:
     """Create a mission; the daemon picks it up. `--plan fix` runs the
-    investigate -> code -> audit pipeline with a ship gate."""
+    investigate -> code -> audit pipeline with a ship gate; `fix-pr` swaps the
+    ship gate for an open-PR gate (branch push + gh pr create)."""
 
     async def go() -> str:
         from rework.config import Config, open_store_from_config
@@ -136,12 +142,13 @@ def new(
         try:
             bus = InProcessEventBus(store)
             plan_spec: dict | None = None
-            if plan == "fix":
+            if plan in ("fix", "fix-pr"):
                 if not repo_path:
-                    raise typer.BadParameter("--plan fix requires --repo")
+                    raise typer.BadParameter(f"--plan {plan} requires --repo")
                 import json as _json
 
-                plan_spec = _json.loads(_json.dumps(PLAN_FIX).replace("$OBJECTIVE", objective))
+                template = PLAN_FIX_PR if plan == "fix-pr" else PLAN_FIX
+                plan_spec = _json.loads(_json.dumps(template).replace("$OBJECTIVE", objective))
             mission = await store.create_mission(
                 Mission(
                     id=mission_id,
