@@ -63,6 +63,14 @@ class ModelCatalog:
     def all(self) -> list[ModelEntry]:
         return list(self._entries.values())
 
+    def cheapest(self) -> ModelEntry | None:
+        """Lowest-tier entry (ties: first registered). The stub/echo fallback:
+        a role whose default model id is absent from a deployment catalog gets
+        the cheapest real model rather than a hard failure."""
+        if not self._entries:
+            return None
+        return min(self._entries.values(), key=lambda e: e.tier)
+
     def promote(self, catalog_id: str, cross_provider: bool = False) -> ModelEntry | None:
         """Next tier up. Same provider unless cross_provider is enabled and a
         higher tier exists elsewhere; returns None when no promotion exists

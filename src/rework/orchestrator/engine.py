@@ -27,7 +27,7 @@ from langgraph.types import Command
 from rework.kernel.events.bus import EventBus
 from rework.kernel.gates import GateManager
 from rework.kernel.llm.adapters import build_provider
-from rework.kernel.llm.catalog import ModelCatalog, ModelProvider
+from rework.kernel.llm.catalog import ModelCatalog, ModelProvider, UnknownModelError
 from rework.kernel.state.records import (
     EventRecord,
     EventType,
@@ -104,7 +104,25 @@ class RunSupervisor:
 
     async def _build_graph(self, run: Run) -> Any:
         spec = self._registry.get(run.role)
-        entry = self._catalog.resolve(str(run.model_ref.get("id") or spec.default_model))
+        wanted = str(run.model_ref.get("id") or spec.default_model)
+        try:
+            entry = self._catalog.resolve(wanted)
+        except UnknownModelError:
+            # a deployment catalog without this role's default id (echo ships
+            # 'fake'): fall back to the cheapest real model, visibly, rather
+            # than failing the run before it starts
+            entry = self._catalog.cheapest() or self._catalog.resolve(wanted)
+            await self._bus.publish(
+                EventRecord(
+                    mission_id=self._mission.id,
+                    run_id=run.id,
+                    type=EventType.INFO,
+                    payload={
+                        "note": f"model {wanted!r} not in catalog; using {entry.id!r} "
+                        "(cheapest available)"
+                    },
+                )
+            )
         workdir = self._workroot / run.id.replace(":", "_")
         workdir.mkdir(parents=True, exist_ok=True)  # roles assume their workspace exists
         from rework.kernel.budget.ledger import Budget
