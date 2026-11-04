@@ -119,7 +119,7 @@ execution per role behind the `ToolExecutor` protocol.
 | M2 | Vertical slice: investigator→coder→auditor on toyrepo; first self-hosted docs-PR | ✅ done (PR #1 self-hosted, merged) |
 | M2.5 | Real-repo effectiveness run on a live project (polystats), owner-driven | waiting until the workflow is competent |
 | M3 | Robustness (escalation policies, burn-gate, lock hardening, concurrency, chaos suite) + eval harness v1 + complaints table (ADR 0004 early) | ✅ done (chaos suite closed 2 recovery gaps: offline gate decisions applied on restart, synthesis no longer resurrects burn-rejected missions) |
-| M4 | rewvis deploy (systemd, Postgres, deploy key, branch protection) + cross-device | planned |
+| M4 | rewvis deploy (systemd, Postgres, deploy key, branch protection) + cross-device | ✅ done (systemd daemon, Postgres state + checkpoints on rewvis, gh auth verified against the private repo; first cross-device mission done: created on the VM, ship gate approved from the Mac, $0.05 total. Open items: branch protection deferred to an owner decision; `rework new --repo` resolves the repo on the creating machine, so cross-device creation needs a daemon-visible path) |
 | M5 | Library v1 (git store, curation, MCP server, role integration) | planned |
 | M5.5 | Complaints clustering → GitHub issues (table + tool landed early in M3, ADR 0004) | planned |
 | M6 | Semantic search + external ingest pipeline + eval-in-CI | planned |

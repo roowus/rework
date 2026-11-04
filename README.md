@@ -50,6 +50,10 @@ branch inside an isolated worktree, audits the diff, then stops and waits for
 your approval. The agent commits sign as `rework <rework@rework.local>` unless
 you set `REWORK_GIT_AUTHOR_NAME` / `REWORK_GIT_AUTHOR_EMAIL`.
 
+One cross-device rule: `--repo` is resolved by the machine that runs `rework
+new`, not by the daemon. If the daemon runs on another host, create the mission
+there or point `--repo` at a path that host can see.
+
 ## Eval + complaints
 
 ```bash

@@ -48,6 +48,12 @@ git-initialized there, so `examples/toyrepo` is never mutated; the fix lands on 
 branch in an isolated worktree. (`--plan fix-pr` swaps the ship gate for an open-PR
 gate; the default plan is `echo`.) Check it registered with `rework ls`.
 
+Cross-device note: `--repo` is resolved by the machine that runs `rework new`,
+not by the daemon. If the daemon runs elsewhere (a VPS, another laptop), either
+create the mission on the daemon's machine or point `--repo` at a path that
+machine can see. A repo path that only exists on the creating machine makes the
+coder's worktree step fail instantly with zero model calls.
+
 ## 3. Watch it work
 
 ```bash
