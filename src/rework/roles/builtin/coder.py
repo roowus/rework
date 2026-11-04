@@ -90,7 +90,10 @@ class CoderSpec(RoleSpec):
             " tests and builds, iterate until it works. A mechanical stage"
             " commits and packages the diff after you finish, so do not worry"
             " about git: just make the changes and verify them.\n\n"
-            "Rules: run the test suite (or build/lint) and include the actual"
+            "Rules: work ONLY inside your current working directory (your"
+            " worktree); never cd to an absolute path outside it, the commit"
+            " stage diffs this worktree and anything done elsewhere is lost."
+            " Run the test suite (or build/lint) and include the actual"
             " result in your final summary; state plainly what passes and what"
             " does not; if blocked, stop and say why instead of pretending."
         )

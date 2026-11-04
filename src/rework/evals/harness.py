@@ -193,7 +193,11 @@ async def run_task(
     """Run one task in-process (no daemon) and grade it. The eval mission id is
     deterministic per (task, attempt-batch) so re-runs are visible in history."""
     mission_id = f"{EVAL_MISSION_PREFIX}{task.id}-{new_stamp()}"
-    repo_dest = workroot / mission_id.replace(":", "_") / "repo"
+    # seed the fixture repo as a SIBLING of the workroot, not inside it: role
+    # worktrees live under workroot, and (the run_command jail being advisory,
+    # see nodes/tools.py) a role that cd's to an absolute path must not be able
+    # to reach the pristine fixture or a previous run's worktree from there.
+    repo_dest = workroot.parent / "eval-fixtures" / mission_id.replace(":", "_") / "repo"
     await asyncio.to_thread(_seed_repo, task, repo_dest)
 
     mission = await store.create_mission(

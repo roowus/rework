@@ -115,7 +115,14 @@ class LazyExecutor:
 
 class LocalExecutor:
     """Path-jailed local tools. Every path arg is resolved against the workdir
-    and rejected if it escapes (symlinks included)."""
+    and rejected if it escapes (symlinks included).
+
+    Known boundary (found live, first real eval run): the jail is ADVISORY for
+    run_command. The shell starts inside the workdir, but a command may `cd`
+    to an absolute path outside it and work there; inspecting the shell string
+    is not a security boundary. The coder prompt pins cwd to the worktree, the
+    eval harness seeds fixture repos outside the workroot, and the real fix is
+    the Docker executor (M7)."""
 
     def __init__(self, workdir: Path, extra_specs: list[ToolSpec] | None = None) -> None:
         self._workdir = workdir.resolve()
