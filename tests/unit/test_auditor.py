@@ -132,6 +132,7 @@ async def test_auditor_reads_context_and_reports(audit_ctx: RoleBuildCtx) -> Non
                         "coverage": "adequate for the one-line change",
                         "business_logic_risk": "none",
                     },
+                    "warnings": [],
                     "blockers": [],
                 }
             ),

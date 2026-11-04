@@ -231,6 +231,25 @@ DISPOSITIONS = ReportSection(
 )
 
 
+WARNINGS = ReportSection(
+    key="warnings",
+    title="Warnings",
+    prompt_fragment=(
+        "List what this review could NOT cover, as short strings: unchecked"
+        " paths, runtime that was unavailable, probes skipped. Empty list"
+        " only when coverage was genuinely complete. This is the honesty"
+        " valve: a reader must know what was traced versus assumed."
+    ),
+    schema_slice={
+        "warnings": {
+            "type": "array",
+            "items": {"type": "string"},
+        }
+    },
+    required_fields=("warnings",),
+)
+
+
 SECTION_REGISTRY: dict[str, ReportSection] = {
     s.key: s
     for s in (
@@ -242,6 +261,7 @@ SECTION_REGISTRY: dict[str, ReportSection] = {
         RULED_OUT,
         CLASSIFICATION,
         STANDING_ASSESSMENTS,
+        WARNINGS,
         DISPOSITIONS,
     )
 }
@@ -249,7 +269,7 @@ SECTION_REGISTRY: dict[str, ReportSection] = {
 # named assemblies: the default checkbox sets (ADR 0003: truss format is the
 # auditor's default; investigator has its own)
 ASSEMBLY_INVESTIGATOR = ("summary", "findings", "blockers")
-ASSEMBLY_AUDIT = ("summary", "findings", "standing_assessments", "blockers")
+ASSEMBLY_AUDIT = ("summary", "findings", "standing_assessments", "warnings", "blockers")
 
 
 def resolve_sections(requested: list[str] | None) -> list[ReportSection]:

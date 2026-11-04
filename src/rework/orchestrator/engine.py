@@ -436,6 +436,61 @@ class MissionRunner:
         self._pr_url = pr_url
         await self._synthesize(mission.id, ship_decision)
 
+    def _pr_body(
+        self, mission: Mission, coder_artifact: dict[str, Any], audit_run: Run | None
+    ) -> str:
+        """The PR description, assembled mechanically from typed artifacts:
+        the coder's summary, the audit's verdict + findings + warnings, and the
+        run-stats table. Never LLM-written (same rule as the md report)."""
+        lines: list[str] = [
+            f"Produced by rework mission `{mission.id}`.",
+            "",
+            "## What changed",
+            "",
+            str(coder_artifact.get("summary") or "")[:4000],
+            "",
+        ]
+        audit_artifact = (audit_run.artifact if audit_run else None) or {}
+        verdict = mechanical_verdict(audit_artifact) if audit_artifact else "no audit"
+        lines += ["## Audit", "", f"Verdict: **{verdict}** (mechanical mapping)."]
+        findings = audit_artifact.get("findings", [])
+        if findings:
+            lines += ["", "| severity | verdict | finding |", "|---|---|---|"]
+            for f in findings:
+                lines.append(f"| {f.get('severity')} | {f.get('verdict')} | {f.get('title')} |")
+            for f in findings:
+                lines += ["", f"**{f.get('title')}**", "", str(f.get("detail", ""))]
+                evidence = f.get("evidence") or []
+                if evidence:
+                    lines += ["", "Evidence: " + " · ".join(f"`{e}`" for e in evidence)]
+        else:
+            lines += ["", "No findings (clean audit)."]
+        warnings = audit_artifact.get("warnings", [])
+        if warnings:
+            lines += ["", "### Audit warnings (coverage limits)", ""]
+            for w in warnings:
+                lines.append(f"- {w}")
+        stats = coder_artifact.get("run_stats")
+        if stats:
+            elapsed = f"{stats.get('elapsed_seconds', 0.0):.1f}s"
+            cost = f"${stats.get('cost_usd', 0.0):.4f} est"
+            lines += [
+                "",
+                "## Run stats",
+                "",
+                f"{stats.get('model_calls', 0)} model calls ·"
+                f" {stats.get('input_tokens', 0):,} in / {stats.get('output_tokens', 0):,} out"
+                f" (cached {stats.get('cached_tokens', 0):,})"
+                f" · {cost} · {elapsed}",
+            ]
+        lines += [
+            "",
+            f"Full report: `rework report {mission.id} --md`.",
+            "",
+            "_Agent-authored, human-merged: rework dogfooding rules._",
+        ]
+        return "\n".join(lines)
+
     async def _create_pr(self, mission: Mission, results: dict[str, Run]) -> str | None:
         """Push the coder's branch and open a PR. Mechanical: title/body from
         the brief + audit verdict; the human does the merging."""
@@ -454,16 +509,8 @@ class MissionRunner:
             return None
         branch = str(coder_run.artifact.get("branch") or "")
         worktree = Path(str(coder_run.artifact.get("worktree") or mission.repo_path or "."))
-        summary = str(coder_run.artifact.get("summary") or "")
-        verdict = "see audit artifact"
         title = f"rework: {mission.objective}"
-        body = (
-            f"Produced by rework mission `{mission.id}`.\n\n"
-            f"## What changed\n\n{summary[:4000]}\n\n"
-            f"## Audit\n\nVerdict at gate time: {verdict}. Full report:"
-            f" `rework report {mission.id}`.\n\n"
-            f"_Agent-authored, human-merged (rework dogfooding rules)._"
-        )
+        body = self._pr_body(mission, coder_run.artifact, results.get("audit"))
         await push_branch(worktree, branch)
         url = await pr_create(worktree, head=branch, title=title, body=body)
         await self._bus.publish(

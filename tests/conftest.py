@@ -140,6 +140,7 @@ AUDIT_CLEAN = json.dumps(
             "coverage": "adequate: existing tests pin the change",
             "business_logic_risk": "none",
         },
+        "warnings": [],
         "blockers": [],
     }
 )
@@ -164,6 +165,7 @@ AUDIT_VETO = json.dumps(
             "coverage": "cannot confirm",
             "business_logic_risk": "none",
         },
+        "warnings": [],
         "blockers": [],
     }
 )
