@@ -29,33 +29,50 @@ def _is_transient(exc: Exception) -> bool:
 
 class RetryingProvider:
     """Decorates any ModelProvider with bounded retry + backoff on transient
-    errors. Non-transient errors (auth, bad request) fail immediately."""
+    errors. Non-transient errors (auth, bad request) fail immediately.
+    429s get a deeper pool + longer backoff: rate-limit windows outlast a
+    5xx blip (found live: the auditor burned 3+1 attempts in one 429 storm)."""
 
     name = "retrying"
 
     def __init__(self, inner: Any, attempts: int = 3, backoff_s: float = 2.0) -> None:
         self._inner = inner
         self._attempts = attempts
+        self._rate_attempts = attempts * 3  # 429: 9 shots when base is 3
         self._backoff = backoff_s
         self.name = getattr(inner, "name", "retrying")
 
+    @staticmethod
+    def _is_rate_limit(exc: Exception) -> bool:
+        if getattr(exc, "status_code", None) == 429:
+            return True
+        text = str(exc).lower()
+        return "429" in text and ("rate limit" in text or "requests" in text)
+
     async def complete(self, request: ChatRequest) -> ChatResult:
         last: Exception | None = None
-        for attempt in range(1, self._attempts + 1):
+        attempt = 0
+        limit = self._attempts
+        while attempt < limit:
+            attempt += 1
             try:
                 return await self._inner.complete(request)
             except Exception as exc:
                 if not _is_transient(exc):
                     raise
                 last = exc
+                if self._is_rate_limit(exc):
+                    limit = self._rate_attempts  # extend the pool for 429s
                 log.warning(
                     "transient provider error (attempt %d/%d): %s",
                     attempt,
-                    self._attempts,
+                    limit,
                     str(exc)[:120],
                 )
-                if attempt < self._attempts:
-                    await asyncio.sleep(self._backoff * attempt)
+                if attempt < limit:
+                    # rate limits need longer waits than 5xx blips
+                    backoff = self._backoff * (attempt * 2 if self._is_rate_limit(exc) else attempt)
+                    await asyncio.sleep(backoff)
         assert last is not None
         raise last
 

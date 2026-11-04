@@ -52,3 +52,19 @@ async def test_exhaustion_raises_last() -> None:
     with pytest.raises(RuntimeError, match="503"):
         await provider.complete(ChatRequest(model="m", messages=[]))
     assert flaky.calls == 3
+
+
+async def test_rate_limits_get_a_deeper_pool() -> None:
+    """429 storms outlast 5xx blips: rate limits get 3x the attempts and
+    longer backoff (found live: the auditor burned all attempts in one)."""
+    flaky = FlakyProvider([RuntimeError("Error code: 429 rate limit reached")] * 5)
+    provider = RetryingProvider(flaky, attempts=3, backoff_s=0.01)
+    result = await provider.complete(ChatRequest(model="m", messages=[]))
+    assert result.text == "ok"
+    assert flaky.calls == 6  # 5 failures + the success, within the 9-shot pool
+
+    flaky2 = FlakyProvider([RuntimeError("Error code: 429 rate limit reached")] * 9)
+    provider2 = RetryingProvider(flaky2, attempts=3, backoff_s=0.01)
+    with pytest.raises(RuntimeError, match="429"):
+        await provider2.complete(ChatRequest(model="m", messages=[]))
+    assert flaky2.calls == 9

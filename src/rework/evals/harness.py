@@ -66,9 +66,12 @@ def grade_tests_pass(runs_by_step: dict[str, Any], workroot: Path) -> dict[str, 
     diff = (coder.artifact or {}).get("diff") if coder is not None else None
     grade["diff_present"] = bool(diff)
     audit = runs_by_step.get("audit")
-    grade["audit_verdict"] = (
-        mechanical_verdict(audit.artifact or {}) if audit is not None else "none"
-    )
+    # a missing/failed audit must not read as approval (found live: both audit
+    # attempts died in a 429 storm and the grade said audit=approve)
+    audit_ran = audit is not None and audit.status.value == "completed"
+    audit_artifact = audit.artifact if audit is not None else None
+    grade["audit_verdict"] = mechanical_verdict(audit_artifact or {}) if audit_ran else "no_audit"
+    grade["audit_completed"] = audit_ran
 
     # run the tests on the coder's final worktree, not trust its summary
     tests_pass = False
@@ -79,7 +82,7 @@ def grade_tests_pass(runs_by_step: dict[str, Any], workroot: Path) -> dict[str, 
             tests_pass, test_output = _run_pytest(Path(str(worktree)))
     grade["tests_pass"] = tests_pass
     grade["test_output_tail"] = test_output
-    grade["passed"] = bool(mission_done and diff and tests_pass)
+    grade["passed"] = bool(mission_done and diff and tests_pass and audit_ran)
     grade["worktree"] = str((coder.artifact or {}).get("worktree") if coder is not None else "")
     del workroot  # grader signature stability for rung-2/3 (judge needs scratch space)
     return grade
