@@ -51,6 +51,7 @@ you set `REWORK_GIT_AUTHOR_NAME` / `REWORK_GIT_AUTHOR_EMAIL`.
 ## Design
 
 - Living architecture: `docs/design.md`
+- Report architecture: `docs/reports.md`
 - Decision records: `docs/adr/`
 
 ## License
