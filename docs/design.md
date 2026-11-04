@@ -125,3 +125,27 @@ execution per role behind the `ToolExecutor` protocol.
 | M5.5 | Complaints clustering → GitHub issues (table + tool landed early in M3, ADR 0004) | planned |
 | M6 | Semantic search + external ingest pipeline + eval-in-CI | planned |
 | M7+ | Container sandboxing, dashboard, real event transport, more roles | stubbed |
+
+## Backlog (back burner: ideas parked for the owner to flesh out later)
+
+The owner steers: new ideas raised mid-build land here MVP-first; deeper design
+happens when the owner picks them back up.
+
+- **Persistent synced workspace**: a project folder kept identical across
+  devices (two-way, continuous, conflict resolution). Rejected for M4.5's
+  one-shot bundles; revisit as its own design effort.
+- **Non-tailnet routes**: Tailscale Funnel or port-forwarded access for
+  devices that cannot join the tailnet. The workspace API + token already
+  work behind it; adapter only.
+- **AI-centered VCS transports**: the owner is researching SCION and GitAI as
+  better version-control substrates. `transport` is an adapter seam (ADR 0005);
+  these would land as new adapters.
+- **Configurable agent-merge**: today humans merge, full stop (no merge code
+  exists). If ever wanted, it must be designed as a gated capability; not
+  built until asked.
+- **Branch protection on main**: blocked by GitHub Pro paywall on private
+  repos. Revisit if the repo goes public or the plan upgrades.
+- **Investigator workspace population**: investigators file complaints that
+  their workdir is empty by design (they get a repo map, not the repo).
+  Candidate workflow improvement (mount the repo read-only or index richer
+  context); evaluate after the Library lands.
