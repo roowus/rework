@@ -7,6 +7,8 @@ but are owned by the checkpointer, not this store.
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import time
 from typing import Any
@@ -136,15 +138,53 @@ def _uj(value: str | None) -> dict[str, Any]:
     return json.loads(value) if value else {}
 
 
+class _TaskLock:
+    """asyncio.Lock, reentrant within one task. PostgresStore shares ONE
+    connection (found live: the engine's concurrent pump loop + role tasks
+    interleaved queries -> 'another command is already in progress'; aiosqlite
+    never showed this because its thread serializes). Public methods hold this
+    lock for their whole body; nested public calls (update_run -> get_run)
+    stay in the same task, so reentrancy is safe here."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task[None] | None = None
+
+    async def __aenter__(self) -> None:
+        me = asyncio.current_task()
+        if self._owner is me:
+            return
+        await self._lock.acquire()
+        self._owner = me
+
+    async def __aexit__(self, *exc: object) -> None:
+        if self._owner is asyncio.current_task():
+            self._owner = None
+            self._lock.release()
+
+
+def _serialized(method: Any) -> Any:
+    """Serialize a store method against the shared connection."""
+
+    @functools.wraps(method)
+    async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        async with self._op_lock:
+            return await method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class PostgresStore:
     """Async Postgres StateStore. Open with `open_postgres(url)`."""
 
     def __init__(self, conn: psycopg.AsyncConnection[DictRow]) -> None:
         self._conn = conn
+        self._op_lock = _TaskLock()
 
     async def aclose(self) -> None:
         await self._conn.close()
 
+    @_serialized
     async def reset_for_tests(self) -> None:
         """Wipe domain tables (test isolation for the shared dev database)."""
         for table in _TABLES:
@@ -208,6 +248,7 @@ class PostgresStore:
         )
 
     # -- missions -----------------------------------------------------------
+    @_serialized
     async def create_mission(self, mission: Mission) -> Mission:
         await self._conn.execute(
             "INSERT INTO missions (id, objective, repo_path, status, plan, result,"
@@ -226,10 +267,12 @@ class PostgresStore:
         await self._conn.commit()
         return mission
 
+    @_serialized
     async def get_mission(self, mission_id: str) -> Mission | None:
         row = await self._fetch_one("SELECT * FROM missions WHERE id = %s", (mission_id,))
         return self._mission(row) if row else None
 
+    @_serialized
     async def update_mission(
         self,
         mission_id: str,
@@ -259,6 +302,7 @@ class PostgresStore:
             await self._conn.commit()
         return await self.get_mission(mission_id)
 
+    @_serialized
     async def list_missions(
         self, status: MissionStatus | None = None, limit: int = 50
     ) -> list[Mission]:
@@ -274,6 +318,7 @@ class PostgresStore:
         return [self._mission(r) for r in rows]
 
     # -- runs -----------------------------------------------------------------
+    @_serialized
     async def create_run(self, run: Run) -> Run:
         """Idempotent on run.id: re-dispatch after a crash returns the stored row."""
         await self._conn.execute(
@@ -302,10 +347,12 @@ class PostgresStore:
         assert existing is not None
         return existing
 
+    @_serialized
     async def get_run(self, run_id: str) -> Run | None:
         row = await self._fetch_one("SELECT * FROM runs WHERE id = %s", (run_id,))
         return self._run(row) if row else None
 
+    @_serialized
     async def update_run(
         self,
         run_id: str,
@@ -347,12 +394,14 @@ class PostgresStore:
             await self._conn.commit()
         return await self.get_run(run_id)
 
+    @_serialized
     async def list_runs(self, mission_id: str) -> list[Run]:
         rows = await self._fetch_all(
             "SELECT * FROM runs WHERE mission_id = %s ORDER BY created_at", (mission_id,)
         )
         return [self._run(r) for r in rows]
 
+    @_serialized
     async def list_runs_by_status(self, status: RunStatus) -> list[Run]:
         rows = await self._fetch_all(
             "SELECT * FROM runs WHERE status = %s ORDER BY created_at", (status.value,)
@@ -360,6 +409,7 @@ class PostgresStore:
         return [self._run(r) for r in rows]
 
     # -- gates ------------------------------------------------------------------
+    @_serialized
     async def create_gate(self, gate: Gate) -> Gate:
         await self._conn.execute(
             "INSERT INTO gates (id, mission_id, kind, question, status, decision_note,"
@@ -378,10 +428,12 @@ class PostgresStore:
         await self._conn.commit()
         return gate
 
+    @_serialized
     async def get_gate(self, gate_id: str) -> Gate | None:
         row = await self._fetch_one("SELECT * FROM gates WHERE id = %s", (gate_id,))
         return self._gate(row) if row else None
 
+    @_serialized
     async def decide_gate(
         self, gate_id: str, approved: bool, note: str | None = None
     ) -> Gate | None:
@@ -399,6 +451,7 @@ class PostgresStore:
         await self._conn.commit()
         return await self.get_gate(gate_id)
 
+    @_serialized
     async def list_open_gates(self, mission_id: str | None = None) -> list[Gate]:
         if mission_id is not None:
             rows = await self._fetch_all(
@@ -413,6 +466,7 @@ class PostgresStore:
         return [self._gate(r) for r in rows]
 
     # -- events ---------------------------------------------------------------------
+    @_serialized
     async def append_event(self, event: EventRecord) -> EventRecord:
         async with self._conn.cursor() as cur:
             await cur.execute(
@@ -432,6 +486,7 @@ class PostgresStore:
         await self._conn.commit()
         return event
 
+    @_serialized
     async def events_since(
         self, seq: int = 0, mission_id: str | None = None, limit: int = 500
     ) -> list[EventRecord]:
@@ -457,6 +512,7 @@ class PostgresStore:
         ]
 
     # -- ledger ------------------------------------------------------------------------
+    @_serialized
     async def charge(self, charge: Charge) -> None:
         await self._conn.execute(
             "INSERT INTO charges (mission_id, run_id, model, input_tokens, output_tokens,"
@@ -474,6 +530,7 @@ class PostgresStore:
         )
         await self._conn.commit()
 
+    @_serialized
     async def run_charges(self, run_id: str) -> list[Charge]:
         rows = await self._fetch_all(
             "SELECT * FROM charges WHERE run_id = %s ORDER BY ts", (run_id,)
@@ -492,6 +549,7 @@ class PostgresStore:
             for r in rows
         ]
 
+    @_serialized
     async def mission_spend(self, mission_id: str) -> BudgetState:
         row = await self._fetch_one(
             "SELECT COALESCE(SUM(input_tokens), 0) AS i, COALESCE(SUM(output_tokens), 0) AS o,"
@@ -509,6 +567,7 @@ class PostgresStore:
 
     # -- leader lock (atomic upsert: the read-then-write version let two daemons
     # both pass the stale check and both win; M3 hardening) ------------------------------
+    @_serialized
     async def acquire_lock(self, owner: str, stale_after_s: float = 60.0) -> bool:
         now = time.time()
         cur = await self._conn.execute(
@@ -522,6 +581,7 @@ class PostgresStore:
         await self._conn.commit()
         return cur.rowcount > 0
 
+    @_serialized
     async def heartbeat_lock(self, owner: str) -> bool:
         cur = await self._conn.execute(
             "UPDATE daemon_lock SET heartbeat_at = %s WHERE id = 1 AND owner = %s",
@@ -530,11 +590,13 @@ class PostgresStore:
         await self._conn.commit()
         return cur.rowcount > 0
 
+    @_serialized
     async def release_lock(self, owner: str) -> None:
         await self._conn.execute("DELETE FROM daemon_lock WHERE id = 1 AND owner = %s", (owner,))
         await self._conn.commit()
 
     # -- complaints inbox (ADR 0004) ------------------------------------------------
+    @_serialized
     async def file_complaint(self, complaint: Complaint) -> Complaint:
         await self._conn.execute(
             "INSERT INTO complaints"
@@ -559,6 +621,7 @@ class PostgresStore:
         await self._conn.commit()
         return complaint
 
+    @_serialized
     async def list_complaints(
         self,
         status: ComplaintStatus | None = None,
@@ -580,6 +643,7 @@ class PostgresStore:
         params.append(limit)
         return [self._complaint(row) for row in await self._fetch_all(sql, tuple(params))]
 
+    @_serialized
     async def update_complaint(
         self, complaint_id: str, *, status: ComplaintStatus | None = None
     ) -> Complaint | None:
@@ -591,6 +655,7 @@ class PostgresStore:
         await self._conn.commit()
         return await self.get_complaint(complaint_id)
 
+    @_serialized
     async def get_complaint(self, complaint_id: str) -> Complaint | None:
         row = await self._fetch_one("SELECT * FROM complaints WHERE id = %s", (complaint_id,))
         return self._complaint(row) if row is not None else None

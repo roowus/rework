@@ -821,14 +821,21 @@ def serve() -> None:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
-    from rework.config import Config, load_catalog, open_store_from_config
+    from rework.config import DEFAULT_STATE_DIR, Config, load_catalog, open_store_from_config
 
     config = Config.from_env()
-    workroot = Path(config.db).expanduser().parent / "work"
+    if config.is_postgres:
+        workroot = DEFAULT_STATE_DIR / "work"
+    else:
+        workroot = Path(config.db).expanduser().parent / "work"
 
     async def go() -> None:
         from rework.kernel.events.bus import InProcessEventBus
-        from rework.orchestrator.daemon import Daemon, DaemonLocked, sqlite_checkpointer_factory
+        from rework.orchestrator.daemon import (
+            Daemon,
+            DaemonLocked,
+            checkpointer_factory_for,
+        )
         from rework.roles.registry import autodiscover
 
         store = await open_store_from_config(config)
@@ -838,7 +845,7 @@ def serve() -> None:
             bus=bus,
             registry=autodiscover(),
             catalog=load_catalog(),
-            make_checkpointer=sqlite_checkpointer_factory(config.checkpoints_db),
+            make_checkpointer=checkpointer_factory_for(config),
             workroot=workroot,
             config=config,
         )
@@ -863,9 +870,14 @@ def eval_run(
     mechanical). Cost is real when the catalog points at real models."""
 
     async def go() -> list[tuple[str, bool, str, str]]:
-        from rework.config import Config, load_catalog, open_store_from_config
+        from rework.config import (
+            DEFAULT_STATE_DIR,
+            Config,
+            load_catalog,
+            open_store_from_config,
+        )
         from rework.evals.harness import builtin_tasks, run_task
-        from rework.orchestrator.daemon import sqlite_checkpointer_factory
+        from rework.orchestrator.daemon import checkpointer_factory_for
         from rework.roles.registry import autodiscover
 
         config = Config.from_env()
@@ -877,8 +889,11 @@ def eval_run(
                 tasks = [t for t in tasks if t.id == task]
                 if not tasks:
                     raise typer.BadParameter(f"no such task: {task}")
-            workroot = Path(config.db).expanduser().parent / "eval-work"  # noqa: ASYNC240
-            checkpointer = sqlite_checkpointer_factory(config.checkpoints_db)
+            if config.is_postgres:
+                workroot = DEFAULT_STATE_DIR / "eval-work"
+            else:
+                workroot = Path(config.db).expanduser().parent / "eval-work"  # noqa: ASYNC240
+            checkpointer = checkpointer_factory_for(config)
             rows = []
             for t in tasks:
                 score = await run_task(t, store, registry, load_catalog(), checkpointer, workroot)

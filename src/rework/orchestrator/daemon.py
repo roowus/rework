@@ -48,6 +48,35 @@ def sqlite_checkpointer_factory(checkpoints_db: str) -> CheckpointerFactory:
     return make
 
 
+def postgres_checkpointer_factory(db_url: str) -> CheckpointerFactory:
+    """One checkpointer connection per run, against Postgres (the M4
+    deployment-grade path: checkpoints share the state database, so a daemon
+    restart resumes threads with no local files). setup() runs the saver's
+    migrations once per connection (idempotent DDL)."""
+
+    async def make(run_id: str) -> tuple[Any, Callable[[], Awaitable[None]]]:
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+        cm = AsyncPostgresSaver.from_conn_string(db_url)
+        saver = await cm.__aenter__()
+        await saver.setup()
+
+        async def close() -> None:
+            await cm.__aexit__(None, None, None)
+
+        return saver, close
+
+    return make
+
+
+def checkpointer_factory_for(config: Config) -> CheckpointerFactory:
+    """Pick the checkpointer backend from the state config: Postgres state
+    means Postgres checkpoints (one substrate), else the sqlite file."""
+    if config.is_postgres:
+        return postgres_checkpointer_factory(config.checkpoints_db)
+    return sqlite_checkpointer_factory(config.checkpoints_db)
+
+
 class Daemon:
     def __init__(
         self,
