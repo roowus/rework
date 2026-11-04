@@ -209,6 +209,7 @@ async def test_complaints_roundtrip(store: StateStore) -> None:
     resolved = await store.update_complaint(c.id, status=ComplaintStatus.RESOLVED)
     assert resolved is not None and resolved.status == ComplaintStatus.RESOLVED
 
+
 async def test_project_roundtrip(store: StateStore) -> None:
     """ADR 0005: projects are labels with settings and repo references."""
     p = Project(
@@ -228,9 +229,7 @@ async def test_project_roundtrip(store: StateStore) -> None:
     assert got.settings["transport"] == "git"
     assert got.settings["repos"][0]["name"] == "firmware"
 
-    updated = await store.update_project(
-        p.id, settings={**p.settings, "transport": "upload"}
-    )
+    updated = await store.update_project(p.id, settings={**p.settings, "transport": "upload"})
     assert updated is not None
     assert updated.settings["transport"] == "upload"
     assert updated.name == "capstone"  # untouched
@@ -238,6 +237,7 @@ async def test_project_roundtrip(store: StateStore) -> None:
     assert await store.get_project("p-missing") is None
     listed = await store.list_projects()
     assert [x.id for x in listed] == [p.id]
+
 
 async def test_mission_carries_project_and_origin(store: StateStore) -> None:
     """ADR 0005: missions reference projects + git origins instead of only

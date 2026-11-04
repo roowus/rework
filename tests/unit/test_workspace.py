@@ -64,9 +64,7 @@ async def test_workspace_api_upload_and_result(tmp_path: Path, store: StateStore
         assert resp.status == 200
         payload = await resp.json()
         staged = Path(payload["path"])
-        ok = await asyncio.to_thread(
-            lambda: staged.exists() and (staged / "notes.md").exists()
-        )
+        ok = await asyncio.to_thread(lambda: staged.exists() and (staged / "notes.md").exists())
         assert ok
         assert payload["workspace_id"].startswith("ws-")
 

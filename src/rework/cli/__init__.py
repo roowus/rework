@@ -118,10 +118,52 @@ def _prepare_repo(repo_arg: str, mission_id: str) -> str:
     return str(dest)
 
 
+def _is_git_url(value: str) -> bool:
+    return value.startswith(("http://", "https://", "git@", "ssh://")) or value.endswith(".git")
+
+
+def _upload_repo_dir(dir_arg: str, ws_name: str) -> str:
+    """The upload transport (ADR 0005): pack a local folder and POST it to the
+    daemon's workspace API; the mission carries the daemon-side staged path."""
+    import os as _os
+
+    import httpx as _httpx
+
+    from rework.orchestrator.workspace import pack_directory, workspace_url_from_env
+
+    src = Path(dir_arg).expanduser().resolve()
+    if not src.is_dir():
+        raise typer.BadParameter(f"--repo-dir not found: {src}")
+    token = _os.environ.get("REWORK_TOKEN")
+    url = f"{workspace_url_from_env().rstrip('/')}/workspaces/{ws_name}"
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    typer.echo(f"packing {src.name} and uploading to {url} ...")
+    data = pack_directory(src)
+    resp = _httpx.post(url, content=data, headers=headers, timeout=300.0)
+    if resp.status_code != 200:
+        raise typer.BadParameter(
+            f"daemon upload failed ({resp.status_code}): {resp.text[:200]}. "
+            "Is the daemon running, and is REWORK_DAEMON_URL pointed at it?"
+        )
+    staged = resp.json()["path"]
+    typer.echo(f"staged on the daemon: {staged}")
+    return staged
+
+
 @app.command()
 def new(
     objective: str,
-    repo: str | None = None,
+    repo: str | None = typer.Option(
+        None,
+        help="A local path (staged where rework new runs), a git URL (the daemon"
+        " clones it), or a repo NAME defined on --project.",
+    ),
+    repo_dir: str | None = typer.Option(
+        None,
+        help="A local folder of non-git working files: packed and uploaded"
+        " to the daemon (ADR 0005 upload transport).",
+    ),
+    project: str | None = typer.Option(None, help="Project id (p-...) to attach."),
     plan: str = typer.Option("echo", help="echo | fix | fix-pr"),
 ) -> None:
     """Create a mission; the daemon picks it up. `--plan fix` runs the
@@ -139,14 +181,56 @@ def new(
         )
 
         mission_id = new_id("m")
-        repo_path = _prepare_repo(repo, mission_id) if repo else None
+        repo_path: str | None = None
+        repo_origin: str | None = None
+        project_id: str | None = None
+        if project:
+            store_probe = await open_store_from_config(Config.from_env())
+            try:
+                found = await store_probe.get_project(project)
+            finally:
+                await store_probe.aclose()
+            if found is None:
+                raise typer.BadParameter(f"project not found: {project}")
+            project_id = found.id
+        if repo_dir:
+            repo_path = _upload_repo_dir(repo_dir, f"{mission_id}-files")
+        elif repo:
+            local_exists = await asyncio.to_thread(lambda: Path(repo).expanduser().exists())
+            if _is_git_url(repo):
+                repo_origin = repo  # the daemon clones this itself (ADR 0005)
+            elif local_exists:
+                repo_path = _prepare_repo(repo, mission_id)
+            elif project:
+                # a repo NAME defined on the project: resolve its reference
+                store_probe = await open_store_from_config(Config.from_env())
+                try:
+                    found = await store_probe.get_project(project)
+                finally:
+                    await store_probe.aclose()
+                ref = next(
+                    (
+                        r
+                        for r in ((found.settings if found else {}).get("repos") or [])
+                        if r.get("name") == repo
+                    ),
+                    None,
+                )
+                if ref is None:
+                    raise typer.BadParameter(f"repo {repo!r} not defined on project {project}")
+                if ref.get("kind") == "github":
+                    repo_origin = str(ref.get("url"))
+                else:
+                    repo_path = str(ref.get("url"))  # path kind: daemon must see it
+            else:
+                raise typer.BadParameter(f"repo not found: {repo}")
         store = await open_store_from_config(Config.from_env())
         try:
             bus = InProcessEventBus(store)
             plan_spec: dict | None = None
             if plan in ("fix", "fix-pr"):
-                if not repo_path:
-                    raise typer.BadParameter(f"--plan {plan} requires --repo")
+                if not repo_path and not repo_origin:
+                    raise typer.BadParameter(f"--plan {plan} requires --repo or --repo-dir")
                 import json as _json
 
                 template = PLAN_FIX_PR if plan == "fix-pr" else PLAN_FIX
@@ -156,6 +240,8 @@ def new(
                     id=mission_id,
                     objective=objective,
                     repo_path=repo_path,
+                    repo_origin=repo_origin,
+                    project_id=project_id,
                     plan=plan_spec,
                 )
             )
@@ -171,6 +257,132 @@ def new(
             await store.aclose()
 
     typer.echo(asyncio.run(go()))
+
+
+project_app = typer.Typer(no_args_is_help=True, add_completion=False, help="Projects (ADR 0005).")
+app.add_typer(project_app, name="project")
+
+
+@project_app.command("create")
+def project_create(
+    name: str,
+    transport: str = typer.Option("git", help="git (daemon clones origins) | upload"),
+    results: str = typer.Option("push_branch", help="push_branch | fetch | both"),
+    # typer needs list for repeatable options (tuple[str, ...] chokes on the
+    # Ellipsis); ruff B008 flags any list-annotated default, so noqa is the
+    # only clean escape (matches the existing ASYNC240 noqa above)
+    repo: list[str] | None = typer.Option(  # noqa: B008
+        None,
+        help="Repo reference NAME=URL, repeatable. A URL marks it github-kind;"
+        " a local path marks it path-kind (the daemon must see that path).",
+    ),
+) -> None:
+    """Create a project: a label with settings and zero-or-more repo refs."""
+
+    async def go() -> str:
+        from rework.config import Config, open_store_from_config
+        from rework.kernel.state.records import Project
+
+        repos: list[dict] = []
+        for spec in repo or []:
+            if "=" not in spec:
+                raise typer.BadParameter(f"--repo wants NAME=URL, got {spec!r}")
+            rname, url = spec.split("=", 1)
+            repos.append(
+                {"name": rname, "kind": "github" if _is_git_url(url) else "path", "url": url}
+            )
+        cfg = Config.from_env()
+        store = await open_store_from_config(cfg)
+        try:
+            settings = {"transport": transport, "results": results, "repos": repos}
+            p = await store.create_project(Project(name=name, settings=settings))
+            return p.id
+        finally:
+            await store.aclose()
+
+    typer.echo(asyncio.run(go()))
+
+
+@project_app.command("ls")
+def project_ls() -> None:
+    """List projects, newest first."""
+
+    async def go() -> list[str]:
+        from rework.config import Config, open_store_from_config
+
+        store = await open_store_from_config(Config.from_env())
+        try:
+            rows = []
+            for p in await store.list_projects():
+                repos = (p.settings or {}).get("repos") or []
+                rows.append(
+                    f"{p.id}  {p.name}  transport={(p.settings or {}).get('transport', 'git')}"
+                    f"  repos={len(repos)}"
+                )
+            return rows
+        finally:
+            await store.aclose()
+
+    for line in asyncio.run(go()):
+        typer.echo(line)
+
+
+@project_app.command("show")
+def project_show(project_id: str) -> None:
+    """One project's full settings."""
+
+    async def go() -> str:
+        import json as _json
+
+        from rework.config import Config, open_store_from_config
+
+        store = await open_store_from_config(Config.from_env())
+        try:
+            p = await store.get_project(project_id)
+        finally:
+            await store.aclose()
+        if p is None:
+            raise typer.BadParameter(f"project not found: {project_id}")
+        return f"{p.id}  {p.name}\n{_json.dumps(p.settings, indent=2)}"
+
+    typer.echo(asyncio.run(go()))
+
+
+@app.command()
+def fetch(
+    mission_id: str,
+    out: str | None = typer.Option(
+        None, help="Directory to extract into (default ./<mission-id>)."
+    ),
+) -> None:
+    """Download the mission's final worktree (ADR 0005 fetch results path)."""
+    import os as _os
+    import tarfile as _tarfile
+
+    import httpx as _httpx
+
+    from rework.orchestrator.workspace import workspace_url_from_env
+
+    token = _os.environ.get("REWORK_TOKEN")
+    url = f"{workspace_url_from_env().rstrip('/')}/workspaces/results/{mission_id}"
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    resp = _httpx.get(url, headers=headers, timeout=300.0)
+    if resp.status_code == 404:
+        typer.secho(
+            f"nothing to fetch for {mission_id} (no finished worktree)",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(1)
+    if resp.status_code != 200:
+        typer.secho(f"fetch failed ({resp.status_code}): {resp.text[:200]}", fg=typer.colors.RED)
+        raise typer.Exit(1)
+    dest = Path(out or mission_id)
+    dest.mkdir(parents=True, exist_ok=True)
+    import io as _io
+
+    with _tarfile.open(fileobj=_io.BytesIO(resp.content), mode="r:gz") as tar:
+        tar.extractall(dest, filter="data")
+    typer.echo(f"extracted to {dest}/")
 
 
 def _fmt_run_stats(stats: dict[str, Any]) -> list[str]:
@@ -856,8 +1068,7 @@ def serve() -> None:
         host, port = default_bind()
         server = await start_workspace_server(store, workroot, host, port)
         typer.secho(
-            f"workspace API on http://{host}:{port} (tailnet-only when the host "
-            "is a tailnet IP)",
+            f"workspace API on http://{host}:{port} (tailnet-only when the host is a tailnet IP)",
             fg=typer.colors.CYAN,
         )
         try:

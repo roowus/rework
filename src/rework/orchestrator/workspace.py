@@ -117,9 +117,7 @@ def build_workspace_app(store: StateStore, workroot: Path) -> web.Application:
         try:
             dest = await asyncio.to_thread(stage_bundle, workroot, data, name)
         except (tarfile.TarError, EOFError, OSError) as exc:
-            return web.json_response(
-                {"error": f"body is not a readable tar.gz: {exc}"}, status=400
-            )
+            return web.json_response({"error": f"body is not a readable tar.gz: {exc}"}, status=400)
         return web.json_response({"workspace_id": dest.parent.name, "path": str(dest)})
 
     async def result(request: web.Request) -> web.Response:
