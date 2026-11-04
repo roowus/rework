@@ -1172,3 +1172,170 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+library_app = typer.Typer(
+    no_args_is_help=True,
+    add_completion=False,
+    help="The Library: cross-project skills/tools/reports/memories (M5, ADR 0001).",
+)
+app.add_typer(library_app, name="library")
+
+
+async def open_library_index(db: str) -> Any:
+    """The library index on the same DB substrate as the state store."""
+    from rework.library.store import open_library_store
+
+    return await open_library_store(db)
+
+
+def _library_root() -> Path:
+    import os as _os
+
+    from rework.config import DEFAULT_STATE_DIR
+
+    return Path(
+        _os.environ.get("REWORK_LIBRARY_DIR", str(DEFAULT_STATE_DIR / "library"))
+    ).expanduser()
+
+
+@library_app.command("add")
+def library_add(
+    body_file: str = typer.Argument(..., help="Path to the markdown body file."),
+    type_: str = typer.Option("skill", "--type", help="skill | tool | report | memory"),
+    name: str = typer.Option(..., help="Item name (searchable)."),
+    description: str = typer.Option("", help="One-line description (searchable)."),
+    tag: list[str] = typer.Option([], "--tag", help="Repeatable."),  # noqa: B008
+    project: str | None = typer.Option(None, help="Provenance: project id."),
+    mission: str | None = typer.Option(None, help="Provenance: mission id."),
+    status: str = typer.Option(
+        "active", help="active (default for skills/reports/memories) | proposed"
+    ),
+) -> None:
+    """Add an item: the body file goes into the library git repo, the metadata
+    into the index. Internal items auto-accept except tools (M5.2 gates)."""
+    from rework.config import Config
+    from rework.library.model import (
+        ItemStatus,
+        ItemType,
+        LibraryItem,
+        Origin,
+        Provenance,
+    )
+    from rework.library.store import GitLibrary
+
+    try:
+        item_type = ItemType(type_)
+    except ValueError as exc:
+        raise typer.BadParameter(f"unknown type: {type_}") from exc
+    try:
+        item_status = ItemStatus(status)
+    except ValueError as exc:
+        raise typer.BadParameter(f"unknown status: {status}") from exc
+    src = Path(body_file).expanduser()
+    if not src.is_file():
+        raise typer.BadParameter(f"body file not found: {src}")
+    item = LibraryItem(
+        type=item_type,
+        name=name,
+        description=description,
+        tags=list(tag),
+        provenance=Provenance(origin=Origin.INTERNAL, mission_id=mission, project=project),
+        status=item_status,
+    )
+
+    async def go() -> str:
+        lib = GitLibrary(_library_root(), author=Config.from_env().git_author)
+        body = await asyncio.to_thread(src.read_text)
+        item.body_path = await asyncio.to_thread(
+            lib.write_body, item, body, f"library: add {item.type.value} {name!r}"
+        )
+        index = await open_library_index(Config.from_env().db)
+        try:
+            await index.upsert_item(item)
+        finally:
+            await index.aclose()
+        return item.id
+
+    typer.echo(asyncio.run(go()))
+
+
+@library_app.command("ls")
+def library_ls(
+    type_: str | None = typer.Option(None, "--type", help="Filter by type."),
+    status: str | None = typer.Option(None, help="Filter by status."),
+) -> None:
+    """List library items, newest first."""
+
+    async def go() -> list[str]:
+        from rework.config import Config
+        from rework.library.model import ItemStatus, ItemType
+
+        index = await open_library_index(Config.from_env().db)
+        try:
+            it = ItemType(type_) if type_ else None
+            st = ItemStatus(status) if status else None
+            return [
+                f"{item.id}  [{item.type.value}/{item.status.value}]"
+                f" {item.name}: {item.description[:60]}"
+                for item in await index.list_items(type_=it, status=st)
+            ]
+        finally:
+            await index.aclose()
+
+    for line in asyncio.run(go()):
+        typer.echo(line)
+
+
+@library_app.command("show")
+def library_show(item_id: str) -> None:
+    """One item: metadata plus its body."""
+    from rework.config import Config
+    from rework.library.store import GitLibrary
+
+    async def go() -> str:
+        index = await open_library_index(Config.from_env().db)
+        try:
+            item = await index.get_item(item_id)
+        finally:
+            await index.aclose()
+        if item is None:
+            raise typer.BadParameter(f"item not found: {item_id}")
+        lib = GitLibrary(_library_root())
+        body = await asyncio.to_thread(lib.read_body, item)
+        meta = (
+            f"{item.id}  [{item.type.value}/{item.status.value}] v{item.version}"
+            f"  uses={item.uses}\n"
+            f"name: {item.name}\ndescription: {item.description}\n"
+            f"tags: {', '.join(item.tags) or '(none)'}\n"
+            f"provenance: {item.provenance.origin.value}"
+            f" mission={item.provenance.mission_id} role={item.provenance.role}\n"
+        )
+        return meta + "\n" + (body or "(no body)")
+
+    typer.echo(asyncio.run(go()))
+
+
+@library_app.command("search")
+def library_search(
+    query: str = typer.Argument(...),
+    type_: str | None = typer.Option(None, "--type", help="Filter by type."),
+) -> None:
+    """Keyword search over names, descriptions, and tags."""
+
+    async def go() -> list[str]:
+        from rework.config import Config
+        from rework.library.model import ItemType
+
+        index = await open_library_index(Config.from_env().db)
+        try:
+            it = ItemType(type_) if type_ else None
+            return [
+                f"{item.id}  [{item.type.value}] {item.name}: {item.description[:60]}"
+                for item in await index.search(query, type_=it)
+            ]
+        finally:
+            await index.aclose()
+
+    for line in asyncio.run(go()):
+        typer.echo(line)
