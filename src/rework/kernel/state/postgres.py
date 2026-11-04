@@ -757,17 +757,49 @@ class PostgresStore:
         )
 
 
+_MIGRATIONS: list[tuple[str, str, str]] = [
+    # (table, column, DDL): check-then-alter. ALTER TABLE takes ACCESS
+    # EXCLUSIVE even as a no-op IF NOT EXISTS, so issuing one on every open
+    # convoyed every CLI/daemon connection behind any long-lived reader
+    # (found live: an attach process idle-in-transaction froze all store
+    # opens for minutes). The catalog read is cheap and takes no table lock;
+    # the ALTER runs only when a column is genuinely missing, under a short
+    # lock_timeout so a deploy colliding with a live reader fails loudly
+    # instead of wedging the queue.
+    (
+        "charges",
+        "cached_tokens",
+        "ALTER TABLE charges ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0",
+    ),
+    ("missions", "repo_origin", "ALTER TABLE missions ADD COLUMN repo_origin TEXT"),
+    ("missions", "project_id", "ALTER TABLE missions ADD COLUMN project_id TEXT"),
+]
+
+
 async def open_postgres(url: str) -> PostgresStore:
     conn = await psycopg.AsyncConnection.connect(
         url, autocommit=False, row_factory=psycopg.rows.dict_row
     )
     for ddl in _DDL:
         await conn.execute(ddl)
-    # migrations for databases created before a column existed
-    await conn.execute(
-        "ALTER TABLE charges ADD COLUMN IF NOT EXISTS cached_tokens INTEGER NOT NULL DEFAULT 0"
-    )
-    await conn.execute("ALTER TABLE missions ADD COLUMN IF NOT EXISTS repo_origin TEXT")
-    await conn.execute("ALTER TABLE missions ADD COLUMN IF NOT EXISTS project_id TEXT")
+    for table, column, alter in _MIGRATIONS:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM information_schema.columns"
+                " WHERE table_name = %s AND column_name = %s",
+                (table, column),
+            )
+            missing = await cur.fetchone() is None
+        if missing:
+            await conn.execute("SET lock_timeout = '5s'")
+            try:
+                await conn.execute(alter)
+            except psycopg.errors.LockNotAvailable:
+                raise RuntimeError(
+                    f"migration could not lock {table} within 5s (a long-lived"
+                    " reader holds it); retry after stopping attached clients"
+                ) from None
+            finally:
+                await conn.execute("SET lock_timeout = 0")
     await conn.commit()
     return PostgresStore(conn)
