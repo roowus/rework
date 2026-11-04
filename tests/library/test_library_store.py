@@ -95,11 +95,10 @@ async def test_roundtrip_and_update(index) -> None:
     assert got2.status == ItemStatus.RETIRED
     assert got2.version == 2
 
+
 async def test_list_and_filters(index) -> None:
     await index.upsert_item(_item("skill one"))
-    await index.upsert_item(
-        _item("tool one", type=ItemType.TOOL, status=ItemStatus.PROPOSED)
-    )
+    await index.upsert_item(_item("tool one", type=ItemType.TOOL, status=ItemStatus.PROPOSED))
     await index.upsert_item(_item("skill two"))
 
     active = await index.list_items(status=ItemStatus.ACTIVE)
@@ -109,11 +108,10 @@ async def test_list_and_filters(index) -> None:
     everything = await index.list_items()
     assert len(everything) == 3
 
+
 async def test_search_ranking(index) -> None:
     await index.upsert_item(_item("toyrepo fix recipe", tags=["toyrepo"]))
-    await index.upsert_item(
-        _item("drive fetcher", description="pull files from google drive")
-    )
+    await index.upsert_item(_item("drive fetcher", description="pull files from google drive"))
     await index.upsert_item(
         _item(
             "pytest patterns",
@@ -135,6 +133,7 @@ async def test_search_ranking(index) -> None:
     got = await index.get_item(hits[0].id)
     assert got is not None and got.uses == 1
 
+
 def test_git_library_commits(tmp_path) -> None:
     import subprocess
 
@@ -145,9 +144,7 @@ def test_git_library_commits(tmp_path) -> None:
     item.body_path = rel  # callers persist the returned path on the item
     body = lib.read_body(item)
     assert body is not None and "pytest" in body
-    log = subprocess.run(
-        ["git", "log", "--oneline"], cwd=lib.root, capture_output=True, text=True
-    )
+    log = subprocess.run(["git", "log", "--oneline"], cwd=lib.root, capture_output=True, text=True)
     assert "library: add skill" in log.stdout
     # a second write bumps the file in place (same body path)
     item.touch()
