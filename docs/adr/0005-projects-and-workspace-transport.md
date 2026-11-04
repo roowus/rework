@@ -2,7 +2,20 @@
 
 ## Status
 
-Proposed (2026-11-04). Landed work planned as M4.5, before M5 Library v1.
+Accepted and landed (2026-11-04, M4.5, commits `b310c9d`..`db171ac`): the
+projects table (both stores, conformance-tested), the daemon workspace API
+(POST /workspaces, GET /workspaces/results/<mission>, healthz; localhost by
+default, tailnet-only via REWORK_HTTP_HOST), the CLI surface (rework project
+create/ls/show, --repo-dir upload, --repo resolving URLs / local paths /
+project refs, rework fetch), and the git transport (the daemon clones
+repo_origin itself at run start, restart-safe). Verified live on the rewvis
+deployment: a mission created from the Mac with a plain non-git folder ran
+investigate -> code -> audit -> ship gate -> DONE via the upload transport
+($0.06, 7m), and a URL-only mission saw the daemon clone the private origin.
+Two live-found fixes: unconditional ALTER TABLE migrations convoyed every
+store open behind one long-lived reader (now check-then-alter with a 5s
+lock_timeout), and the echo stub's absent default model failed real
+deployments (now a visible cheapest-tier fallback).
 
 ## Context
 

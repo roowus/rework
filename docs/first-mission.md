@@ -49,10 +49,21 @@ branch in an isolated worktree. (`--plan fix-pr` swaps the ship gate for an open
 gate; the default plan is `echo`.) Check it registered with `rework ls`.
 
 Cross-device note: `--repo` is resolved by the machine that runs `rework new`,
-not by the daemon. If the daemon runs elsewhere (a VPS, another laptop), either
-create the mission on the daemon's machine or point `--repo` at a path that
-machine can see. A repo path that only exists on the creating machine makes the
-coder's worktree step fail instantly with zero model calls.
+not by the daemon. If the daemon runs elsewhere (a VPS, another laptop), you
+have three first-class options (ADR 0005):
+
+- `--repo https://github.com/you/repo.git`: the daemon clones the origin
+  itself; the creating machine needs no copy of the repo at all.
+- `--repo NAME --project p-...`: resolve a repo reference defined on a
+  project (`rework project create`).
+- `--repo-dir ~/folder`: non-git working files are packed and uploaded to the
+  daemon's workspace API (set `REWORK_DAEMON_URL` to the daemon's address;
+  the API is tailnet-only when the daemon binds its tailnet IP).
+
+A bare local path (the original form) is staged where `rework new` runs, so
+it only works when the daemon shares that filesystem. The results come back
+as a branch behind the open_pr gate (git repos) or via `rework fetch <id>`
+(any project).
 
 ## 3. Watch it work
 

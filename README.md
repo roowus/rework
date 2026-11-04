@@ -51,8 +51,13 @@ your approval. The agent commits sign as `rework <rework@rework.local>` unless
 you set `REWORK_GIT_AUTHOR_NAME` / `REWORK_GIT_AUTHOR_EMAIL`.
 
 One cross-device rule: `--repo` is resolved by the machine that runs `rework
-new`, not by the daemon. If the daemon runs on another host, create the mission
-there or point `--repo` at a path that host can see.
+new`, not by the daemon. If the daemon runs on another host, use one of the
+transport forms (ADR 0005): a git URL (`--repo https://github.com/you/x.git`,
+the daemon clones it), a project repo reference (`--project p-... --repo NAME`),
+or an uploaded folder (`--repo-dir ~/folder` with `REWORK_DAEMON_URL` pointed
+at the daemon; the workspace API is tailnet-only when the daemon binds its
+tailnet IP). Results return as a branch (open_pr gate) or via `rework fetch
+<mission-id>`.
 
 ## Eval + complaints
 
