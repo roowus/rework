@@ -118,7 +118,7 @@ execution per role behind the `ToolExecutor` protocol.
 | M1 | Kernel seams + engine + Echo stub role + CLI + crash-recovery demo | ✅ done (LLM plan/check-in nodes land in M2's supervisor graph) |
 | M2 | Vertical slice: investigator→coder→auditor on toyrepo; first self-hosted docs-PR | ✅ done (PR #1 self-hosted, merged) |
 | M2.5 | Real-repo effectiveness run on a live project (polystats), owner-driven | waiting until the workflow is competent |
-| M3 | Robustness (escalation policies, burn-gate, lock hardening, concurrency) + eval harness v1 + complaints table (ADR 0004 early) | in progress (chunk 1 + most of chunk 2 done) |
+| M3 | Robustness (escalation policies, burn-gate, lock hardening, concurrency, chaos suite) + eval harness v1 + complaints table (ADR 0004 early) | ✅ done (chaos suite closed 2 recovery gaps: offline gate decisions applied on restart, synthesis no longer resurrects burn-rejected missions) |
 | M4 | rewvis deploy (systemd, Postgres, deploy key, branch protection) + cross-device | planned |
 | M5 | Library v1 (git store, curation, MCP server, role integration) | planned |
 | M5.5 | Complaints clustering → GitHub issues (table + tool landed early in M3, ADR 0004) | planned |
