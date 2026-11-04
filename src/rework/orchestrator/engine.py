@@ -44,7 +44,7 @@ from rework.kernel.state.records import (
 )
 from rework.kernel.state.store import StateStore
 from rework.nodes.report_sections import mechanical_verdict
-from rework.roles.base import RoleBuildCtx
+from rework.roles.base import EscalationKind, RoleBuildCtx
 from rework.roles.registry import RoleRegistry
 
 DEFAULT_PLAN: dict[str, Any] = {"steps": [{"step": "echo", "role": "echo"}]}
@@ -107,8 +107,25 @@ class RunSupervisor:
         entry = self._catalog.resolve(str(run.model_ref.get("id") or spec.default_model))
         workdir = self._workroot / run.id.replace(":", "_")
         workdir.mkdir(parents=True, exist_ok=True)  # roles assume their workspace exists
+        from rework.kernel.budget.ledger import Budget
         from rework.kernel.llm.adapters.retry import with_retries
 
+        # the resolved catalog id belongs on the run row: escalation policies
+        # (needs_model promotion) read it from there
+        if not run.model_ref.get("id"):
+            resolved = {**run.model_ref, "id": entry.id}
+            await self._store.update_run(run.id, model_ref=resolved)
+            run = run.model_copy(update={"model_ref": resolved})
+
+        # plan-level mission budget overrides the spec default cap
+        budget = spec.budget
+        plan_cap = ((self._mission.plan or {}).get("budget") or {}).get("max_usd")
+        if plan_cap is not None:
+            budget = Budget(
+                max_usd=float(plan_cap),
+                max_input_tokens=spec.budget.max_input_tokens,
+                max_output_tokens=spec.budget.max_output_tokens,
+            )
         base_provider = self._provider or build_provider(entry)
         ctx = RoleBuildCtx(
             run=run,
@@ -118,7 +135,7 @@ class RunSupervisor:
             store=self._store,
             bus=self._bus,
             gates=GateManager(self._store, self._bus),
-            budget=spec.budget,
+            budget=budget,
             workdir=workdir,
             git_author=self._git_author,
         )
@@ -280,6 +297,7 @@ class MissionRunner:
         self._poll = poll_interval_s
         self._git_author = git_author
         self._provider = provider
+        self._plan: dict[str, Any] | None = None
         self._gates = GateManager(store, bus)
         self.mission_id = mission_id
         self._supervisor: RunSupervisor | None = None
@@ -288,6 +306,7 @@ class MissionRunner:
         mission = await self._store.get_mission(self.mission_id)
         if mission is None:
             raise ValueError(f"mission {self.mission_id} not found")
+        self._plan = mission.plan
         self._workroot.mkdir(parents=True, exist_ok=True)
         if mission.status == MissionStatus.PENDING:
             await self._store.update_mission(mission.id, status=MissionStatus.RUNNING)
@@ -318,7 +337,10 @@ class MissionRunner:
             step = steps[index]
             step_name = str(step.get("step") or step["role"])
             runs = await self._dispatch_step(mission, step)
-            await self._pump_until_terminal(runs)
+            pump_result = await self._pump_until_terminal(runs)
+            if pump_result == "cancelled":
+                await self._synthesize(mission.id, ship_decision=None)
+                return
             fresh = await self._store.get_run(runs[-1].id)
             if fresh is not None:
                 results[step_name] = fresh
@@ -618,23 +640,110 @@ class MissionRunner:
         context.update(step.get("context") or {})
         return context
 
-    async def _pump_until_terminal(self, runs: list[Run]) -> None:
+    async def _pump_until_terminal(self, runs: list[Run]) -> str:
+        """Pump until every run is terminal. Returns "cancelled" when the burn
+        gate cancelled the mission (the caller skips to synthesis). The burn
+        gate is checked BEFORE handling halts: a spend-cap hold must not sit
+        behind an unanswered escalation gate."""
         while True:
             fetched = [await self._store.get_run(r.id) for r in runs]
             fresh: list[Run] = [r for r in fetched if r is not None]
+            if await self._burn_gate_hit() == "cancelled":
+                return "cancelled"
             halted = [r for r in fresh if r.status == RunStatus.HALTED_ESCALATED]
             if halted:
                 await self._handle_halted(halted)
             if all(_terminal(r) for r in fresh):
-                return
+                return "ok"
             await asyncio.sleep(self._poll)
 
+    async def _burn_gate_hit(self) -> str:
+        """The owner's burn-gate: plan budget cap exceeded puts the mission
+        ON_HOLD and opens a continue/abort gate (ADR 0003 decision 6).
+        Returns "cancelled" (stop pumping) or "ok" (cap raised or not hit)."""
+        cap = ((self._plan or {}).get("budget") or {}).get("max_usd")
+        if cap is None:
+            return "ok"
+        spend = await self._store.mission_spend(self.mission_id)
+        if spend.spent_usd <= float(cap):
+            return "ok"
+        mission = await self._store.get_mission(self.mission_id)
+        if mission is None or mission.status != MissionStatus.RUNNING:
+            return "ok"  # already held, or not ours to hold
+        gate = await self._gates.request(
+            self.mission_id,
+            kind=GateKind.GENERIC,
+            question=(
+                f"Burn cap hit: ${spend.spent_usd:.2f} spent > ${float(cap):.2f} cap."
+                f" Continue (cap raised to ${float(cap) * 2:.2f}) or cancel?"
+            ),
+        )
+        await self._store.update_mission(self.mission_id, status=MissionStatus.ON_HOLD)
+        await self._bus.publish(
+            EventRecord(
+                mission_id=self.mission_id,
+                type=EventType.INFO,
+                payload={
+                    "note": f"burn cap hit (${spend.spent_usd:.2f} > ${float(cap):.2f}); "
+                    f"mission ON_HOLD, gate {gate.id}"
+                },
+            )
+        )
+        while True:
+            if not await self._store.list_open_gates(self.mission_id):
+                break
+            await asyncio.sleep(self._poll)
+        decision = await self._gate_decision(self.mission_id, gate.id)
+        if not decision:
+            await self._store.update_mission(
+                self.mission_id,
+                status=MissionStatus.CANCELLED,
+                result={"reason": "burn cap rejected"},
+            )
+            return "cancelled"
+        budget = (self._plan or {}).get("budget") or {}
+        budget["max_usd"] = float(cap) * 2
+        if isinstance(self._plan, dict):
+            self._plan["budget"] = budget
+            await self._store.update_mission(
+                self.mission_id,
+                plan=self._plan,
+            )
+        await self._store.update_mission(self.mission_id, status=MissionStatus.RUNNING)
+        await self._bus.publish(
+            EventRecord(
+                mission_id=self.mission_id,
+                type=EventType.INFO,
+                payload={"note": f"burn cap raised to ${float(cap) * 2:.2f}; continuing"},
+            )
+        )
+        return "ok"
+
     async def _handle_halted(self, halted: list[Run]) -> None:
-        """Materialize gates for halted runs, then wait out decisions and apply."""
+        """Apply escalation policies, then materialize gates for the rest.
+
+        needs_model is handled mechanically first (promote within the provider,
+        resume the role): the human only sees it when the catalog runs out.
+        Everything else becomes a gate; the gate ID opened FOR a run is tracked
+        so decisions are read from that row directly (question-matching broke
+        for escalations whose payload carries detail, not question)."""
         assert self._supervisor is not None
+        gated: list[tuple[Run, str | None]] = []  # (run, open_gate_id or None)
         for run in halted:
+            # a resume already in flight (earlier iteration): skip; the row
+            # flips RUNNING when the resume lands, and re-gating a resuming
+            # run would loop forever (found live in the exhaustion test)
+            live = self._supervisor.tasks.get(run.id)
+            if live is not None and not live.done():
+                continue
             payload = run.escalation or {}
-            if not await self._has_open_gate(run):
+            if str(payload.get("kind")) == EscalationKind.NEEDS_MODEL.value:
+                if await self._promote_and_resume(run):
+                    continue
+            # falls through to a human gate; reuse the run's existing open
+            # gate when a previous pass opened one (idempotent materialization)
+            existing = await self._open_gate_for_run(run)
+            if existing is None:
                 gate = await self._gates.request(
                     self.mission_id,
                     kind=self._gate_kind(payload),
@@ -648,23 +757,29 @@ class MissionRunner:
                         payload={"gate_id": gate.id, "for_run": run.id},
                     )
                 )
-        await self._store.update_mission(self.mission_id, status=MissionStatus.AWAITING_GATE)
+                gated.append((run, gate.id))
+            else:
+                gated.append((run, existing.id))
+        if gated:
+            await self._store.update_mission(self.mission_id, status=MissionStatus.AWAITING_GATE)
         while True:
             open_gates = await self._store.list_open_gates(self.mission_id)
             if not open_gates:
                 break
             await asyncio.sleep(self._poll)
-        await self._store.update_mission(self.mission_id, status=MissionStatus.RUNNING)
-        # apply decisions to halted runs (match by question; M1 halts one at a time)
-        for run in halted:
+        if gated:
+            await self._store.update_mission(self.mission_id, status=MissionStatus.RUNNING)
+        # apply decisions, straight from each run's gate row
+        for run, gate_id in gated:
+            if gate_id is None:
+                continue
+            gate_row = await self._store.get_gate(gate_id)
+            if gate_row is None or gate_row.status == GateStatus.OPEN:
+                continue  # decided while we were down is handled by recovery; not open here
             fresh = await self._store.get_run(run.id)
             if fresh is None or fresh.status != RunStatus.HALTED_ESCALATED:
                 continue
-            decision = await self._decision_for(fresh)
-            if decision is None:
-                continue
-            approved, _gate_id = decision
-            if approved:
+            if gate_row.status == GateStatus.APPROVED:
                 await self._supervisor.resume_with_decision(fresh, True)
             else:
                 await self._store.update_run(fresh.id, status=RunStatus.ABORTED)
@@ -676,6 +791,65 @@ class MissionRunner:
                         payload={"reason": "gate rejected"},
                     )
                 )
+
+    async def _open_gate_for_run(self, run: Run) -> Any:
+        """The run's open gate, if a previous pass materialized one (the
+        run-id pointer event written at gate creation is the link)."""
+        events = await self._store.events_since(0, mission_id=self.mission_id, limit=5000)
+        gate_ids = [
+            e.payload.get("gate_id")
+            for e in events
+            if e.type == EventType.INFO and e.payload.get("for_run") == run.id
+        ]
+        for gate_id in reversed(gate_ids):
+            gate = await self._store.get_gate(str(gate_id))
+            if gate is not None and gate.status == GateStatus.OPEN:
+                return gate
+        return None
+
+    async def _promote_and_resume(self, run: Run) -> bool:
+        """needs_model policy: promote within the provider (cross-provider is
+        config-gated, ADR 0001) and resume the role with the new tier. Returns
+        True when handled mechanically; False falls through to a human gate.
+        Reads the run ROW: model_ref gets resolved onto it at graph-build time,
+        and the in-memory object here may predate that."""
+        payload = run.escalation or {}
+        fresh = await self._store.get_run(run.id)
+        current_id = str((fresh or run).model_ref.get("id") or "")
+        promoted = self._catalog.promote(current_id) if current_id else None
+        if promoted is None:
+            await self._bus.publish(
+                EventRecord(
+                    mission_id=self.mission_id,
+                    run_id=run.id,
+                    type=EventType.INFO,
+                    payload={
+                        "note": f"needs_model: no higher tier for {current_id!r}; "
+                        "escalating to human"
+                    },
+                )
+            )
+            return False
+        new_ref = {**(fresh or run).model_ref, "id": promoted.id}
+        await self._store.update_run(run.id, model_ref=new_ref)
+        await self._bus.publish(
+            EventRecord(
+                mission_id=self.mission_id,
+                run_id=run.id,
+                type=EventType.MODEL_PROMOTED,
+                payload={
+                    "from": current_id,
+                    "to": promoted.id,
+                    "detail": str(payload.get("detail") or "")[:200],
+                },
+            )
+        )
+        resumed = await self._store.get_run(run.id)
+        if resumed is not None and self._supervisor is not None:
+            await self._supervisor.resume_with_decision(
+                resumed, {"resolution": "model_promoted", "model": promoted.id}
+            )
+        return True
 
     async def _has_open_gate(self, run: Run) -> bool:
         payload = run.escalation or {}

@@ -48,14 +48,15 @@ def make_git_repo(tmp_path: Path) -> Path:
 
 
 def role_catalog() -> ModelCatalog:
-    """Catalog covering every builtin role's default model id (compile canaries)."""
+    """Catalog covering every builtin role's default model id (compile canaries).
+    Tiers matter: promotion (needs_model policy) walks them."""
     from rework.kernel.llm.catalog import ModelCatalog, ModelEntry
 
     return ModelCatalog(
         [
-            ModelEntry(id="flash", provider="fake", model="fake-flash"),
-            ModelEntry(id="pro", provider="fake", model="fake-pro"),
-            ModelEntry(id="fake", provider="fake", model="fake-1"),
+            ModelEntry(id="flash", provider="fake", model="fake-flash", tier=1),
+            ModelEntry(id="pro", provider="fake", model="fake-pro", tier=2),
+            ModelEntry(id="fake", provider="fake", model="fake-1", tier=0),
         ]
     )
 
