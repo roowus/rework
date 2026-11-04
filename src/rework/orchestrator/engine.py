@@ -313,6 +313,7 @@ class MissionRunner:
         audit_rounds: dict[str, int] = {}
         last_audit_artifact: dict[str, Any] | None = None
         index = 0
+        step_retries: dict[str, int] = {}
         while index < len(steps):
             step = steps[index]
             step_name = str(step.get("step") or step["role"])
@@ -321,6 +322,29 @@ class MissionRunner:
             fresh = await self._store.get_run(runs[-1].id)
             if fresh is not None:
                 results[step_name] = fresh
+
+            # retry rule: a step that died on a transient failure (rate limit,
+            # provider 5xx) gets ONE in-mission retry before the plan moves on.
+            # Found live: a 429-storm killed the docs mission's investigator,
+            # which never got the recovery pass's second chance because the
+            # mission stayed up.
+            if fresh is not None and fresh.status == RunStatus.FAILED:
+                retries = step_retries.get(step_name, 0)
+                if retries < 1:
+                    step_retries[step_name] = retries + 1
+                    await self._bus.publish(
+                        EventRecord(
+                            mission_id=mission.id,
+                            type=EventType.INFO,
+                            payload={
+                                "note": f"step {step_name} failed; retrying once "
+                                f"(attempt {retries + 2})",
+                            },
+                        )
+                    )
+                    index += 1
+                    steps[index:index] = [{**step}]
+                    continue
             if step.get("on_request_changes") and fresh is not None:
                 last_audit_artifact = fresh.artifact
 

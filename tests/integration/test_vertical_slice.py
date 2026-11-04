@@ -15,127 +15,22 @@ from typing import Any
 
 import pytest
 
-from conftest import ScriptedProvider, role_catalog
+from conftest import (
+    AUDIT_CLEAN,
+    AUDIT_VETO,
+    ScriptedProvider,
+    _auditor_script,
+    _coder_script,
+    _investigator_script,
+    role_catalog,
+)
 from rework.cli import PLAN_FIX
 from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.gates import GateManager
-from rework.kernel.llm.types import ChatResult, ToolCall, Usage
 from rework.kernel.state.records import Mission, MissionStatus
 from rework.kernel.state.sqlite import SqliteStore, open_sqlite
 from rework.orchestrator.engine import MissionRunner
 from rework.roles.registry import autodiscover
-
-INV_REPORT = json.dumps(
-    {
-        "summary": "add() subtracts instead of adding: calc.py line 4 returns a - b.",
-        "findings": [
-            {
-                "title": "add returns a - b",
-                "detail": (
-                    "The planted bug: add(2,3) returns -1. mul() compounds it but"
-                    " its tests pass anyway by luck of the implementation."
-                ),
-                "evidence": ["calc.py:4"],
-                "severity": "high",
-                "verdict": "CONFIRMED",
-                "confidence": 0.95,
-            }
-        ],
-        "suggested_fix": "Change `return a - b` to `return a + b` in calc.py.",
-        "proposed_tests": [
-            {"name": "test_add", "exercises": "add(2, 3) == 5 already in test_calc.py"}
-        ],
-        "blockers": [],
-    }
-)
-
-AUDIT_CLEAN = json.dumps(
-    {
-        "summary": "Fix is correct: add() now adds; mul() unaffected and still passing.",
-        "findings": [],
-        "standing_assessments": {
-            "proportionality": "proportionate (no accessory)",
-            "complexity": "trivial, appropriate",
-            "priority": "appropriate",
-            "coverage": "adequate: existing tests pin the change",
-            "business_logic_risk": "none",
-        },
-        "blockers": [],
-    }
-)
-
-AUDIT_VETO = json.dumps(
-    {
-        "summary": "Requested changes: the diff is right but no test run was shown.",
-        "findings": [
-            {
-                "title": "No verification evidence",
-                "detail": "The handoff summary does not show the test suite passing on the branch.",
-                "evidence": [],
-                "severity": "critical",
-                "verdict": "PLAUSIBLE",
-                "confidence": 0.4,
-            }
-        ],
-        "standing_assessments": {
-            "proportionality": "proportionate",
-            "complexity": "trivial, appropriate",
-            "priority": "appropriate",
-            "coverage": "cannot confirm",
-            "business_logic_risk": "none",
-        },
-        "blockers": [],
-    }
-)
-
-
-def _coder_script(final_summary: str) -> list[ChatResult]:
-    return [
-        ChatResult(
-            text="fixing",
-            tool_calls=[
-                ToolCall(
-                    id="c1",
-                    name="run_command",
-                    arguments={
-                        "command": "printf 'def add(a, b):\\n    return a + b\\n' > calc.py"
-                    },
-                )
-            ],
-            usage=Usage(input_tokens=10, output_tokens=5),
-            stop_reason="tool_calls",
-        ),
-        ChatResult(
-            text="verifying",
-            tool_calls=[
-                ToolCall(id="c2", name="run_command", arguments={"command": "python3 -m pytest -q"})
-            ],
-            usage=Usage(input_tokens=10, output_tokens=5),
-            stop_reason="tool_calls",
-        ),
-        ChatResult(
-            text=final_summary,
-            usage=Usage(input_tokens=10, output_tokens=8),
-            stop_reason="end_turn",
-        ),
-    ]
-
-
-def _auditor_script(report_json: str) -> list[ChatResult]:
-    return [
-        ChatResult(
-            text="reading the diff and code",
-            tool_calls=[ToolCall(id="a1", name="read_file", arguments={"path": "calc.py"})],
-            usage=Usage(input_tokens=20, output_tokens=10),
-            stop_reason="tool_calls",
-        ),
-        ChatResult(
-            text="analysis done",
-            usage=Usage(input_tokens=15, output_tokens=8),
-            stop_reason="end_turn",
-        ),
-        ChatResult(text=report_json, usage=Usage(input_tokens=40, output_tokens=50)),
-    ]
 
 
 @pytest.fixture
@@ -275,20 +170,3 @@ async def test_vertical_slice_veto_triggers_revision(slice_world: dict[str, Any]
     )
     mission = await store.get_mission(slice_world["mission"].id)
     assert mission is not None and mission.status == MissionStatus.DONE
-
-
-def _investigator_script() -> list[ChatResult]:
-    return [
-        ChatResult(
-            text="reading the file",
-            tool_calls=[ToolCall(id="i1", name="read_file", arguments={"path": "calc.py"})],
-            usage=Usage(input_tokens=20, output_tokens=10),
-            stop_reason="tool_calls",
-        ),
-        ChatResult(
-            text="add() subtracts; that is the bug.",
-            usage=Usage(input_tokens=15, output_tokens=8),
-            stop_reason="end_turn",
-        ),
-        ChatResult(text=INV_REPORT, usage=Usage(input_tokens=40, output_tokens=50)),
-    ]
