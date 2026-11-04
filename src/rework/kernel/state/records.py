@@ -80,12 +80,26 @@ class EventType(StrEnum):
 class Mission(BaseModel):
     id: str
     objective: str
-    repo_path: str | None = None
+    repo_path: str | None = None  # a path the DAEMON can see (ADR 0005)
+    repo_origin: str | None = None  # git URL the daemon clones at run start (ADR 0005)
+    project_id: str | None = None  # label grouping; missions may be project-less
     status: MissionStatus = MissionStatus.PENDING
     plan: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
     created_at: float = Field(default_factory=now)
     updated_at: float = Field(default_factory=now)
+
+
+class Project(BaseModel):
+    """A label grouping missions, with per-project settings and zero-or-more
+    repo references (ADR 0005). Repos are references, never synced by rework:
+    code travels via its VCS; the upload transport is for non-git working files
+    only."""
+
+    id: str = Field(default_factory=lambda: new_id("p"))
+    name: str
+    settings: dict[str, Any] = Field(default_factory=dict)
+    created_at: float = Field(default_factory=now)
 
 
 class Run(BaseModel):

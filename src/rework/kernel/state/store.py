@@ -21,6 +21,7 @@ from rework.kernel.state.records import (
     GateStatus,
     Mission,
     MissionStatus,
+    Project,
     Run,
     RunStatus,
 )
@@ -50,6 +51,17 @@ class StateStore(Protocol):
     async def list_missions(
         self, status: MissionStatus | None = None, limit: int = 50
     ) -> list[Mission]: ...
+
+    # -- projects (ADR 0005) ------------------------------------------------
+    async def create_project(self, project: Project) -> Project: ...
+
+    async def get_project(self, project_id: str) -> Project | None: ...
+
+    async def update_project(
+        self, project_id: str, *, name: str | None = None, settings: dict[str, Any] | None = None
+    ) -> Project | None: ...
+
+    async def list_projects(self, limit: int = 100) -> list[Project]: ...
 
     # -- runs ---------------------------------------------------------------
     async def create_run(self, run: Run) -> Run:

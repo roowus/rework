@@ -29,6 +29,7 @@ from rework.kernel.state.records import (
     GateStatus,
     Mission,
     MissionStatus,
+    Project,
     Run,
     RunStatus,
 )
@@ -39,11 +40,21 @@ _DDL = [
         id TEXT PRIMARY KEY,
         objective TEXT NOT NULL,
         repo_path TEXT,
+        repo_origin TEXT,
+        project_id TEXT,
         status TEXT NOT NULL,
         plan TEXT,
         result TEXT,
         created_at DOUBLE PRECISION NOT NULL,
         updated_at DOUBLE PRECISION NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS projects (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        settings TEXT NOT NULL DEFAULT '{}',
+        created_at DOUBLE PRECISION NOT NULL
     )
     """,
     """
@@ -127,7 +138,16 @@ _DDL = [
     "CREATE INDEX IF NOT EXISTS idx_complaints_status ON complaints(status)",
 ]
 
-_TABLES = ["events", "charges", "gates", "runs", "missions", "daemon_lock", "complaints"]
+_TABLES = [
+    "events",
+    "charges",
+    "gates",
+    "runs",
+    "projects",
+    "missions",
+    "daemon_lock",
+    "complaints",
+]
 
 
 def _j(value: dict[str, Any] | None) -> str | None:
@@ -209,11 +229,22 @@ class PostgresStore:
             id=row["id"],
             objective=row["objective"],
             repo_path=row["repo_path"],
+            repo_origin=row["repo_origin"],
+            project_id=row["project_id"],
             status=MissionStatus(row["status"]),
             plan=_uj(row["plan"]) or None,
             result=_uj(row["result"]) or None,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _project(row: DictRow) -> Project:
+        return Project(
+            id=row["id"],
+            name=row["name"],
+            settings=_uj(row["settings"]),
+            created_at=row["created_at"],
         )
 
     @staticmethod
@@ -251,12 +282,15 @@ class PostgresStore:
     @_serialized
     async def create_mission(self, mission: Mission) -> Mission:
         await self._conn.execute(
-            "INSERT INTO missions (id, objective, repo_path, status, plan, result,"
-            " created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            "INSERT INTO missions (id, objective, repo_path, repo_origin, project_id,"
+            " status, plan, result, created_at, updated_at)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 mission.id,
                 mission.objective,
                 mission.repo_path,
+                mission.repo_origin,
+                mission.project_id,
                 mission.status.value,
                 _j(mission.plan),
                 _j(mission.result),
@@ -316,6 +350,48 @@ class PostgresStore:
                 "SELECT * FROM missions ORDER BY created_at DESC LIMIT %s", (limit,)
             )
         return [self._mission(r) for r in rows]
+
+    # -- projects (ADR 0005) --------------------------------------------------
+    @_serialized
+    async def create_project(self, project: Project) -> Project:
+        await self._conn.execute(
+            "INSERT INTO projects (id, name, settings, created_at) VALUES (%s, %s, %s, %s)",
+            (project.id, project.name, _j(project.settings) or "{}", project.created_at),
+        )
+        await self._conn.commit()
+        return project
+
+    @_serialized
+    async def get_project(self, project_id: str) -> Project | None:
+        row = await self._fetch_one("SELECT * FROM projects WHERE id = %s", (project_id,))
+        return self._project(row) if row else None
+
+    @_serialized
+    async def update_project(
+        self, project_id: str, *, name: str | None = None, settings: dict[str, Any] | None = None
+    ) -> Project | None:
+        sets: list[str] = []
+        params: list[Any] = []
+        if name is not None:
+            sets.append("name = %s")
+            params.append(name)
+        if settings is not None:
+            sets.append("settings = %s")
+            params.append(_j(settings) or "{}")
+        if sets:
+            params.append(project_id)
+            await self._conn.execute(
+                f"UPDATE projects SET {', '.join(sets)} WHERE id = %s", tuple(params)
+            )
+            await self._conn.commit()
+        return await self.get_project(project_id)
+
+    @_serialized
+    async def list_projects(self, limit: int = 100) -> list[Project]:
+        rows = await self._fetch_all(
+            "SELECT * FROM projects ORDER BY created_at DESC LIMIT %s", (limit,)
+        )
+        return [self._project(r) for r in rows]
 
     # -- runs -----------------------------------------------------------------
     @_serialized
@@ -684,15 +760,10 @@ async def open_postgres(url: str) -> PostgresStore:
     for ddl in _DDL:
         await conn.execute(ddl)
     # migrations for databases created before a column existed
-    async with conn.cursor() as cur:
-        await cur.execute(
-            "SELECT 1 FROM information_schema.columns"
-            " WHERE table_name = 'charges' AND column_name = 'cached_tokens'"
-        )
-        row = await cur.fetchone()
-    if row is None:
-        await conn.execute(
-            "ALTER TABLE charges ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0"
-        )
+    await conn.execute(
+        "ALTER TABLE charges ADD COLUMN IF NOT EXISTS cached_tokens INTEGER NOT NULL DEFAULT 0"
+    )
+    await conn.execute("ALTER TABLE missions ADD COLUMN IF NOT EXISTS repo_origin TEXT")
+    await conn.execute("ALTER TABLE missions ADD COLUMN IF NOT EXISTS project_id TEXT")
     await conn.commit()
     return PostgresStore(conn)

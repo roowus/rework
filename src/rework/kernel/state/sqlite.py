@@ -25,6 +25,7 @@ from rework.kernel.state.records import (
     GateStatus,
     Mission,
     MissionStatus,
+    Project,
     Run,
     RunStatus,
 )
@@ -34,11 +35,19 @@ CREATE TABLE IF NOT EXISTS missions (
     id TEXT PRIMARY KEY,
     objective TEXT NOT NULL,
     repo_path TEXT,
+    repo_origin TEXT,
+    project_id TEXT,
     status TEXT NOT NULL,
     plan TEXT,
     result TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    settings TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY,
@@ -142,11 +151,22 @@ class SqliteStore:
             id=row["id"],
             objective=row["objective"],
             repo_path=row["repo_path"],
+            repo_origin=row["repo_origin"],
+            project_id=row["project_id"],
             status=MissionStatus(row["status"]),
             plan=_uj(row["plan"]) or None,
             result=_uj(row["result"]) or None,
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _project(row: aiosqlite.Row) -> Project:
+        return Project(
+            id=row["id"],
+            name=row["name"],
+            settings=_uj(row["settings"]),
+            created_at=row["created_at"],
         )
 
     @staticmethod
@@ -183,12 +203,15 @@ class SqliteStore:
     # -- missions -----------------------------------------------------------
     async def create_mission(self, mission: Mission) -> Mission:
         await self._db.execute(
-            "INSERT INTO missions (id, objective, repo_path, status, plan, result,"
-            " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO missions (id, objective, repo_path, repo_origin, project_id,"
+            " status, plan, result, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 mission.id,
                 mission.objective,
                 mission.repo_path,
+                mission.repo_origin,
+                mission.project_id,
                 mission.status.value,
                 _j(mission.plan),
                 _j(mission.result),
@@ -244,6 +267,43 @@ class SqliteStore:
                 "SELECT * FROM missions ORDER BY created_at DESC LIMIT ?", (limit,)
             )
         return [self._mission(r) for r in rows]
+
+    # -- projects (ADR 0005) --------------------------------------------------
+    async def create_project(self, project: Project) -> Project:
+        await self._db.execute(
+            "INSERT INTO projects (id, name, settings, created_at) VALUES (?, ?, ?, ?)",
+            (project.id, project.name, _j(project.settings) or "{}", project.created_at),
+        )
+        await self._db.commit()
+        return project
+
+    async def get_project(self, project_id: str) -> Project | None:
+        row = await self._fetch_one("SELECT * FROM projects WHERE id = ?", (project_id,))
+        return self._project(row) if row else None
+
+    async def update_project(
+        self, project_id: str, *, name: str | None = None, settings: dict[str, Any] | None = None
+    ) -> Project | None:
+        sets: list[str] = []
+        params: list[Any] = []
+        if name is not None:
+            sets.append("name = ?")
+            params.append(name)
+        if settings is not None:
+            sets.append("settings = ?")
+            params.append(_j(settings) or "{}")
+        if not sets:
+            return await self.get_project(project_id)
+        params.append(project_id)
+        await self._db.execute(f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", tuple(params))
+        await self._db.commit()
+        return await self.get_project(project_id)
+
+    async def list_projects(self, limit: int = 100) -> list[Project]:
+        rows = await self._fetch_all(
+            "SELECT * FROM projects ORDER BY created_at DESC LIMIT ?", (limit,)
+        )
+        return [self._project(r) for r in rows]
 
     # -- runs -----------------------------------------------------------------
     async def create_run(self, run: Run) -> Run:
@@ -588,5 +648,11 @@ async def open_sqlite(path: str) -> SqliteStore:
     names = {row[1] for row in await cols.fetchall()}
     if "cached_tokens" not in names:
         await db.execute("ALTER TABLE charges ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0")
+    cols = await db.execute("PRAGMA table_info(missions)")
+    names = {row[1] for row in await cols.fetchall()}
+    if "repo_origin" not in names:
+        await db.execute("ALTER TABLE missions ADD COLUMN repo_origin TEXT")
+    if "project_id" not in names:
+        await db.execute("ALTER TABLE missions ADD COLUMN project_id TEXT")
     await db.commit()
     return SqliteStore(db)
