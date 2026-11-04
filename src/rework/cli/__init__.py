@@ -12,6 +12,7 @@ from typing import Any
 import typer
 
 from rework import __version__
+from rework.nodes.report_sections import mechanical_verdict
 
 app = typer.Typer(
     name="rework",
@@ -318,6 +319,118 @@ def _md_run_stats(stats: dict[str, Any]) -> list[str]:
     ]
 
 
+_SEVERITY_GROUPS = [
+    ("critical", "Critical"),
+    ("high", "Important"),
+    ("medium", "Minor"),
+    ("low", "Minor"),
+]
+
+
+def _truss_group(severity: str) -> str:
+    low = severity.lower()
+    for needle, label in _SEVERITY_GROUPS:
+        if low == needle:
+            return label
+    return "Minor"
+
+
+def _md_audit_truss(artifact: dict[str, Any], stats: dict[str, Any], run: Any) -> list[str]:
+    """The auditor section, laid out like the owner's truss pr-audit report:
+    header line, context paragraph, findings grouped by severity as numbered
+    narrative blocks, assessments, warnings, machine-readable block. The
+    truss report is the format reference (ADR 0003); the artifact is ours."""
+    out: list[str] = []
+    models = ", ".join(stats.get("models", ["?"]))
+    head = str(artifact.get("head") or stats.get("commit") or "")
+    out.append(f"### 🔍 Audit — {models}" + (f" · head `{head[:10]}`" if head else ""))
+    out.append("")
+
+    # context paragraph: what was reviewed, its size, its verification
+    summary = str(artifact.get("summary", "")).strip()
+    if summary:
+        out.append(summary)
+        out.append("")
+
+    # findings grouped by severity, numbered B1.. down the review
+    findings = artifact.get("findings", [])
+    groups: dict[str, list[tuple[int, dict[str, Any]]]] = {
+        "Critical": [],
+        "Important": [],
+        "Minor": [],
+    }
+    for i, f in enumerate(findings, 1):
+        groups[_truss_group(str(f.get("severity", "low")))].append((i, f))
+    if not findings:
+        out.append("Findings: none. Explicitly clean, not silence.")
+        out.append("")
+    for label in ("Critical", "Important", "Minor"):
+        group = groups[label]
+        if not group:
+            continue
+        out.append(f"**{label}**")
+        out.append("")
+        for i, f in group:
+            loc = f.get("file") or ""
+            if f.get("line"):
+                loc += f":{f['line']}"
+            where = f" — `{loc}`" if loc else ""
+            out.append(f"**B{i}. {f.get('title')}**{where}")
+            out.append("")
+            out.append(str(f.get("detail", "")))
+            out.append("")
+            evidence = f.get("evidence") or []
+            if evidence:
+                out.append("Evidence: " + " · ".join(f"`{e}`" for e in evidence))
+                out.append("")
+
+    sa = artifact.get("standing_assessments")
+    if sa:
+        out.append("### Assessments")
+        out.append("")
+        for k, v in sa.items():
+            out.append(f"**{k}:** {v}")
+            out.append("")
+
+    warnings = artifact.get("warnings", [])
+    if warnings:
+        out.append("### Warnings (coverage limits)")
+        out.append("")
+        for w in warnings:
+            out.append(f"- {w}")
+        out.append("")
+
+    dispositions = artifact.get("dispositions", [])
+    if dispositions:
+        out.append("### Dispositions")
+        out.append("")
+        for d in dispositions:
+            out.append(f"- `{d.get('finding_id')}` **{d.get('action')}** — {d.get('reason')}")
+        out.append("")
+
+    # machine-readable block: the same audit as data; must agree with the prose
+    machine: dict[str, Any] = {
+        "version": 1,
+        "head": head,
+        "verdict": mechanical_verdict(artifact),
+        "findings": findings,
+        "warnings": warnings,
+    }
+    out.append("### Machine-readable block")
+    out.append("")
+    out.append("```json")
+    out.append(json.dumps(machine, indent=2))
+    out.append("```")
+    out.append("")
+
+    out.append(
+        f"_audit model: {models} · run {run.attempt if run else '?'} ·"
+        f" {stats.get('model_calls', 0)} calls, {stats.get('elapsed_seconds', 0.0):.1f}s_"
+    )
+    out.append("")
+    return out
+
+
 def _render_md(runs: list[tuple[Any, dict[str, Any]]], spend: Any, mission: Any) -> str:
     wall_clock = max(0.0, mission.updated_at - mission.created_at)
     out = [
@@ -399,32 +512,10 @@ def _render_md(runs: list[tuple[Any, dict[str, Any]]], spend: Any, mission: Any)
             out.append("```")
             out.append("")
         elif role == "auditor":
-            out.append("### Summary")
-            out.append("")
-            out.append(str(artifact.get("summary", "")))
-            out.append("")
-            out.append("### Findings")
-            out.append("")
-            out.extend(_md_findings(artifact.get("findings", [])))
-            sa = artifact.get("standing_assessments")
-            if sa:
-                out.append("### Standing assessments")
-                out.append("")
-                for k, v in sa.items():
-                    out.append(f"- **{k}:** {v}")
-                out.append("")
-            dispositions = artifact.get("dispositions", [])
-            if dispositions:
-                out.append("### Dispositions")
-                out.append("")
-                for d in dispositions:
-                    out.append(
-                        f"- `{d.get('finding_id')}` **{d.get('action')}** — {d.get('reason')}"
-                    )
-                out.append("")
+            out.extend(_md_audit_truss(artifact, stats=artifact.get("run_stats", {}), run=run))
         out.extend(_md_blockers(artifact.get("blockers", [])))
         stats = artifact.get("run_stats")
-        if stats:
+        if stats and role != "auditor":
             out.append("### Run stats (mechanical, from the ledger)")
             out.append("")
             out.extend(_md_run_stats(stats))
