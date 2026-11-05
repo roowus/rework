@@ -67,6 +67,12 @@ def translate_request(request: ChatRequest) -> dict[str, Any]:
             }
             for t in request.tools
         ]
+    if request.effort:
+        # OpenAI-style reasoning effort. Servers that don't know the key ignore
+        # it; reasoning endpoints reject max_tokens in favour of
+        # max_completion_tokens, so send the modern name when effort is set.
+        payload["reasoning_effort"] = request.effort
+        payload["max_completion_tokens"] = payload.pop("max_tokens", None)
     return payload
 
 

@@ -42,6 +42,7 @@ def make_toolloop_node(
     budget: Budget,
     max_iterations: int = DEFAULT_GUARD_ITERATIONS,
     temperature: float | None = None,
+    effort: str | None = None,
 ) -> ToolLoopNode:
     entry = catalog.resolve(catalog_id)
 
@@ -78,6 +79,7 @@ def make_toolloop_node(
                     tools=specs,
                     temperature=temperature,
                     max_tokens=entry.max_output,
+                    effort=effort,
                 )
             )
             await charge(result.usage, entry.model)

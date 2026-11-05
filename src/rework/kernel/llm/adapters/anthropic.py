@@ -70,6 +70,14 @@ def translate_request(request: ChatRequest) -> dict[str, Any]:
             }
             for t in request.tools
         ]
+    if request.effort:
+        # Anthropic expresses effort as an extended-thinking budget. The API
+        # requires max_tokens > budget_tokens and temperature unset while
+        # thinking is enabled, so lift max_tokens and drop temperature.
+        budget = {"low": 2_048, "medium": 8_192, "high": 24_576}.get(request.effort, 8_192)
+        payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        payload["max_tokens"] = max(int(payload.get("max_tokens") or 0), budget + 1_024)
+        payload.pop("temperature", None)
     return payload
 
 

@@ -257,8 +257,22 @@ class Pane(Static):
 
 
 class WorkPane(Pane):
-    """The typing surface: a big prompt, recent missions, wizard one enter
-    away. Slash commands route from here too."""
+    """The typing surface: a big prompt, the MODEL and EFFORT the mission will
+    run at, recent missions, wizard one enter away.
+
+    Owner ask: 'i should be able to see which model im using as an orchestrator
+    and be able to change that as well as the effort'. The pickers read the
+    live catalog (REWORK_MODELS) so they always list what is actually usable;
+    the choice lands in the mission plan and every role inherits it."""
+
+    BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
+        # ctrl+m IS enter (CR) and ctrl+e is end-of-line inside Input —
+        # both were eaten. alt keys do not collide with editing.
+        Binding("alt+m", "cycle_model", "Model", show=False),
+        Binding("alt+e", "cycle_effort", "Effort", show=False),
+    ]
+
+    EFFORTS: ClassVar[tuple[str, ...]] = ("default", "low", "medium", "high")
 
     def compose(self) -> ComposeResult:
         yield Label("[b]Work[/b]", id="work-title")
@@ -266,16 +280,76 @@ class WorkPane(Pane):
             placeholder="what should rework do?  (type / for commands, enter to launch)",
             id="prompt",
         )
+        with Horizontal(id="work-settings"):
+            yield Label("", id="work-model")
+            yield Label("", id="work-effort")
         yield Label("[dim]recent missions[/dim]", id="recent-head")
         yield ListView(id="recent")
         yield Label(
-            "[dim]enter on a mission opens it · /gates /library /fetch /new /projects[/dim]",
+            "[dim]enter on a mission opens it · /gates /library /fetch /new /projects"
+            " · alt+m model · alt+e effort[/dim]",
             id="work-hint",
         )
 
     def on_mount(self) -> None:
         self.query_one("#prompt", Input).focus()
+        self._model_ids: list[str] = []
+        self._effort_index = 0
+        self._load_models()
         self.run_worker(self.reload_recents(), exclusive=True)
+
+    def _load_models(self) -> None:
+        from rework.config import load_catalog
+
+        try:
+            entries = load_catalog().all()
+        except Exception:  # a broken catalog must not kill the tab
+            entries = []
+        self._model_ids = [e.id for e in entries]
+        self._update_setting_labels()
+
+    def _model_index(self) -> int:
+        current = self.shell.rw._mission_defaults.get("model")
+        if current in self._model_ids:
+            return self._model_ids.index(str(current))
+        return 0
+
+    def _current_model(self) -> str | None:
+        return self.shell.rw._mission_defaults.get("model")
+
+    def _current_effort(self) -> str | None:
+        return self.shell.rw._mission_defaults.get("effort")
+
+    def _update_setting_labels(self) -> None:
+        model = self._current_model()
+        if not model and self._model_ids:
+            model = self._model_ids[0]
+        effort = self._current_effort() or "default"
+        self.query_one("#work-model", Label).update(
+            f"[dim]model[/dim] [b]{model or 'catalog default'}[/b] [dim]alt+m[/dim]"
+        )
+        self.query_one("#work-effort", Label).update(
+            f"[dim]effort[/dim] [b]{effort}[/b] [dim]alt+e[/dim]"
+        )
+
+    def action_cycle_model(self) -> None:
+        if not self._model_ids:
+            self.notify("no models in the catalog (REWORK_MODELS)", severity="warning")
+            return
+        index = (self._model_index() + 1) % len(self._model_ids)
+        self.shell.rw._mission_defaults["model"] = self._model_ids[index]
+        self._update_setting_labels()
+        self.notify(f"model: {self._model_ids[index]}")
+
+    def action_cycle_effort(self) -> None:
+        nxt = self.EFFORTS[(self._effort_index + 1) % len(self.EFFORTS)]
+        self._effort_index = self.EFFORTS.index(nxt)
+        self.shell.rw._mission_defaults["effort"] = None if nxt == "default" else nxt
+        self._update_setting_labels()
+        self.notify(f"effort: {nxt}")
+
+    def on_show(self) -> None:
+        self._update_setting_labels()
 
     async def reload_recents(self) -> None:
         recent = self.query_one("#recent", ListView)
@@ -1180,13 +1254,18 @@ class Shell(Screen):
         self.show_tab(event.name)
 
     def on_key(self, event: Any) -> None:
-        """escape on the home screen quits, in two steps.
+        """escape on the HOME screen quits, in two steps.
 
         There was no discoverable way out (owner got stuck): ctrl+q is eaten
         by macOS terminal flow control and the menus were broken. Escape is
-        the key people try; the first press explains, the second exits."""
+        the key people try; the first press explains, the second exits.
+
+        ONLY on the home screen: with a modal open (the mission deep view),
+        escape must close the modal, not arm a quit (owner: 'i cant go back')."""
         if event.key != "escape":
             return
+        if len(self.app.screen_stack) > 1:
+            return  # a modal owns escape
         if getattr(self, "_quit_armed", False):
             self.app.exit()
             return
@@ -1249,9 +1328,16 @@ class Shell(Screen):
             "repo_dir": result.get("repo_dir"),
             "project_id": result.get("project_id"),
             "plan": result.get("plan"),
+            # the Work tab's pickers survive the round trip
+            "model": rw._mission_defaults.get("model"),
+            "effort": rw._mission_defaults.get("effort"),
         }
         self.notify("creating mission…")
         try:
+            if rw._mission_defaults.get("model"):
+                result["model"] = rw._mission_defaults["model"]
+            if rw._mission_defaults.get("effort"):
+                result["effort"] = rw._mission_defaults["effort"]
             mission = await rw.data.create_mission(**result)
             self.notify(f"mission {mission.id} created")
             dash = self.query_one("#pane-dashboard", DashboardPane)
@@ -1332,8 +1418,10 @@ class Shell(Screen):
 
 
 class MissionDeepView(ModalScreen[None]):
-    """Full-screen deep view of one mission: tabs Feed / Findings / Diff /
-    Report. Gates actionable here; f fetches the result. esc returns."""
+    """Full-screen deep view of one mission: a live flow strip (which role the
+    mission is at), then tabs Feed / Findings / Diff / Report. Gates are
+    actionable here; f fetches; esc goes back. Polls while open so the flow
+    strip advances without pressing r."""
 
     BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
         Binding("escape", "back", "Back", show=True),
@@ -1363,22 +1451,32 @@ class MissionDeepView(ModalScreen[None]):
         return app
 
     def compose(self) -> ComposeResult:
-        yield Label("", id="deep-head")
-        with Horizontal(id="deep-tabs"):
-            for name in self.TABS:
-                yield Label(f" {name} ", id=f"tab-{name}", classes="deep-tab")
-        with VerticalScroll(id="deep-content"):
-            yield SelectableLog(
-                id="deep-feed", markup=True, highlight=False, wrap=True, max_lines=900
+        with Vertical(id="deep-frame"):
+            yield Label("", id="deep-head")
+            yield Label("", id="deep-flow")
+            with Horizontal(id="deep-tabs"):
+                for name in self.TABS:
+                    yield Label(f" {name} ", id=f"tab-{name}", classes="deep-tab")
+            with VerticalScroll(id="deep-content"):
+                yield SelectableLog(
+                    id="deep-feed", markup=True, highlight=False, wrap=True, max_lines=900
+                )
+                yield Static("", id="deep-findings", markup=True)
+                yield Static("", id="deep-diff", markup=False)
+                yield Static("", id="deep-report", markup=False)
+            yield Static("", id="deep-gates")
+            yield Label(
+                "[dim]esc back[/dim]  ·  tab/←→ switch tabs  ·  "
+                "[dim]a[/dim] approve  [dim]x[/dim] reject  ·  [dim]f[/dim] fetch  "
+                "· [dim]r[/dim] refresh",
+                id="deep-foot",
             )
-            yield Static("", id="deep-findings", markup=True)
-            yield Static("", id="deep-diff", markup=False)
-            yield Static("", id="deep-report", markup=False)
-        yield Static("", id="deep-gates")
 
     def on_mount(self) -> None:
         self.show_tab(0)
         self.run_worker(self.refresh_all(force=True), exclusive=True)
+        # live: the flow strip and feed advance while the view is open
+        self.set_interval(POLL_SECONDS, self._poll)
 
     def show_tab(self, index: int) -> None:
         self._tab = index % len(self.TABS)
@@ -1395,6 +1493,10 @@ class MissionDeepView(ModalScreen[None]):
     def action_prev_tab(self) -> None:
         self.show_tab(self._tab - 1)
 
+    async def _poll(self) -> None:
+        if self.is_current:
+            self.run_worker(self.refresh_all(), exclusive=True)
+
     async def refresh_all(self, force: bool = False) -> None:
         if self._refreshing:
             return
@@ -1408,9 +1510,10 @@ class MissionDeepView(ModalScreen[None]):
             spend = await self.rw.data.mission_spend(self._mission_id)
             head = self.query_one("#deep-head", Label)
             head.update(
-                f"[b]{m.id}[/b] {status_rich(m.status.value)}  {m.objective}  "
-                f"[dim]${spend:.4f}[/dim]"
+                f"[b]{m.id}[/b]  {status_rich(m.status.value)}  "
+                f"[dim]${spend:.4f}[/dim]\n{m.objective}"
             )
+            await self._render_flow(m)
             await self._stream_feed(force=force)
             await self._render_findings()
             await self._render_diff()
@@ -1420,6 +1523,60 @@ class MissionDeepView(ModalScreen[None]):
             self.notify(f"refresh failed: {exc}", severity="error")
         finally:
             self._refreshing = False
+
+    async def _render_flow(self, mission: Any) -> None:
+        """The mission's pipeline as a left-to-right strip: one box per plan
+        step with its role, mark, and attempt; the live one highlighted.
+
+        Owner ask: 'make it easier to see/visualize and track the flow/state
+        of a mission, which role it's at'. Everything here is derived from
+        run rows — the store is the truth, never a local guess."""
+        flow = self.query_one("#deep-flow", Label)
+        runs = await self.rw.data.mission_runs(self._mission_id)
+        plan = mission.plan or {}
+        steps: list[tuple[str, str]] = []
+        for step in plan.get("steps") or []:
+            if isinstance(step, dict) and step.get("step"):
+                steps.append((str(step["step"]), str(step.get("role", ""))))
+        if not steps:
+            # no explicit plan steps (echo, or pre-plan missions): fall back
+            # to the steps that actually ran, in first-seen order
+            seen: dict[str, str] = {}
+            for run in runs:
+                seen.setdefault(run.step, run.role)
+            steps = list(seen.items())
+        if not steps:
+            flow.update("[dim]no plan steps yet[/dim]")
+            return
+
+        by_step: dict[str, list[Any]] = {}
+        for run in runs:
+            by_step.setdefault(run.step, []).append(run)
+        for group in by_step.values():
+            group.sort(key=lambda r: r.attempt)
+
+        parts: list[str] = []
+        for index, (step, role) in enumerate(steps, start=1):
+            group = by_step.get(step, [])
+            latest = group[-1] if group else None
+            status = latest.status.value if latest is not None else "pending"
+            tries = f"#{latest.attempt}" if latest is not None else ""
+            icon = {
+                "completed": "[green]✔[/green]",
+                "running": "[bold cyan]▶[/bold cyan]",
+                "failed": "[red]✘[/red]",
+                "pending": "[dim]·[/dim]",
+                "awaiting_gate": "[yellow]‖[/yellow]",
+                "cancelled": "[dim]-[/dim]",
+            }.get(status, "·")
+            label = f"{role or step} {tries}".strip()
+            cell = f"{icon} {label}"
+            if latest is not None and latest.status.value == "running":
+                cell = f"[reverse]{icon} {label}[/reverse]"
+            elif status == "failed":
+                cell = f"[red]{icon} {label}[/red]"
+            parts.append(f"[dim]{index}[/dim] {cell}")
+        flow.update("  [dim]→[/dim]  ".join(parts))
 
     async def _stream_feed(self, force: bool = False) -> None:
         log = self.query_one("#deep-feed", SelectableLog)
@@ -1604,6 +1761,9 @@ class ReworkApp(App[None]):
     #pane-work { height: 1fr; padding: 1 2; }
     #pane-work #prompt { border: none; background: transparent;
                          border-bottom: round $accent; height: 3; }
+    #work-settings { height: 1; }
+    #work-model { width: auto; }
+    #work-effort { width: auto; margin-left: 3; }
     #recent { height: 1fr; }
     #recent-head, #work-title, #work-hint { height: 1; }
     #pane-dashboard { height: 1fr; padding: 0 1; }
@@ -1627,12 +1787,21 @@ class ReworkApp(App[None]):
     #lib-body-pane { width: 3fr; padding: 1 2; }
     #lib-body { padding: 0 1; }
     #lib-query { border: none; background: transparent; border-bottom: round $accent; }
-    #deep-tabs { height: 1; }
+    /* the deep view is a full SCREEN: it must paint its own opaque
+       background, or the pane underneath shows through and the window
+       'falls apart' (owner's screenshot) */
+    MissionDeepView { background: $surface; }
+    #deep-frame { height: 1fr; background: $surface; padding: 0 1; }
+    #deep-head { height: auto; padding: 0 1; background: $surface; }
+    #deep-flow { height: auto; padding: 0 1; background: $surface; }
+    #deep-tabs { height: 1; background: $surface; }
     .deep-tab { color: $text-muted; padding: 0 2; }
     .deep-tab.active { color: $text; background: $panel; text-style: bold; }
-    #deep-content { height: 1fr; border-top: round $panel; padding: 0 1; }
+    #deep-content { height: 1fr; border-top: round $panel; padding: 0 1;
+                    background: $surface; }
     #deep-feed { height: auto; max-height: 100%; }
-    #deep-gates { height: auto; padding: 0 1; }
+    #deep-gates { height: auto; padding: 0 1; background: $surface; }
+    #deep-foot { height: 1; color: $text-muted; background: $surface; padding: 0 1; }
     #gates-table { height: 1fr; }
     """
 

@@ -184,6 +184,7 @@ class CoderSpec(RoleSpec):
             mission_id=ctx.mission.id,
             run_id=ctx.run.id,
             budget=ctx.budget,
+            effort=ctx.run.model_ref.get("effort"),
         )
 
         graph = StateGraph(CoderState)

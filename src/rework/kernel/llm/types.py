@@ -38,6 +38,10 @@ class ChatRequest(BaseModel):
     tools: list[ToolSpec] = Field(default_factory=list)
     max_tokens: int = 4096
     temperature: float | None = None
+    # Reasoning effort: "low" | "medium" | "high". How it travels is the
+    # adapter's business (Anthropic thinking budget, OpenAI reasoning_effort);
+    # adapters that cannot express it ignore it. None = provider default.
+    effort: str | None = None
 
 
 class ChatResult(BaseModel):

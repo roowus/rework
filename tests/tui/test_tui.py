@@ -804,3 +804,181 @@ async def test_file_menu_quit_action_wired(seeded: dict[str, str]) -> None:
         # and no binding relies on ctrl+q alone: F10 is also bound
         keys = [str(getattr(b, "key", "")) for b in app.BINDINGS]
         assert "f10" in keys
+
+
+# ------------------------------------- round 6: deep view, flow, model/effort
+
+
+async def test_deep_view_has_opaque_background_and_footer(seeded: dict[str, str]) -> None:
+    """The window 'fell apart' because the full-screen view had no background
+    (the pane underneath showed through) and no visible way back."""
+    from textual.widgets import Label
+
+    from rework.tui.app import MissionDeepView
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        deep = MissionDeepView(seeded["waiting"])
+        await app.push_screen(deep)
+        for _ in range(6):
+            await pilot.pause()
+        assert deep.query_one("#deep-frame")
+        foot = str(deep.query_one("#deep-foot", Label).content)
+        assert "esc" in foot and "back" in foot
+
+
+async def test_deep_view_escape_returns_and_does_not_arm_quit(seeded: dict[str, str]) -> None:
+    """Owner: 'i cant go back'. Escape must pop the deep view and NOT be
+    eaten by the shell's escape-twice-quit handler."""
+    from rework.tui.app import MissionDeepView
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        await app.push_screen(MissionDeepView(seeded["waiting"]))
+        for _ in range(6):
+            await pilot.pause()
+        assert isinstance(app.screen, MissionDeepView)
+        await pilot.press("escape")
+        for _ in range(4):
+            await pilot.pause()
+        assert isinstance(app.screen, Shell), "escape did not return to the shell"
+        assert not getattr(shell, "_quit_armed", False), "escape armed quit instead"
+
+
+async def test_deep_view_flow_strip_shows_roles_and_position(seeded: dict[str, str], tui_env: Path):
+    """Owner: 'visualize and track the flow/state of a mission, which role
+    it's at'. The strip renders every plan step with a mark; the live one is
+    highlighted."""
+    from textual.widgets import Label
+
+    from rework.kernel.state.records import MissionStatus, Run
+    from rework.kernel.state.sqlite import open_sqlite
+    from rework.tui.app import MissionDeepView
+
+    store = await open_sqlite(str(tui_env))
+    try:
+        m = await store.get_mission(seeded["waiting"])
+        assert m is not None
+        m.plan = {
+            "kind": "fix",
+            "steps": [
+                {"step": "investigate", "role": "investigator"},
+                {"step": "code", "role": "coder"},
+                {"step": "audit", "role": "auditor"},
+            ],
+        }
+        m.status = MissionStatus.RUNNING
+        await store.update_mission(seeded["waiting"], status=MissionStatus.RUNNING, plan=m.plan)
+        await store.create_run(
+            Run(
+                id=f"{seeded['waiting']}:investigate:investigator:1",
+                mission_id=seeded["waiting"],
+                step="investigate",
+                role="investigator",
+                attempt=1,
+                status="completed",
+            )
+        )
+        await store.create_run(
+            Run(
+                id=f"{seeded['waiting']}:code:coder:1",
+                mission_id=seeded["waiting"],
+                step="code",
+                role="coder",
+                attempt=1,
+                status="running",
+            )
+        )
+    finally:
+        await store.aclose()
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 34)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        deep = MissionDeepView(seeded["waiting"])
+        await app.push_screen(deep)
+        for _ in range(8):
+            await pilot.pause()
+        flow = str(deep.query_one("#deep-flow", Label).content)
+        for role in ("investigator", "coder", "auditor"):
+            assert role in flow, f"{role} missing from the flow strip: {flow}"
+        assert "✔" in flow, "completed step has no check mark"
+        assert "▶" in flow, "running step is not marked live"
+
+
+async def test_work_tab_shows_model_and_effort_and_cycles(
+    seeded: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner: see which model the mission will use and change it + effort."""
+    import json
+
+    from textual.widgets import Label
+
+    monkeypatch.setenv(
+        "REWORK_MODELS",
+        json.dumps(
+            [
+                {"id": "flash", "provider": "fake", "model": "fake-flash", "tier": 1},
+                {"id": "pro", "provider": "fake", "model": "fake-pro", "tier": 2},
+            ]
+        ),
+    )
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        work = shell.query_one("#pane-work")
+        await pilot.pause()
+        model_label = str(work.query_one("#work-model", Label).content)
+        effort_label = str(work.query_one("#work-effort", Label).content)
+        assert "model" in model_label and "flash" in model_label
+        assert "effort" in effort_label
+
+        work.query_one("#prompt").focus()
+        await pilot.press("alt+m")
+        await pilot.pause()
+        assert app._mission_defaults["model"] == "pro"
+        await pilot.press("alt+e")
+        await pilot.pause()
+        assert app._mission_defaults["effort"] == "low"
+        assert "pro" in str(work.query_one("#work-model", Label).content)
+
+
+async def test_mission_model_and_effort_reach_the_plan(seeded: dict[str, str], tui_env: Path):
+    """The pickers must not be cosmetic: a created mission carries the choice
+    and the engine resolves it onto run rows."""
+    from rework.missions import PLAN_FIX, create_mission
+
+    plan = __import__("json").loads(__import__("json").dumps(PLAN_FIX))
+    steps = plan["steps"]
+    assert any(s.get("model") for s in steps), "template pins per-step models"
+
+    from rework.kernel.state.sqlite import open_sqlite
+
+    store = await open_sqlite(str(tui_env))
+    try:
+        repo_dir = tui_env.parent / "probe-repo"
+        repo_dir.mkdir(exist_ok=True)
+        (repo_dir / "README.md").write_text("probe")
+        mission = await create_mission(
+            "model plumbing probe",
+            repo=str(repo_dir),
+            plan="fix",
+            model="pro",
+            effort="high",
+            store=store,
+        )
+        assert mission.plan is not None
+        assert mission.plan.get("model") == "pro"
+        assert mission.plan.get("effort") == "high"
+        # per-step pins are dropped so the mission-wide choice wins
+        assert all("model" not in s for s in mission.plan["steps"])
+    finally:
+        await store.aclose()

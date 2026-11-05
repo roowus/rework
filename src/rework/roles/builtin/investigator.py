@@ -113,6 +113,7 @@ class InvestigatorSpec(RoleSpec):
             mission_id=ctx.mission.id,
             run_id=ctx.run.id,
             budget=ctx.budget,
+            effort=ctx.run.model_ref.get("effort"),
         )
 
         report = make_report_writer_node(

@@ -697,6 +697,18 @@ class MissionRunner:
                     await self._supervisor.ensure_started(run)
                 return [prior[-1]]
         attempt = len(prior) + 1
+        # Model/effort resolution: a step override wins, then the plan-level
+        # default (the TUI writes plan["model"]/plan["effort"]), then the
+        # role's default_model at graph build. model_ref is a free-form dict
+        # on the run row, so both ride along with no schema change.
+        plan = mission.plan or {}
+        model_id = step.get("model") or plan.get("model")
+        effort = step.get("effort") or plan.get("effort")
+        model_ref: dict[str, Any] = {}
+        if model_id:
+            model_ref["id"] = str(model_id)
+        if effort:
+            model_ref["effort"] = str(effort)
         run = Run(
             id=make_run_id(mission.id, step_name, role, attempt),
             mission_id=mission.id,
@@ -704,7 +716,7 @@ class MissionRunner:
             step=step_name,
             attempt=attempt,
             context=await self._resolve_context(mission, step),
-            model_ref={"id": str(step["model"])} if step.get("model") else {},
+            model_ref=model_ref,
         )
         created = await self._store.create_run(run)
         assert self._supervisor is not None

@@ -196,12 +196,16 @@ async def create_mission(
     repo_dir: str | None = None,
     project_id: str | None = None,
     plan: str = "echo",
+    model: str | None = None,
+    effort: str | None = None,
     store: StateStore | None = None,
 ) -> Mission:
     """Create a mission row (+ created event) and return it. When `store` is
     given it is used and NOT closed (the TUI holds one open); otherwise a
-    connection is opened and closed here (CLI behavior)."""
+    connection is opened and closed here (CLI behavior).
 
+    `model` and `effort` are the mission-level defaults the TUI exposes: they
+    land in the plan, so every step without its own override uses them."""
     from rework.config import Config, open_store_from_config
 
     mission_id = new_id("m")
@@ -215,6 +219,13 @@ async def create_mission(
         template = PLAN_FIX_PR if plan == "fix-pr" else PLAN_FIX
         plan_spec = json.loads(json.dumps(template).replace("$OBJECTIVE", objective))
         plan_spec["kind"] = plan
+        if model:
+            # a mission-wide model choice replaces the template's per-step pins
+            for step in plan_spec["steps"]:
+                step.pop("model", None)
+            plan_spec["model"] = model
+        if effort:
+            plan_spec["effort"] = effort
 
     async def _go(own_store: StateStore) -> Mission:
         from rework.kernel.events.bus import InProcessEventBus
