@@ -121,7 +121,7 @@ execution per role behind the `ToolExecutor` protocol.
 | M3 | Robustness (escalation policies, burn-gate, lock hardening, concurrency, chaos suite) + eval harness v1 + complaints table (ADR 0004 early) | ✅ done (chaos suite closed 2 recovery gaps: offline gate decisions applied on restart, synthesis no longer resurrects burn-rejected missions) |
 | M4 | rewvis deploy (systemd, Postgres, deploy key, branch protection) + cross-device | ✅ done (systemd daemon, Postgres state + checkpoints on rewvis, gh auth verified against the private repo; first cross-device mission done: created on the VM, ship gate approved from the Mac, $0.05 total. Open items: branch protection deferred to an owner decision; `rework new --repo` resolves the repo on the creating machine, so cross-device creation needs a daemon-visible path) |
 | M4.5 | Projects + workspace transport (ADR 0005): project entity, daemon-side repo resolution, one-shot upload for non-git working files, daemon workspace API (tailnet-only v1) | ✅ done (`b310c9d`..`db171ac`: projects table + conformance, workspace API, CLI project/new/fetch, git transport clone; live: mission created from the Mac with a non-git folder ran to DONE on rewvis via upload, and a URL-only mission cloned the private origin on the daemon; found + fixed en route: unconditional ALTER migrations convoyed store opens behind a live reader, and the echo stub's absent default model failed real deployments) |
-| M5 | Library v1 (git store, curation, MCP server, role integration) | planned |
+| M5 | Library v1 (git store, curation, MCP server, role integration) | ✅ done MVP (`251c1fc`..`cbe9fd3`: item model + git store + index on both backends, CLI add/ls/show/search/activate/retire, curation tiers (tools human-gated), roles carry search/read/contribute + spawn menu, MCP server mounted by Claude Code. Flywheel live-verified: mission m-4b9de000d56c contributed two skills (git-provenance stamped mission+role), read the seeded one, audit approved the contribution as a deliverable. Open for later: pgvector hybrid ranking (M6), library repo mirror sync across devices (back burner), per-project memory namespaces |
 | M5.5 | Complaints clustering → GitHub issues (table + tool landed early in M3, ADR 0004) | planned |
 | M6 | Semantic search + external ingest pipeline + eval-in-CI | planned |
 | M7+ | Container sandboxing, dashboard, real event transport, more roles | stubbed |
@@ -148,4 +148,8 @@ happens when the owner picks them back up.
 - **Investigator workspace population**: investigators file complaints that
   their workdir is empty by design (they get a repo map, not the repo).
   Candidate workflow improvement (mount the repo read-only or index richer
-  context); evaluate after the Library lands.
+  context); evaluate now that the Library landed.
+- **Library repo mirror sync**: the library git repo is daemon-canonical
+  (rewvis); other devices share the INDEX via the state DB, but body fetches
+  need the daemon until the repo is mirrored (GitHub per the owner plan) and
+  cloned elsewhere. Mac mount currently mirrors one seeded file by hand.
