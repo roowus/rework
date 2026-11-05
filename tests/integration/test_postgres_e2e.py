@@ -36,6 +36,10 @@ async def test_engine_runs_end_to_end_on_postgres_state_and_checkpoints() -> Non
     url = os.environ["REWORK_TEST_POSTGRES"]
     config = Config(db=url, checkpoints_db=url)
     store = await open_store_from_config(config)
+    # a leftover run of THIS test (CI retries, an earlier matrix job against a
+    # shared service) makes the deterministic mission id resume a COMPLETED
+    # checkpoint: no new gate ever opens and the assert fires. Clean state first.
+    await store.reset_for_tests()
     bus = InProcessEventBus(store)
     mission_id = "pg_e2e_echo"
     await store.create_mission(Mission(id=mission_id, objective="echo me"))
