@@ -249,3 +249,55 @@ def _investigator_script() -> list[ChatResult]:
         ),
         ChatResult(text=INV_REPORT, usage=Usage(input_tokens=40, output_tokens=50)),
     ]
+
+
+# -- Library index fixture (M5): sqlite always, postgres when REWORK_TEST_POSTGRES
+# is set (pointed at the dedicated rework_test DB, never the deployment database)
+
+BACKENDS_LIB = ["sqlite"]
+_TEST_PG_LIB = os.environ.get("REWORK_TEST_POSTGRES")
+if _TEST_PG_LIB:
+    BACKENDS_LIB.append("postgres")
+
+
+@pytest.fixture(params=BACKENDS_LIB)
+async def library_index(request: pytest.FixtureRequest) -> AsyncIterator[object]:
+    if request.param == "postgres":
+        import psycopg
+        from psycopg.rows import dict_row
+
+        from rework.library.store import _DDL, PostgresLibraryStore
+
+        assert _TEST_PG_LIB
+        conn = await psycopg.AsyncConnection.connect(
+            _TEST_PG_LIB, autocommit=False, row_factory=dict_row
+        )
+        for ddl in _DDL:
+            await conn.execute(ddl)
+        await conn.execute("TRUNCATE TABLE library_items")
+        await conn.commit()
+        store = PostgresLibraryStore(conn)
+        yield store
+        await store.aclose()
+    else:
+        import asyncio as _asyncio
+        import tempfile
+
+        import aiosqlite
+
+        from rework.library.store import _SQLITE_DDL, SqliteLibraryStore
+
+        tmp = Path(tempfile.mkdtemp()) / "lib.sqlite3"
+
+        def _prep() -> str:
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            return str(tmp)
+
+        conn = await aiosqlite.connect(await _asyncio.to_thread(_prep))
+        conn.row_factory = aiosqlite.Row
+        for ddl in _SQLITE_DDL:
+            await conn.execute(ddl)
+        await conn.commit()
+        store = SqliteLibraryStore(conn)
+        yield store
+        await store.aclose()

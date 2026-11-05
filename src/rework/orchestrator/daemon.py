@@ -87,6 +87,7 @@ class Daemon:
         make_checkpointer: CheckpointerFactory,
         workroot: Path,
         config: Config,
+        library: Any | None = None,
     ) -> None:
         self._store = store
         self._bus = bus
@@ -95,6 +96,7 @@ class Daemon:
         self._make_checkpointer = make_checkpointer
         self._workroot = workroot
         self._config = config
+        self._library = library  # LibraryHandle | None (M5)
         self._sem = asyncio.Semaphore(config.concurrency)
         self._runners: dict[str, asyncio.Task[None]] = {}
         self._bg: set[asyncio.Task[None]] = set()
@@ -146,6 +148,7 @@ class Daemon:
                     self._workroot,
                     poll_interval_s=self._config.poll_interval_s,
                     git_author=self._config.git_author,
+                    library=self._library,
                 )
                 await runner.run()
 

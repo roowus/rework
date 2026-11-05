@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from rework.kernel.state.records import EventRecord, EventType
+from rework.library.tools import library_executor, with_library_menu
 from rework.nodes.repo_map import build_repo_map
 from rework.nodes.report_sections import resolve_sections
 from rework.nodes.report_writer import make_report_writer_node
@@ -97,14 +98,17 @@ class InvestigatorSpec(RoleSpec):
             provider=ctx.provider,
             catalog=ctx.catalog,
             catalog_id=catalog_id,
-            executor=ComplaintAwareExecutor(
-                LocalExecutor(ctx.workdir),
-                ctx.store,
-                ctx.mission.id,
-                ctx.run.id,
-                self.name,
+            executor=library_executor(
+                ctx,
+                ComplaintAwareExecutor(
+                    LocalExecutor(ctx.workdir),
+                    ctx.store,
+                    ctx.mission.id,
+                    ctx.run.id,
+                    self.name,
+                ),
             ),
-            system_prompt=system_prompt,
+            system_prompt=with_library_menu(ctx, system_prompt),
             store=ctx.store,
             mission_id=ctx.mission.id,
             run_id=ctx.run.id,

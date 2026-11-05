@@ -195,8 +195,11 @@ class SqliteLibraryStore:
         self, query: str, type_: ItemType | None = None, limit: int = 20
     ) -> list[LibraryItem]:
         # MVP: fetch candidates (LIKE narrows little that matters at this
-        # scale), score in Python, sort best-first
-        items = await self.list_items(type_=type_, limit=1000)
+        # scale), score in Python, sort best-first. ACTIVE only: search is a
+        # serving path; proposed/retired items never surface (curation).
+        items = [
+            i for i in await self.list_items(type_=type_, status=ItemStatus.ACTIVE, limit=1000)
+        ]
         hits = [(_score(i, query), i) for i in items if _matches(i, query)]
         hits.sort(key=lambda pair: (-pair[0], pair[1].name))
         return [i for _, i in hits[:limit]]
@@ -286,7 +289,10 @@ class PostgresLibraryStore:
     async def search(
         self, query: str, type_: ItemType | None = None, limit: int = 20
     ) -> list[LibraryItem]:
-        items = await self.list_items(type_=type_, limit=1000)
+        # serving path: ACTIVE only (see the sqlite impl's note)
+        items = [
+            i for i in await self.list_items(type_=type_, status=ItemStatus.ACTIVE, limit=1000)
+        ]
         hits = [(_score(i, query), i) for i in items if _matches(i, query)]
         hits.sort(key=lambda pair: (-pair[0], pair[1].name))
         return [i for _, i in hits[:limit]]

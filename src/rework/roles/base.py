@@ -70,6 +70,10 @@ class RoleBuildCtx(BaseModel):
     budget: Budget
     workdir: Path  # per-run workspace (path-jailing is the v1 isolation line)
     git_author: tuple[str, str] = ("rework", "rework@rework.local")  # commit identity
+    # the Library (M5): None = library off (tests, deployments without one);
+    # menu is the prebuilt ACTIVE-skills list for the system prompt
+    library: Any | None = None
+    library_menu: str = ""
 
     @property
     def model_ref(self) -> dict[str, Any]:

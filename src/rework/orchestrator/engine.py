@@ -88,6 +88,7 @@ class RunSupervisor:
         workroot: Path,
         git_author: tuple[str, str] = ("rework", "rework@rework.local"),
         provider: ModelProvider | None = None,
+        library: Any | None = None,
     ) -> None:
         self._mission = mission
         self._store = store
@@ -98,6 +99,7 @@ class RunSupervisor:
         self._workroot = workroot
         self._git_author = git_author
         self._provider = provider  # test/di override; None = build from catalog
+        self._library = library  # LibraryHandle | None (M5); never breaks a run
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self._closers: list[Callable[[], Awaitable[None]]] = []
         self._ctxs: dict[str, RoleBuildCtx] = {}
@@ -145,6 +147,19 @@ class RunSupervisor:
                 max_output_tokens=spec.budget.max_output_tokens,
             )
         base_provider = self._provider or build_provider(entry)
+        library_menu = ""
+        if self._library is not None:
+            try:
+                library_menu = await self._library.menu()
+            except Exception as exc:  # the Library must never break a run
+                await self._bus.publish(
+                    EventRecord(
+                        mission_id=self._mission.id,
+                        run_id=run.id,
+                        type=EventType.INFO,
+                        payload={"error": f"library menu unavailable: {exc}"},
+                    )
+                )
         ctx = RoleBuildCtx(
             run=run,
             mission=self._mission,
@@ -156,6 +171,8 @@ class RunSupervisor:
             budget=budget,
             workdir=workdir,
             git_author=self._git_author,
+            library=self._library,
+            library_menu=library_menu,
         )
         graph = spec.build_graph(ctx)
         checkpointer, close = await self._make_checkpointer(run.id)
@@ -305,6 +322,7 @@ class MissionRunner:
         poll_interval_s: float = 0.25,
         git_author: tuple[str, str] = ("rework", "rework@rework.local"),
         provider: ModelProvider | None = None,
+        library: Any | None = None,
     ) -> None:
         self._store = store
         self._bus = bus
@@ -315,6 +333,7 @@ class MissionRunner:
         self._poll = poll_interval_s
         self._git_author = git_author
         self._provider = provider
+        self._library = library
         self._plan: dict[str, Any] | None = None
         self._gates = GateManager(store, bus)
         self.mission_id = mission_id
@@ -339,6 +358,7 @@ class MissionRunner:
             self._workroot,
             self._git_author,
             self._provider,
+            self._library,
         )
         try:
             await self._run_steps(mission)

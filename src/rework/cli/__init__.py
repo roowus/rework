@@ -1053,6 +1053,24 @@ def serve() -> None:
 
         store = await open_store_from_config(config)
         bus = InProcessEventBus(store)
+
+        # the Library (M5): best-effort at boot; a broken library must never
+        # stop missions (roles run library-less when this fails)
+        library = None
+        try:
+            from rework.library.store import GitLibrary, open_library_store
+            from rework.library.tools import LibraryHandle
+
+            index = await open_library_store(config.db)
+            library = LibraryHandle(
+                index=index, git=GitLibrary(_library_root(), author=config.git_author)
+            )
+            typer.secho(f"library at {_library_root()}", fg=typer.colors.CYAN)
+        except Exception as exc:
+            typer.secho(
+                f"library unavailable ({exc}); roles run library-less", fg=typer.colors.YELLOW
+            )
+
         daemon = Daemon(
             store=store,
             bus=bus,
@@ -1061,6 +1079,7 @@ def serve() -> None:
             make_checkpointer=checkpointer_factory_for(config),
             workroot=workroot,
             config=config,
+            library=library,
         )
         # the workspace API rides the daemon's event loop (ADR 0005); binding
         # is localhost by default, tailnet-only when REWORK_HTTP_HOST points at
@@ -1208,54 +1227,86 @@ def library_add(
     tag: list[str] = typer.Option([], "--tag", help="Repeatable."),  # noqa: B008
     project: str | None = typer.Option(None, help="Provenance: project id."),
     mission: str | None = typer.Option(None, help="Provenance: mission id."),
-    status: str = typer.Option(
-        "active", help="active (default for skills/reports/memories) | proposed"
-    ),
 ) -> None:
     """Add an item: the body file goes into the library git repo, the metadata
-    into the index. Internal items auto-accept except tools (M5.2 gates)."""
+    into the index. Skills/reports/memories auto-accept; TOOLS always start
+    proposed and need `rework library activate` (supply-chain gate)."""
     from rework.config import Config
-    from rework.library.model import (
-        ItemStatus,
-        ItemType,
-        LibraryItem,
-        Origin,
-        Provenance,
-    )
+    from rework.library.curation import contribute
+    from rework.library.model import ItemType
     from rework.library.store import GitLibrary
 
     try:
         item_type = ItemType(type_)
     except ValueError as exc:
         raise typer.BadParameter(f"unknown type: {type_}") from exc
-    try:
-        item_status = ItemStatus(status)
-    except ValueError as exc:
-        raise typer.BadParameter(f"unknown status: {status}") from exc
     src = Path(body_file).expanduser()
     if not src.is_file():
         raise typer.BadParameter(f"body file not found: {src}")
-    item = LibraryItem(
-        type=item_type,
-        name=name,
-        description=description,
-        tags=list(tag),
-        provenance=Provenance(origin=Origin.INTERNAL, mission_id=mission, project=project),
-        status=item_status,
-    )
 
     async def go() -> str:
         lib = GitLibrary(_library_root(), author=Config.from_env().git_author)
         body = await asyncio.to_thread(src.read_text)
-        item.body_path = await asyncio.to_thread(
-            lib.write_body, item, body, f"library: add {item.type.value} {name!r}"
-        )
         index = await open_library_index(Config.from_env().db)
         try:
-            await index.upsert_item(item)
+            item, note = await contribute(
+                index,
+                lib,
+                type_=item_type,
+                name=name,
+                description=description,
+                body=body,
+                tags=list(tag),
+                mission_id=mission,
+                project=project,
+            )
         finally:
             await index.aclose()
+        typer.echo(note)
         return item.id
+
+    typer.echo(asyncio.run(go()))
+
+
+@library_app.command("activate")
+def library_activate(item_id: str, note: str | None = typer.Option(None)) -> None:
+    """The human gate for tools: promote a proposed item to active."""
+    from rework.config import Config
+
+    async def go() -> str:
+        index = await open_library_index(Config.from_env().db)
+        try:
+            item = await index.get_item(item_id)
+            if item is None:
+                raise typer.BadParameter(f"item not found: {item_id}")
+            item.status = item.status.__class__.ACTIVE
+            item.touch()
+            await index.upsert_item(item)
+            return f"{item.id} is now active ({item.type.value} {item.name!r})"
+        finally:
+            await index.aclose()
+
+    _ = note
+    typer.echo(asyncio.run(go()))
+
+
+@library_app.command("retire")
+def library_retire(item_id: str) -> None:
+    """The off switch: a retired item is kept for history, never served."""
+    from rework.config import Config
+
+    async def go() -> str:
+        index = await open_library_index(Config.from_env().db)
+        try:
+            item = await index.get_item(item_id)
+            if item is None:
+                raise typer.BadParameter(f"item not found: {item_id}")
+            item.status = item.status.__class__.RETIRED
+            item.touch()
+            await index.upsert_item(item)
+            return f"{item.id} retired ({item.type.value} {item.name!r})"
+        finally:
+            await index.aclose()
 
     typer.echo(asyncio.run(go()))
 
