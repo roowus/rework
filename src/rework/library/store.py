@@ -34,7 +34,8 @@ _DDL = [
         version INTEGER NOT NULL DEFAULT 1,
         uses INTEGER NOT NULL DEFAULT 0,
         created_at DOUBLE PRECISION NOT NULL,
-        updated_at DOUBLE PRECISION NOT NULL
+        updated_at DOUBLE PRECISION NOT NULL,
+        vectors TEXT NOT NULL DEFAULT '{}'
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_library_type_status ON library_items(type, status)",
@@ -43,7 +44,14 @@ _DDL = [
 # sqlite equivalent of DOUBLE PRECISION: REAL (only the type words differ)
 _SQLITE_DDL = [ddl.replace("DOUBLE PRECISION", "REAL") for ddl in _DDL]
 
-_MIGRATIONS: list[tuple[str, str, str]] = []  # none yet; pattern kept for future columns
+# (table, column, DDL): check-then-alter (the ADR 0005 lock-convoy rule)
+_MIGRATIONS: list[tuple[str, str, str]] = [
+    (
+        "library_items",
+        "vectors",
+        "ALTER TABLE library_items ADD COLUMN vectors TEXT NOT NULL DEFAULT '{}'",
+    ),
+]
 
 
 def _j(value: Any) -> str:
@@ -52,7 +60,12 @@ def _j(value: Any) -> str:
 
 def _row_to_item(row: Any) -> LibraryItem:
     prov = row["provenance"] or "{}"
-    return LibraryItem(
+    try:
+        raw_vectors = row["vectors"]
+    except (KeyError, IndexError):
+        raw_vectors = None
+    vectors = json.loads(raw_vectors) if raw_vectors else {}
+    item = LibraryItem(
         id=row["id"],
         type=ItemType(row["type"]),
         name=row["name"],
@@ -65,7 +78,9 @@ def _row_to_item(row: Any) -> LibraryItem:
         uses=int(row["uses"]),
         created_at=float(row["created_at"]),
         updated_at=float(row["updated_at"]),
+        vectors=vectors,
     )
+    return item
 
 
 @runtime_checkable
@@ -146,13 +161,13 @@ class SqliteLibraryStore:
         r = item_to_row(item)
         await self._conn.execute(
             "INSERT INTO library_items (id, type, name, description, body_path, tags,"
-            " provenance, status, version, uses, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            " provenance, status, version, uses, created_at, updated_at, vectors)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT(id) DO UPDATE SET"
             " type=excluded.type, name=excluded.name, description=excluded.description,"
             " body_path=excluded.body_path, tags=excluded.tags, provenance=excluded.provenance,"
             " status=excluded.status, version=excluded.version, uses=excluded.uses,"
-            " updated_at=excluded.updated_at",
+            " updated_at=excluded.updated_at, vectors=excluded.vectors",
             (
                 r["id"],
                 r["type"],
@@ -166,6 +181,7 @@ class SqliteLibraryStore:
                 r["uses"],
                 r["created_at"],
                 r["updated_at"],
+                _j(item.vectors) or "{}",
             ),
         )
         await self._conn.commit()
@@ -238,14 +254,14 @@ class PostgresLibraryStore:
             r = item_to_row(item)
             await self._conn.execute(
                 "INSERT INTO library_items (id, type, name, description, body_path,"
-                " tags, provenance, status, version, uses, created_at, updated_at)"
-                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                " tags, provenance, status, version, uses, created_at, updated_at, vectors)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
                 " ON CONFLICT (id) DO UPDATE SET"
                 " type=EXCLUDED.type, name=EXCLUDED.name, description=EXCLUDED.description,"
                 " body_path=EXCLUDED.body_path, tags=EXCLUDED.tags,"
                 " provenance=EXCLUDED.provenance, status=EXCLUDED.status,"
                 " version=EXCLUDED.version, uses=EXCLUDED.uses,"
-                " updated_at=EXCLUDED.updated_at",
+                " updated_at=EXCLUDED.updated_at, vectors=EXCLUDED.vectors",
                 (
                     r["id"],
                     r["type"],
@@ -259,6 +275,7 @@ class PostgresLibraryStore:
                     r["uses"],
                     r["created_at"],
                     r["updated_at"],
+                    _j(item.vectors) or "{}",
                 ),
             )
             await self._conn.commit()
@@ -331,6 +348,25 @@ class _LibLock:
         self._lock.release()
 
 
+async def apply_library_migrations(conn: Any) -> None:
+    """Check-then-alter for databases created before a column existed (the
+    ADR 0005 lock-convoy rule: cheap catalog read, ALTER only when missing)."""
+    for table, column, alter in _MIGRATIONS:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM information_schema.columns"
+                " WHERE table_name = %s AND column_name = %s",
+                (table, column),
+            )
+            missing = await cur.fetchone() is None
+        if missing:
+            await conn.execute("SET lock_timeout = '5s'")
+            try:
+                await conn.execute(alter)
+            finally:
+                await conn.execute("SET lock_timeout = 0")
+
+
 async def open_library_store(db: str) -> LibraryStore:
     """Open the library index on the same database substrate as the state
     store (sqlite path or postgresql:// URL)."""
@@ -341,20 +377,7 @@ async def open_library_store(db: str) -> LibraryStore:
         conn = await psycopg.AsyncConnection.connect(db, autocommit=False, row_factory=dict_row)
         for ddl in _DDL:
             await conn.execute(ddl)
-        for table, column, alter in _MIGRATIONS:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT 1 FROM information_schema.columns"
-                    " WHERE table_name = %s AND column_name = %s",
-                    (table, column),
-                )
-                missing = await cur.fetchone() is None
-            if missing:
-                await conn.execute("SET lock_timeout = '5s'")
-                try:
-                    await conn.execute(alter)
-                finally:
-                    await conn.execute("SET lock_timeout = 0")
+        await apply_library_migrations(conn)
         await conn.commit()
         return PostgresLibraryStore(conn)
     import aiosqlite

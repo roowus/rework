@@ -28,6 +28,17 @@ class LibraryHandle(BaseModel):
 
     index: LibraryStore
     git: GitLibrary
+    hybrid: Any | None = None  # HybridSearch when the semantic layer is on
+
+    async def search_items(self, query: str, type_name: str | None = None):
+        """Hybrid when configured, keyword-only otherwise."""
+        if self.hybrid is not None:
+            return await self.hybrid.search(
+                query, type_=ItemType(type_name) if type_name else None, limit=10
+            )
+        return await self.index.search(
+            query, type_=ItemType(type_name) if type_name else None, limit=10
+        )
 
     async def menu(self) -> str:
         """The spawn menu: ACTIVE skills only, name + description."""
@@ -42,8 +53,7 @@ class LibraryHandle(BaseModel):
         return "\n".join(lines)
 
     async def search_text(self, query: str, type_name: str | None = None) -> str:
-        type_ = ItemType(type_name) if type_name else None
-        items = await self.index.search(query, type_=type_, limit=10)
+        items = await self.search_items(query, type_name)
         if not items:
             return "(no library matches)"
         await asyncio.gather(*(self.index.record_use(i.id) for i in items))

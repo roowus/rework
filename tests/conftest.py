@@ -266,7 +266,11 @@ async def library_index(request: pytest.FixtureRequest) -> AsyncIterator[object]
         import psycopg
         from psycopg.rows import dict_row
 
-        from rework.library.store import _DDL, PostgresLibraryStore
+        from rework.library.store import (
+            _DDL,
+            PostgresLibraryStore,
+            apply_library_migrations,
+        )
 
         assert _TEST_PG_LIB
         conn = await psycopg.AsyncConnection.connect(
@@ -274,6 +278,7 @@ async def library_index(request: pytest.FixtureRequest) -> AsyncIterator[object]
         )
         for ddl in _DDL:
             await conn.execute(ddl)
+        await apply_library_migrations(conn)
         await conn.execute("TRUNCATE TABLE library_items")
         await conn.commit()
         store = PostgresLibraryStore(conn)

@@ -20,7 +20,7 @@ from rework.library.model import ItemStatus, ItemType
 from rework.library.store import GitLibrary, LibraryStore
 
 
-def build_mcp_server(index: LibraryStore, git: GitLibrary) -> Any:
+def build_mcp_server(index: LibraryStore, git: GitLibrary, hybrid: Any | None = None) -> Any:
     """Build the FastMCP server over an open index. Separate function so
     tests can connect an in-memory client without spawning a process."""
     from mcp.server.fastmcp import FastMCP
@@ -33,7 +33,11 @@ def build_mcp_server(index: LibraryStore, git: GitLibrary) -> Any:
         memories that rework missions (and you) built up over time. Returns
         matching items as 'id  [type] name: description'."""
         type_ = ItemType(item_type) if item_type else None
-        items = await index.search(query, type_=type_, limit=10)
+        items = (
+            await hybrid.search(query, type_=type_, limit=10)
+            if hybrid is not None
+            else await index.search(query, type_=type_, limit=10)
+        )
         if not items:
             return "(no library matches)"
         return "\n".join(f"{i.id}  [{i.type.value}] {i.name}: {i.description}" for i in items)
@@ -95,10 +99,15 @@ def run_stdio() -> None:
     config = Config.from_env()
     root = Path(os.environ.get("REWORK_LIBRARY_DIR", str(DEFAULT_STATE_DIR / "library")))
 
-    async def _open() -> tuple[LibraryStore, GitLibrary]:
-        index = await open_library_store(config.db)
-        return index, GitLibrary(root, author=config.git_author)
+    async def _open() -> tuple[LibraryStore, GitLibrary, Any]:
+        from rework.library.embeddings import embeddings_from_env
+        from rework.library.search import HybridSearch
 
-    index, git = asyncio.run(_open())
-    mcp = build_mcp_server(index, git)
+        index = await open_library_store(config.db)
+        embedder = embeddings_from_env()
+        hybrid = HybridSearch(index, embedder) if embedder else None
+        return index, GitLibrary(root, author=config.git_author), hybrid
+
+    index, git, hybrid = asyncio.run(_open())
+    mcp = build_mcp_server(index, git, hybrid=hybrid)
     mcp.run()  # stdio transport

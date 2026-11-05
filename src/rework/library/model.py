@@ -63,6 +63,8 @@ class LibraryItem(BaseModel):
     status: ItemStatus = ItemStatus.PROPOSED
     version: int = 1  # bumped on every body/metadata edit
     uses: int = 0  # retrieval counter (usage signal for ranking later)
+    # model id -> embedding vector (M6.1); empty when the semantic layer is off
+    vectors: dict[str, list[float]] = Field(default_factory=dict)
     created_at: float = Field(default_factory=time.time)
     updated_at: float = Field(default_factory=time.time)
 
