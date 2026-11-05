@@ -20,6 +20,7 @@ pytestmark = pytest.mark.skipif(
     not os.environ.get("REWORK_TEST_POSTGRES"), reason="REWORK_TEST_POSTGRES not set"
 )
 
+
 async def _purge_checkpoint_threads(url: str, mission_id: str) -> None:
     """Delete this test's checkpoint threads (any run of this mission from any
     earlier attempt). The checkpoints table is the langgraph checkpointer's;
@@ -36,9 +37,7 @@ async def _purge_checkpoint_threads(url: str, mission_id: str) -> None:
 
     conn = await psycopg.AsyncConnection.connect(url, autocommit=True)
     try:
-        await conn.execute(
-            "DELETE FROM checkpoints WHERE thread_id LIKE %s", (f"{mission_id}:%",)
-        )
+        await conn.execute("DELETE FROM checkpoints WHERE thread_id LIKE %s", (f"{mission_id}:%",))
     finally:
         await conn.close()
 
