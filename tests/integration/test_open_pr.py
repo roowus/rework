@@ -16,11 +16,11 @@ import pytest
 from test_vertical_slice import AUDIT_CLEAN, _auditor_script, _coder_script, _investigator_script
 
 from conftest import ScriptedProvider, role_catalog
-from rework.missions import PLAN_FIX_PR
 from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.gates import GateManager
 from rework.kernel.state.records import Mission, MissionStatus
 from rework.kernel.state.sqlite import SqliteStore, open_sqlite
+from rework.missions import PLAN_FIX_PR
 from rework.orchestrator.engine import MissionRunner
 from rework.roles.registry import autodiscover
 

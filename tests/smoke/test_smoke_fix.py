@@ -19,12 +19,12 @@ from typing import Any
 import pytest
 from langgraph.types import Command  # noqa: F401
 
-from rework.missions import PLAN_FIX
 from rework.config import Config, load_catalog, open_store_from_config
 from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.gates import GateManager
 from rework.kernel.state.records import Mission, MissionStatus
 from rework.kernel.state.sqlite import SqliteStore
+from rework.missions import PLAN_FIX
 from rework.orchestrator.daemon import sqlite_checkpointer_factory
 from rework.orchestrator.engine import MissionRunner
 from rework.roles.registry import autodiscover

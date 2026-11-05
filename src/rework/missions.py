@@ -146,7 +146,11 @@ async def resolve_repo(
     repo_origin: str | None = None
     notes: list[str] = []
     if repo_dir:
-        repo_path = upload_repo_dir(repo_dir, f"{mission_id}-files")
+        # packing + POST can take seconds on big folders: keep the caller's
+        # loop (the TUI) responsive by running the sync transport in a thread
+        import asyncio as _asyncio
+
+        repo_path = await _asyncio.to_thread(upload_repo_dir, repo_dir, f"{mission_id}-files")
         notes.append(f"uploaded and staged on the daemon: {repo_path}")
     elif repo:
         import asyncio as _asyncio
@@ -210,6 +214,7 @@ async def create_mission(
             raise ValueError(f"--plan {plan} requires a repo (URL, path, folder, or project ref)")
         template = PLAN_FIX_PR if plan == "fix-pr" else PLAN_FIX
         plan_spec = json.loads(json.dumps(template).replace("$OBJECTIVE", objective))
+        plan_spec["kind"] = plan
 
     async def _go(own_store: StateStore) -> Mission:
         from rework.kernel.events.bus import InProcessEventBus

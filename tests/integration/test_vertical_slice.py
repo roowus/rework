@@ -24,12 +24,12 @@ from conftest import (
     _investigator_script,
     role_catalog,
 )
-from rework.missions import PLAN_FIX
 from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.gates import GateManager
 from rework.kernel.llm.types import ChatResult, ToolCall, Usage
 from rework.kernel.state.records import Mission, MissionStatus
 from rework.kernel.state.sqlite import SqliteStore, open_sqlite
+from rework.missions import PLAN_FIX
 from rework.orchestrator.engine import MissionRunner
 from rework.roles.registry import autodiscover
 

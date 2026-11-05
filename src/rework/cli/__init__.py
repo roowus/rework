@@ -999,6 +999,15 @@ def eval_history(task: str | None = typer.Argument(None)) -> None:
 
 
 def main() -> None:
+    import sys
+
+    # bare `rework` (no arguments at all) opens the TUI dashboard; everything
+    # else keeps the command surface (`rework --help`, `rework new ...`)
+    if len(sys.argv) == 1:
+        from rework.tui import run_tui
+
+        run_tui()
+        return
     app()
 
 
