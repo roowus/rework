@@ -684,3 +684,75 @@ async def test_ctrl_c_copies_instead_of_quitting(seeded: dict[str, str]) -> None
         assert all("quit" not in str(getattr(b, "action", "")) for b in ctrl_c)
         ctrl_q = [b for b in app.BINDINGS if str(getattr(b, "key", "")) == "ctrl+q"]
         assert any("quit" in str(getattr(b, "action", "")) for b in ctrl_q)
+
+
+async def test_menu_dropdown_opens_stays_and_acts(seeded: dict[str, str]) -> None:
+    """The owner's 'top toolbar dropdowns dont work': the bar blurred into the
+    dropdown and closed it instantly, and MenuAction never reached a handler
+    (messages stop at the screen). Click File, pick New mission, wizard opens."""
+    from rework.tui.app import MenuBar, NewMissionModal
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        bar = shell.query_one("#menu-bar", MenuBar)
+        start = {n: (s, w) for n, s, w in bar._menu_spans()}["File"][0]
+
+        await pilot.click("#menu-bar", offset=(start + 1, 0))
+        for _ in range(4):
+            await pilot.pause()
+        assert bar._open_menu == "File", "dropdown closed itself (blur bug)"
+        assert bar._dropdown is not None
+
+        content = bar._dropdown.content_region
+        await pilot.click(offset=(content.x + 6, content.y))  # New mission…
+        for _ in range(8):
+            await pilot.pause()
+        assert bar._open_menu is None
+        assert isinstance(app.screen, NewMissionModal), "MenuAction never dispatched"
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert isinstance(app.screen, Shell)
+
+
+async def test_menu_view_switches_tabs(seeded: dict[str, str]) -> None:
+    """View > Library really moves the app (the dispatch path end to end)."""
+    from rework.tui.app import MenuBar, TabBar
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        bar = shell.query_one("#menu-bar", MenuBar)
+        start = {n: (s, w) for n, s, w in bar._menu_spans()}["View"][0]
+        await pilot.click("#menu-bar", offset=(start + 1, 0))
+        for _ in range(4):
+            await pilot.pause()
+        content = bar._dropdown.content_region
+        await pilot.click(offset=(content.x + 6, content.y + 3))  # Library
+        for _ in range(8):
+            await pilot.pause()
+        assert shell.query_one("#tab-bar", TabBar)._active == "library"
+
+
+async def test_hover_markup_is_a_real_colour(seeded: dict[str, str]) -> None:
+    """Hover used '[on $boost]' — Rich markup, not CSS — so it rendered as
+    nothing. The hovered label must carry a concrete colour."""
+    from rework.tui.app import MenuBar
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        bar = shell.query_one("#menu-bar", MenuBar)
+        start = {n: (s, w) for n, s, w in bar._menu_spans()}["Edit"][0]
+        await pilot.hover("#menu-bar", offset=(start + 1, 0))
+        await pilot.pause()
+        assert bar._hover == "Edit"
+        rendered = str(bar.render())
+        assert "[on #" in rendered and "$boost" not in rendered

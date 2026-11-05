@@ -880,8 +880,23 @@ class MenuBar(Static, can_focus=True):
             col += width + 1
         return spans
 
+    def _hover_markup(self, label: str) -> str:
+        """Rich markup for a hovered label. Rich knows no theme variables
+        (`[on $boost]` renders as literal nothing), so resolve a real colour
+        off the app theme and fall back to a fixed one."""
+        color = "#3a5a7a"
+        try:
+            theme = self.app.current_theme
+            for attr in ("panel", "surface", "primary"):
+                value = getattr(theme, attr, None)
+                if value:
+                    color = str(value)
+                    break
+        except Exception:  # pragma: no cover - theme shape varies
+            pass
+        return f"[on {color}]{label}[/on {color}]"
+
     def render(self) -> Any:
-        parts = [f"[bold]{WORDMARK}[/bold]".ljust(0)]
         out = f"[bold]{WORDMARK}[/bold]" + " " * WORDMARK_PAD
         for name, _start, _width in self._menu_spans():
             label = f" {name} "
@@ -890,11 +905,10 @@ class MenuBar(Static, can_focus=True):
             if active:
                 out += f"[reverse]{label}[/reverse]"
             elif hover:
-                out += f"[on $boost]{label}[/on $boost]"
+                out += self._hover_markup(label)
             else:
                 out += label
             out += " "
-        del parts
         badge = ""
         if self._gate_count:
             badge = f"[bold yellow][ Gates ●{self._gate_count} ][/bold yellow]"
@@ -948,11 +962,16 @@ class MenuBar(Static, can_focus=True):
             self._open_menu = None
             self.refresh(layout=True)
 
-    @on(OptionList.OptionSelected)
-    async def option_selected(self, event: OptionList.OptionSelected) -> None:
+    async def handle_selected(self, event: OptionList.OptionSelected) -> None:
+        """Route a choice made in OUR dropdown.
+
+        The dropdown mounts on the SCREEN (it must, to paint over other
+        widgets), so its OptionSelected bubbles up through the screen and
+        never through the MenuBar's own DOM branch — the @on handler that
+        used to live here never fired (the owner's 'dropdowns dont work').
+        The Shell, which IS the screen, catches the message and calls this."""
         if event.option_list is not self._dropdown:
             return
-        event.stop()
         action = self._actions[event.option_index]
         await self.close_dropdown()
         if action:
@@ -964,6 +983,14 @@ class MenuBar(Static, can_focus=True):
             self.focus()
 
     def on_blur(self, event: Any) -> None:
+        # focusing the dropdown blurs the bar — that is NOT a dismissal (the
+        # owner's 'dropdowns dont work': this closed every menu the instant it
+        # opened). Only close when focus left for something else.
+        focused = self.app.focused
+        if focused is not None and focused is self._dropdown:
+            return
+        if self._dropdown is not None and self._dropdown.has_focus_within:
+            return
         self.run_worker(self.close_dropdown(), exclusive=True)
 
     def on_mouse_move(self, event: Any) -> None:
@@ -1120,6 +1147,26 @@ class Shell(Screen):
         self.show_tab("work")
         # the badge poll: one place, drives badge + notifications
         self.set_interval(POLL_SECONDS, self.poll_badge)
+
+    @on(OptionList.OptionSelected)
+    async def dropdown_selected(self, event: OptionList.OptionSelected) -> None:
+        """The menu dropdown mounts on this screen, so its messages land
+        here (not on the MenuBar branch). Hand off when it is ours."""
+        bar = self.query_one("#menu-bar", MenuBar)
+        if event.option_list is not bar._dropdown:
+            return
+        event.stop()
+        await bar.handle_selected(event)
+
+    @on(MenuBar.MenuAction)
+    async def menu_action(self, event: MenuBar.MenuAction) -> None:
+        """Menu choices arrive at the SCREEN (custom messages bubble up the
+        DOM and stop there; an App-level @on never sees them — the reason
+        'dropdowns dont work' even once they opened)."""
+        event.stop()
+        result = self.rw.run_menu_action(event.action)
+        if result is not None:
+            self.run_worker(result, exclusive=True)
 
     @on(TabBar.TabPicked)
     async def tab_picked(self, event: TabBar.TabPicked) -> None:
@@ -1653,18 +1700,18 @@ class ReworkApp(App[None]):
 
     # -- menu actions (from MenuBar.MenuAction) ------------------------------
 
-    @on(MenuBar.MenuAction)
-    async def menu_action(self, event: MenuBar.MenuAction) -> None:
-        action = event.action
+    def run_menu_action(self, action: str) -> Any:
+        """Dispatch a MenuBar choice. Returns the coroutine for async work so
+        the Shell (which owns the widgets) can schedule it as a worker."""
         shell = self._find_shell()
         if action == "quit":
             self.exit()
         elif action == "new_mission" and shell:
-            shell.run_worker(shell.new_mission_flow(), exclusive=True)
+            return shell.new_mission_flow()
         elif action == "new_project" and shell:
-            shell.run_worker(shell.new_project_flow(), exclusive=True)
+            return shell.new_project_flow()
         elif action == "fetch" and shell:
-            await shell.fetch_selected()
+            return shell.fetch_selected()
         elif action.startswith("tab_") and shell:
             shell.switch_tab(action[4:])
         elif action == "keys":
@@ -1689,6 +1736,7 @@ class ReworkApp(App[None]):
             self.action_copy_text()
         elif action == "select_all":
             self.action_select_all_text()
+        return None
 
     # -- slash commands ------------------------------------------------------
 
