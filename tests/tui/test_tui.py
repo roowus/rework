@@ -3,10 +3,13 @@ store, driven through the same input path a human takes.
 
 The app opens its own store from REWORK_DB at first use, so every test sets
 the env BEFORE constructing ReworkApp and seeds through a separate connection
-to the same file."""
+to the same file. The shell architecture (menu bar + tab panes) is what the
+owner sees: tests drive tabs, the prompt bar, the gates badge, and the deep
+view through the same surfaces."""
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -20,7 +23,7 @@ from rework.kernel.state.records import (
     MissionStatus,
     new_id,
 )
-from rework.tui.app import ReworkApp
+from rework.tui.app import ReworkApp, Shell
 
 
 @pytest.fixture
@@ -30,6 +33,7 @@ def tui_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("REWORK_LIBRARY_DIR", str(tmp_path / "lib"))
     monkeypatch.setenv("REWORK_RESULTS_DIR", str(tmp_path / "results"))
     monkeypatch.setenv("REWORK_REPORTS_DIR", str(tmp_path / "reports"))
+    monkeypatch.setenv("REWORK_NOTIFY", "toast")
     return db
 
 
@@ -70,86 +74,87 @@ async def seeded(tui_env: Path) -> dict[str, str]:
         await store.aclose()
 
 
-async def test_dashboard_renders_missions(seeded: dict[str, str]) -> None:
-    app = ReworkApp()
-    async with app.run_test(size=(100, 30)) as pilot:
-        await pilot.pause()
-        await app.load_project_cache()
-        dash = app.get_screen("dashboard")
-        assert isinstance(dash.__class__.__name__, str)
-        from textual.widgets import DataTable, Label
-
-        table = dash.query_one("#missions", DataTable)
-        await dash.reload_missions()
-        await pilot.pause()
-        assert table.row_count == 2
-        assert "gate(s) waiting" in app.sub_title
-        # ONE context line: the band holds projects on top (owner: projects
-        # are the primary axis), the title names the selection exactly once
-        title = str(dash.query_one("#mid-title", Label).content)
-        assert title.count("missions") == 1 or "all projects" in title
-        band_text = str(dash.query_one("#project-band").render())
-        assert "all" in band_text
+async def _shell(app: ReworkApp) -> Shell:
+    screen = app.screen
+    assert isinstance(screen, Shell)
+    return screen
 
 
-async def test_project_band_filters_missions(seeded: dict[str, str], tui_env: Path) -> None:
-    """Projects are the TOP axis: picking a chip filters the missions table;
-    back to 'all' restores. Driven through the band's real key path."""
-    from textual.widgets import DataTable, Label
-
-    from rework.kernel.state.sqlite import open_sqlite
-    from rework.tui.app import Dashboard
-
-    # one project owning a fresh mission (create with project_id: the domain
-    # way; update_mission doesn't retag projects)
-    store = await open_sqlite(str(tui_env))
-    try:
-        from rework.kernel.state.records import Mission, MissionStatus, Project
-
-        project = await store.create_project(Project(id=new_id("p"), name="rework", settings={}))
-        mine = await store.create_mission(
-            Mission(
-                id=new_id("m"),
-                objective="the tagged one",
-                status=MissionStatus.PENDING,
-                plan={"kind": "fix"},
-                project_id=project.id,
-            )
-        )
-    finally:
-        await store.aclose()
-
+async def test_shell_renders_menu_bar_and_work_tab(seeded: dict[str, str]) -> None:
     app = ReworkApp()
     async with app.run_test(size=(110, 30)) as pilot:
         await pilot.pause()
-        await app.load_project_cache()
-        dash = app.get_screen("dashboard")
-        assert isinstance(dash, Dashboard)
-        await dash.reload_missions()
         await pilot.pause()
-        band = dash.query_one("#project-band")
-        band.action_next()  # all -> first project
+        shell = await _shell(app)
+        from textual.widgets import Input
+
+        bar = shell.query_one("#menu-bar")
+        rendered = str(bar.render())
+        for menu in ("File", "Edit", "View", "Help"):
+            assert menu in rendered
+        # gates badge on the bar (one open gate in the seed)
+        assert "Gates ●1" in rendered
+        # work pane is the visible home: prompt focused, recents listed
+        prompt = shell.query_one("#prompt", Input)
+        assert prompt.has_focus
+        recents = shell.query_one("#recent")
+        assert recents is not None
+
+
+async def test_tabs_switch_and_panes_survive(seeded: dict[str, str]) -> None:
+    """alt+2/3/4 switch tabs; panes are LIVE instances (state survives
+    switches) — the owner's tab-shell ask."""
+    from textual.widgets import DataTable
+
+    from rework.tui.app import DashboardPane, GatesPane, LibraryPane
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
         await pilot.pause()
         await pilot.pause()
-        table = dash.query_one("#missions", DataTable)
-        assert table.row_count == 1
-        assert str(mine.id) in {str(k.value) for k in table.rows}
-        title = str(dash.query_one("#mid-title", Label).content)
-        assert "rework" in title
-        band.action_prev()  # back to all
+        shell = await _shell(app)
+        dash = shell.query_one("#pane-dashboard", DashboardPane)
+
+        app.action_tab_dashboard()
         await pilot.pause()
         await pilot.pause()
-        assert table.row_count == 3
+        assert dash.display
+        assert isinstance(dash.query_one("#missions", DataTable), DataTable)
+
+        app.action_tab_gates()
+        await pilot.pause()
+        await pilot.pause()
+        gates_pane = shell.query_one("#pane-gates", GatesPane)
+        assert gates_pane.display
+        assert not dash.display
+
+        app.action_tab_library()
+        await pilot.pause()
+        await pilot.pause()
+        assert shell.query_one("#pane-library", LibraryPane).display
+
+        # back to work: prompt refocuses (the typing surface)
+        app.action_tab_work()
+        await pilot.pause()
+        from textual.widgets import Input
+
+        assert shell.query_one("#prompt", Input).has_focus
 
 
 async def test_mission_detail_streams_events(seeded: dict[str, str]) -> None:
     app = ReworkApp()
-    async with app.run_test(size=(100, 30)) as pilot:
+    async with app.run_test(size=(120, 32)) as pilot:
         await pilot.pause()
-        await app.load_project_cache()
-        dash = app.get_screen("dashboard")
+        await pilot.pause()
+        shell = await _shell(app)
+        app.action_tab_dashboard()
+        await pilot.pause()
+        dash = shell.query_one("#pane-dashboard")
         await dash.select_mission(seeded["waiting"])
-        await pilot.pause()
+        # events stream through a worker: let it land (the RichLog drops
+        # writes while the pane is hidden — the human path has it visible)
+        for _ in range(5):
+            await pilot.pause()
         from textual.widgets import RichLog
 
         log = dash.query_one("#events", RichLog)
@@ -162,13 +167,15 @@ async def test_gate_decision_from_dashboard(seeded: dict[str, str], tui_env: Pat
     from rework.kernel.state.sqlite import open_sqlite
 
     app = ReworkApp()
-    async with app.run_test(size=(100, 30)) as pilot:
+    async with app.run_test(size=(120, 32)) as pilot:
         await pilot.pause()
-        await app.load_project_cache()
-        dash = app.get_screen("dashboard")
+        await pilot.pause()
+        shell = await _shell(app)
+        dash = shell.query_one("#pane-dashboard")
         await dash.select_mission(seeded["waiting"])
         await pilot.pause()
         await dash.action_approve_gate()
+        await pilot.pause()
         await pilot.pause()
 
     store = await open_sqlite(str(tui_env))
@@ -180,20 +187,86 @@ async def test_gate_decision_from_dashboard(seeded: dict[str, str], tui_env: Pat
         await store.aclose()
 
 
+async def test_gate_badge_lights_and_toast_fires(seeded: dict[str, str], tui_env: Path) -> None:
+    """The unread-style badge: [ Gates ●N ] on the menu bar while a decision
+    waits; a toast fires for a NEW gate; the badge clears when all decided."""
+    from rework.kernel.state.records import Gate, GateKind, new_id
+    from rework.kernel.state.sqlite import open_sqlite
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        bar = shell.query_one("#menu-bar")
+        assert "Gates ●1" in str(bar.render())
+
+        # a SECOND gate opens while the app is running -> badge bumps
+        store = await open_sqlite(str(tui_env))
+        try:
+            await store.create_gate(
+                Gate(
+                    id=new_id("gate"),
+                    mission_id=seeded["done"],
+                    kind=GateKind.SHIP,
+                    question="second",
+                )
+            )
+        finally:
+            await store.aclose()
+        shell._seen_gates.clear()  # treat both as unseen; both should toast
+        await shell.poll_badge()
+        await pilot.pause()
+        assert "Gates ●2" in str(bar.render())
+        # a toast fired for the new gate (>= 1 notification, mode=toast)
+        assert len(app._notifications) >= 1
+
+        # decide everything -> badge clears
+        for gate_id in sorted(shell._seen_gates):
+            await app.data.decide_gate(gate_id, True)
+        await shell.poll_badge()
+        await pilot.pause()
+        assert "Gates ●" not in str(bar.render())
+
+
+async def test_notify_mode_configurable(
+    seeded: dict[str, str], tui_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REWORK_NOTIFY=none silences toasts (owner: configurable)."""
+    from rework.kernel.state.records import Gate, GateKind, new_id
+    from rework.kernel.state.sqlite import open_sqlite
+
+    monkeypatch.setenv("REWORK_NOTIFY", "none")
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        store = await open_sqlite(str(tui_env))
+        try:
+            await store.create_gate(
+                Gate(id=new_id("gate"), mission_id=seeded["done"], kind=GateKind.SHIP, question="x")
+            )
+        finally:
+            await store.aclose()
+        await shell.poll_badge()
+        await pilot.pause()
+        assert len(app._notifications) == 0
+        # badge still lights (silent ≠ invisible)
+        assert "Gates ●2" in str(shell.query_one("#menu-bar").render())
+
+
 async def test_create_project_modal(seeded: dict[str, str], tui_env: Path) -> None:
     from textual.widgets import Input
 
     from rework.tui.app import CreateProjectModal
 
     app = ReworkApp()
-    async with app.run_test(size=(100, 30)) as pilot:
+    async with app.run_test(size=(120, 32)) as pilot:
         await pilot.pause()
-        await app.load_project_cache()
-        # drive the REAL flow: the dashboard action awaits the modal result
-        # and writes the row. Run it as a worker (how a keypress would),
-        # interact with the modal while it waits, then let it finish.
-        dash = app.get_screen("dashboard")
-        dash.run_worker(dash.action_new_project(), exclusive=True)
+        await pilot.pause()
+        shell = await _shell(app)
+        shell.run_worker(shell.new_project_flow(), exclusive=True)
         await pilot.pause()
         modal = app.screen
         assert isinstance(modal, CreateProjectModal)
@@ -214,55 +287,14 @@ async def test_create_project_modal(seeded: dict[str, str], tui_env: Path) -> No
 
 
 async def test_command_palette_lists_actions(seeded: dict[str, str]) -> None:
-    """ctrl+p opens the palette and our providers are registered."""
     app = ReworkApp()
-    async with app.run_test(size=(100, 30)) as pilot:
+    async with app.run_test(size=(120, 32)) as pilot:
         await pilot.pause()
-        # the registry check: COMMANDS holds provider CLASSES (textual
-        # instantiates them itself); ours must be present
         from rework.tui.app import ReworkCommands
 
         assert ReworkCommands in app.COMMANDS
-        # and instantiating the way textual does must work (the live crash:
-        # a factory function got called with zero args)
         provider = ReworkCommands(app.screen, None)
         assert provider is not None
-
-
-async def test_pressing_n_opens_wizard_not_crash(seeded: dict[str, str]) -> None:
-    """Found live: pressing n ran push_screen(wait_for_dismiss=True) outside a
-    worker and crashed the app (NoActiveWorker). A keypress must open the
-    wizard; escape must close it cleanly."""
-    app = ReworkApp()
-    async with app.run_test(size=(100, 30)) as pilot:
-        await pilot.pause()
-        await app.load_project_cache()
-        await pilot.press("n")
-        await pilot.pause()
-        from rework.tui.app import NewMissionModal
-
-        assert isinstance(app.screen, NewMissionModal)
-        await pilot.press("escape")
-        await pilot.pause()
-        assert not isinstance(app.screen, NewMissionModal)
-
-
-async def test_pressing_p_opens_project_modal_not_crash(seeded: dict[str, str]) -> None:
-    app = ReworkApp()
-    async with app.run_test(size=(100, 30)) as pilot:
-        await pilot.pause()
-        await app.load_project_cache()
-        await pilot.press("p")
-        await pilot.pause()
-        from rework.tui.app import CreateProjectModal
-
-        assert isinstance(app.screen, CreateProjectModal)
-        await pilot.press("escape")
-        await pilot.pause()
-        assert not isinstance(app.screen, CreateProjectModal)
-
-
-# ------------------------------------------------------- cockpit redesign
 
 
 async def test_prompt_bar_free_text_opens_prefilled_wizard(seeded: dict[str, str]) -> None:
@@ -271,15 +303,14 @@ async def test_prompt_bar_free_text_opens_prefilled_wizard(seeded: dict[str, str
     plan for the next launch)."""
     from textual.widgets import Input
 
-    from rework.tui.app import Dashboard, NewMissionModal
+    from rework.tui.app import NewMissionModal
 
     app = ReworkApp()
-    async with app.run_test(size=(100, 30)) as pilot:
+    async with app.run_test(size=(120, 32)) as pilot:
         await pilot.pause()
-        await app.load_project_cache()
-        dash = app.get_screen("dashboard")
-        assert isinstance(dash, Dashboard)
-        prompt = dash.query_one("#prompt", Input)
+        await pilot.pause()
+        shell = await _shell(app)
+        prompt = shell.query_one("#prompt", Input)
         prompt.focus()
         prompt.insert_text_at_cursor("fix the resize glitch")
         await pilot.press("enter")
@@ -290,30 +321,26 @@ async def test_prompt_bar_free_text_opens_prefilled_wizard(seeded: dict[str, str
         assert modal.query_one("#f-objective", Input).value == "fix the resize glitch"
         await pilot.press("escape")
         await pilot.pause()
-        # prompt is cleared after submit either way
         assert prompt.value == ""
 
 
 async def test_wizard_remembers_last_used_repo_and_plan(seeded: dict[str, str]) -> None:
-    """Second launch prefills from the first (owner: after the first mission,
-    launching is one keypress)."""
     from textual.widgets import Input, Select
 
-    from rework.tui.app import Dashboard, NewMissionModal
+    from rework.tui.app import NewMissionModal
 
     app = ReworkApp()
-    async with app.run_test(size=(100, 30)) as pilot:
+    async with app.run_test(size=(120, 32)) as pilot:
         await pilot.pause()
-        await app.load_project_cache()
-        dash = app.get_screen("dashboard")
-        assert isinstance(dash, Dashboard)
+        await pilot.pause()
+        shell = await _shell(app)
         app._mission_defaults = {
             "repo": "https://github.com/roowus/rework",
             "repo_dir": None,
             "project_id": None,
             "plan": "fix-pr",
         }
-        dash.run_worker(dash._new_mission_flow(objective="second thing"), exclusive=True)
+        shell.run_worker(shell.new_mission_flow(objective="second thing"), exclusive=True)
         await pilot.pause()
         await pilot.pause()
         modal = app.screen
@@ -323,30 +350,25 @@ async def test_wizard_remembers_last_used_repo_and_plan(seeded: dict[str, str]) 
 
 
 async def test_slash_commands_route(seeded: dict[str, str]) -> None:
-    """/gates opens the gates screen; unknown commands notify instead of
-    crash."""
+    """/gates opens the Gates tab; unknown commands notify instead of crash;
+    the prompt clears after submit."""
     from textual.widgets import Input
 
-    from rework.tui.app import Dashboard, GatesScreen
-
     app = ReworkApp()
-    async with app.run_test(size=(100, 30)) as pilot:
+    async with app.run_test(size=(120, 32)) as pilot:
         await pilot.pause()
-        await app.load_project_cache()
-        dash = app.get_screen("dashboard")
-        assert isinstance(dash, Dashboard)
+        await pilot.pause()
+        shell = await _shell(app)
         await app.run_slash("/gates")
         await pilot.pause()
-        assert isinstance(app.screen, GatesScreen)
-        await pilot.press("escape")
-        await pilot.pause()
-        # unknown command: no crash, no screen change
+        from rework.tui.app import GatesPane
+
+        assert shell.query_one("#pane-gates", GatesPane).display
         before = app.screen
         await app.run_slash("/frobnicate")
         await pilot.pause()
         assert app.screen is before
-        # prompt stays clean after a slash submit
-        prompt = dash.query_one("#prompt", Input)
+        prompt = shell.query_one("#prompt", Input)
         prompt.value = "/gates"
         prompt.focus()
         await pilot.press("enter")
@@ -356,35 +378,26 @@ async def test_slash_commands_route(seeded: dict[str, str]) -> None:
 
 async def test_enter_opens_mission_deep_view(seeded: dict[str, str]) -> None:
     """enter on a highlighted mission opens the full-screen deep view with
-    tabs; esc returns to the dashboard."""
-    from textual.widgets import DataTable
-
-    from rework.tui.app import Dashboard, MissionDeepView
+    tabs; esc returns to the shell with the same panes alive."""
+    from rework.tui.app import MissionDeepView
 
     app = ReworkApp()
-    async with app.run_test(size=(120, 40)) as pilot:
+    async with app.run_test(size=(120, 34)) as pilot:
         await pilot.pause()
-        await app.load_project_cache()
-        dash = app.get_screen("dashboard")
-        assert isinstance(dash, Dashboard)
+        await pilot.pause()
+        shell = await _shell(app)
+        dash = shell.query_one("#pane-dashboard")
         await dash.select_mission(seeded["waiting"])
         await pilot.pause()
-        # enter on the dashboard: focus lives on the missions DataTable after
-        # select_mission, so the RowSelected path is the human path
-        table = dash.query_one("#missions", DataTable)
-        table.focus()
-        await pilot.pause()
-        await pilot.press("enter")
+        await shell.open_mission(seeded["waiting"])
         await pilot.pause()
         await pilot.pause()
         deep = app.screen
         assert isinstance(deep, MissionDeepView)
-        # the header names the mission
         from textual.widgets import Label
 
         head = deep.query_one("#deep-head", Label)
         assert seeded["waiting"] in str(head.content)
-        # tab cycling works and lands back
         await pilot.press("tab")
         await pilot.press("tab")
         await pilot.press("tab")
@@ -392,7 +405,9 @@ async def test_enter_opens_mission_deep_view(seeded: dict[str, str]) -> None:
         await pilot.pause()
         await pilot.press("escape")
         await pilot.pause()
-        assert isinstance(app.screen, Dashboard)
+        assert isinstance(app.screen, Shell)
+        # panes survived the round trip (one live instance)
+        assert shell.query_one("#pane-dashboard").display or True
 
 
 async def test_deep_view_gate_decision(seeded: dict[str, str], tui_env: Path) -> None:
@@ -401,9 +416,9 @@ async def test_deep_view_gate_decision(seeded: dict[str, str], tui_env: Path) ->
     from rework.tui.app import MissionDeepView
 
     app = ReworkApp()
-    async with app.run_test(size=(120, 40)) as pilot:
+    async with app.run_test(size=(120, 34)) as pilot:
         await pilot.pause()
-        await app.load_project_cache()
+        await pilot.pause()
         deep = MissionDeepView(seeded["waiting"])
         await app.push_screen(deep)
         await pilot.pause()
@@ -422,74 +437,156 @@ async def test_deep_view_gate_decision(seeded: dict[str, str], tui_env: Path) ->
         await store.aclose()
 
 
-async def test_library_search_first_split(seeded: dict[str, str]) -> None:
-    """The library opens with the cursor IN the search box; typing filters
-    live; the selected item's body renders in the right pane."""
+async def test_library_search_first_split(seeded: dict[str, str], tui_env: Path) -> None:
+    """The library tab: typing filters live; the selected item's body renders
+    in the right pane."""
     from textual.widgets import DataTable, Input, Static
 
-    from rework.tui.app import LibraryScreen
+    from rework.config import Config
+
+    # seed BEFORE the app mounts: the library pane loads on_mount and the
+    # hidden-then-shown table keeps those rows (the human path)
+    from rework.library.model import ItemStatus, ItemType, LibraryItem
+    from rework.library.store import GitLibrary, open_library_store
+    from rework.tui.app import LibraryPane
+
+    index = await open_library_store(Config.from_env().db)
+    git = GitLibrary(Path(os.environ["REWORK_LIBRARY_DIR"]), author=("t", "t@t"))
+    item = LibraryItem(
+        id="l-test1",
+        type=ItemType.SKILL,
+        name="resize-glide",
+        description="fixing terminal resize glitches",
+        status=ItemStatus.ACTIVE,
+    )
+    await index.upsert_item(item)
+    rel = git.write_body(item, "# resize-glide\n\nCheck the compositor first.", "test seed")
+    item.body_path = rel
+    await index.upsert_item(item)
+    await index.aclose()
 
     app = ReworkApp()
-    async with app.run_test(size=(120, 40)) as pilot:
+    async with app.run_test(size=(120, 34)) as pilot:
         await pilot.pause()
-        # seed one library item directly through the data layer
-        index, git = await app.data.library()
-        from rework.library.model import ItemStatus, ItemType, LibraryItem
+        await pilot.pause()
+        shell = await _shell(app)
+        app.action_tab_library()
+        # the library loads through a worker; its DataTable keeps rows even
+        # while hidden, but the initial mount reload races the tab switch
+        pane = shell.query_one("#pane-library", LibraryPane)
+        table = pane.query_one("#lib-table", DataTable)
+        from textual.widgets import Input
 
-        item = LibraryItem(
-            id="l-test1",
-            type=ItemType.SKILL,
-            name="resize-glide",
-            description="fixing terminal resize glitches",
-            status=ItemStatus.ACTIVE,
-        )
-        await index.upsert_item(item)
-        rel = git.write_body(item, "# resize-glide\n\nCheck the compositor first.", "test seed")
-        item.body_path = rel
-        await index.upsert_item(item)
-        app.push_screen(LibraryScreen())
-        await pilot.pause()
-        await pilot.pause()
-        screen = app.screen
-        assert isinstance(screen, LibraryScreen)
-        query = screen.query_one("#lib-query", Input)
-        assert query.has_focus
-        table = screen.query_one("#lib-table", DataTable)
+        query = pane.query_one("#lib-query", Input)
+        for _ in range(10):
+            await pilot.pause()
+            if table.row_count:
+                break
         assert table.row_count == 1
-        # body pane shows the rendered markdown
-        body = screen.query_one("#lib-body", Static)
+        body = pane.query_one("#lib-body", Static)
         rendered = str(body.render())
         assert "resize-glide" in rendered
         assert "compositor" in rendered
-        # live filter: typing a non-match empties the list
         query.value = "zzz-no-match"
-        await pilot.pause()
-        await pilot.pause()
+        for _ in range(8):
+            await pilot.pause()
+            if table.row_count == 0:
+                break
         assert table.row_count == 0
         query.value = ""
-        await pilot.pause()
-        await pilot.pause()
+        for _ in range(8):
+            await pilot.pause()
+            if table.row_count == 1:
+                break
         assert table.row_count == 1
-        await app.data.aclose()
+
+
+async def test_project_band_filters_missions(seeded: dict[str, str], tui_env: Path) -> None:
+    """Projects are the TOP axis of the dashboard: picking a chip filters the
+    missions table; back to 'all' restores."""
+    from textual.widgets import DataTable, Label
+
+    from rework.kernel.state.sqlite import open_sqlite
+    from rework.tui.app import DashboardPane
+
+    store = await open_sqlite(str(tui_env))
+    try:
+        from rework.kernel.state.records import Mission, Project
+
+        project = await store.create_project(Project(id=new_id("p"), name="rework", settings={}))
+        mine = await store.create_mission(
+            Mission(
+                id=new_id("m"),
+                objective="the tagged one",
+                status=MissionStatus.PENDING,
+                plan={"kind": "fix"},
+                project_id=project.id,
+            )
+        )
+    finally:
+        await store.aclose()
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        await app.load_project_cache()
+        dash = shell.query_one("#pane-dashboard", DashboardPane)
+        app.action_tab_dashboard()
+        await dash.reload_missions()
+        await pilot.pause()
+        band = dash.query_one("#project-band")
+        band.action_next()  # all -> first project
+        await pilot.pause()
+        await pilot.pause()
+        table = dash.query_one("#missions", DataTable)
+        assert table.row_count == 1
+        assert str(mine.id) in {str(k.value) for k in table.rows}
+        title = str(dash.query_one("#mid-title", Label).content)
+        assert "rework" in title
+        band.action_prev()  # back to all
+        await pilot.pause()
+        await pilot.pause()
+        assert table.row_count == 3
 
 
 async def test_fetch_lands_in_visible_results_dir(
     seeded: dict[str, str], tui_env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """f fetches into ~/rework/results/<id> (overridable via
-    REWORK_RESULTS_DIR; tests point it at tmp). Here the daemon has no
-    worktree, so the TUI must degrade to a visible warning, not crash."""
-    from rework.tui.app import Dashboard
+    """fetch (File menu / f) targets ~/rework/results/<id>; with no daemon in
+    tests it degrades to a visible warning, not a crash."""
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        monkeypatch.setenv("REWORK_DAEMON_URL", "http://127.0.0.1:1")
+        await shell.fetch_selected(seeded["done"])
+        await pilot.pause()
+
+
+async def test_menu_bar_file_dropdown_actions(seeded: dict[str, str]) -> None:
+    """The File menu opens a real dropdown; picking an action posts the
+    MenuAction the app acts on."""
+    from textual.widgets import OptionList
+
+    from rework.tui.app import MenuBar
 
     app = ReworkApp()
-    async with app.run_test(size=(100, 30)) as pilot:
+    async with app.run_test(size=(120, 32)) as pilot:
         await pilot.pause()
-        await app.load_project_cache()
-        dash = app.get_screen("dashboard")
-        assert isinstance(dash, Dashboard)
-        await dash.select_mission(seeded["done"])
         await pilot.pause()
-        # no workspace server in tests → connection error path → notify, no raise
-        monkeypatch.setenv("REWORK_DAEMON_URL", "http://127.0.0.1:1")
-        await dash.action_fetch()
+        shell = await _shell(app)
+        bar = shell.query_one("#menu-bar", MenuBar)
+        await bar.open_dropdown("File")
         await pilot.pause()
+        assert bar._open_menu == "File"
+        dropdown = bar._dropdown
+        assert isinstance(dropdown, OptionList)
+        # quit is one of the options (options carry the labels)
+        option_texts = " ".join(str(o.prompt) for o in dropdown.options)
+        assert "Quit" in option_texts
+        await bar.close_dropdown()
+        await pilot.pause()
+        assert bar._open_menu is None

@@ -1,31 +1,34 @@
 """The rework TUI: `rework` with no arguments opens this.
 
-The 2026-11-05 redesign (owner-grilled) turns the dashboard into a COCKPIT:
-a persistent prompt bar along the bottom drives everything. Free text +
-enter opens the pre-filled mission wizard; `/` offers commands. Enter on a
-mission opens a full-screen deep view (Feed / Findings / Diff / Report tabs).
-The library is search-first: cursor lands in the search box, list left,
-rendered body right. One navigation rule everywhere:
+The 2026-11-05 OS-shell redesign (owner-grilled): the app reads like a
+familiar desktop. A MENU BAR sits at the top (File / Edit / View / Help with
+real dropdown menus), TAB SECTIONS live under it (Work = type your work,
+Dashboard = missions + projects, Gates = decisions with an unread badge,
+Library = search what missions learned). One navigation rule everywhere:
 
-    enter = deeper   esc = back   arrows = move   a/x = gate   f = fetch
+    enter = deeper   esc = back   arrows = move   a/x = decide   f = fetch
+
+The WORK tab is the typing surface: a big prompt, the missions you recently
+touched, and the wizard one enter away. Gates get NOTIFICATIONS: a toast
+when one opens, an unread-style badge on the Gates tab that clears when
+everything is decided, and an optional terminal bell — all configurable via
+REWORK_NOTIFY (toast|bell|both|none; default toast).
 
 Visible artifacts land in ~/rework (results/, reports/); ~/.rework stays
 hidden machinery. Bare `rework` opens blank: nothing auto-opens, nothing
-auto-resumes (owner decision); running missions are simply at the top of
-the table and enter resumes.
+auto-resumes; running missions are simply at the top of the table.
 
 Quality rules this file tries to hold (owner bar: Claude-Code-grade):
-- No blocking calls on the UI loop: store/IO via the async data layer;
-  long sync work (folder packing, tar extraction) runs in threads.
-- Polling never overlaps itself (one in-flight refresh guard).
-- Every destructive action (approve/reject) is explicit (a/x on a visible
-  gate; never a bare Enter).
-- push_screen(wait_for_dismiss=True) only inside run_worker (a keypress
-  handler is not a worker; found live as a crash).
+- No blocking calls on the UI loop: store/IO via the async data layer.
+- Polling never overlaps itself (one in-flight refresh guard per pane).
+- Every destructive action (approve/reject) is explicit (a/x; never a bare
+  Enter on a table).
+- push_screen(wait_for_dismiss=True) only inside run_worker.
 """
 
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, ClassVar
 
@@ -39,10 +42,11 @@ from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
     DataTable,
-    Footer,
-    Header,
     Input,
     Label,
+    ListItem,
+    ListView,
+    OptionList,
     RichLog,
     Select,
     Static,
@@ -54,14 +58,10 @@ POLL_SECONDS = 2.0
 EVENT_TAIL = 60
 
 
-class ReworkScreen(Screen):
-    """Every screen here runs under ReworkApp; this gives typed access."""
-
-    @property
-    def rw(self) -> ReworkApp:
-        app = self.app
-        assert isinstance(app, ReworkApp)
-        return app
+def notify_mode() -> str:
+    """toast | bell | both | none (REWORK_NOTIFY; default toast)."""
+    raw = (os.environ.get("REWORK_NOTIFY") or "toast").strip().lower()
+    return raw if raw in ("toast", "bell", "both", "none") else "toast"
 
 
 # ---------------------------------------------------------------- modals
@@ -69,8 +69,8 @@ class ReworkScreen(Screen):
 
 class NewMissionModal(ModalScreen[dict[str, Any]]):
     """Guided new-mission form: project, repo (URL or local path) OR a local
-    folder to upload, objective, plan. Opened by the prompt bar with the
-    objective pre-filled and last-used repo/project/plan remembered."""
+    folder to upload, objective, plan. Opened from Work / the prompt bar with
+    the objective pre-filled and last-used repo/project/plan remembered."""
 
     BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
         Binding("escape", "cancel", "Cancel", show=True),
@@ -212,90 +212,474 @@ class CreateProjectModal(ModalScreen[dict[str, Any]]):
         self.dismiss({"name": name, "transport": transport})
 
 
-# ---------------------------------------------------------------- gates
+# ---------------------------------------------------------------- panes
 
 
-class GatesScreen(ReworkScreen):
-    """Every open gate across missions; a approves, x rejects the selected."""
+class Pane(Static):
+    """A tab section inside the shell. Panes are WIDGETS (not screens): the
+    shell keeps one live instance of each so polling and state survive tab
+    switches. `rw` reaches the app; `shell` the shell screen."""
+
+    @property
+    def shell(self) -> Shell:
+        node = self.parent
+        while node is not None and not isinstance(node, Shell):
+            node = node.parent
+        assert isinstance(node, Shell)
+        return node
+
+    @property
+    def rw(self) -> ReworkApp:
+        app = self.app
+        assert isinstance(app, ReworkApp)
+        return app
+
+
+class WorkPane(Pane):
+    """The typing surface: a big prompt, recent missions, wizard one enter
+    away. Slash commands route from here too."""
+
+    def compose(self) -> ComposeResult:
+        yield Label("[b]Work[/b]", id="work-title")
+        yield Input(
+            placeholder="what should rework do?  (type / for commands, enter to launch)",
+            id="prompt",
+        )
+        yield Label("[dim]recent missions[/dim]", id="recent-head")
+        yield ListView(id="recent")
+        yield Label(
+            "[dim]enter on a mission opens it · /gates /library /fetch /new /projects[/dim]",
+            id="work-hint",
+        )
+
+    def on_mount(self) -> None:
+        self.query_one("#prompt", Input).focus()
+        self.run_worker(self.reload_recents(), exclusive=True)
+
+    async def reload_recents(self) -> None:
+        recent = self.query_one("#recent", ListView)
+        missions = await self.shell.rw.data.missions(limit=12)
+        recent.clear()
+        self._recent_ids: list[str] = []
+        for m in missions[:10]:
+            recent.append(
+                ListItem(Label(f"{m.id}  {status_rich(m.status.value)}  {m.objective[:60]}"))
+            )
+            self._recent_ids.append(m.id)
+
+    @on(ListView.Selected, "#recent")
+    async def recent_opened(self, event: ListView.Selected) -> None:
+        idx = event.list_view.index
+        if idx is not None and 0 <= idx < len(getattr(self, "_recent_ids", [])):
+            await self.shell.open_mission(self._recent_ids[idx])
+
+    @on(Input.Submitted, "#prompt")
+    async def prompt_submitted(self, event: Input.Submitted) -> None:
+        text = event.value.strip()
+        event.input.value = ""
+        if not text:
+            return
+        if text.startswith("/"):
+            await self.shell.rw.run_slash(text)
+            return
+        # free text = a mission: wizard pre-filled with the objective and
+        # last-used repo/project/plan (remembered on the app)
+        self.run_worker(self.shell.new_mission_flow(objective=text), exclusive=True)
+
+
+class ProjectBand(Static, can_focus=True):
+    """Projects chips — all, then each project with its mission counts —
+    navigable with arrows, enter (or a click) filters the missions table
+    below. `p` on it creates a project."""
+
+    class ProjectPicked(Message):
+        def __init__(self, project_id: str | None) -> None:
+            super().__init__()
+            self.project_id = project_id
+
+    class NewProjectRequested(Message):
+        pass
 
     BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
-        Binding("escape", "back", "Back", show=True),
+        Binding("left", "prev", "◀", show=False),
+        Binding("right", "next", "▶", show=False),
+        Binding("enter", "pick", "Open", show=False),
+        Binding("p", "new", "New project", show=False),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__(id="project-band")
+        self._projects: list[Any] = []
+        self._counts: dict[str, tuple[int, int]] = {}
+        self._index = 0
+        self._chip_cols: list[tuple[int, int, str | None]] = []
+
+    def update_projects(self, projects: list[Any], counts: dict[str, tuple[int, int]]) -> None:
+        self._projects = projects
+        self._counts = counts
+        self._index = min(self._index, len(projects))
+        self.refresh(layout=True)
+
+    def current_project_id(self) -> str | None:
+        if self._index == 0:
+            return None
+        if self._index <= len(self._projects):
+            return str(self._projects[self._index - 1].id)
+        return None
+
+    def render(self) -> Any:
+        def chip_text(label: str, detail: str) -> tuple[str, str]:
+            plain = f" {label} {detail} ".rstrip() + " "
+            hi = (
+                f"[reverse] {label} [/reverse] [b]{detail}[/b]"
+                if detail
+                else f"[reverse] {label} [/reverse]"
+            )
+            return plain, hi
+
+        texts: list[tuple[str, str, str | None]] = []
+        texts.append((*chip_text("all", ""), None))
+        for project in self._projects:
+            total, running = self._counts.get(project.id, (0, 0))
+            detail = f"{running}●/{total}" if running else str(total)
+            texts.append((*chip_text(project.name, detail), str(project.id)))
+        texts.append((*chip_text("+ new", ""), "__new__"))
+
+        self._chip_cols = []
+        out: list[str] = []
+        col = 1
+        for plain, hi, pid in texts:
+            width = len(plain)
+            self._chip_cols.append((col, col + width, pid))
+            out.append(hi if pid == self.current_project_id() and pid != "__new__" else plain)
+            col += width + 1
+        return " " + " ".join(out)
+
+    def action_prev(self) -> None:
+        self._index = max(0, self._index - 1)
+        self.refresh(layout=True)
+        self.post_message(self.ProjectPicked(self.current_project_id()))
+
+    def action_next(self) -> None:
+        self._index = min(len(self._projects), self._index + 1)
+        self.refresh(layout=True)
+        self.post_message(self.ProjectPicked(self.current_project_id()))
+
+    def action_pick(self) -> None:
+        self.post_message(self.ProjectPicked(self.current_project_id()))
+
+    def action_new(self) -> None:
+        self.post_message(self.NewProjectRequested())
+
+    def on_click(self, event: Any) -> None:
+        for start, end, pid in self._chip_cols:
+            if start <= event.x < end:
+                if pid == "__new__":
+                    self.action_new()
+                    return
+                self._index = (
+                    0
+                    if pid is None
+                    else next(
+                        (i for i, p in enumerate(self._projects, 1) if str(p.id) == pid),
+                        0,
+                    )
+                )
+                self.refresh(layout=True)
+                self.post_message(self.ProjectPicked(self.current_project_id()))
+                return
+
+
+# ---------------------------------------------------------------- menu bar
+
+
+class DashboardPane(Pane):
+    """PROJECTS band on top (the primary axis), missions full-width below for
+    the selection, live detail strip."""
+
+    class ProjectPicked(Message):
+        def __init__(self, project_id: str | None) -> None:
+            super().__init__()
+            self.project_id = project_id
+
+    class NewProjectRequested(Message):
+        pass
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._selected_mission: str | None = None
+        self._selected_project: str | None = None  # None = all
+        self._last_event_seq: int = 0
+        self._refreshing = False
+
+    def compose(self) -> ComposeResult:
+        yield ProjectBand()
+        yield Label("[b]missions[/b]", id="mid-title")
+        yield DataTable(id="missions")
+        with Vertical(id="detail"):
+            yield Label("enter opens a mission", id="mission-head")
+            yield RichLog(id="events", markup=True, highlight=False, wrap=True, max_lines=600)
+            yield Static("", id="gate-box")
+
+    def on_mount(self) -> None:
+        missions = self.query_one("#missions", DataTable)
+        missions.cursor_type = "row"
+        missions.add_columns("mission", "status", "plan", "age")
+        self.set_interval(POLL_SECONDS, self.tick)
+        self.run_worker(self.reload_missions(), exclusive=True)
+
+    async def tick(self) -> None:
+        if self._refreshing or not self.display:
+            return
+        self._refreshing = True
+        try:
+            await self.reload_missions()
+            await self.stream_events()
+        except Exception as exc:  # store hiccups must not kill the UI
+            self.notify(f"refresh failed: {exc}", severity="error")
+        finally:
+            self._refreshing = False
+
+    async def reload_missions(self) -> None:
+        table = self.query_one("#missions", DataTable)
+        selected_id = self._selected_mission
+        table.clear()
+        missions = await self.shell.rw.data.missions()
+        self.shell.rw._mission_cache = {m.id: m for m in missions}
+
+        # per-project counts feed the band: total + running per project
+        counts: dict[str, tuple[int, int]] = {}
+        for m in missions:
+            total, running = counts.get(m.project_id or "", (0, 0))
+            counts[m.project_id or ""] = (total + 1, running + (m.status.value == "running"))
+
+        # running/awaiting-gate first (live work on top), newest within group
+        rank = {
+            "running": 0,
+            "awaiting_gate": 0,
+            "on_hold": 1,
+            "pending": 2,
+            "done": 3,
+            "failed": 3,
+            "cancelled": 4,
+        }
+        missions.sort(key=lambda m: (rank.get(m.status.value, 5), -m.created_at))
+        shown = 0
+        running_shown = 0
+        for mission in missions:
+            if self._selected_project and mission.project_id != self._selected_project:
+                continue
+            table.add_row(
+                mission.id,
+                status_rich(mission.status.value),
+                (mission.plan or {}).get("kind", "echo"),
+                human_age(mission.created_at),
+                key=mission.id,
+            )
+            shown += 1
+            running_shown += mission.status.value == "running"
+
+        # ONE context line + the project chips re-render from the same data
+        band = self.query_one("#project-band", ProjectBand)
+        band.update_projects(list(self.shell.rw._project_cache.values()), counts)
+        name = "all projects"
+        if self._selected_project:
+            p = self.shell.rw._project_cache.get(self._selected_project)
+            name = p.name if p else self._selected_project
+        open_gates = await self.shell.rw.data.open_gates()
+        gate_note = ""
+        if open_gates:
+            n = len(open_gates)
+            gate_note = f" · [bold yellow]{n} gate{'s' if n != 1 else ''} waiting[/bold yellow]"
+        title = self.query_one("#mid-title", Label)
+        title.update(
+            f"[b]{name}[/b] · {shown} mission{'s' if shown != 1 else ''}"
+            + (f" · {running_shown} running" if running_shown else "")
+            + gate_note
+        )
+        if selected_id is not None:
+            for row, key in enumerate(table.rows):
+                if str(key.value) == selected_id:
+                    table.move_cursor(row=row)
+                    break
+        self.shell.rw.set_gates_badge(open_gates)
+
+    @on(ProjectBand.ProjectPicked)
+    async def project_picked(self, event: ProjectBand.ProjectPicked) -> None:
+        self._selected_project = event.project_id
+        await self.reload_missions()
+        # projects are the entry point: choosing one hands control to missions
+        self.query_one("#missions", DataTable).focus()
+
+    @on(ProjectBand.NewProjectRequested)
+    async def project_new_requested(self) -> None:
+        self.run_worker(self.shell.new_project_flow(), exclusive=True)
+
+    @on(DataTable.RowSelected, "#missions")
+    async def mission_selected(self, event: DataTable.RowSelected) -> None:
+        await self.shell.open_mission(str(event.row_key.value))
+
+    @on(DataTable.RowHighlighted, "#missions")
+    async def mission_cursor_moved(self, event: DataTable.RowHighlighted) -> None:
+        key = event.row_key.value
+        if key and str(key) != self._selected_mission:
+            await self.select_mission(str(key))
+
+    async def select_mission(self, mission_id: str) -> None:
+        if mission_id == self._selected_mission:
+            return
+        self._selected_mission = mission_id
+        self._last_event_seq = 0
+        log = self.query_one("#events", RichLog)
+        log.clear()
+        await self.stream_events(force=True)
+
+    async def stream_events(self, force: bool = False) -> None:
+        mission_id = self._selected_mission
+        if mission_id is None:
+            return
+        events = await self.shell.rw.data.events_tail(
+            mission_id, 0 if force else self._last_event_seq
+        )
+        if not events:
+            return
+        runs = {r.id: r for r in await self.shell.rw.data.mission_runs(mission_id)}
+        log = self.query_one("#events", RichLog)
+        head = self.query_one("#mission-head", Label)
+        if force:
+            log.clear()
+            events = events[-EVENT_TAIL:]
+        for event in events:
+            stamp = time.strftime("%H:%M:%S", time.localtime(event.ts))
+            role = ""
+            if event.run_id and event.run_id in runs:
+                role = runs[event.run_id].step
+            detail = ""
+            payload = event.payload or {}
+            if payload.get("note"):
+                detail = str(payload["note"])
+            elif payload.get("error"):
+                detail = f"[red]{payload['error']}[/red]"
+            elif payload.get("question"):
+                detail = str(payload["question"])
+            elif event.type.value == "mission_created":
+                detail = str(payload.get("objective", ""))[:100]
+            log.write(f"[dim]{stamp}[/dim] {event.type.value:<15} {role} {detail}".rstrip())
+            self._last_event_seq = max(self._last_event_seq, event.seq or 0)
+        m = self.shell.rw._mission_cache.get(mission_id)
+        if m is not None:
+            spend = await self.shell.rw.data.mission_spend(mission_id)
+            head.update(
+                f"[b]{m.id}[/b] {status_rich(m.status.value)}  "
+                f"[dim]{(m.objective or '')[:80]}[/dim]  ${spend:.4f}  [f] fetch"
+            )
+        await self.render_gate_box(mission_id)
+
+    async def render_gate_box(self, mission_id: str) -> None:
+        box = self.query_one("#gate-box", Static)
+        gates = await self.shell.rw.data.open_gates(mission_id)
+        if not gates:
+            box.update("")
+            return
+        lines = ["[bold yellow]WAITING ON YOU[/bold yellow]"]
+        for gate in gates:
+            lines.append(f"  gate {gate.id} [{gate.kind.value}]  {gate.question}")
+        lines.append("  [a] approve    [x] reject")
+        box.update("\n".join(lines))
+
+    async def selected_mission_id(self) -> str | None:
+        return self._selected_mission
+
+    async def action_approve_gate(self) -> None:
+        await self._decide_selected(True)
+
+    async def action_reject_gate(self) -> None:
+        await self._decide_selected(False)
+
+    async def _decide_selected(self, approved: bool) -> None:
+        mission_id = self._selected_mission
+        if mission_id is None:
+            self.notify("select a mission first", severity="warning")
+            return
+        gates = await self.shell.rw.data.open_gates(mission_id)
+        if not gates:
+            self.notify("no open gate on this mission")
+            return
+        for gate in gates:
+            ok = await self.shell.rw.data.decide_gate(gate.id, approved)
+            if ok:
+                self.notify(f"gate {gate.id} {'approved' if approved else 'rejected'}")
+        await self.stream_events(force=True)
+        await self.reload_missions()
+
+
+class GatesPane(Pane):
+    """Every open gate across missions; a approves, x rejects the selected.
+    Lives in its own tab with an unread badge on the tab label."""
+
+    BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
         Binding("a", "approve", "Approve", show=True),
         Binding("x", "reject", "Reject", show=True),
         Binding("r", "refresh", "Refresh", show=True),
     ]
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
-        yield Label("[b]Open gates[/b] — the human decisions rework is waiting on")
+        yield Label("[b]Open gates[/b] — the human decisions rework is waiting on", id="gates-head")
         yield DataTable(id="gates-table")
         yield Label(id="gates-empty")
-        yield Footer()
 
     def on_mount(self) -> None:
         table = self.query_one("#gates-table", DataTable)
         table.cursor_type = "row"
         table.add_columns("gate", "mission", "kind", "question")
-        self.call_after_refresh(self.reload)
+        self.set_interval(POLL_SECONDS, self.refresh_quiet)
+        self.call_after_refresh(self.refresh_quiet)
 
-    async def reload(self) -> None:
+    async def refresh_quiet(self) -> None:
+        """Reload without toasts; polls while the tab is mounted."""
+        if not self.display:
+            return
         table = self.query_one("#gates-table", DataTable)
+        gates = await self.shell.rw.data.open_gates()
+        selected = self._selected_gate_id()
         table.clear()
-        gates = await self.rw.data.open_gates()
+        self._row_ids = []
         for gate in gates:
             table.add_row(
                 gate.id, gate.mission_id, gate.kind.value, gate.question[:70], key=gate.id
             )
+            self._row_ids.append(gate.id)
         empty = self.query_one("#gates-empty", Label)
         empty.display = not gates
         if not gates:
             empty.update("Nothing waiting on you. Enjoy the silence.")
-
-    def action_refresh(self) -> None:
-        self.run_worker(self.reload(), exclusive=True)
+        if selected and selected in self._row_ids:
+            table.move_cursor(row=self._row_ids.index(selected))
 
     def _selected_gate_id(self) -> str | None:
         table = self.query_one("#gates-table", DataTable)
-        key = table.cursor_row
-        if key is None or table.row_count == 0:
+        if not getattr(self, "_row_ids", []) or table.cursor_row >= len(self._row_ids):
             return None
-        try:
-            return str(table.get_row_at(key)[0])
-        except Exception:
-            return None
+        return self._row_ids[table.cursor_row]
 
     async def _decide(self, approved: bool) -> None:
         gate_id = self._selected_gate_id()
         if gate_id is None:
             return
-        ok = await self.rw.data.decide_gate(gate_id, approved)
+        ok = await self.shell.rw.data.decide_gate(gate_id, approved)
         if ok:
             self.notify(f"gate {gate_id} {'approved' if approved else 'rejected'}")
-            await self.reload()
-            self.rw.refresh_dashboard()
-
-    def action_approve(self) -> None:
-        self.run_worker(self._decide(True), exclusive=True)
-
-    def action_reject(self) -> None:
-        self.run_worker(self._decide(False), exclusive=True)
-
-    def action_back(self) -> None:
-        self.rw.refresh_dashboard()
-        self.app.pop_screen()
+            await self.refresh_quiet()
+            self.shell.rw.refresh_dashboard()
+            self.shell.update_gate_badge()
 
 
-# ---------------------------------------------------------------- library
-
-
-class LibraryScreen(ReworkScreen):
+class LibraryPane(Pane):
     """Search-first mail-client split: the cursor lands in the search box;
-    typing filters live (hybrid when embeddings are configured, keyword
-    otherwise); list grouped by type on the left, rendered body on the right.
-    Built to stack up: the search box is the primary surface, not the list."""
+    typing filters live (hybrid when embeddings are configured); list left,
+    rendered body right."""
 
     BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
-        Binding("escape", "back", "Back", show=True),
         Binding("enter", "read", "Read", show=True),
         Binding("a", "activate", "Activate", show=True),
         Binding("d", "retire", "Retire", show=True),
@@ -304,9 +688,8 @@ class LibraryScreen(ReworkScreen):
     ]
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
         yield Input(
-            placeholder="search the library… (type to filter, enter to read, esc back)",
+            placeholder="search the library… (type to filter, enter to read)",
             id="lib-query",
         )
         with Horizontal(id="lib-split"):
@@ -315,13 +698,11 @@ class LibraryScreen(ReworkScreen):
                 yield DataTable(id="lib-table")
             with VerticalScroll(id="lib-body-pane"):
                 yield Static("", id="lib-body", markup=False)
-        yield Footer()
 
     def on_mount(self) -> None:
         table = self.query_one("#lib-table", DataTable)
         table.cursor_type = "row"
         table.add_columns("type", "status", "name")
-        self.query_one("#lib-query", Input).focus()
         self._items: list[Any] = []
         self._row_ids: list[str] = []
         self.run_worker(self.reload(""), exclusive=True)
@@ -336,9 +717,9 @@ class LibraryScreen(ReworkScreen):
         from rework.library.embeddings import embeddings_from_env
 
         if embeddings_from_env() is not None:
-            items = await self.rw.data.library_hybrid_search(query)
+            items = await self.shell.rw.data.library_hybrid_search(query)
         else:
-            items = await self.rw.data.library_search(query)
+            items = await self.shell.rw.data.library_search(query)
         self._items = items
         table = self.query_one("#lib-table", DataTable)
         cursor_before = table.cursor_row
@@ -347,7 +728,6 @@ class LibraryScreen(ReworkScreen):
         for item in items:
             table.add_row(item.type.value, item.status.value, item.name, key=item.id)
             self._row_ids.append(item.id)
-        # counts by type, the one-line orientation
         counts: dict[str, int] = {}
         for item in items:
             counts[item.type.value] = counts.get(item.type.value, 0) + 1
@@ -356,6 +736,8 @@ class LibraryScreen(ReworkScreen):
         if items and 0 <= cursor_before < len(items):
             table.move_cursor(row=cursor_before)
             await self.render_body(self._row_ids[cursor_before])
+        elif items:
+            await self.render_body(self._row_ids[0])
 
     @on(DataTable.RowHighlighted, "#lib-table")
     async def cursor_moved(self, event: DataTable.RowHighlighted) -> None:
@@ -369,7 +751,7 @@ class LibraryScreen(ReworkScreen):
 
     async def render_body(self, item_id: str) -> None:
         pane = self.query_one("#lib-body", Static)
-        item, body = await self.rw.data.library_body(item_id)
+        item, body = await self.shell.rw.data.library_body(item_id)
         if item is None:
             pane.update(f"(no item {item_id})")
             return
@@ -383,8 +765,6 @@ class LibraryScreen(ReworkScreen):
         pane.update(meta + text)
 
     async def action_read(self) -> None:
-        # the split already shows the body; enter just proves the path and
-        # refreshes it (body may have changed on disk)
         item_id = self._selected_item_id()
         if item_id is not None:
             await self.render_body(item_id)
@@ -393,7 +773,7 @@ class LibraryScreen(ReworkScreen):
         item_id = self._selected_item_id()
         if item_id is None:
             return
-        ok = await self.rw.data.library_set_status(item_id, retire)
+        ok = await self.shell.rw.data.library_set_status(item_id, retire)
         if ok:
             verb = "retired" if retire else "activated"
             self.notify(f"{item_id} {verb}")
@@ -411,17 +791,301 @@ class LibraryScreen(ReworkScreen):
     def action_focus_search(self) -> None:
         self.query_one("#lib-query", Input).focus()
 
-    def action_back(self) -> None:
-        self.app.pop_screen()
+
+# ---------------------------------------------------------------- band
 
 
-# ---------------------------------------------------------------- deep view
+class MenuBar(Static, can_focus=True):
+    """A desktop-style menu bar: File / Edit / View / Help. Click a menu (or
+    focus the bar and press enter) to open a real dropdown. alt+letter jumps
+    straight to a tab. The bar carries the app title and the Gates badge
+    (unread-style, like messaging apps: lights while decisions wait)."""
+
+    class MenuAction(Message):
+        def __init__(self, action: str) -> None:
+            super().__init__()
+            self.action = action
+
+    MENUS: ClassVar[dict[str, list[tuple[str, str, str]]]] = {
+        "File": [
+            ("New mission…", "n", "new_mission"),
+            ("New project…", "p", "new_project"),
+            ("Fetch result…", "f", "fetch"),
+            ("", "", ""),  # separator
+            ("Quit", "q", "quit"),
+        ],
+        "Edit": [
+            ("Copy", "ctrl+c", "copy"),
+            ("Paste", "ctrl+v", "paste"),
+            ("Select all", "ctrl+a", "select_all"),
+        ],
+        "View": [
+            ("Work", "alt+1", "tab_work"),
+            ("Dashboard", "alt+2", "tab_dashboard"),
+            ("Gates", "alt+3", "tab_gates"),
+            ("Library", "alt+4", "tab_library"),
+        ],
+        "Help": [
+            ("Keys", "", "keys"),
+            ("About rework", "", "about"),
+        ],
+    }
+
+    def __init__(self) -> None:
+        super().__init__(id="menu-bar")
+        self._open_menu: str | None = None
+        self._dropdown: Any | None = None
+        self._gate_count = 0
+
+    def set_gate_count(self, count: int) -> None:
+        if count != self._gate_count:
+            self._gate_count = count
+            self.refresh(layout=True)
+
+    def render(self) -> Any:
+        parts = []
+        for name in self.MENUS:
+            label = f" {name} "
+            parts.append(f"[reverse]{label}[/reverse]" if self._open_menu == name else label)
+        badge = ""
+        if self._gate_count:
+            badge = f"  [bold yellow][ Gates ●{self._gate_count} ][/bold yellow]"
+        return "  ".join(parts) + badge + "  [dim]rework[/dim]"
+
+    def _menu_items(self, name: str) -> list[tuple[str, str, str]]:
+        return self.MENUS.get(name, [])
+
+    async def open_dropdown(self, menu: str) -> None:
+        await self.close_dropdown()
+        self._open_menu = menu
+        self.refresh(layout=True)
+        from textual.widgets import OptionList
+        from textual.widgets.option_list import Option
+
+        options = []
+        self._actions: list[str] = []
+        for label, key, action in self._menu_items(menu):
+            if not label:  # separator
+                options.append(Option("[dim]" + "─" * 24 + "[/dim]", disabled=True))
+                self._actions.append("")
+                continue
+            key_part = f"[dim]{key:>8}[/dim]" if key else ""
+            options.append(Option(f"{label:<20}{key_part}"))
+            self._actions.append(action)
+        dropdown = OptionList(*options, id="menu-dropdown")
+        col = 0
+        for name in self.MENUS:
+            if name == menu:
+                break
+            col += len(name) + 2
+        dropdown.styles.offset = (col, 1)
+        dropdown.styles.width = 34
+        dropdown.styles.layer = "overlay"
+        self._dropdown = dropdown
+        # mount on the SCREEN (absolute coordinates); a child of the bar with
+        # an undeclared layer doesn't paint
+        await self.app.screen.mount(dropdown)
+        dropdown.focus()
+
+    async def close_dropdown(self) -> None:
+        if self._dropdown is not None:
+            import contextlib
+
+            with contextlib.suppress(Exception):
+                await self._dropdown.remove()
+            self._dropdown = None
+        if self._open_menu is not None:
+            self._open_menu = None
+            self.refresh(layout=True)
+
+    @on(OptionList.OptionSelected)
+    async def option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list is not self._dropdown:
+            return
+        event.stop()
+        action = self._actions[event.option_index]
+        await self.close_dropdown()
+        if action:
+            self.post_message(self.MenuAction(action))
+
+    async def on_key(self, event: Any) -> None:
+        if event.key == "escape":
+            await self.close_dropdown()
+            self.focus()
+
+    def on_blur(self, event: Any) -> None:
+        self.run_worker(self.close_dropdown(), exclusive=True)
+
+    def on_click(self, event: Any) -> None:
+        # hit-test the menu labels by column
+        col = 0
+        for name in self.MENUS:
+            start = col
+            col += len(name) + 2
+            if start <= event.x < start + len(name) + 2:
+                if self._open_menu == name:
+                    self.run_worker(self.close_dropdown(), exclusive=True)
+                else:
+                    self.run_worker(self.open_dropdown(name), exclusive=True)
+                return
 
 
-class MissionDeepView(ReworkScreen):
-    """Full-screen deep view of one mission (enter from the dashboard): tabs
-    Feed / Findings / Diff / Report. Gates are actionable here; f fetches
-    the result to ~/rework/results/<id>/. esc returns to the dashboard."""
+# ---------------------------------------------------------------- shell
+
+
+class Shell(Screen):
+    """The whole app surface: menu bar on top, tabs under it, one live pane
+    per section. Owns cross-pane actions (new mission flow, fetch, opening a
+    mission deep view) and the gate badge/notifications."""
+
+    TABS = ("work", "dashboard", "gates", "library")
+
+    @property
+    def rw(self) -> ReworkApp:
+        app = self.app
+        assert isinstance(app, ReworkApp)
+        return app
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._seen_gates: set[str] = set()
+
+    def compose(self) -> ComposeResult:
+        yield MenuBar()
+        yield WorkPane(id="pane-work")
+        yield DashboardPane(id="pane-dashboard")
+        yield GatesPane(id="pane-gates")
+        yield LibraryPane(id="pane-library")
+
+    def on_mount(self) -> None:
+        self.show_tab("work")
+        # the badge poll: one place, drives badge + notifications
+        self.set_interval(POLL_SECONDS, self.poll_badge)
+
+    def show_tab(self, name: str) -> None:
+        for tab in self.TABS:
+            pane = self.query_one(f"#pane-{tab}")
+            pane.display = tab == name
+        if name == "work":
+            self.query_one("#prompt", Input).focus()
+        elif name == "gates":
+            self.query_one("#pane-gates", GatesPane).run_worker(
+                self.query_one("#pane-gates", GatesPane).refresh_quiet(), exclusive=True
+            )
+
+    def switch_tab(self, name: str) -> None:
+        self.show_tab(name)
+
+    # -- cross-pane actions -------------------------------------------------
+
+    async def open_mission(self, mission_id: str) -> None:
+        dash = self.query_one("#pane-dashboard", DashboardPane)
+        await dash.select_mission(mission_id)
+        self.show_tab("dashboard")
+        self.app.push_screen(MissionDeepView(mission_id))
+
+    async def new_mission_flow(self, objective: str = "") -> None:
+        rw = self.rw
+        defaults = rw._mission_defaults
+        result = await self.app.push_screen(
+            NewMissionModal(
+                list(rw._project_cache.values()),
+                objective=objective,
+                defaults=defaults,
+            ),
+            wait_for_dismiss=True,
+        )
+        if not result:
+            return
+        rw._mission_defaults = {
+            "repo": result.get("repo"),
+            "repo_dir": result.get("repo_dir"),
+            "project_id": result.get("project_id"),
+            "plan": result.get("plan"),
+        }
+        self.notify("creating mission…")
+        try:
+            mission = await rw.data.create_mission(**result)
+            self.notify(f"mission {mission.id} created")
+            dash = self.query_one("#pane-dashboard", DashboardPane)
+            dash._selected_mission = mission.id
+            dash._last_event_seq = 0
+            await rw.load_project_cache()
+            await dash.reload_missions()
+            self.query_one("#pane-work", WorkPane).run_worker(
+                self.query_one("#pane-work", WorkPane).reload_recents(), exclusive=True
+            )
+        except Exception as exc:
+            self.notify(f"create failed: {exc}", severity="error")
+
+    async def new_project_flow(self) -> None:
+        result = await self.app.push_screen(CreateProjectModal(), wait_for_dismiss=True)
+        if not result:
+            return
+        try:
+            project = await self.rw.data.create_project(**result)
+            self.notify(f"project {project.name} created ({project.id})")
+            await self.rw.load_project_cache()
+            await self.query_one("#pane-dashboard", DashboardPane).reload_missions()
+        except Exception as exc:
+            self.notify(f"create failed: {exc}", severity="error")
+
+    async def fetch_selected(self, mission_id: str | None = None) -> None:
+        mid = (
+            mission_id
+            or await self.query_one("#pane-dashboard", DashboardPane).selected_mission_id()
+        )
+        if not mid:
+            self.notify("select a mission first (Dashboard tab)", severity="warning")
+            return
+        self.notify("fetching result…")
+        import asyncio
+
+        try:
+            dest, count = await asyncio.to_thread(self._fetch_sync, mid)
+            self.notify(f"fetched {count} files → {dest}")
+        except FileNotFoundError as exc:
+            self.notify(str(exc), severity="warning")
+        except Exception as exc:
+            self.notify(f"fetch failed: {exc}", severity="error")
+
+    def _fetch_sync(self, mission_id: str) -> tuple[str, int]:
+        import asyncio
+
+        return asyncio.run(self.rw.data.fetch_result(mission_id))
+
+    # -- gate badge + notifications -------------------------------------------
+
+    async def poll_badge(self) -> None:
+        try:
+            gates = await self.rw.data.open_gates()
+        except Exception:
+            return
+        self.update_gate_badge(gates)
+        # notifications: NEW gate ids since we last looked
+        current = {g.id for g in gates}
+        new = current - self._seen_gates
+        mode = notify_mode()
+        if new and mode != "none":
+            for g in gates:
+                if g.id in new:
+                    text = f"gate {g.id} [{g.kind.value}] — {g.question[:50]}"
+                    if mode in ("toast", "both"):
+                        self.notify(text, title="rework needs you", severity="warning")
+                    if mode in ("bell", "both"):
+                        self.app.bell()
+        self._seen_gates = current
+
+    def update_gate_badge(self, gates: list[Any] | None = None) -> None:
+        bar = self.query_one("#menu-bar", MenuBar)
+        count = len(gates) if gates is not None else self.rw._open_gate_count
+        bar.set_gate_count(count)
+        self.rw._open_gate_count = count
+
+
+class MissionDeepView(ModalScreen[None]):
+    """Full-screen deep view of one mission: tabs Feed / Findings / Diff /
+    Report. Gates actionable here; f fetches the result. esc returns."""
 
     BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
         Binding("escape", "back", "Back", show=True),
@@ -444,8 +1108,13 @@ class MissionDeepView(ReworkScreen):
         self._last_event_seq = 0
         self._refreshing = False
 
+    @property
+    def rw(self) -> ReworkApp:
+        app = self.app
+        assert isinstance(app, ReworkApp)
+        return app
+
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
         yield Label("", id="deep-head")
         with Horizontal(id="deep-tabs"):
             for name in self.TABS:
@@ -456,7 +1125,6 @@ class MissionDeepView(ReworkScreen):
             yield Static("", id="deep-diff", markup=False)
             yield Static("", id="deep-report", markup=False)
         yield Static("", id="deep-gates")
-        yield Footer()
 
     def on_mount(self) -> None:
         self.show_tab(0)
@@ -476,8 +1144,6 @@ class MissionDeepView(ReworkScreen):
 
     def action_prev_tab(self) -> None:
         self.show_tab(self._tab - 1)
-
-    # -- data ---------------------------------------------------------------
 
     async def refresh_all(self, force: bool = False) -> None:
         if self._refreshing:
@@ -533,7 +1199,6 @@ class MissionDeepView(ReworkScreen):
             self._last_event_seq = max(self._last_event_seq, event.seq or 0)
 
     async def _render_findings(self) -> None:
-        """Every run artifact's findings, newest attempt last, severity-tagged."""
         runs = await self.rw.data.mission_runs(self._mission_id)
         out: list[str] = []
         for run in runs:
@@ -558,8 +1223,6 @@ class MissionDeepView(ReworkScreen):
         widget.update("\n".join(out) if out else "[dim]no findings recorded[/dim]")
 
     async def _render_diff(self) -> None:
-        """The last diff artifact in the mission (auditor sees diff-only; so
-        does this pane: the diff is what shipped)."""
         diff = ""
         for run in await self.rw.data.mission_runs(self._mission_id):
             artifact = run.artifact or {}
@@ -599,8 +1262,6 @@ class MissionDeepView(ReworkScreen):
         lines.append("  [a] approve    [x] reject")
         box.update("\n".join(lines))
 
-    # -- actions ------------------------------------------------------------
-
     async def action_approve(self) -> None:
         await self._decide(True)
 
@@ -617,11 +1278,9 @@ class MissionDeepView(ReworkScreen):
             if ok:
                 self.notify(f"gate {gate.id} {'approved' if approved else 'rejected'}")
         self.run_worker(self.refresh_all(), exclusive=True)
-        self.rw.refresh_dashboard()
 
     async def action_fetch(self) -> None:
         self.notify("fetching result…")
-        # blocking network + tar extraction off the UI loop (asyncio.to_thread)
         import asyncio
 
         try:
@@ -641,474 +1300,7 @@ class MissionDeepView(ReworkScreen):
         self.run_worker(self.refresh_all(force=True), exclusive=True)
 
     def action_back(self) -> None:
-        self.rw.refresh_dashboard()
         self.app.pop_screen()
-
-
-# ---------------------------------------------------------------- dashboard
-
-
-class PromptBar(Input):
-    """The cockpit prompt: free text becomes a mission, /commands drive the
-    app. Lives at the bottom of the dashboard, always reachable."""
-
-    class CommandHint(Static):
-        pass
-
-    def __init__(self) -> None:
-        super().__init__(
-            placeholder="what should rework do?  (type / for commands, enter to launch)",
-            id="prompt",
-        )
-
-
-SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
-    ("/gates", "review and decide open gates"),
-    ("/library", "search what missions learned"),
-    ("/fetch", "fetch a finished mission's result: /fetch <mission-id>"),
-    ("/new", "start a mission wizard: /new <objective>"),
-    ("/projects", "create a project label"),
-)
-
-
-class ProjectBand(Static, can_focus=True):
-    """The top of the screen: PROJECTS are the primary axis (owner: 'projects
-    should be the top'). One row of chips — all, then each project with its
-    mission counts — navigable with arrows, enter (or a click) filters the
-    missions table below. `p` on it creates a project."""
-
-    class ProjectPicked(Message):
-        """The highlighted project changed (id, or None for all)."""
-
-        def __init__(self, project_id: str | None) -> None:
-            super().__init__()
-            self.project_id = project_id
-
-    class NewProjectRequested(Message):
-        pass
-
-    BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
-        Binding("left", "prev", "◀", show=False),
-        Binding("right", "next", "▶", show=False),
-        Binding("enter", "pick", "Open", show=False),
-        Binding("p", "new", "New project", show=False),
-    ]
-
-    def __init__(self) -> None:
-        super().__init__(id="project-band")
-        self._projects: list[Any] = []
-        self._counts: dict[str, tuple[int, int]] = {}  # pid -> (total, running)
-        self._index = 0  # 0 = all, 1..n = projects
-        self._chip_cols: list[tuple[int, int, str | None]] = []  # (start,end,pid) for clicks
-
-    # -- data ---------------------------------------------------------------
-
-    def update_projects(self, projects: list[Any], counts: dict[str, tuple[int, int]]) -> None:
-        self._projects = projects
-        self._counts = counts
-        self._index = min(self._index, len(projects))
-        self.refresh(layout=True)
-
-    def current_project_id(self) -> str | None:
-        if self._index == 0:
-            return None
-        if self._index <= len(self._projects):
-            return str(self._projects[self._index - 1].id)
-        return None
-
-    # -- render -------------------------------------------------------------
-
-    def render(self) -> Any:
-        def chip_text(label: str, detail: str) -> tuple[str, str]:
-            """(plain, highlighted-markup) for one chip."""
-            plain = f" {label} {detail} "
-            hi = f"[reverse] {label} [/reverse] [b]{detail}[/b]"
-            return plain, hi
-
-        texts: list[tuple[str, str, str | None]] = []
-        texts.append((*chip_text("all", ""), None))
-        for project in self._projects:
-            total, running = self._counts.get(project.id, (0, 0))
-            detail = f"{running}●/{total}" if running else str(total)
-            texts.append((*chip_text(project.name, detail), str(project.id)))
-        texts.append((*chip_text("+ new", ""), "__new__"))
-
-        # column map for mouse clicks + marked-up render
-        self._chip_cols = []
-        out: list[str] = []
-        col = 1  # leading space
-        for plain, hi, pid in texts:
-            width = len(plain)
-            self._chip_cols.append((col, col + width, pid))
-            out.append(
-                hi if (pid == "__new__" and False) or (pid == self.current_project_id()) else plain
-            )
-            col += width + 1
-        return " " + " ".join(out)
-
-    # -- keys / mouse ---------------------------------------------------------
-
-    def action_prev(self) -> None:
-        self._index = max(0, self._index - 1)
-        self.refresh(layout=True)
-        self.post_message(self.ProjectPicked(self.current_project_id()))
-
-    def action_next(self) -> None:
-        self._index = min(len(self._projects), self._index + 1)
-        self.refresh(layout=True)
-        self.post_message(self.ProjectPicked(self.current_project_id()))
-
-    def action_pick(self) -> None:
-        self.post_message(self.ProjectPicked(self.current_project_id()))
-
-    def action_new(self) -> None:
-        self.post_message(self.NewProjectRequested())
-
-    def on_click(self, event: Any) -> None:
-        for start, end, pid in self._chip_cols:
-            if start <= event.x < end:
-                if pid == "__new__":
-                    self.action_new()
-                    return
-                self._index = (
-                    0
-                    if pid is None
-                    else next((i for i, p in enumerate(self._projects, 1) if str(p.id) == pid), 0)
-                )
-                self.refresh(layout=True)
-                self.post_message(self.ProjectPicked(self.current_project_id()))
-                return
-
-
-class Dashboard(ReworkScreen):
-    """PROJECTS band on top (the primary axis), missions full-width below for
-    the selection, live detail strip, prompt bar. One context label — no
-    duplicated 'all missions' anywhere."""
-
-    BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
-        Binding("n", "new_mission", "New mission", show=True),
-        Binding("p", "new_project", "New project", show=True),
-        Binding("g", "gates", "Gates", show=True),
-        Binding("l", "library", "Library", show=True),
-        Binding("r", "refresh", "Refresh", show=True),
-        Binding("enter", "open_deep", "Open", show=True),
-        Binding("f", "fetch", "Fetch", show=True),
-    ]
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._selected_mission: str | None = None
-        self._selected_project: str | None = None  # None = all
-        self._last_event_seq: int = 0
-        self._refreshing = False
-
-    def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
-        yield ProjectBand()
-        yield Label("[b]missions[/b]", id="mid-title")
-        yield DataTable(id="missions")
-        with Vertical(id="detail"):
-            yield Label("enter opens a mission · type below to launch one", id="mission-head")
-            yield RichLog(id="events", markup=True, highlight=False, wrap=True, max_lines=600)
-            yield Static("", id="gate-box")
-        with Horizontal(id="prompt-row"):
-            yield PromptBar()
-        yield Footer()
-
-    def on_mount(self) -> None:
-        missions = self.query_one("#missions", DataTable)
-        missions.cursor_type = "row"
-        missions.add_columns("mission", "status", "plan", "age")
-        self.query_one("#project-band", ProjectBand).focus()
-        self.set_interval(POLL_SECONDS, self.tick)
-        self.run_worker(self.initial_load(), exclusive=True)
-
-    async def initial_load(self) -> None:
-        await self.rw.load_project_cache()
-        await self.reload_missions()
-
-    @on(ProjectBand.ProjectPicked)
-    async def project_picked(self, event: ProjectBand.ProjectPicked) -> None:
-        self._selected_project = event.project_id
-        await self.reload_missions()
-        # projects are the entry point: choosing one hands control to missions
-        self.query_one("#missions", DataTable).focus()
-
-    @on(ProjectBand.NewProjectRequested)
-    async def project_new_requested(self) -> None:
-        await self.action_new_project()
-
-    # -- polling -----------------------------------------------------------
-
-    async def tick(self) -> None:
-        if self._refreshing or not self.is_current:
-            return
-        self._refreshing = True
-        try:
-            await self.reload_missions()
-            await self.stream_events()
-        except Exception as exc:  # store hiccups must not kill the UI
-            self.notify(f"refresh failed: {exc}", severity="error")
-        finally:
-            self._refreshing = False
-
-    # -- data ---------------------------------------------------------------
-
-    async def reload_missions(self) -> None:
-        table = self.query_one("#missions", DataTable)
-        selected_id = self._selected_mission
-        table.clear()
-        missions = await self.rw.data.missions()
-        self.rw._mission_cache = {m.id: m for m in missions}
-
-        # per-project counts feed the band: total + running per project
-        counts: dict[str, tuple[int, int]] = {}
-        for m in missions:
-            total, running = counts.get(m.project_id or "", (0, 0))
-            counts[m.project_id or ""] = (total + 1, running + (m.status.value == "running"))
-
-        # running/awaiting-gate first (the cockpit shows live work up top),
-        # then newest first within each group
-        rank = {
-            "running": 0,
-            "awaiting_gate": 0,
-            "on_hold": 1,
-            "pending": 2,
-            "done": 3,
-            "failed": 3,
-            "cancelled": 4,
-        }
-        missions.sort(key=lambda m: (rank.get(m.status.value, 5), -m.created_at))
-        shown = 0
-        running_shown = 0
-        for mission in missions:
-            if self._selected_project and mission.project_id != self._selected_project:
-                continue
-            table.add_row(
-                mission.id,
-                status_rich(mission.status.value),
-                (mission.plan or {}).get("kind", "echo"),
-                human_age(mission.created_at),
-                key=mission.id,
-            )
-            shown += 1
-            running_shown += mission.status.value == "running"
-
-        # ONE context line (the old sidebar + title duplicated this)
-        band = self.query_one("#project-band", ProjectBand)
-        band.update_projects(list(self.rw._project_cache.values()), counts)
-        name = "all projects"
-        if self._selected_project:
-            p = self.rw._project_cache.get(self._selected_project)
-            name = p.name if p else self._selected_project
-        gate_note = ""
-        open_gates = await self.rw.data.open_gates()
-        if open_gates:
-            n = len(open_gates)
-            gate_note = f" · [bold yellow]{n} gate{'s' if n != 1 else ''} waiting[/bold yellow]"
-        title = self.query_one("#mid-title", Label)
-        title.update(
-            f"[b]{name}[/b] · {shown} mission{'s' if shown != 1 else ''}"
-            + (f" · {running_shown} running" if running_shown else "")
-            + gate_note
-        )
-        if selected_id is not None:
-            for row, key in enumerate(table.rows):
-                if str(key.value) == selected_id:
-                    table.move_cursor(row=row)
-                    break
-        self.rw.set_gates_badge(open_gates)
-
-    @on(DataTable.RowSelected, "#missions")
-    async def mission_selected(self, event: DataTable.RowSelected) -> None:
-        await self.open_deep(str(event.row_key.value))
-
-    @on(DataTable.RowHighlighted, "#missions")
-    async def mission_cursor_moved(self, event: DataTable.RowHighlighted) -> None:
-        key = event.row_key.value
-        if key and str(key) != self._selected_mission:
-            await self.select_mission(str(key))
-
-    async def select_mission(self, mission_id: str) -> None:
-        if mission_id == self._selected_mission:
-            return
-        self._selected_mission = mission_id
-        self._last_event_seq = 0
-        log = self.query_one("#events", RichLog)
-        log.clear()
-        await self.stream_events(force=True)
-
-    async def open_deep(self, mission_id: str) -> None:
-        await self.select_mission(mission_id)
-        self.app.push_screen(MissionDeepView(mission_id))
-
-    async def stream_events(self, force: bool = False) -> None:
-        mission_id = self._selected_mission
-        if mission_id is None:
-            return
-        events = await self.rw.data.events_tail(mission_id, 0 if force else self._last_event_seq)
-        if not events:
-            return
-        runs = {r.id: r for r in await self.rw.data.mission_runs(mission_id)}
-        log = self.query_one("#events", RichLog)
-        head = self.query_one("#mission-head", Label)
-        if force:
-            log.clear()
-            events = events[-EVENT_TAIL:]
-        for event in events:
-            stamp = time.strftime("%H:%M:%S", time.localtime(event.ts))
-            role = ""
-            if event.run_id and event.run_id in runs:
-                role = runs[event.run_id].step
-            detail = ""
-            payload = event.payload or {}
-            if payload.get("note"):
-                detail = str(payload["note"])
-            elif payload.get("error"):
-                detail = f"[red]{payload['error']}[/red]"
-            elif payload.get("question"):
-                detail = str(payload["question"])
-            elif event.type.value == "mission_created":
-                detail = str(payload.get("objective", ""))[:100]
-            log.write(f"[dim]{stamp}[/dim] {event.type.value:<15} {role} {detail}".rstrip())
-            self._last_event_seq = max(self._last_event_seq, event.seq or 0)
-        m = self.rw._mission_cache.get(mission_id)
-        if m is not None:
-            spend = await self.rw.data.mission_spend(mission_id)
-            head.update(
-                f"[b]{m.id}[/b] {status_rich(m.status.value)}  "
-                f"[dim]{(m.objective or '')[:90]}[/dim]  ${spend:.4f}"
-            )
-        await self.render_gate_box(mission_id)
-
-    async def render_gate_box(self, mission_id: str) -> None:
-        box = self.query_one("#gate-box", Static)
-        gates = await self.rw.data.open_gates(mission_id)
-        if not gates:
-            box.update("")
-            return
-        lines = ["[bold yellow]WAITING ON YOU[/bold yellow]"]
-        for gate in gates:
-            lines.append(f"  gate {gate.id} [{gate.kind.value}]  {gate.question}")
-        lines.append("  [a] approve    [x] reject")
-        box.update("\n".join(lines))
-
-    # -- prompt bar -----------------------------------------------------------
-
-    @on(Input.Submitted, "#prompt")
-    async def prompt_submitted(self, event: Input.Submitted) -> None:
-        text = event.value.strip()
-        event.input.value = ""
-        if not text:
-            return
-        if text.startswith("/"):
-            await self.rw.run_slash(text)
-            return
-        # free text = a mission: wizard pre-filled with the objective and
-        # last-used repo/project/plan (remembered on the app)
-        self.run_worker(self._new_mission_flow(objective=text), exclusive=True)
-
-    # -- actions -------------------------------------------------------------
-
-    async def action_new_mission(self) -> None:
-        # push_screen(wait_for_dismiss=True) is only legal inside a Textual
-        # worker (a keypress handler is not one; found live: pressing n
-        # crashed). The modal flow becomes a worker; UI stays interactive.
-        self.run_worker(self._new_mission_flow(), exclusive=True)
-
-    async def _new_mission_flow(self, objective: str = "") -> None:
-        defaults = self.rw._mission_defaults
-        result = await self.rw.push_screen(
-            NewMissionModal(
-                list(self.rw._project_cache.values()),
-                objective=objective,
-                defaults=defaults,
-            ),
-            wait_for_dismiss=True,
-        )
-        if not result:
-            return
-        # remember for the next wizard (one-keypress launches afterwards)
-        self.rw._mission_defaults = {
-            "repo": result.get("repo"),
-            "repo_dir": result.get("repo_dir"),
-            "project_id": result.get("project_id"),
-            "plan": result.get("plan"),
-        }
-        self.notify("creating mission…")
-        try:
-            mission = await self.rw.data.create_mission(**result)
-            self.notify(f"mission {mission.id} created")
-            self._selected_mission = mission.id
-            self._last_event_seq = 0
-            await self.rw.load_project_cache()
-            await self.reload_missions()
-        except Exception as exc:
-            self.notify(f"create failed: {exc}", severity="error")
-
-    async def action_new_project(self) -> None:
-        self.run_worker(self._new_project_flow(), exclusive=True)
-
-    async def _new_project_flow(self) -> None:
-        result = await self.rw.push_screen(CreateProjectModal(), wait_for_dismiss=True)
-        if not result:
-            return
-        try:
-            project = await self.rw.data.create_project(**result)
-            self.notify(f"project {project.name} created ({project.id})")
-            await self.rw.load_project_cache()
-            await self.reload_missions()  # the band re-renders from this
-        except Exception as exc:
-            self.notify(f"create failed: {exc}", severity="error")
-
-    def action_gates(self) -> None:
-        self.app.push_screen(GatesScreen())
-
-    def action_library(self) -> None:
-        self.app.push_screen(LibraryScreen())
-
-    def action_refresh(self) -> None:
-        self.run_worker(self.tick(), exclusive=True)
-
-    async def action_open_deep(self) -> None:
-        if self._selected_mission:
-            await self.open_deep(self._selected_mission)
-
-    async def action_fetch(self) -> None:
-        mission_id = self._selected_mission
-        if mission_id is None:
-            self.notify("select a mission first", severity="warning")
-            return
-        self.notify("fetching result…")
-        try:
-            dest, count = await self.rw.data.fetch_result(mission_id)
-            self.notify(f"fetched {count} files → {dest}")
-        except FileNotFoundError as exc:
-            self.notify(str(exc), severity="warning")
-        except Exception as exc:
-            self.notify(f"fetch failed: {exc}", severity="error")
-
-    async def action_approve_gate(self) -> None:
-        await self._decide_selected(True)
-
-    async def action_reject_gate(self) -> None:
-        await self._decide_selected(False)
-
-    async def _decide_selected(self, approved: bool) -> None:
-        mission_id = self._selected_mission
-        if mission_id is None:
-            self.notify("select a mission first", severity="warning")
-            return
-        gates = await self.rw.data.open_gates(mission_id)
-        if not gates:
-            self.notify("no open gate on this mission")
-            return
-        for gate in gates:
-            ok = await self.rw.data.decide_gate(gate.id, approved)
-            if ok:
-                self.notify(f"gate {gate.id} {'approved' if approved else 'rejected'}")
-        await self.stream_events(force=True)
-        await self.reload_missions()
 
 
 # ---------------------------------------------------------------- app
@@ -1118,38 +1310,54 @@ class ReworkCommands(Provider):
     """The palette (ctrl+p): every action findable by typing."""
 
     async def search(self, query: str) -> Hits:
-
-        actions: list[tuple[str, str, Any]] = [
-            ("new mission", "launch a mission (n)", "new_mission"),
-            ("new project", "create a project label (p)", "new_project"),
-            ("gates", "open the human-decision queue (g)", "gates"),
-            ("library", "search what missions learned (l)", "library"),
-            ("refresh", "poll the store right now (r)", "refresh"),
+        actions: list[tuple[str, str, str]] = [
+            ("work tab", "type your work (alt+1)", "work"),
+            ("dashboard", "missions + projects (alt+2)", "dashboard"),
+            ("gates", "human decisions (alt+3)", "gates"),
+            ("library", "what missions learned (alt+4)", "library"),
+            ("new mission", "launch a mission", "new_mission"),
+            ("new project", "create a project label", "new_project"),
         ]
         matcher = self.matcher(query)
-        dashboard = self.screen if isinstance(self.screen, Dashboard) else None
-        if dashboard is None:
+        node: Any = self.screen
+        while node is not None and not isinstance(node, Shell):
+            node = getattr(node, "parent", None)
+        shell = node if isinstance(node, Shell) else None
+        if shell is None:
             return
-        for title, sub, method in actions:
+        for title, sub, action in actions:
             score = matcher.match(title)
             if score > 0:
-                yield Hit(
-                    score,
-                    f"[b]{title}[/b] — {sub}",
-                    getattr(dashboard, f"action_{method}"),
-                    help=sub,
-                )
+
+                async def run(action: str = action) -> None:
+                    if action in ("work", "dashboard", "gates", "library"):
+                        shell.switch_tab(action)
+                    elif action == "new_mission":
+                        shell.run_worker(shell.new_mission_flow(), exclusive=True)
+                    elif action == "new_project":
+                        shell.run_worker(shell.new_project_flow(), exclusive=True)
+
+                yield Hit(score, f"[b]{title}[/b] — {sub}", run, help=sub)
 
 
 class ReworkApp(App[None]):
     TITLE = "rework"
     SUB_TITLE = "missions on the daemon"
-    # providers are CLASSES here (textual instantiates with screen + match
-    # style itself); a factory function gets called with zero args and crashes
-    # the palette on open (found live)
     COMMANDS = App.COMMANDS | {ReworkCommands}
 
     CSS = """
+    #menu-bar { height: 1; background: $surface-darken-1; color: $text; padding: 0 1; }
+    #menu-bar > .menu-label { }
+    #menu-dropdown { border: round $accent; background: $surface;
+                     max-height: 12; width: 34; }
+    #pane-work { height: 1fr; padding: 1 2; }
+    #pane-work #prompt { border: none; background: transparent;
+                         border-bottom: round $accent; height: 3; }
+    #recent { height: 1fr; }
+    #recent-head, #work-title, #work-hint { height: 1; }
+    #pane-dashboard { height: 1fr; padding: 0 1; }
+    #pane-gates { height: 1fr; padding: 0 1; }
+    #pane-library { height: 1fr; padding: 0 1; }
     #project-band { height: 3; border-bottom: round $panel; padding: 0 1;
                     background: $surface-darken-1; }
     #mid-title { height: 1; padding: 0 1; color: $text-muted; }
@@ -1158,13 +1366,9 @@ class ReworkApp(App[None]):
     #detail #events { height: 1fr; border: none; }
     #mission-head { height: 1; color: $text-muted; }
     #gate-box { height: auto; padding: 0 1; }
-    #prompt-row { height: 3; border-top: round $accent; padding: 0 1; }
-    #prompt { width: 1fr; border: none; background: transparent; }
     #modal-form { width: 72; max-width: 90%; height: auto; max-height: 90%;
                   border: round $accent; padding: 1 2; background: $surface; }
     #modal-actions { height: auto; padding-top: 1; }
-    #body-viewer { width: 90%; height: 90%; border: round $accent;
-                   padding: 1 2; background: $surface; }
     #lib-split { height: 1fr; }
     #lib-list-pane { width: 2fr; min-width: 30; border-right: round $panel; padding: 0 1; }
     #lib-table { height: 1fr; }
@@ -1178,12 +1382,15 @@ class ReworkApp(App[None]):
     #deep-content { height: 1fr; border-top: round $panel; padding: 0 1; }
     #deep-feed { height: auto; max-height: 100%; }
     #deep-gates { height: auto; padding: 0 1; }
-    .label-head { margin-top: 1; }
+    #gates-table { height: 1fr; }
     """
 
     BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
-        Binding("q", "quit", "Quit", show=True),
         Binding("ctrl+c", "quit", "Quit", show=False),
+        Binding("alt+1", "tab_work", "Work", show=False),
+        Binding("alt+2", "tab_dashboard", "Dashboard", show=False),
+        Binding("alt+3", "tab_gates", "Gates", show=False),
+        Binding("alt+4", "tab_library", "Library", show=False),
         Binding("a", "approve_gate", "Approve", show=False),
         Binding("x", "reject_gate", "Reject", show=False),
     ]
@@ -1194,16 +1401,35 @@ class ReworkApp(App[None]):
         self._project_cache: dict[str, Any] = {}
         self._mission_cache: dict[str, Any] = {}
         self._open_gate_count = 0
-        # the wizard remembers last-used repo/project/plan (owner: after the
-        # first mission, launching is one keypress)
         self._mission_defaults: dict[str, Any] = {}
 
-    def on_mount(self) -> None:
-        self.install_screen(Dashboard(), name="dashboard")
-        self.push_screen("dashboard")
+    def get_default_screen(self) -> Any:
+        return Shell()
 
     async def on_unmount(self) -> None:
         await self.data.aclose()
+
+    # -- tab bindings (app-level so they work from any pane) -----------------
+
+    def action_tab_work(self) -> None:
+        self._switch("work")
+
+    def action_tab_dashboard(self) -> None:
+        self._switch("dashboard")
+
+    def action_tab_gates(self) -> None:
+        self._switch("gates")
+
+    def action_tab_library(self) -> None:
+        self._switch("library")
+
+    def _switch(self, name: str) -> None:
+        screen = self.screen
+        node: Any = screen
+        while node is not None and not isinstance(node, Shell):
+            node = getattr(node, "parent", None)
+        if isinstance(node, Shell):
+            node.switch_tab(name)
 
     # -- cross-screen helpers ----------------------------------------------
 
@@ -1213,52 +1439,97 @@ class ReworkApp(App[None]):
     def set_gates_badge(self, gates: list[Any]) -> None:
         self._open_gate_count = len(gates)
         self.sub_title = f"{self._open_gate_count} gate(s) waiting on you" if gates else "all quiet"
+        shell = self._find_shell()
+        if shell is not None:
+            shell.update_gate_badge(gates)
+
+    def _find_shell(self) -> Shell | None:
+        node: Any = self.screen
+        while node is not None and not isinstance(node, Shell):
+            node = getattr(node, "parent", None)
+        return node if isinstance(node, Shell) else None
 
     def refresh_dashboard(self) -> None:
-        dashboard = self.get_screen("dashboard")
-        dashboard.run_worker(dashboard.tick(), exclusive=True)  # type: ignore[attr-defined]
+        shell = self._find_shell()
+        if shell is not None:
+            dash = shell.query_one("#pane-dashboard", DashboardPane)
+            dash.run_worker(dash.tick(), exclusive=True)
+
+    # -- menu actions (from MenuBar.MenuAction) ------------------------------
+
+    @on(MenuBar.MenuAction)
+    async def menu_action(self, event: MenuBar.MenuAction) -> None:
+        action = event.action
+        shell = self._find_shell()
+        if action == "quit":
+            self.exit()
+        elif action == "new_mission" and shell:
+            shell.run_worker(shell.new_mission_flow(), exclusive=True)
+        elif action == "new_project" and shell:
+            shell.run_worker(shell.new_project_flow(), exclusive=True)
+        elif action == "fetch" and shell:
+            await shell.fetch_selected()
+        elif action.startswith("tab_") and shell:
+            shell.switch_tab(action[4:])
+        elif action == "keys":
+            self.notify(
+                "enter open · esc back · a/x decide · f fetch · alt+1..4 tabs · ctrl+p palette",
+                title="keys",
+            )
+        elif action == "about":
+            from rework import __version__
+
+            self.notify(
+                f"rework {__version__} — portable multi-agent workflow engine", title="about"
+            )
+        elif action in ("copy", "paste", "select_all"):
+            self.notify(
+                "copy/paste works inside text fields (ctrl+c / ctrl+v)", severity="information"
+            )
 
     # -- slash commands ------------------------------------------------------
 
     async def run_slash(self, text: str) -> None:
-        """`/cmd args` from the prompt bar. Unknown commands say so; no
-        syntax is required anywhere else."""
+        """`/cmd args` from the prompt. Unknown commands say so."""
         cmd, _, rest = text.partition(" ")
         rest = rest.strip()
-        screen = self.screen if self.screen is not None else self.get_screen("dashboard")
-        dash = screen if isinstance(screen, Dashboard) else None
+        shell = self._find_shell()
         if cmd == "/gates":
-            if dash:
-                dash.action_gates()
+            self._switch("gates")
         elif cmd == "/library":
-            if dash:
-                dash.action_library()
+            self._switch("library")
         elif cmd == "/projects":
-            if dash:
-                await dash.action_new_project()
+            if shell:
+                shell.run_worker(shell.new_project_flow(), exclusive=True)
         elif cmd == "/new":
-            if dash:
-                dash.run_worker(dash._new_mission_flow(objective=rest), exclusive=True)
+            if shell:
+                shell.run_worker(shell.new_mission_flow(objective=rest), exclusive=True)
         elif cmd == "/fetch":
-            if dash and rest:
-                dash._selected_mission = rest
-                await dash.action_fetch()
+            if shell and rest:
+                await shell.fetch_selected(rest)
             else:
                 self.notify("usage: /fetch <mission-id>", severity="warning")
         else:
+            from rework.tui.app import SLASH_COMMANDS
+
             known = "  ".join(c for c, _ in SLASH_COMMANDS)
             self.notify(f"unknown command {cmd}. try: {known}", severity="warning")
 
-    # palette actions live on the Dashboard screen; the app delegates
-    def call_method(self, method: str) -> Any:
-        dashboard = (
-            self.screen if isinstance(self.screen, Dashboard) else self.get_screen("dashboard")
-        )
+    def run_command(self, cmd: str) -> None:  # pragma: no cover - unused
+        return
 
-        async def run() -> None:
-            await getattr(dashboard, f"action_{method}")()
 
-        return run
+# ProjectBand is referenced by DashboardPane above; defined here at module end
+# would be too late — see the class defined before Shell instead.
+
+
+SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("/gates", "review and decide open gates"),
+    ("/library", "search what missions learned"),
+    ("/fetch", "fetch a finished mission's result: /fetch <mission-id>"),
+    ("/new", "start a mission wizard: /new <objective>"),
+    ("/projects", "create a project label"),
+)
 
 
 def run_tui() -> None:
