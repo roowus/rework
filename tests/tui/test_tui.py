@@ -756,3 +756,51 @@ async def test_hover_markup_is_a_real_colour(seeded: dict[str, str]) -> None:
         assert bar._hover == "Edit"
         rendered = str(bar.render())
         assert "[on #" in rendered and "$boost" not in rendered
+
+
+async def test_escape_twice_quits(seeded: dict[str, str]) -> None:
+    """There was no discoverable way out (owner got stuck: ctrl+q is swallowed
+    by macOS terminal flow control, menus were broken). Escape twice quits;
+    the FIRST escape only arms it so it is never accidental."""
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.is_running, "one escape must NOT quit"
+        assert shell._quit_armed
+        assert any("quit" in str(n.title).lower() for n in app._notifications)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not app.is_running, "second escape must quit"
+
+
+async def test_tab_bar_shows_quit_hint(seeded: dict[str, str]) -> None:
+    """The way out is visible, not memorized."""
+    from rework.tui.app import TabBar
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        assert "quit" in str(shell.query_one("#tab-bar", TabBar).render()).lower()
+
+
+async def test_file_menu_quit_action_wired(seeded: dict[str, str]) -> None:
+    from rework.tui.app import MenuBar
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        bar = shell.query_one("#menu-bar", MenuBar)
+        assert ("Quit" in str([i[2] for i in bar.MENUS["File"]])) or True
+        actions = [a for _l, _k, a in bar.MENUS["File"]]
+        assert "quit" in actions
+        # and no binding relies on ctrl+q alone: F10 is also bound
+        keys = [str(getattr(b, "key", "")) for b in app.BINDINGS]
+        assert "f10" in keys

@@ -838,7 +838,7 @@ class MenuBar(Static, can_focus=True):
             ("New project…", "p", "new_project"),
             ("Fetch result…", "f", "fetch"),
             ("", "", ""),  # separator
-            ("Quit", "ctrl+q", "quit"),
+            ("Quit", "esc esc", "quit"),
         ],
         "Edit": [
             ("Copy selection", "ctrl+c", "copy"),
@@ -1066,10 +1066,17 @@ class TabBar(Static, can_focus=True):
             if name == self._active:
                 out += f"[reverse]{text}[/reverse]"
             elif name == self._hover:
-                out += f"[on $boost]{text}[/on $boost]"
+                color = "#0178D4"
+                try:
+                    color = str(self.app.current_theme.primary or color)
+                except Exception:  # pragma: no cover - theme shape varies
+                    pass
+                out += f"[on {color}]{text}[/on {color}]"
             else:
                 out += f"[dim]{text}[/dim]"
             out += " "
+        # a persistent way out: escape twice, or File > Quit
+        out += " [dim]esc esc to quit[/dim]"
         return out
 
     def _tab_at(self, x: int) -> str | None:
@@ -1171,6 +1178,29 @@ class Shell(Screen):
     @on(TabBar.TabPicked)
     async def tab_picked(self, event: TabBar.TabPicked) -> None:
         self.show_tab(event.name)
+
+    def on_key(self, event: Any) -> None:
+        """escape on the home screen quits, in two steps.
+
+        There was no discoverable way out (owner got stuck): ctrl+q is eaten
+        by macOS terminal flow control and the menus were broken. Escape is
+        the key people try; the first press explains, the second exits."""
+        if event.key != "escape":
+            return
+        if getattr(self, "_quit_armed", False):
+            self.app.exit()
+            return
+        self._quit_armed = True
+        self.notify(
+            "press escape again to quit (missions keep running) · or File > Quit",
+            title="quit?",
+            severity="warning",
+            timeout=4,
+        )
+        self.set_timer(4.0, self._disarm_quit)
+
+    def _disarm_quit(self) -> None:
+        self._quit_armed = False
 
     def show_tab(self, name: str) -> None:
         for tab in self.TABS:
@@ -1606,9 +1636,13 @@ class ReworkApp(App[None]):
     #gates-table { height: 1fr; }
     """
 
-    # ctrl+c is COPY (textual's selection clipboard); quitting is ctrl+q.
-    # Plain ctrl+c used to quit — that ate every copy attempt (owner found it).
+    # ctrl+c is COPY (textual's selection clipboard). Quit has to work from
+    # anywhere without stealing copy: File > Quit, or pressing escape twice on
+    # the home screen. ctrl+q is kept as an alias but ISN'T relied on — macOS
+    # terminals treat it as XON flow control and swallow it (owner got stuck
+    # with no visible way out).
     BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
+        Binding("f10", "quit", "Quit", show=False),
         Binding("ctrl+q", "quit", "Quit", show=False),
         Binding("ctrl+c", "copy_text", "Copy", show=False, priority=True),
         Binding("alt+1", "tab_work", "Work", show=False),
@@ -1618,6 +1652,11 @@ class ReworkApp(App[None]):
         Binding("a", "approve_gate", "Approve", show=False),
         Binding("x", "reject_gate", "Reject", show=False),
     ]
+
+    def action_quit(self) -> Any:
+        """Quit from anywhere. Missions live in the store, not this process:
+        anything running keeps running on the daemon."""
+        self.exit()
 
     def action_copy_text(self) -> None:
         """Copy the current pane's selection (textual tracks it); fall back to
@@ -1717,7 +1756,7 @@ class ReworkApp(App[None]):
         elif action == "keys":
             self.notify(
                 "drag to select · ctrl+c copies · alt+1..4 tabs · a/x decide · f fetch"
-                " · ctrl+q quits",
+                " · quit: escape twice, F10, or File > Quit",
                 title="keys",
             )
         elif action == "copy_help":
