@@ -152,17 +152,34 @@ class OrchestratorChat:
     def model_label(self) -> str:
         return self._entry.id
 
+    @property
+    def supports_images(self) -> bool:
+        """Whether the catalog says this model can read images. A model without
+        the capability must be refused BEFORE sending, not silently stripped —
+        a chat that quietly drops the screenshot answers confidently about
+        something it never saw."""
+        return "vision" in getattr(self._entry, "capabilities", set())
+
     def _system(self) -> str:
         parts = [SYSTEM_PROMPT]
         if self._context:
             parts.append("## Context\n" + self._context)
         return "\n\n".join(parts)
 
-    async def send(self, text: str) -> ChatResult:
-        """One owner message in, one orchestrator turn out."""
+    async def send(self, text: str, images: list[str] | None = None) -> ChatResult:
+        """One owner message in, one orchestrator turn out.
+
+        `images` are file paths attached to this user turn (see
+        kernel/llm/types.py: paths, not bytes)."""
         text = text.strip()
-        if not text:
+        images = list(images or [])
+        if not text and not images:
             return ChatResult()
+        if images and not self.supports_images:
+            raise ValueError(
+                f"{self._entry.id} has no vision capability; "
+                "switch the orchestrator model or drop the attachment"
+            )
 
         # A bare yes after a proposal launches it — the owner's confirm gate.
         if self.proposal is not None and text.lower() in YES_WORDS:
@@ -175,7 +192,10 @@ class OrchestratorChat:
                 transcript=[Turn("you", text)],
             )
 
-        self._history.append({"role": "user", "content": text})
+        user_msg: dict[str, Any] = {"role": "user", "content": text}
+        if images:
+            user_msg["images"] = images
+        self._history.append(user_msg)
         request = ChatRequest(
             model=self._entry.model,
             system=self._system(),

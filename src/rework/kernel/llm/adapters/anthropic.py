@@ -49,6 +49,23 @@ def translate_request(request: ChatRequest) -> dict[str, Any]:
                     }
                 )
             messages.append({"role": "assistant", "content": blocks})
+        elif msg.get("images"):
+            # Anthropic content blocks: images first, then the words that
+            # refer to them (the usual reading order for a screenshot + note).
+            from rework.kernel.llm.adapters.images import load_image
+
+            content: list[dict[str, Any]] = []
+            for path in msg["images"]:
+                data, mime = load_image(str(path))
+                content.append(
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": mime, "data": data},
+                    }
+                )
+            if msg.get("content"):
+                content.append({"type": "text", "text": msg["content"]})
+            messages.append({"role": role, "content": content})
         else:
             messages.append({"role": role, "content": msg["content"]})
 

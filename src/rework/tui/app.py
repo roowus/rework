@@ -6,7 +6,7 @@ real dropdown menus), TAB SECTIONS live under it (Work = type your work,
 Dashboard = missions + projects, Gates = decisions with an unread badge,
 Library = search what missions learned). One navigation rule everywhere:
 
-    enter = deeper   esc = back   arrows = move   a/x = decide   f = fetch
+    enter = deeper   esc = back   arrows = move   alt+a / alt+x = decide   f = fetch
 
 The WORK tab is the typing surface: a big prompt, the missions you recently
 touched, and the wizard one enter away. Gates get NOTIFICATIONS: a toast
@@ -31,6 +31,7 @@ from __future__ import annotations
 import contextlib
 import os
 import time
+from pathlib import Path
 from typing import Any, ClassVar
 
 from textual import on
@@ -49,6 +50,7 @@ from textual.widgets import (
     RichLog,
     Select,
     Static,
+    TextArea,
 )
 
 from rework.tui.data import TuiData, human_age, status_rich
@@ -107,6 +109,172 @@ def format_event_line(event: Any, role: str) -> str:
     elif event.type.value == "mission_created":
         detail = str(payload.get("objective", ""))[:100]
     return f"[dim]{stamp}[/dim] {event.type.value:<15} {role} {detail}".rstrip()
+
+
+MAX_PASTE_CHARS = 20_000  # mirrors Input.MAX_SIZES' spirit; a paste is fine
+MAX_ATTACHMENTS = 8
+MAX_IMAGE_BYTES = 4 * 1024 * 1024
+
+
+class PromptInput(TextArea):
+    """The orchestrator prompt: multi-line, accepts pastes of any length, and
+    accepts IMAGES.
+
+    Owner: "allow prompt text box to suppor images and large pastes". The old
+    Input both kept a single line and refused pastes past MAX_SIZES (the paste
+    silently vanished, which reads as the app being broken).
+
+    Images: terminals send no image bytes, so a pasted path is sniffed here.
+    Textual also reports the clipboard's content type on some terminals; when
+    it says image/* we stash the bytes and tell the owner to press enter.
+    Either way the attachment is a PATH handed to the vision API — rework never
+    inlines image bytes into mission objectives, which get checkpointed and
+    replayed (ADR: messages are plain dicts)."""
+
+    BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
+        Binding("tab", "complete", "Complete", show=False),
+    ]
+
+    async def _on_key(self, event: Any) -> None:
+        """Enter sends, shift/alt+enter adds a line.
+
+        This has to be a key handler, not a binding: TextArea's own `_on_key`
+        inserts '\\n' for enter and stops the event, so a Binding('enter', …)
+        never runs. Handling it before delegating is the documented escape."""
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            # call_later, not a direct post_message: a message posted from
+            # inside key dispatch never reaches the parent handler (found by
+            # test: the pane's Submitted handler simply never ran). Deferring
+            # one tick puts it back on the normal queue.
+            self.call_later(self.action_submit)
+            return
+        if event.key in ("shift+enter", "alt+enter"):
+            event.stop()
+            event.prevent_default()
+            self.action_newline()
+            return
+        await super()._on_key(event)
+
+    class Submitted(Message):
+        def __init__(self, text: str, images: list[str]) -> None:
+            super().__init__()
+            self.text = text
+            self.images = images
+
+    class Attached(Message):
+        """An image (or a long paste) became an attachment chip."""
+
+        def __init__(self, label: str) -> None:
+            super().__init__()
+            self.label = label
+
+    class Completions(Message):
+        """Slash-command candidates for the current first line (may be empty)."""
+
+        def __init__(self, matches: list[str]) -> None:
+            super().__init__()
+            self.matches = matches
+
+    def __init__(self, **kwargs: Any) -> None:
+        kwargs.setdefault("show_line_numbers", False)
+        kwargs.setdefault("tab_behavior", "focus")
+        super().__init__(**kwargs)
+        self.attachments: list[str] = []  # file paths only
+        self.commands: list[str] = []  # e.g. ["/new", "/fetch", …]
+
+    # -- slash completion ----------------------------------------------------
+    # Input had Textual's Suggester; TextArea does not. Completion is done here
+    # so command autocomplete survives the switch to a multi-line prompt.
+
+    def _first_line(self) -> str:
+        return self.text.split("\n", 1)[0]
+
+    def _matches(self) -> list[str]:
+        head = self._first_line().lstrip()
+        if not head.startswith("/"):
+            return []
+        return [c for c in self.commands if c.startswith(head)][:6]
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        self.post_message(self.Completions(self._matches()))
+
+    def action_complete(self) -> None:
+        """Tab: finish the command with the first match."""
+        matches = self._matches()
+        if not matches:
+            return
+        rest = self.text.split("\n", 1)[1:]
+        self.text = matches[0] + ("\n" + "\n".join(rest) if rest else "")
+        self.cursor_location = (0, len(matches[0]))
+
+    # -- pastes --------------------------------------------------------------
+
+    async def _on_paste(self, event: Any) -> None:
+        text = getattr(event, "text", "") or ""
+        images = self._paths_from(text)
+        if images:
+            event.stop()
+            for path in images:
+                self.attach_path(path)
+            return
+        if len(text) > MAX_PASTE_CHARS:
+            # a huge log pasted into a chat box is an ATTACHMENT, not a prompt
+            event.stop()
+            self.attach_path(self._spill(text))
+            return
+        await super()._on_paste(event)
+
+    def _paths_from(self, text: str) -> list[str]:
+        """Every whitespace-separated token that is an existing image file."""
+        found: list[str] = []
+        for raw in text.replace("\n", " ").split():
+            token = raw.strip("'\"")
+            if not token.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
+                continue
+            path = Path(token).expanduser()
+            try:
+                if path.is_file() and path.stat().st_size <= MAX_IMAGE_BYTES:
+                    found.append(str(path.resolve()))
+            except OSError:
+                continue
+        return found
+
+    def _spill(self, text: str) -> str:
+        """Write an oversized paste to a temp file and attach that instead."""
+        import hashlib
+        import tempfile
+
+        digest = hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:10]
+        path = Path(tempfile.gettempdir()) / f"rework-paste-{digest}.txt"
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    def attach_path(self, path: str) -> None:
+        """Add one attachment. Named attach_path, not _attach: MessagePump owns
+        `_attach` and an override there is a Liskov violation."""
+        if path in self.attachments:
+            return
+        if len(self.attachments) >= MAX_ATTACHMENTS:
+            self.app.notify(f"at most {MAX_ATTACHMENTS} attachments", severity="warning")
+            return
+        self.attachments.append(path)
+        self.post_message(self.Attached(Path(path).name))
+
+    def clear_attachments(self) -> None:
+        self.attachments.clear()
+
+    # -- submit --------------------------------------------------------------
+
+    def action_submit(self) -> None:
+        text = self.text.strip()
+        if not text and not self.attachments:
+            return
+        self.post_message(self.Submitted(text, list(self.attachments)))
+
+    def action_newline(self) -> None:
+        self.insert("\n")
 
 
 class SelectableLog(RichLog):
@@ -310,8 +478,10 @@ class WorkPane(Pane):
             yield Button("", id="btn-project", classes="work-knob")
             yield Button("", id="btn-model", classes="work-knob")
             yield Button("", id="btn-effort", classes="work-knob")
-        yield Input(
-            placeholder="tell the orchestrator what you want…",
+        yield Label("", id="attach-bar")
+        yield Label("", id="complete-bar")
+        yield PromptInput(
+            placeholder="tell the orchestrator what you want… (paste images or long text)",
             id="prompt",
         )
 
@@ -322,7 +492,7 @@ class WorkPane(Pane):
         self._chat: Any = None  # OrchestratorChat, built lazily per conversation
         self._load_models()
         self._install_suggestions()
-        self.query_one("#prompt", Input).focus()
+        self.query_one("#prompt", PromptInput).focus()
         # ONE worker per mount: two exclusive run_worker calls share the
         # default worker GROUP, so the second cancels the first and leaves an
         # unawaited coroutine (the pane froze on mount — found live).
@@ -402,18 +572,27 @@ class WorkPane(Pane):
         self._chat_log().clear()
         self._greet()
 
-    async def _converse(self, text: str) -> None:
+    async def _converse(self, text: str, images: list[str] | None = None) -> None:
         if self._chat is None:
             try:
                 self._chat = self._build_chat()
             except Exception as exc:
                 self._say("error", f"cannot reach a model: {exc}")
                 return
-        self._say("you", text)
+        images = images or []
+        chip = " ".join(f"📎 {Path(p).name}" for p in images)
+        self._say("you", f"{text}  {chip}".strip() if chip else text)
         self.query_one("#chat-model-line", Label).update("")
+        if images and not self._chat.supports_images:
+            self._say(
+                "error",
+                f"{self._chat.model_label} cannot read images; drop the attachment "
+                "or switch the orchestrator model",
+            )
+            return
 
         try:
-            result = await self._chat.send(text)
+            result = await self._chat.send(text, images=images)
         except Exception as exc:
             self._say("error", f"the orchestrator call failed: {exc}")
             return
@@ -513,25 +692,19 @@ class WorkPane(Pane):
     # -- command autocomplete ------------------------------------------------
 
     def _install_suggestions(self) -> None:
-        from textual.suggester import SuggestFromList
-
-        prompt = self.query_one("#prompt", Input)
-        # Suggestions are recomputed when this is called again; the command set
-        # is static, project ids change so reload_projects refreshes it.
-        prompt.suggester = SuggestFromList(self._suggestions(), case_sensitive=False)
-
-    def _suggestions(self) -> list[str]:
         from rework.tui.app import SLASH_COMMANDS
 
-        out = [c for c, _ in SLASH_COMMANDS]
-        out.extend(getattr(self, "_project_names", []))
-        return out
+        self.query_one("#prompt", PromptInput).commands = [c for c, _ in SLASH_COMMANDS]
 
-    def _refresh_suggestions(self) -> None:
-        from textual.suggester import SuggestFromList
-
-        prompt = self.query_one("#prompt", Input)
-        prompt.suggester = SuggestFromList(self._suggestions(), case_sensitive=False)
+    def on_prompt_input_completions(self, event: PromptInput.Completions) -> None:
+        try:
+            bar = self.query_one("#complete-bar", Label)
+        except Exception:  # pragma: no cover
+            return
+        if not event.matches:
+            bar.update("")
+            return
+        bar.update("[dim]" + "   ".join(event.matches) + "   ·  tab completes[/dim]")
 
     # -- project selection ---------------------------------------------------
 
@@ -559,7 +732,6 @@ class WorkPane(Pane):
         if current in self._project_ids:
             self._project_index = self._project_ids.index(current)
         self._update_project_label()
-        self._refresh_suggestions()
 
     def action_cycle_project(self) -> None:
         """Cycle through: no project -> each project. The choice is visible in
@@ -626,18 +798,42 @@ class WorkPane(Pane):
     def on_show(self) -> None:
         self._update_setting_labels()
 
-    @on(Input.Submitted, "#prompt")
-    async def prompt_submitted(self, event: Input.Submitted) -> None:
-        text = event.value.strip()
-        event.input.value = ""
-        if not text:
+    # NOTE: no @on(Input.Submitted) decorator here — the prompt is a TextArea
+    # now, and a decorator filtered to Input.Submitted silently dropped every
+    # message (the handler ran for spies but never for real dispatch).
+    def on_prompt_input_submitted(self, event: PromptInput.Submitted) -> None:
+        text = event.text.strip()
+        images = list(event.images)
+        prompt = self.query_one("#prompt", PromptInput)
+        prompt.text = ""
+        prompt.clear_attachments()
+        self._render_chips()
+        if not text and not images:
             return
-        if text.startswith("/"):
-            await self.shell.rw.run_slash(text)
+        if text.startswith("/") and not images:
+            self.run_worker(self.shell.rw.run_slash(text), exclusive=True, group="slash")
             return
         # free text = a message to the orchestrator (missions are a
         # conversation now; the form wizard is gone)
-        self.run_worker(self._converse(text), exclusive=True, group="chat")
+        self.run_worker(self._converse(text, images), exclusive=True, group="chat")
+
+    def on_prompt_input_attached(self, event: PromptInput.Attached) -> None:
+        self._render_chips()
+        self.notify(f"attached {event.label} — press enter to send")
+
+    def _render_chips(self) -> None:
+        """Show what is attached, where the owner can see it: an attachment
+        nobody can see is an attachment nobody trusts."""
+        try:
+            bar = self.query_one("#attach-bar", Static)
+        except Exception:  # pragma: no cover - compose always makes it
+            return
+        prompt = self.query_one("#prompt", PromptInput)
+        if not prompt.attachments:
+            bar.update("")
+            return
+        chips = "  ".join(f"📎 {Path(p).name}" for p in prompt.attachments)
+        bar.update(f"[dim]{chips}  ·  enter sends[/dim]")
 
 
 class ProjectBand(Static, can_focus=True):
@@ -926,17 +1122,11 @@ class DashboardPane(Pane):
         lines = ["[bold yellow]WAITING ON YOU[/bold yellow]"]
         for gate in gates:
             lines.append(f"  gate {gate.id} [{gate.kind.value}]  {gate.question}")
-        lines.append("  [a] approve    [x] reject")
+        lines.append("  [b]alt+a[/b] approve    [b]alt+x[/b] reject")
         box.update("\n".join(lines))
 
     async def selected_mission_id(self) -> str | None:
         return self._selected_mission
-
-    async def action_approve_gate(self) -> None:
-        await self._decide_selected(True)
-
-    async def action_reject_gate(self) -> None:
-        await self._decide_selected(False)
 
     async def _decide_selected(self, approved: bool) -> None:
         mission_id = self._selected_mission
@@ -1014,6 +1204,107 @@ class GatesPane(Pane):
             await self.refresh_quiet()
             self.shell.rw.refresh_dashboard()
             self.shell.update_gate_badge()
+
+
+class CostPane(Pane):
+    """What rework is costing you: the ledger, grouped by model and by mission.
+
+    Owner ask: "have a cost tab to monitor usage and cost". Everything here is
+    the charges table, which is the exact accounting record (the budget guard
+    is approximate by design; this view is not).
+
+    Two scopes: ALL spend, or the selected mission's. Aggregation happens in
+    SQL, so the tab costs one query per poll no matter how long the ledger is.
+    """
+
+    BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
+        Binding("r", "refresh", "Refresh", show=True),
+        Binding("s", "toggle_scope", "All/mission", show=True),
+    ]
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._mission_id: str | None = None  # None = every mission
+
+    def compose(self) -> ComposeResult:
+        yield Label("", id="cost-head")
+        yield Label("by model", id="cost-models-title", classes="cost-title")
+        yield DataTable(id="cost-models")
+        yield Label("by mission (last 20)", id="cost-missions-title", classes="cost-title")
+        yield DataTable(id="cost-missions")
+        yield Label("", id="cost-foot")
+
+    def on_mount(self) -> None:
+        models = self.query_one("#cost-models", DataTable)
+        models.cursor_type = "row"
+        models.add_columns("model", "calls", "in", "out", "cost")
+        missions = self.query_one("#cost-missions", DataTable)
+        missions.cursor_type = "row"
+        missions.add_columns("mission", "objective", "cost")
+        self.set_interval(POLL_SECONDS * 3, self.refresh_quiet)
+        self.call_after_refresh(self.refresh_quiet)
+
+    def action_refresh(self) -> None:
+        self.run_worker(self.refresh_quiet(), exclusive=True, group="cost")
+
+    def action_toggle_scope(self) -> None:
+        """s flips between all-missions and the Dashboard's selected mission."""
+        if self._mission_id is not None:
+            self._mission_id = None
+            self.notify("showing ALL spend")
+        else:
+            dash = self.query_one("#pane-dashboard", DashboardPane)
+            if dash._selected_mission is None:
+                self.notify("select a mission on the Dashboard first", severity="warning")
+                return
+            self._mission_id = dash._selected_mission
+            self.notify(f"showing spend for {self._mission_id}")
+        self.run_worker(self.refresh_quiet(), exclusive=True, group="cost")
+
+    async def refresh_quiet(self) -> None:
+        if not self.display:
+            return
+        scope = self._mission_id
+        rows = await self.shell.rw.data.spend_by_model(scope)
+        total_usd = sum(float(r.get("cost_usd") or 0) for r in rows)
+        total_in = sum(int(r.get("input_tokens") or 0) for r in rows)
+        total_out = sum(int(r.get("output_tokens") or 0) for r in rows)
+        calls = sum(int(r.get("calls") or 0) for r in rows)
+
+        where = f"mission {scope}" if scope else "all missions"
+        self.query_one("#cost-head", Label).update(
+            f"[b]${total_usd:,.2f}[/b] total  ·  {calls:,} calls  ·  "
+            f"{total_in:,} in / {total_out:,} out  ·  [dim]{where}[/dim]"
+        )
+        table = self.query_one("#cost-models", DataTable)
+        table.clear()
+        for row in rows:
+            table.add_row(
+                str(row.get("model") or "?"),
+                f"{int(row.get('calls') or 0):,}",
+                f"{int(row.get('input_tokens') or 0):,}",
+                f"{int(row.get('output_tokens') or 0):,}",
+                f"${float(row.get('cost_usd') or 0):.4f}",
+            )
+
+        # per-mission totals: counting the same ledger a different way is the
+        # only way to answer "which mission drained the budget"
+        missions = self.query_one("#cost-missions", DataTable)
+        missions.clear()
+        cached = self.shell.rw._mission_cache
+        if scope is None:
+            per_mission: list[tuple[str, float]] = []
+            for mission_id in cached:
+                spend = await self.shell.rw.data.mission_spend(mission_id)
+                if spend > 0:
+                    per_mission.append((mission_id, spend))
+            per_mission.sort(key=lambda pair: pair[1], reverse=True)
+            for mission_id, spend in per_mission[:20]:
+                objective = str(getattr(cached.get(mission_id), "objective", "") or "")
+                missions.add_row(mission_id, objective[:60], f"${spend:.4f}")
+        self.query_one("#cost-foot", Label).update(
+            "[dim]s toggles scope  ·  r refreshes  ·  charges table = exact accounting[/dim]"
+        )
 
 
 class LibraryPane(Pane):
@@ -1170,6 +1461,7 @@ class MenuBar(Static, can_focus=True):
             ("Dashboard", "alt+2", "tab_dashboard"),
             ("Gates", "alt+3", "tab_gates"),
             ("Library", "alt+4", "tab_library"),
+            ("Cost", "alt+5", "tab_cost"),
         ],
         "Help": [
             ("Keys", "", "keys"),
@@ -1352,6 +1644,7 @@ class TabBar(Static, can_focus=True):
         ("dashboard", "Dashboard"),
         ("gates", "Gates"),
         ("library", "Library"),
+        ("cost", "Cost"),
     )
 
     def __init__(self) -> None:
@@ -1451,7 +1744,7 @@ class Shell(Screen):
     per section. Owns cross-pane actions (new mission flow, fetch, opening a
     mission deep view) and the gate badge/notifications."""
 
-    TABS = ("work", "dashboard", "gates", "library")
+    TABS = ("work", "dashboard", "gates", "library", "cost")
 
     @property
     def rw(self) -> ReworkApp:
@@ -1462,6 +1755,7 @@ class Shell(Screen):
     def __init__(self) -> None:
         super().__init__()
         self._seen_gates: set[str] = set()
+        self._active_tab = "work"
 
     def compose(self) -> ComposeResult:
         yield MenuBar()
@@ -1470,6 +1764,7 @@ class Shell(Screen):
         yield DashboardPane(id="pane-dashboard")
         yield GatesPane(id="pane-gates")
         yield LibraryPane(id="pane-library")
+        yield CostPane(id="pane-cost")
 
     def on_mount(self) -> None:
         self.show_tab("work")
@@ -1529,15 +1824,22 @@ class Shell(Screen):
         self._quit_armed = False
 
     def show_tab(self, name: str) -> None:
+        self._active_tab = name
         for tab in self.TABS:
             pane = self.query_one(f"#pane-{tab}")
             pane.display = tab == name
         self.query_one("#tab-bar", TabBar).set_active(name)
         if name == "work":
-            self.query_one("#prompt", Input).focus()
+            self.query_one("#prompt", PromptInput).focus()
         elif name == "gates":
             self.query_one("#pane-gates", GatesPane).run_worker(
                 self.query_one("#pane-gates", GatesPane).refresh_quiet(), exclusive=True
+            )
+        elif name == "cost":
+            self.query_one("#pane-cost", CostPane).run_worker(
+                self.query_one("#pane-cost", CostPane).refresh_quiet(),
+                exclusive=True,
+                group="cost",
             )
         elif name == "dashboard":
             # a hidden pane has zero size and the log drops writes: replay the
@@ -1568,7 +1870,7 @@ class Shell(Screen):
         if objective.strip():
             work.run_worker(work._converse(objective.strip()), exclusive=True, group="chat")
         else:
-            work.query_one("#prompt", Input).focus()
+            work.query_one("#prompt", PromptInput).focus()
 
     async def launch_proposal(self, proposal: Any) -> Any:
         """Create the mission the orchestrator proposed, AFTER the owner said
@@ -1603,7 +1905,7 @@ class Shell(Screen):
             )
             work._chat = None  # fresh conversation for the repo answer
             self.show_tab("work")
-            work.query_one("#prompt", Input).focus()
+            work.query_one("#prompt", PromptInput).focus()
             return None  # the Work pane has already explained; not an error
         dash = self.query_one("#pane-dashboard", DashboardPane)
         dash._selected_mission = mission.id
@@ -1654,6 +1956,35 @@ class Shell(Screen):
         return asyncio.run(self.rw.data.fetch_result(mission_id))
 
     # -- gate badge + notifications -------------------------------------------
+
+    async def gate_ids_in_context(self) -> list[str]:
+        """Which gates 'a'/'x' should decide right now, by visible context.
+        Gates tab: the selected row. Otherwise: the dashboard's selected
+        mission. Never the whole database — a stray keypress must not approve
+        something the owner was not looking at."""
+        active = getattr(self, "_active_tab", "work")
+        if active == "gates":
+            gates_pane = self.query_one("#pane-gates", GatesPane)
+            selected = gates_pane._selected_gate_id()
+            return [selected] if selected else []
+        if active == "dashboard":
+            dash_pane = self.query_one("#pane-dashboard", DashboardPane)
+            mission_id = dash_pane._selected_mission
+            if mission_id is None:
+                return []
+            return [g.id for g in await self.rw.data.open_gates(mission_id)]
+        return []
+
+    def refresh_after_decision(self) -> None:
+        """A gate just changed: the dashboard's gate box, the Gates table and
+        the badge all show stale state until they re-read."""
+        dashboard = self.query_one("#pane-dashboard", DashboardPane)
+        if dashboard._selected_mission:
+            self.run_worker(dashboard.stream_events(force=True), exclusive=False)
+            self.run_worker(dashboard.reload_missions(), exclusive=False)
+        gates_pane = self.query_one("#pane-gates", GatesPane)
+        self.run_worker(gates_pane.refresh_quiet(), exclusive=False)
+        self.run_worker(self.poll_badge(), exclusive=False)
 
     async def poll_badge(self) -> None:
         try:
@@ -1921,7 +2252,7 @@ class MissionDeepView(ModalScreen[None]):
         lines = ["[bold yellow]WAITING ON YOU[/bold yellow]"]
         for gate in gates:
             lines.append(f"  {gate.id} [{gate.kind.value}]  {gate.question}")
-        lines.append("  [a] approve    [x] reject")
+        lines.append("  [b]alt+a[/b] approve    [b]alt+x[/b] reject")
         box.update("\n".join(lines))
 
     async def action_approve(self) -> None:
@@ -1977,6 +2308,7 @@ class ReworkCommands(Provider):
             ("dashboard", "missions + projects (alt+2)", "dashboard"),
             ("gates", "human decisions (alt+3)", "gates"),
             ("library", "what missions learned (alt+4)", "library"),
+            ("cost", "usage and spend (alt+5)", "cost"),
             ("new mission", "launch a mission", "new_mission"),
             ("new project", "create a project label", "new_project"),
         ]
@@ -1992,7 +2324,7 @@ class ReworkCommands(Provider):
             if score > 0:
 
                 async def run(action: str = action) -> None:
-                    if action in ("work", "dashboard", "gates", "library"):
+                    if action in ("work", "dashboard", "gates", "library", "cost"):
                         shell.switch_tab(action)
                     elif action == "new_mission":
                         shell.run_worker(shell.new_mission_flow(), exclusive=True)
@@ -2025,6 +2357,14 @@ class ReworkApp(App[None]):
     #pane-dashboard { height: 1fr; padding: 0 1; }
     #pane-gates { height: 1fr; padding: 0 1; }
     #pane-library { height: 1fr; padding: 0 1; }
+    #pane-cost { height: 1fr; padding: 0 1; }
+    #cost-head { height: auto; padding: 0 1 1 1; }
+    .cost-title { height: 1; padding: 0 1; color: $text-muted; }
+    #cost-models { height: 8; }
+    #cost-missions { height: 1fr; }
+    #cost-foot { height: 1; color: $text-muted; padding: 0 1; }
+    #attach-bar { height: 1; padding: 0 1; }
+    #complete-bar { height: 1; padding: 0 1; }
     #project-band { height: 3; border-bottom: round $panel; padding: 0 1;
                     background: $surface-darken-1; }
     #mid-title { height: 1; padding: 0 1; color: $text-muted; }
@@ -2074,8 +2414,11 @@ class ReworkApp(App[None]):
         Binding("alt+2", "tab_dashboard", "Dashboard", show=False),
         Binding("alt+3", "tab_gates", "Gates", show=False),
         Binding("alt+4", "tab_library", "Library", show=False),
-        Binding("a", "approve_gate", "Approve", show=False),
-        Binding("x", "reject_gate", "Reject", show=False),
+        Binding("alt+5", "tab_cost", "Cost", show=False),
+        # GATES ANSWER: alt+a / alt+x are UNAMBIGUOUS (plain a/x collide with
+        # typing in any Input and with the Gates tab's own row actions).
+        Binding("alt+a", "approve_gate", "Approve gate", show=False),
+        Binding("alt+x", "reject_gate", "Reject gate", show=False),
     ]
 
     def action_quit(self) -> Any:
@@ -2116,6 +2459,40 @@ class ReworkApp(App[None]):
     async def on_unmount(self) -> None:
         await self.data.aclose()
 
+    # -- gate bindings -------------------------------------------------------
+    # These MUST live here. The bindings are declared on ReworkApp, so textual
+    # looks for action_approve_gate on the APP; DashboardPane had same-named
+    # methods but nothing ever called them, and 'a' did nothing. Owner: "heres
+    # a gate but theres no way to answer it".
+
+    async def action_approve_gate(self) -> None:
+        await self._decide_focused_gate(True)
+
+    async def action_reject_gate(self) -> None:
+        await self._decide_focused_gate(False)
+
+    async def _decide_focused_gate(self, approved: bool) -> None:
+        """Decide the gate the CURRENT context is showing: the deep view's
+        mission, the Gates tab's selected row, else the dashboard's mission."""
+        verb = "approved" if approved else "rejected"
+        screen = self.screen
+        if isinstance(screen, MissionDeepView):
+            gate_ids = [g.id for g in await self.data.open_gates(screen._mission_id)]
+        elif isinstance(screen, Shell):
+            gate_ids = await screen.gate_ids_in_context()
+        else:
+            gate_ids = []
+        if not gate_ids:
+            self.notify("no open gate here — open Gates to answer one", severity="warning")
+            return
+        for gate_id in gate_ids:
+            if await self.data.decide_gate(gate_id, approved):
+                self.notify(f"gate {gate_id} {verb}")
+        if isinstance(screen, Shell):
+            screen.refresh_after_decision()
+        elif isinstance(screen, MissionDeepView):
+            self.run_worker(screen.refresh_all(), exclusive=True)
+
     # -- tab bindings (app-level so they work from any pane) -----------------
 
     def action_tab_work(self) -> None:
@@ -2129,6 +2506,9 @@ class ReworkApp(App[None]):
 
     def action_tab_library(self) -> None:
         self._switch("library")
+
+    def action_tab_cost(self) -> None:
+        self._switch("cost")
 
     def _switch(self, name: str) -> None:
         screen = self.screen
@@ -2213,6 +2593,8 @@ class ReworkApp(App[None]):
             self._switch("gates")
         elif cmd == "/library":
             self._switch("library")
+        elif cmd == "/cost":
+            self._switch("cost")
         elif cmd == "/projects":
             if shell:
                 shell.run_worker(shell.new_project_flow(), exclusive=True)
@@ -2241,6 +2623,7 @@ class ReworkApp(App[None]):
 SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/gates", "review and decide open gates"),
     ("/library", "search what missions learned"),
+    ("/cost", "token usage and spend by model"),
     ("/fetch", "fetch a finished mission's result: /fetch <mission-id>"),
     ("/new", "start a mission wizard: /new <objective>"),
     ("/projects", "create a project label"),

@@ -4,6 +4,11 @@ Messages are plain dicts: {"role": "user"|"assistant"|"tool", "content": str, pl
 "tool_calls" on assistant turns and "tool_call_id"/"name" on tool turns}. Keeping
 them dumb makes checkpointed histories portable across adapters (within a provider
 family; cross-provider promotion needs a normalization pass, ADR 0001).
+
+Images ride as a `images` list of FILE PATHS on the user message. Paths, not
+bytes: message dicts land in the LangGraph checkpoint and get replayed, and
+base64 blobs there would bloat every checkpoint write. Adapters read the file
+at request time and encode on the wire.
 """
 
 from __future__ import annotations

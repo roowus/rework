@@ -61,15 +61,19 @@ tailnet IP). Results return as a branch (open_pr gate) or via `rework fetch
 
 ## The TUI: just type `rework`
 
-With no arguments, `rework` opens a full-screen dashboard (mouse + keyboard):
+With no arguments, `rework` opens a full-screen shell (mouse + keyboard):
 
-- **Left**: projects (select one to filter; create with `p`)
-- **Right**: missions with live status (`n` opens the new-mission wizard:
-  objective, repo URL / local path / folder upload, plan)
-- **Bottom**: the selected mission's event timeline, streaming every 2 s;
-  when a gate is waiting on you it shows an approve/reject box (`a` / `x`)
-- **`g`** the gates queue across all missions · **`l`** the Library browser ·
-  **`ctrl+p`** the command palette (find any action by typing) · **`q`** quit
+- **Work** — talk to the orchestrator; it proposes missions and you approve
+  them. Enter sends, shift+enter adds a line, `/` completes commands on tab,
+  and the prompt accepts pasted images and large pastes
+- **Dashboard** — projects across the top, missions below, the selected
+  mission's live agent trajectory and cost, and an approve/reject box
+- **Gates** — every open gate, with an unread badge and notifications
+- **Library** — search what missions learned
+- **Cost** — spend and token usage by model, and per mission
+
+Gate keys are `alt+a` / `alt+x`; tabs are `alt+1..5`; `ctrl+p` is the command
+palette; escape twice quits.
 
 The TUI is a client like every other command: it reads `REWORK_DB`, so from
 your laptop it shows and controls the missions running on the daemon.

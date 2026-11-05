@@ -154,6 +154,34 @@ async def test_ledger_sums(store: StateStore) -> None:
     assert spend == BudgetState(input_tokens=110, output_tokens=55, spent_usd=0.03)
 
 
+async def test_spend_by_model(store: StateStore) -> None:
+    """The Cost tab's query: grouped by model, most expensive first, and
+    optionally scoped to one mission. Both backends must agree."""
+    m1 = await store.create_mission(Mission(id=new_id("m"), objective="one"))
+    m2 = await store.create_mission(Mission(id=new_id("m"), objective="two"))
+    await store.charge(
+        Charge(mission_id=m1.id, model="flash", input_tokens=100, output_tokens=10, cost_usd=0.01)
+    )
+    await store.charge(
+        Charge(mission_id=m2.id, model="pro", input_tokens=900, output_tokens=90, cost_usd=0.50)
+    )
+    await store.charge(
+        Charge(mission_id=m2.id, model="flash", input_tokens=200, output_tokens=20, cost_usd=0.02)
+    )
+
+    rows = await store.spend_by_model()
+    assert [r["model"] for r in rows] == ["pro", "flash"]
+    assert rows[0]["calls"] == 1
+    assert rows[0]["cost_usd"] == 0.50
+    assert rows[1]["calls"] == 2
+    assert rows[1]["input_tokens"] == 300  # summed across missions
+
+    scoped = await store.spend_by_model(m1.id)
+    assert len(scoped) == 1
+    assert scoped[0]["model"] == "flash"
+    assert scoped[0]["cost_usd"] == 0.01
+
+
 async def test_leader_lock(store: StateStore) -> None:
     assert await store.acquire_lock("daemon-1") is True
     assert await store.acquire_lock("daemon-2") is False  # live foreign lock refused

@@ -114,6 +114,15 @@ class StateStore(Protocol):
 
     async def mission_spend(self, mission_id: str) -> BudgetState: ...
 
+    async def spend_by_model(self, mission_id: str | None = None) -> list[dict[str, Any]]:
+        """Ledger grouped by model: tokens and cost, one row per model.
+
+        The Cost tab's whole point is "what is this thing costing me", which the
+        per-mission total cannot answer once more than one model is in play.
+        Grouped in SQL rather than in the TUI so the tab never loads every
+        charge row into the client."""
+        ...
+
     async def run_charges(self, run_id: str) -> list[Charge]:
         """Per-run charge rows, oldest first: feeds the mechanical run_stats
         section stamped onto every report artifact."""

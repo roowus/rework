@@ -679,6 +679,24 @@ class PostgresStore:
         ]
 
     @_serialized
+    async def spend_by_model(self, mission_id: str | None = None) -> list[dict[str, Any]]:
+        """Ledger grouped by model (optionally scoped to one mission)."""
+        sql = (
+            "SELECT model, COUNT(*) AS calls,"
+            " COALESCE(SUM(input_tokens), 0) AS input_tokens,"
+            " COALESCE(SUM(output_tokens), 0) AS output_tokens,"
+            " COALESCE(SUM(cost_usd), 0.0) AS cost_usd"
+            " FROM charges"
+        )
+        params: tuple[Any, ...] = ()
+        if mission_id is not None:
+            sql += " WHERE mission_id = %s"
+            params = (mission_id,)
+        sql += " GROUP BY model ORDER BY cost_usd DESC"
+        rows = await self._fetch_all(sql, params)
+        return [dict(r) for r in rows]
+
+    @_serialized
     async def mission_spend(self, mission_id: str) -> BudgetState:
         row = await self._fetch_one(
             "SELECT COALESCE(SUM(input_tokens), 0) AS i, COALESCE(SUM(output_tokens), 0) AS o,"

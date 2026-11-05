@@ -83,6 +83,20 @@ class TuiData:
         spend = await store.mission_spend(mission_id)
         return spend.spent_usd
 
+    async def spend_by_model(self, mission_id: str | None = None) -> list[dict[str, Any]]:
+        store = await self.store()
+        return await store.spend_by_model(mission_id)
+
+    async def spend_total(self) -> dict[str, float]:
+        """Every model's row summed: the number the owner actually wants."""
+        rows = await self.spend_by_model()
+        return {
+            "usd": sum(float(r.get("cost_usd") or 0) for r in rows),
+            "in": sum(int(r.get("input_tokens") or 0) for r in rows),
+            "out": sum(int(r.get("output_tokens") or 0) for r in rows),
+            "calls": sum(int(r.get("calls") or 0) for r in rows),
+        }
+
     async def get_mission(self, mission_id: str) -> Any:
         store = await self.store()
         return await store.get_mission(mission_id)

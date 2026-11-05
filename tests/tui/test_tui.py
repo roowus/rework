@@ -23,7 +23,7 @@ from rework.kernel.state.records import (
     MissionStatus,
     new_id,
 )
-from rework.tui.app import ReworkApp, Shell
+from rework.tui.app import PromptInput, ReworkApp, Shell
 
 
 @pytest.fixture
@@ -86,7 +86,6 @@ async def test_shell_renders_menu_bar_and_work_tab(seeded: dict[str, str]) -> No
         await pilot.pause()
         await pilot.pause()
         shell = await _shell(app)
-        from textual.widgets import Input
 
         bar = shell.query_one("#menu-bar")
         rendered = str(bar.render())
@@ -97,7 +96,7 @@ async def test_shell_renders_menu_bar_and_work_tab(seeded: dict[str, str]) -> No
         # work pane is the visible home: prompt focused, knobs are buttons
         from textual.widgets import Button
 
-        prompt = shell.query_one("#prompt", Input)
+        prompt = shell.query_one("#prompt", PromptInput)
         assert prompt.has_focus
         for knob in ("#btn-project", "#btn-model", "#btn-effort"):
             assert isinstance(shell.query_one(knob), Button)
@@ -111,7 +110,7 @@ async def test_tabs_switch_and_panes_survive(seeded: dict[str, str]) -> None:
     switches) — the owner's tab-shell ask."""
     from textual.widgets import DataTable
 
-    from rework.tui.app import DashboardPane, GatesPane, LibraryPane
+    from rework.tui.app import DashboardPane, GatesPane, LibraryPane, PromptInput
 
     app = ReworkApp()
     async with app.run_test(size=(120, 32)) as pilot:
@@ -141,9 +140,8 @@ async def test_tabs_switch_and_panes_survive(seeded: dict[str, str]) -> None:
         # back to work: prompt refocuses (the typing surface)
         app.action_tab_work()
         await pilot.pause()
-        from textual.widgets import Input
 
-        assert shell.query_one("#prompt", Input).has_focus
+        assert shell.query_one("#prompt", PromptInput).has_focus
 
 
 async def test_mission_detail_streams_events(seeded: dict[str, str]) -> None:
@@ -167,8 +165,12 @@ async def test_mission_detail_streams_events(seeded: dict[str, str]) -> None:
 
 
 async def test_gate_decision_from_dashboard(seeded: dict[str, str], tui_env: Path) -> None:
-    """a on the dashboard approves the selected mission's gate: the STORE row
-    flips (the daemon reads the same truth and resumes the mission)."""
+    """alt+a approves the selected mission's gate: the STORE row flips (the
+    daemon reads the same truth and resumes the mission).
+
+    The binding lives on ReworkApp, so the action must be defined THERE too —
+    it used to be on the pane, which is why 'heres a gate but theres no way to
+    answer it' happened."""
     from rework.kernel.state.sqlite import open_sqlite
 
     app = ReworkApp()
@@ -176,10 +178,12 @@ async def test_gate_decision_from_dashboard(seeded: dict[str, str], tui_env: Pat
         await pilot.pause()
         await pilot.pause()
         shell = await _shell(app)
+        shell.show_tab("dashboard")  # the key acts on the VISIBLE context
         dash = shell.query_one("#pane-dashboard")
         await dash.select_mission(seeded["waiting"])
         await pilot.pause()
-        await dash.action_approve_gate()
+        # the real path: the APP binding (what the owner presses)
+        await pilot.press("alt+a")
         await pilot.pause()
         await pilot.pause()
 
@@ -306,8 +310,6 @@ async def test_prompt_sends_message_to_the_orchestrator(seeded: dict[str, str]) 
     """Mission creation is a CONVERSATION (owner: 'rework works by u talking
     to an orchestrator and the orchestrator decides'). Enter on the prompt
     must send a chat turn — there is no form any more."""
-    from textual.widgets import Input
-
     from conftest import ScriptedProvider, role_catalog
     from rework.kernel.llm.types import ChatResult
     from rework.orchestrator.chat import OrchestratorChat
@@ -323,13 +325,13 @@ async def test_prompt_sends_message_to_the_orchestrator(seeded: dict[str, str]) 
         await pilot.pause()
         await pilot.pause()
         shell = await _shell(app)
-        prompt = shell.query_one("#prompt", Input)
+        prompt = shell.query_one("#prompt", PromptInput)
         prompt.focus()
-        prompt.insert_text_at_cursor("fix the resize glitch")
+        prompt.insert("fix the resize glitch")
         await pilot.press("enter")
         for _ in range(4):
             await pilot.pause()
-        assert prompt.value == ""
+        assert prompt.text == ""
         # no modal: the Work tab owns the conversation
         assert isinstance(app.screen, Shell)
         chat_lines = " ".join(line.text for line in shell.query_one("#chat").lines)
@@ -339,7 +341,6 @@ async def test_prompt_sends_message_to_the_orchestrator(seeded: dict[str, str]) 
 async def test_slash_commands_route(seeded: dict[str, str]) -> None:
     """/gates opens the Gates tab; unknown commands notify instead of crash;
     the prompt clears after submit."""
-    from textual.widgets import Input
 
     app = ReworkApp()
     async with app.run_test(size=(120, 32)) as pilot:
@@ -355,12 +356,12 @@ async def test_slash_commands_route(seeded: dict[str, str]) -> None:
         await app.run_slash("/frobnicate")
         await pilot.pause()
         assert app.screen is before
-        prompt = shell.query_one("#prompt", Input)
-        prompt.value = "/gates"
+        prompt = shell.query_one("#prompt", PromptInput)
+        prompt.text = "/gates"
         prompt.focus()
         await pilot.press("enter")
         await pilot.pause()
-        assert prompt.value == ""
+        assert prompt.text == ""
 
 
 async def test_enter_opens_mission_deep_view(seeded: dict[str, str]) -> None:
@@ -990,20 +991,27 @@ async def test_mission_model_and_effort_reach_the_plan(seeded: dict[str, str], t
 
 
 async def test_prompt_command_autocomplete(seeded: dict[str, str]) -> None:
-    """Owner: 'commands should have autocomplete'."""
-    from textual.widgets import Input
+    """Owner: 'commands should have autocomplete'. The prompt is a TextArea
+    now (it needs multi-line + pastes), so completion lives in the widget."""
+    from rework.tui.app import PromptInput
 
     app = ReworkApp()
     async with app.run_test(size=(120, 32)) as pilot:
         await pilot.pause()
         await pilot.pause()
         shell = await _shell(app)
-        prompt = shell.query_one("#prompt", Input)
-        suggester = prompt.suggester
-        assert suggester is not None
-        assert await suggester.get_suggestion("/ga") == "/gates"
-        assert await suggester.get_suggestion("/li") == "/library"
-        assert await suggester.get_suggestion("/zzz") is None
+        prompt = shell.query_one("#prompt", PromptInput)
+        prompt.text = "/ga"
+        assert prompt._matches() == ["/gates"]
+        prompt.text = "/li"
+        assert prompt._matches() == ["/library"]
+        prompt.text = "/zzz"
+        assert prompt._matches() == []
+        prompt.text = "write me a haiku"
+        assert prompt._matches() == []  # plain prose is not a command
+        prompt.text = "/co"
+        prompt.action_complete()
+        assert prompt.text == "/cost"
 
 
 async def test_work_tab_project_selector_visible_and_cycles(
@@ -1199,7 +1207,7 @@ async def test_chat_propose_then_confirm_creates_mission(
         prompt = shell.query_one("#prompt")
 
         prompt.focus()
-        prompt.insert_text_at_cursor("fix the glitch")
+        prompt.insert("fix the glitch")
         await pilot.press("enter")
         for _ in range(6):
             await pilot.pause()
@@ -1218,7 +1226,7 @@ async def test_chat_propose_then_confirm_creates_mission(
         assert before == [], "the proposal launched itself"
 
         prompt.focus()
-        prompt.insert_text_at_cursor("y")
+        prompt.insert("y")
         await pilot.press("enter")
         for _ in range(10):
             await pilot.pause()
@@ -1232,3 +1240,161 @@ async def test_chat_propose_then_confirm_creates_mission(
             await store.aclose()
         assert len(after) == 1, "confirming the proposal did not create the mission"
         assert after[0].project_id == "p-rw"
+
+
+async def test_gate_answerable_from_gates_tab(seeded: dict[str, str], tui_env: Path) -> None:
+    """Owner: 'heres a gate but theres no way to answer it'. The Gates tab is
+    where a decision naturally gets answered, so alt+a there must flip the row
+    of the SELECTED gate (not anything else on the board)."""
+    from rework.kernel.state.sqlite import open_sqlite
+    from rework.tui.app import GatesPane
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        shell = await _shell(app)
+        shell.show_tab("gates")
+        await pilot.pause(0.4)
+        table = shell.query_one("#pane-gates", GatesPane).query_one("#gates-table")
+        assert table.row_count == 1
+        await pilot.press("alt+a")
+        await pilot.pause(0.5)
+
+    store = await open_sqlite(str(tui_env))
+    try:
+        gate = await store.get_gate(seeded["gate"])
+        assert gate is not None and gate.status.value == "approved"
+    finally:
+        await store.aclose()
+
+
+async def test_gate_keys_refuse_when_context_has_no_gate(seeded: dict[str, str]) -> None:
+    """A stray alt+a on the Work tab must NOT approve some unrelated mission's
+    gate. Approving is destructive; it only acts on what you are looking at."""
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        shell = await _shell(app)
+        shell.show_tab("work")
+        await pilot.pause()
+        await pilot.press("alt+a")
+        await pilot.pause()
+        assert any("no open gate here" in n.message for n in app._notifications)
+
+
+async def test_cost_tab_shows_spend_by_model(seeded: dict[str, str], tui_env: Path) -> None:
+    """Owner: 'have a cost tab to monitor usage and cost'. It must read the
+    ledger, not invent numbers: charge two runs on two models and check the
+    table and the headline total."""
+    from textual.widgets import DataTable, Label
+
+    from rework.kernel.state.records import Charge
+    from rework.kernel.state.sqlite import open_sqlite
+
+    store = await open_sqlite(str(tui_env))
+    try:
+        await store.charge(
+            Charge(
+                mission_id=seeded["done"],
+                model="flash",
+                input_tokens=1000,
+                output_tokens=200,
+                cost_usd=0.0125,
+            )
+        )
+        await store.charge(
+            Charge(
+                mission_id=seeded["waiting"],
+                model="pro",
+                input_tokens=4000,
+                output_tokens=900,
+                cost_usd=0.2500,
+            )
+        )
+        await store.charge(
+            Charge(
+                mission_id=seeded["waiting"],
+                model="pro",
+                input_tokens=1000,
+                output_tokens=100,
+                cost_usd=0.0500,
+            )
+        )
+    finally:
+        await store.aclose()
+
+    app = ReworkApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        shell = await _shell(app)
+        shell._active_tab = "cost"  # make the pane visible for the refresh
+        shell.query_one("#pane-dashboard").display = False
+        shell.query_one("#pane-work").display = False
+        shell.query_one("#pane-gates").display = False
+        shell.query_one("#pane-library").display = False
+        cost = shell.query_one("#pane-cost")
+        cost.display = True
+        await cost.refresh_quiet()
+        await pilot.pause()
+
+        head = str(cost.query_one("#cost-head", Label).render())
+        assert "$0.3125" in head or "$0.31" in head, head
+        assert "3 calls" in head or "3 " in head, head
+
+        table = cost.query_one("#cost-models", DataTable)
+        models = [str(table.get_row_at(i)[0]) for i in range(table.row_count)]
+        assert models[0] == "pro"  # sorted by cost, most expensive first
+        assert "flash" in models
+        pro_row = table.get_row_at(0)
+        assert pro_row[1] == "2"  # two calls
+        assert pro_row[4] in ("$0.3000", "$0.3")
+
+
+async def test_prompt_accepts_long_paste_as_attachment(seeded: dict[str, str]) -> None:
+    """Owner: 'large pastes'. The old Input silently dropped anything past its
+    size limit, which reads as the app losing your work. A huge paste becomes
+    an attachment file instead."""
+    import asyncio
+
+    from textual.widgets import Label
+
+    from rework.tui.app import MAX_PASTE_CHARS, PromptInput
+
+    app = ReworkApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        shell = await _shell(app)
+        prompt = shell.query_one("#prompt", PromptInput)
+        big = "x" * (MAX_PASTE_CHARS + 5000)
+        path = prompt._spill(big)
+        prompt.attach_path(path)
+        await pilot.pause()
+
+        assert prompt.attachments == [path]
+        assert prompt.text == ""  # the prompt stayed clean
+        written = await asyncio.to_thread(Path(path).read_text, "utf-8")
+        assert len(written) == len(big)  # nothing was truncated
+        chip = str(shell.query_one("#attach-bar", Label).render())
+        assert "rework-paste-" in chip
+
+
+async def test_prompt_attaches_pasted_image_paths(seeded: dict[str, str], tmp_path) -> None:
+    """'images': a pasted path that points at a real image becomes an
+    attachment; non-image text stays ordinary paste text."""
+    from rework.tui.app import PromptInput
+
+    png = tmp_path / "screenshot.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+
+    app = ReworkApp()
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause()
+        prompt = (await _shell(app)).query_one("#prompt", PromptInput)
+
+        assert prompt._paths_from(str(png)) == [str(png.resolve())]
+        assert prompt._paths_from("just some words") == []
+        assert prompt._paths_from("/nope/missing.png") == []
+
+        prompt.attach_path(str(png))
+        await pilot.pause()
+        assert prompt.attachments == [str(png)]

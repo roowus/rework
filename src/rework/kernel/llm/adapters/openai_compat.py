@@ -45,6 +45,19 @@ def translate_request(request: ChatRequest) -> dict[str, Any]:
                     ],
                 }
             )
+        elif msg.get("images"):
+            # OpenAI content parts: text first, then image_url data URIs.
+            from rework.kernel.llm.adapters.images import load_image
+
+            parts: list[dict[str, Any]] = []
+            if msg.get("content"):
+                parts.append({"type": "text", "text": msg["content"]})
+            for path in msg["images"]:
+                data, mime = load_image(str(path))
+                parts.append(
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
+                )
+            messages.append({"role": role, "content": parts})
         else:
             messages.append({"role": role, "content": msg["content"]})
 

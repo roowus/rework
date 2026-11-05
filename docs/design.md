@@ -86,21 +86,37 @@ with a continue/abort gate; approving doubles the cap and resumes, rejecting can
 Steps that FAIL get exactly one in-mission retry (the 429-storm lesson) before the
 plan moves on; synthesis counts only the latest attempt per step.
 
-### The TUI (owner ask, post-M5; cockpit redesign owner-grilled 2026-11-05)
+### The TUI (owner ask, post-M5; OS-shell redesign 2026-11-05)
 
-Bare `rework` opens a Textual COCKPIT: projects sidebar, missions table
-(running/awaiting-gate first), live detail pane, and a persistent PROMPT BAR
-along the bottom that drives everything. Free text + enter opens the
-new-mission wizard pre-filled with the objective and the LAST-USED
-repo/project/plan (one-keypress launches after the first); `/` offers
-commands (/gates /library /fetch /new /projects). Enter on a mission opens
-the full-screen DEEP VIEW with tabs (Feed / Findings / Diff / Report);
-gates are actionable there, f fetches the result. The LIBRARY is
-search-first: the cursor lands in the search box, typing filters live
-(hybrid when embeddings are configured), list on the left, rendered body on
-the right, a/d activate/retire. One navigation rule everywhere:
-enter = deeper, esc = back, a/x = gate, f = fetch. Bare `rework` opens
-blank: nothing auto-opens, nothing auto-resumes (owner decision).
+Bare `rework` opens a Textual OS-style shell: a MENU BAR on top (rework
+wordmark, File / Edit / View / Help with working dropdowns), a TAB BAR under
+it, one full-width pane per section, and a hint row. Five tabs, `alt+1..5`:
+
+- **Work** — the CONVERSATION with the orchestrator. Missions are created by
+  talking, never by a form; the orchestrator proposes, you approve. The prompt
+  is a multi-line editor: enter sends, shift+enter adds a line, `/` completes
+  commands on tab, a pasted image path attaches the image, and a paste larger
+  than 20k chars becomes an attachment file instead of vanishing. Project /
+  model / effort are selection screens below the prompt.
+- **Dashboard** — projects as chips on top (the primary axis), missions
+  full-width below, then the selected mission's live trajectory (turns, tool
+  calls, tool results), its cost, and an approve/reject box when a gate waits.
+- **Gates** — every open gate across missions, with an unread badge on the tab
+  and a notification on arrival (REWORK_NOTIFY=toast|bell|both|none).
+- **Library** — search-first; hybrid when embeddings are configured.
+- **Cost** — the charges ledger, grouped by model (calls, input/output tokens,
+  USD) plus per-mission totals; `s` toggles all-missions vs the selected one.
+
+Gate keys are `alt+a` / `alt+x` (plain `a`/`x` collide with typing in any
+input and with the Gates table). They act on the VISIBLE context only: the
+deep view's mission, the Gates tab's selected row, or the Dashboard's
+selection — never a stray database-wide approval. The bindings live on the
+app, so the actions must exist there too: they were defined on a pane once,
+the key silently did nothing, and a gate had "no way to answer it".
+
+Deep view tabs are Feed / Findings / Diff / Report. One navigation rule
+everywhere: enter = deeper, esc = back, alt+a/x = decide, f = fetch.
+Bare `rework` opens blank: nothing auto-opens, nothing auto-resumes.
 
 Visible ARTIFACTS land in ~/rework (results/<mission-id>/, reports/), so
 deliverables are never buried in a dot-directory; ~/.rework stays hidden
