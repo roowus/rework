@@ -217,6 +217,38 @@ def _coder_script(final_summary: str) -> list[ChatResult]:
     ]
 
 
+def _coder_script_broken_writes_whole_file() -> list[ChatResult]:
+    """The historical failure mode: a 'fix' that rewrites calc.py WITHOUT mul().
+    The grader's mechanical pytest re-run must fail it."""
+    broken = (
+        '"""Tiny calculator."""\n\n\n'
+        "def add(a, b):\n"
+        "    return a + b\n"  # mul GONE
+    )
+    heredoc_cmd = "cat > calc.py << 'REWORK_EOF'\n" + broken + "REWORK_EOF"
+    return [
+        ChatResult(
+            text="fixing",
+            tool_calls=[ToolCall(id="c1", name="run_command", arguments={"command": heredoc_cmd})],
+            usage=Usage(input_tokens=10, output_tokens=5),
+            stop_reason="tool_calls",
+        ),
+        ChatResult(
+            text="verifying",
+            tool_calls=[
+                ToolCall(id="c2", name="run_command", arguments={"command": "python3 -m pytest -q"})
+            ],
+            usage=Usage(input_tokens=10, output_tokens=5),
+            stop_reason="tool_calls",
+        ),
+        ChatResult(
+            text="done (mul dropped by mistake)",
+            usage=Usage(input_tokens=10, output_tokens=8),
+            stop_reason="end_turn",
+        ),
+    ]
+
+
 def _auditor_script(report_json: str) -> list[ChatResult]:
     return [
         ChatResult(

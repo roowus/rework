@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from rework.kernel.state.records import Complaint, ComplaintKind, ComplaintStatus
+from rework.library.model import ItemType
 from rework.library.triage import cluster_complaints, issue_body, similarity, triage
 
 
@@ -114,3 +117,35 @@ async def test_triage_survives_gh_failure() -> None:
         _ = b
     finally:
         await store.aclose()
+
+
+def test_external_gate_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
+    """External ingest (M6.2): allowlisted host + owner approval, or denied."""
+    from rework.library.curation import external_gate_status
+    from rework.library.model import LibraryItem, Origin, Provenance
+
+    def ext(url: str) -> Any:
+        return LibraryItem(
+            type=ItemType.SKILL,
+            name="web thing",
+            provenance=Provenance(origin=Origin.EXTERNAL, source_url=url),
+        )
+
+    # no allowlist configured -> nothing external can pass
+    monkeypatch.delenv("REWORK_LIBRARY_ALLOWLIST", raising=False)
+    ok, why = external_gate_status(ext("https://docs.python.org/3/x"))
+    assert not ok and "ALLOWLIST" in why
+
+    # allowlisted host -> passes (per-item approval already applied by the cmd)
+    monkeypatch.setenv("REWORK_LIBRARY_ALLOWLIST", "docs.python.org, real.world")
+    ok, why = external_gate_status(ext("https://docs.python.org/3/x"))
+    assert ok and "docs.python.org" in why
+
+    # a lookalike host is NOT on the list (exact host match)
+    ok, _ = external_gate_status(ext("https://docs.python.org.evil.io/3/x"))
+    assert not ok
+
+    # internal items sail through
+    internal = LibraryItem(type=ItemType.SKILL, name="mine")
+    ok, why = external_gate_status(internal)
+    assert ok and why == "internal"

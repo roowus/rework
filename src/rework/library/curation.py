@@ -18,6 +18,25 @@ from rework.library.model import (
     Origin,
 )
 
+# External ingest MVP (M6.2): the owner allowlists SITES (hosts) in
+# REWORK_LIBRARY_ALLOWLIST (comma-separated); an external item needs (1) a
+# source host on that list AND (2) an explicit per-item human approval
+# (rework library approve-external). Both conditions are checked on ACTIVATE,
+# so nothing an agent does can shortcut the owner.
+
+
+def allowed_host(source_url: str) -> str | None:
+    """The source's host when it is on the allowlist, else None."""
+    import os as _os
+    from urllib.parse import urlparse
+
+    raw = _os.environ.get("REWORK_LIBRARY_ALLOWLIST", "")
+    allowlist = {h.strip().lower() for h in raw.split(",") if h.strip()}
+    if not allowlist:
+        return None
+    host = (urlparse(source_url).hostname or "").lower()
+    return host if host in allowlist else None
+
 
 def accept_status(item_type: ItemType, origin: Origin = Origin.INTERNAL) -> ItemStatus:
     """The status an item gets when contributed. One rule table:
@@ -25,6 +44,21 @@ def accept_status(item_type: ItemType, origin: Origin = Origin.INTERNAL) -> Item
     if item_type is ItemType.TOOL or origin is Origin.EXTERNAL:
         return ItemStatus.PROPOSED
     return ItemStatus.ACTIVE
+
+
+def external_gate_status(item: LibraryItem) -> tuple[bool, str]:
+    """(ok_to_activate, reason). External items pass only when their host is
+    allowlisted AND status was manually set by the owner (the approve-
+    external command moves PROPOSED -> ACTIVE after a human reads it)."""
+    if item.provenance.origin is not Origin.EXTERNAL:
+        return True, "internal"
+    host = allowed_host(item.provenance.source_url or "")
+    if host is None:
+        return (
+            False,
+            "source host is not on REWORK_LIBRARY_ALLOWLIST; external ingest denied",
+        )
+    return True, f"allowlisted source {host} + owner approval"
 
 
 async def contribute(

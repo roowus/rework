@@ -1126,11 +1126,16 @@ def library_activate(item_id: str, note: str | None = typer.Option(None)) -> Non
     from rework.config import Config
 
     async def go() -> str:
+        from rework.library.curation import external_gate_status
+
         index = await open_library_index(Config.from_env().db)
         try:
             item = await index.get_item(item_id)
             if item is None:
                 raise typer.BadParameter(f"item not found: {item_id}")
+            ok, reason = external_gate_status(item)
+            if not ok:
+                raise typer.BadParameter(f"cannot activate {item_id}: {reason}")
             item.status = item.status.__class__.ACTIVE
             item.touch()
             await index.upsert_item(item)
@@ -1139,6 +1144,86 @@ def library_activate(item_id: str, note: str | None = typer.Option(None)) -> Non
             await index.aclose()
 
     _ = note
+    typer.echo(asyncio.run(go()))
+
+
+@library_app.command("add-external")
+def library_add_external(
+    body_file: str = typer.Argument(...),
+    name: str = typer.Option(...),
+    source_url: str = typer.Option(
+        ..., help="Where this came from (host must be allowlisted to activate)."
+    ),
+    description: str = typer.Option(""),
+    tag: list[str] = typer.Option([], "--tag", help="Repeatable."),  # noqa: B008
+) -> None:
+    """Stage an EXTERNAL item (from the web). Always lands proposed; needs an
+    allowlisted host + explicit owner approval to ever go active."""
+    from rework.config import Config
+    from rework.library.model import (
+        ItemStatus,
+        ItemType,
+        LibraryItem,
+        Origin,
+        Provenance,
+    )
+    from rework.library.store import GitLibrary
+
+    src = Path(body_file).expanduser()
+    if not src.is_file():
+        raise typer.BadParameter(f"body file not found: {src}")
+    item = LibraryItem(
+        type=ItemType.SKILL,  # external content enters as knowledge, never tools
+        name=name,
+        description=description,
+        tags=list(tag),
+        provenance=Provenance(origin=Origin.EXTERNAL, source_url=source_url),
+        status=ItemStatus.PROPOSED,
+    )
+
+    async def go() -> str:
+        lib = GitLibrary(_library_root(), author=Config.from_env().git_author)
+        item.body_path = await asyncio.to_thread(
+            lib.write_body,
+            item,
+            await asyncio.to_thread(src.read_text),
+            f"library: add external skill {name!r} from {source_url}",
+        )
+        index = await open_library_index(Config.from_env().db)
+        try:
+            await index.upsert_item(item)
+        finally:
+            await index.aclose()
+        return item.id
+
+    typer.echo(asyncio.run(go()))
+
+
+@library_app.command("approve-external")
+def library_approve_external(item_id: str) -> None:
+    """The explicit per-item human approval for EXTERNAL ingest (ADR 0001:
+    allowlisted sites only + owner reads it first)."""
+    from rework.config import Config
+    from rework.library.curation import external_gate_status
+
+    async def go() -> str:
+        index = await open_library_index(Config.from_env().db)
+        try:
+            item = await index.get_item(item_id)
+            if item is None:
+                raise typer.BadParameter(f"item not found: {item_id}")
+            if item.provenance.origin.value != "external":
+                return f"{item_id} is internal; plain `library activate` is the gate"
+            ok, reason = external_gate_status(item)
+            if not ok:
+                raise typer.BadParameter(reason)
+            item.status = item.status.__class__.ACTIVE
+            item.touch()
+            await index.upsert_item(item)
+            return f"{item.id} external ingest approved; now active ({item.name!r})"
+        finally:
+            await index.aclose()
+
     typer.echo(asyncio.run(go()))
 
 
