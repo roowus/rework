@@ -41,15 +41,21 @@ class LibraryHandle(BaseModel):
         )
 
     async def menu(self) -> str:
-        """The spawn menu: ACTIVE skills only, name + description."""
+        """The spawn menu: ACTIVE skills, id + name + description.
+
+        The id is REQUIRED here, not decoration: found live (prod mission
+        m-c8b72e7734b7), a coder with a name-only menu invented
+        `fix-<slug>-<procedure>` and ate an `error: no library item` turn. The
+        model can only pass back what it was shown."""
         skills = await self.index.list_items(
             type_=ItemType.SKILL, status=ItemStatus.ACTIVE, limit=50
         )
         if not skills:
             return ""
-        lines = ["Active library skills (library_search for more, library_read for the body):"]
+        lines = ["Active library skills (library_read takes the id shown here):"]
         for s in skills:
-            lines.append(f"- {s.name}: {s.description}" if s.description else f"- {s.name}")
+            line = f"- {s.id}  {s.name}"
+            lines.append(f"{line}: {s.description}" if s.description else line)
         return "\n".join(lines)
 
     async def search_text(self, query: str, type_name: str | None = None) -> str:
@@ -59,15 +65,32 @@ class LibraryHandle(BaseModel):
         await asyncio.gather(*(self.index.record_use(i.id) for i in items))
         return "\n".join(f"{i.id}  [{i.type.value}] {i.name}: {i.description}" for i in items)
 
+    async def resolve(self, ref: str) -> Any:
+        """An id, or failing that a name. Models pass back whatever they were
+        shown; a slugified name used to become an opaque miss."""
+        item = await self.index.get_item(ref)
+        if item is not None:
+            return item
+        wanted = ref.strip().lower()
+        for candidate in await self.index.list_items(limit=500):
+            if candidate.id == ref or candidate.name.strip().lower() == wanted:
+                return candidate
+        return None
+
     async def read_text(self, item_id: str) -> str:
-        item = await self.index.get_item(item_id)
+        item = await self.resolve(item_id)
         if item is None:
-            return f"error: no library item {item_id}"
+            known = await self.index.list_items(limit=5)
+            available = ", ".join(f"{i.id} ({i.name})" for i in known) or "none"
+            return (
+                f"error: no library item {item_id!r}. Use an id from the library"
+                f" menu or library_search; available now: {available}"
+            )
         if item.status is not ItemStatus.ACTIVE:
             return f"error: {item.name} is {item.status.value}; only active items are served"
         body = await asyncio.to_thread(self.git.read_body, item)
-        await self.index.record_use(item_id)
-        return body or f"(item {item_id} has no body file)"
+        await self.index.record_use(item.id)
+        return body or f"(item {item.id} has no body file)"
 
     async def contribute_text(self, **args: Any) -> str:
         try:

@@ -99,6 +99,17 @@ class CoderSpec(RoleSpec):
             " does not; if blocked, stop and say why instead of pretending."
         )
 
+        async def ensure_attached() -> None:
+            """RESUME SAFETY (found live: 'LazyExecutor used before attach()'
+            killed a recovered mission). LangGraph resumes at the node AFTER
+            prepare, so prepare never replays on restart — but the executor is
+            rebuilt fresh and unattached. The loop calls this first; the
+            worktree already exists by then, so re-deriving it is cheap."""
+            if executor.attached:
+                return
+            worktree, _base = await ensure_worktree(repo, worktree_path, branch)
+            executor.attach(worktree)
+
         async def prepare(state: CoderState) -> dict[str, Any]:
             run_ctx = ctx.run.context or {}
             worktree, base_sha = await ensure_worktree(repo, worktree_path, branch)
@@ -186,6 +197,7 @@ class CoderSpec(RoleSpec):
             budget=ctx.budget,
             effort=ctx.run.model_ref.get("effort"),
             bus=ctx.bus,
+            on_start=ensure_attached,
         )
 
         graph = StateGraph(CoderState)

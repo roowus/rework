@@ -59,6 +59,33 @@ async def test_run_command_jailed_cwd(workdir: Path) -> None:
     assert expected in out
 
 
+async def test_absolute_cd_outside_worktree_is_refused(workdir: Path, tmp_path: Path) -> None:
+    """Live bug (m-c8b72e7734b7): the model invented an absolute worktree path
+    that did not exist; /bin/sh exited 2 and every chained command silently
+    skipped. Refuse with the real location instead of an opaque failure."""
+    ex = LocalExecutor(workdir)
+    outside = tmp_path / "code_coder_2" / "worktree"
+    out = await ex.execute("run_command", {"command": f"cd {outside} && git status"})
+    assert out.startswith("error: refusing `cd")
+    expected = str(workdir.resolve())  # noqa: ASYNC240  (test: sync resolve of a fixture path)
+    assert expected in out
+
+
+async def test_absolute_cd_to_the_worktree_is_allowed(workdir: Path) -> None:
+    ex = LocalExecutor(workdir)
+    target = str(workdir.resolve())  # noqa: ASYNC240  (test: sync resolve of a fixture path)
+    out = await ex.execute("run_command", {"command": f"cd {target} && pwd"})
+    assert out.startswith("(exit 0)")
+
+
+async def test_relative_cd_is_left_alone(workdir: Path) -> None:
+    (workdir / "sub").mkdir()
+    ex = LocalExecutor(workdir)
+    out = await ex.execute("run_command", {"command": "cd sub && pwd"})
+    assert out.startswith("(exit 0)")
+    assert "/sub" in out
+
+
 async def test_specs_filtered_by_allowed(workdir: Path) -> None:
     ex = LocalExecutor(workdir)
     assert {s.name for s in ex.specs()} == {"read_file", "list_dir", "run_command"}

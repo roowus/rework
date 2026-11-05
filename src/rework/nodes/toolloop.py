@@ -65,6 +65,7 @@ def make_toolloop_node(
     temperature: float | None = None,
     effort: str | None = None,
     bus: Any | None = None,
+    on_start: Any | None = None,
 ) -> ToolLoopNode:
     """`bus` (optional) turns on TRAJECTORY events: one per model turn and one
     per tool call, so the UI can show the agent loop the way Claude Code and
@@ -98,6 +99,11 @@ def make_toolloop_node(
         )
 
     async def node(state: dict[str, Any]) -> dict[str, Any]:
+        # RESUME HOOK: a graph resumed from a checkpoint re-enters at the node
+        # AFTER the one that did setup, so one-time binding (e.g. the coder's
+        # worktree executor) is missing. `on_start` re-establishes it.
+        if on_start is not None:
+            await on_start()
         messages: list[dict[str, Any]] = list(state.get("messages") or [])
         turns = 0
         stop_note: str | None = None

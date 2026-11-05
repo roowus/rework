@@ -9,6 +9,7 @@ never change.
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -113,6 +114,15 @@ class LazyExecutor:
         return self._inner.specs(allowed)
 
 
+# A leading `cd <abs path>` in a shell command. Agents write these from memory
+# and get them wrong (found live: a coder invented
+# .../<mission>/code_coder_2/worktree when the real dir is
+# .../<mission>_code_coder_2/worktree), and the failure is INVISIBLE: /bin/sh
+# exits 2 on the failed cd, every later command in the chain silently skips,
+# and the model reads a truncated transcript as if the work happened.
+_LEADING_CD = re.compile(r"^\s*cd\s+(?P<path>'[^']*'|\"[^\"]*\"|[^\s;&|]+)")
+
+
 class LocalExecutor:
     """Path-jailed local tools. Every path arg is resolved against the workdir
     and rejected if it escapes (symlinks included).
@@ -122,7 +132,13 @@ class LocalExecutor:
     to an absolute path outside it and work there; inspecting the shell string
     is not a security boundary. The coder prompt pins cwd to the worktree, the
     eval harness seeds fixture repos outside the workroot, and the real fix is
-    the Docker executor (M7)."""
+    the Docker executor (M7).
+
+    What the inspection DOES buy (found live, prod mission m-c8b72e7734b7): the
+    shell is already inside the workdir, so a leading absolute `cd` is never
+    necessary. When one points outside the workdir — or at a path that does not
+    exist — we refuse it and say where it actually is, instead of handing back
+    an opaque exit 2 the model misreads as success."""
 
     def __init__(self, workdir: Path, extra_specs: list[ToolSpec] | None = None) -> None:
         self._workdir = workdir.resolve()
@@ -133,6 +149,31 @@ class LocalExecutor:
         if candidate != self._workdir and self._workdir not in candidate.parents:
             raise ValueError(f"path escapes workspace: {path_str}")
         return candidate
+
+    def _check_leading_cd(self, command: str) -> str | None:
+        """Return an error message if the command starts with an absolute `cd`
+        we should refuse, else None. The shell already runs in the workdir, so
+        `cd .`, relative cd's and `cd $PWD` are all no-ops we leave alone."""
+        match = _LEADING_CD.match(command)
+        if not match:
+            return None
+        raw = match.group("path").strip().strip("'\"")
+        if not raw.startswith(("/", "~")):
+            return None
+        target = Path(raw).expanduser()
+        if target.resolve() == self._workdir:
+            return None
+        exists = target.exists()
+        hint = (
+            f"error: refusing `cd {raw}`."
+            f" You are ALREADY inside your worktree: {self._workdir}."
+            " Relative paths (and no cd at all) are correct here."
+        )
+        if not exists:
+            hint += " That path does not exist."
+        else:
+            hint += " That path is outside the worktree; work done there is lost at handoff."
+        return hint
 
     async def execute(self, name: str, args: dict[str, Any]) -> str:
         try:
@@ -154,6 +195,9 @@ class LocalExecutor:
                 return "\n".join(rendered) or "(empty)"
             if name == "run_command":
                 command = str(args["command"])
+                refusal = self._check_leading_cd(command)
+                if refusal is not None:
+                    return refusal
                 timeout = float(args.get("timeout_seconds", 120))
                 proc = await asyncio.create_subprocess_shell(
                     command,

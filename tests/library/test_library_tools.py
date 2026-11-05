@@ -150,6 +150,56 @@ async def test_menu_lists_active_skills_only(tmp_path, library_index) -> None:
     assert "Active library skills" in menu
 
 
+async def test_menu_carries_ids_so_read_can_be_called(tmp_path, library_index) -> None:
+    """Live bug (m-c8b72e7734b7): a name-only menu made the coder invent a
+    slug id and burn a turn on `error: no library item`. Whatever the menu
+    shows, library_read must accept."""
+    handle = _handle(tmp_path, library_index)
+    skill, _ = await contribute(
+        handle.index,
+        handle.git,
+        type_=ItemType.SKILL,
+        name="fix rework toyrepo planted bug 3",
+        description="command verified procedure",
+        body="the body",
+        tags=[],
+    )
+    menu = await handle.menu()
+    assert skill.id in menu
+    body = await handle.read_text(skill.id)
+    assert body == "the body"
+
+
+async def test_read_accepts_the_name_as_fallback(tmp_path, library_index) -> None:
+    handle = _handle(tmp_path, library_index)
+    await contribute(
+        handle.index,
+        handle.git,
+        type_=ItemType.SKILL,
+        name="Named Skill",
+        description="d",
+        body="body by name",
+        tags=[],
+    )
+    assert await handle.read_text("Named Skill") == "body by name"
+
+
+async def test_read_miss_names_what_is_available(tmp_path, library_index) -> None:
+    handle = _handle(tmp_path, library_index)
+    skill, _ = await contribute(
+        handle.index,
+        handle.git,
+        type_=ItemType.SKILL,
+        name="real one",
+        description="d",
+        body="b",
+        tags=[],
+    )
+    out = await handle.read_text("fix-rework-toyrepo-add---planted-bug")
+    assert out.startswith("error: no library item")
+    assert skill.id in out  # tells the model what it CAN use
+
+
 def test_wrappers_identity_when_library_off() -> None:
     class _Ctx:
         library = None
