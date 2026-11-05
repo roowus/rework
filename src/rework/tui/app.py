@@ -87,117 +87,6 @@ class SelectableLog(RichLog):
 # ---------------------------------------------------------------- modals
 
 
-class NewMissionModal(ModalScreen[dict[str, Any]]):
-    """Guided new-mission form: project, repo (URL or local path) OR a local
-    folder to upload, objective, plan. Opened from Work / the prompt bar with
-    the objective pre-filled and last-used repo/project/plan remembered."""
-
-    BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
-        Binding("escape", "cancel", "Cancel", show=True),
-        Binding("ctrl+s", "submit", "Create", show=True),
-    ]
-
-    def __init__(
-        self,
-        projects: list[Any],
-        objective: str = "",
-        defaults: dict[str, Any] | None = None,
-    ) -> None:
-        super().__init__()
-        self._projects = projects
-        self._objective = objective
-        self._defaults = defaults or {}
-
-    def compose(self) -> ComposeResult:
-        choices = [("(no project)", "__none__")] + [
-            (f"{p.name} ({p.id})", p.id) for p in self._projects
-        ]
-        default_project = self._defaults.get("project_id") or "__none__"
-        # a remembered project may have been deleted; fall back cleanly
-        if default_project != "__none__" and not any(v == default_project for _, v in choices):
-            default_project = "__none__"
-        with Vertical(id="modal-form"):
-            yield Label("[b]New mission[/b]  [dim]ctrl+s create · esc cancel[/dim]")
-            yield Input(
-                id="f-objective",
-                placeholder="Objective (what should happen)",
-                value=self._objective,
-            )
-            yield Input(
-                id="f-repo",
-                placeholder="Repo: git URL or local path",
-                value=self._defaults.get("repo") or "",
-            )
-            yield Input(
-                id="f-repodir",
-                placeholder="Folder to upload (non-git files), optional",
-                value=self._defaults.get("repo_dir") or "",
-            )
-            yield Select(
-                [
-                    ("echo (no roles)", "echo"),
-                    ("fix: investigate > code > audit + ship gate", "fix"),
-                    ("fix-pr: like fix, opens a PR", "fix-pr"),
-                ],
-                value=self._defaults.get("plan") or "fix",
-                id="f-plan",
-                allow_blank=False,
-            )
-            yield Select(choices, value=default_project, id="f-project", allow_blank=False)
-            with HorizontalGroup(id="modal-actions"):
-                yield Button("Create", id="btn-create", variant="success")
-                yield Button("Cancel", id="btn-cancel")
-
-    def on_mount(self) -> None:
-        self.query_one("#f-objective", Input).focus()
-
-    @on(Button.Pressed, "#btn-cancel")
-    def cancel_btn(self) -> None:
-        self._safe_dismiss()
-
-    def _safe_dismiss(self) -> None:
-        self._safe_dismiss_with(None)
-
-    def _safe_dismiss_with(self, result: Any) -> None:
-        """Dismiss without blowing up when the awaiting future was already
-        cancelled (found live: InvalidStateError in ResultCallback.__call__
-        when another exclusive worker cancelled the modal flow)."""
-        import contextlib
-
-        with contextlib.suppress(Exception):
-            self.dismiss(result)
-
-    @on(Button.Pressed, "#btn-create")
-    def create_btn(self) -> None:
-        self.action_submit()
-
-    def action_cancel(self) -> None:
-        self._safe_dismiss()
-
-    def action_submit(self) -> None:
-        objective = self.query_one("#f-objective", Input).value.strip()
-        if not objective:
-            self.notify("Objective is required", severity="error")
-            return
-        repo = self.query_one("#f-repo", Input).value.strip() or None
-        repo_dir = self.query_one("#f-repodir", Input).value.strip() or None
-        if not repo and not repo_dir:
-            self.notify("Give a repo (URL or path) or a folder to upload", severity="warning")
-            return
-        plan = self.query_one("#f-plan", Select).value
-        project = self.query_one("#f-project", Select).value
-        project_id = None if project == "__none__" else str(project)
-        self._safe_dismiss_with(
-            {
-                "objective": objective,
-                "repo": repo,
-                "repo_dir": repo_dir,
-                "project_id": project_id,
-                "plan": str(plan),
-            }
-        )
-
-
 CHOICE_CANCELLED = object()  # sentinel: esc, not "I picked the None row"
 
 
@@ -348,13 +237,15 @@ class Pane(Static):
 
 
 class WorkPane(Pane):
-    """The typing surface: a prompt with command autocomplete, and THREE
-    buttons (project / model / effort) for the knobs a mission runs with.
+    """The CONVERSATION with the orchestrator — how missions get created.
 
-    Owner asks folded in: 'commands should have autocomplete'; the pickers
-    should be buttons, not hidden key bindings ('make this stuff buttons');
-    and the old action-button row plus the recent-missions list were clutter
-    and were removed ('these buttons are redundant', 'remove them also')."""
+    Owner principle: 'rework works by u talking to an orchestrator and the
+    orchestrator decides'. There is no mission form any more: you write what
+    you want, the orchestrator works out project/plan/repo (asking only when a
+    wrong guess would cost real money), proposes the mission, and launches when
+    you say yes.
+
+    The three buttons are overrides for the proposal, not a wizard."""
 
     BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
         # ctrl+m IS enter (CR) and ctrl+e is end-of-line inside Input —
@@ -367,23 +258,22 @@ class WorkPane(Pane):
     EFFORTS: ClassVar[tuple[str, ...]] = ("default", "low", "medium", "high")
 
     def compose(self) -> ComposeResult:
-        yield Input(
-            placeholder="what should rework do?  (type / for commands, enter to launch)",
-            id="prompt",
-        )
+        yield Label("", id="chat-model-line")
+        yield SelectableLog(id="chat", markup=True, highlight=False, wrap=True, max_lines=800)
         with Horizontal(id="work-settings"):
             yield Button("", id="btn-project", classes="work-knob")
             yield Button("", id="btn-model", classes="work-knob")
             yield Button("", id="btn-effort", classes="work-knob")
-        yield Label(
-            "[dim]tab completes a command · click a button to change it[/dim]",
-            id="work-hint",
+        yield Input(
+            placeholder="tell the orchestrator what you want…",
+            id="prompt",
         )
 
     def on_mount(self) -> None:
         self._model_ids: list[str] = []
         self._effort_index = 0
         self._project_ids: list[str] = []
+        self._chat: Any = None  # OrchestratorChat, built lazily per conversation
         self._load_models()
         self._install_suggestions()
         self.query_one("#prompt", Input).focus()
@@ -397,6 +287,124 @@ class WorkPane(Pane):
             await self.reload_projects()
         except Exception as exc:  # a bad project list must not kill the tab
             self.notify(f"projects unavailable: {exc}", severity="warning")
+        self._greet()
+
+    # -- the conversation -----------------------------------------------------
+
+    def _chat_log(self) -> Any:
+        return self.query_one("#chat", SelectableLog)
+
+    def _say(self, who: str, text: str) -> None:
+        color = {"you": "cyan", "orchestrator": "green", "note": "dim", "error": "red"}.get(
+            who, "white"
+        )
+        for line in text.splitlines() or [""]:
+            self._chat_log().write(f"[{color}]{who:>12}[/{color}]  {line}")
+
+    def _greet(self) -> None:
+        name = self._display_model()
+        self._say(
+            "orchestrator",
+            f"Tell me what you want done and I'll propose a mission.\n"
+            f"Talking on {name}; the mission runs on the model in the button below.",
+        )
+
+    def _display_model(self) -> str:
+        return self._current_model() or (self._model_ids[0] if self._model_ids else "no catalog")
+
+    def _context_note(self) -> str:
+        rw = self.shell.rw
+        projects = [p.name for p in rw._project_cache.values()]
+        chosen = self._project_name(self._current_project())
+        repos = []
+        for p in rw._project_cache.values():
+            for ref in (p.settings or {}).get("repos") or []:
+                repos.append(f"{p.name}: {ref}")
+        bits = [
+            f"Projects available: {', '.join(projects) if projects else '(none)'}",
+            f"Project chosen in the UI: {chosen}",
+        ]
+        if repos:
+            bits.append("Repo refs:\n" + "\n".join(f"- {r}" for r in repos[:20]))
+        bits.append(
+            "Plans: echo (no roles), fix (investigate>code>audit>ship gate), "
+            "fix-pr (same, opens a PR)."
+        )
+        return "\n".join(bits)
+
+    def _build_chat(self) -> Any:
+        from rework.config import load_catalog
+        from rework.kernel.llm.adapters import build_provider
+        from rework.orchestrator.chat import OrchestratorChat
+
+        catalog = load_catalog()
+        model_id = self._current_model() or (self._model_ids[0] if self._model_ids else "")
+        if not model_id:
+            raise RuntimeError("no model in the catalog (set REWORK_MODELS)")
+        provider = build_provider(catalog.resolve(model_id))
+        return OrchestratorChat(
+            provider,
+            catalog,
+            model_id,
+            effort=self._current_effort(),
+            context=self._context_note(),
+        )
+
+    def reset_chat(self) -> None:
+        """Start a fresh conversation (after a launch, or from the File menu)."""
+        self._chat = None
+        self._chat_log().clear()
+        self._greet()
+
+    async def _converse(self, text: str) -> None:
+        if self._chat is None:
+            try:
+                self._chat = self._build_chat()
+            except Exception as exc:
+                self._say("error", f"cannot reach a model: {exc}")
+                return
+        self._say("you", text)
+        self.query_one("#chat-model-line", Label).update("")
+
+        try:
+            result = await self._chat.send(text)
+        except Exception as exc:
+            self._say("error", f"the orchestrator call failed: {exc}")
+            return
+
+        for turn in result.transcript:
+            if turn.who == "you":
+                continue  # already echoed
+            self._say(turn.who, turn.text)
+
+        if result.turn_tokens:
+            cost = result.turn_cost_usd
+            self.query_one("#chat-model-line", Label).update(
+                f"[dim]{self._display_model()} · {result.turn_tokens:,} tokens · ${cost:.4f}[/dim]"
+            )
+
+        if self._chat.proposal is not None and not self._chat.launched:
+            self._say("orchestrator", "launch? (y / n)")
+        elif self._chat.launched:
+            await self._launch_proposal()
+
+    async def _launch_proposal(self) -> None:
+        chat = self._chat
+        assert chat is not None and chat.proposal is not None
+        proposal = chat.proposal
+        self._say("note", "launching…")
+        try:
+            mission = await self.shell.launch_proposal(proposal)
+        except Exception as exc:
+            self._say("error", f"launch failed: {exc}")
+            return
+        if mission is None:
+            # the shell already explained what it needs (e.g. a repo) and
+            # reset the conversation; stay here so the owner can answer
+            return
+        self._say("note", f"mission {mission.id} created — watch it on the Dashboard")
+        self.reset_chat()
+        self.shell.show_tab("dashboard")
 
     # -- the three knob buttons: each opens a SELECTION screen ----------------
 
@@ -581,9 +589,9 @@ class WorkPane(Pane):
         if text.startswith("/"):
             await self.shell.rw.run_slash(text)
             return
-        # free text = a mission: wizard pre-filled with the objective and
-        # last-used repo/project/plan (remembered on the app)
-        self.run_worker(self.shell.new_mission_flow(objective=text), exclusive=True)
+        # free text = a message to the orchestrator (missions are a
+        # conversation now; the form wizard is gone)
+        self.run_worker(self._converse(text), exclusive=True, group="chat")
 
 
 class ProjectBand(Static, can_focus=True):
@@ -1515,44 +1523,64 @@ class Shell(Screen):
         self.app.push_screen(MissionDeepView(mission_id))
 
     async def new_mission_flow(self, objective: str = "") -> None:
+        """Mission creation is a CONVERSATION now: jump to the Work tab and,
+        when the caller supplied text, send it to the orchestrator.
+
+        The old form (project/repo/folder/plan selects) is gone — the owner's
+        principle is that you talk to an orchestrator and it decides."""
+        self.show_tab("work")
+        work = self.query_one("#pane-work", WorkPane)
+        if objective.strip():
+            work.run_worker(work._converse(objective.strip()), exclusive=True, group="chat")
+        else:
+            work.query_one("#prompt", Input).focus()
+
+    async def launch_proposal(self, proposal: Any) -> Any:
+        """Create the mission the orchestrator proposed, AFTER the owner said
+        yes. Resolves the project name to its id and honours UI overrides."""
         rw = self.rw
-        defaults = rw._mission_defaults
-        result = await self.app.push_screen(
-            NewMissionModal(
-                list(rw._project_cache.values()),
-                objective=objective,
-                defaults=defaults,
-            ),
-            wait_for_dismiss=True,
-        )
-        if not result:
-            return
-        rw._mission_defaults = {
-            "repo": result.get("repo"),
-            "repo_dir": result.get("repo_dir"),
-            "project_id": result.get("project_id"),
-            "plan": result.get("plan"),
-            # the Work tab's pickers survive the round trip
-            "model": rw._mission_defaults.get("model"),
-            "effort": rw._mission_defaults.get("effort"),
+        project_id: str | None = None
+        if proposal.project:
+            for project in rw._project_cache.values():
+                if project.name.lower() == proposal.project.lower():
+                    project_id = str(project.id)
+                    break
+            if project_id is None:
+                raise ValueError(f"no project named {proposal.project!r}")
+        kwargs: dict[str, Any] = {
+            "objective": proposal.objective,
+            "plan": proposal.plan or "fix",
+            "project_id": project_id,
+            "repo": proposal.repo or None,
+            "model": proposal.model or rw._mission_defaults.get("model"),
+            "effort": proposal.effort or rw._mission_defaults.get("effort"),
         }
-        self.notify("creating mission…")
+        if kwargs["plan"] == "echo":
+            kwargs["repo"] = None
         try:
-            if rw._mission_defaults.get("model"):
-                result["model"] = rw._mission_defaults["model"]
-            if rw._mission_defaults.get("effort"):
-                result["effort"] = rw._mission_defaults["effort"]
-            mission = await rw.data.create_mission(**result)
-            self.notify(f"mission {mission.id} created")
-            dash = self.query_one("#pane-dashboard", DashboardPane)
-            dash._selected_mission = mission.id
-            dash._last_event_seq = 0
-            await rw.load_project_cache()
-            await dash.reload_missions()
+            mission = await rw.data.create_mission(**kwargs)
+        except ValueError as exc:
+            # a plan that needs a repo (fix/fix-pr) with nothing to work on:
+            # send it back to the conversation rather than a dead error
             work = self.query_one("#pane-work", WorkPane)
-            work.run_worker(work.reload_projects(), exclusive=True, group="work-reload")
-        except Exception as exc:
-            self.notify(f"create failed: {exc}", severity="error")
+            work._say(
+                "orchestrator", f"{exc}\nWhich repo should I use? Paste a git URL or a folder path."
+            )
+            work._chat = None  # fresh conversation for the repo answer
+            self.show_tab("work")
+            work.query_one("#prompt", Input).focus()
+            return None  # the Work pane has already explained; not an error
+        dash = self.query_one("#pane-dashboard", DashboardPane)
+        dash._selected_mission = mission.id
+        dash._last_event_seq = 0
+        await rw.load_project_cache()
+        await dash.reload_missions()
+        self.query_one("#pane-work", WorkPane).run_worker(
+            self.query_one("#pane-work", WorkPane).reload_projects(),
+            exclusive=True,
+            group="work-reload",
+        )
+        return mission
 
     async def new_project_flow(self) -> None:
         result = await self.app.push_screen(CreateProjectModal(), wait_for_dismiss=True)
@@ -1967,6 +1995,9 @@ class ReworkApp(App[None]):
     #work-settings { height: 3; }
     .work-knob { min-width: 16; margin-right: 1; height: 3; }
     #work-hint { height: 1; color: $text-muted; }
+    #chat { height: 1fr; border: none; padding: 0 1; }
+    #chat-model-line { height: 1; color: $text-muted; padding: 0 1; }
+    #pane-work #prompt { border: round $accent; }
     #pane-dashboard { height: 1fr; padding: 0 1; }
     #pane-gates { height: 1fr; padding: 0 1; }
     #pane-library { height: 1fr; padding: 0 1; }

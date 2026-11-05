@@ -302,14 +302,22 @@ async def test_command_palette_lists_actions(seeded: dict[str, str]) -> None:
         assert provider is not None
 
 
-async def test_prompt_bar_free_text_opens_prefilled_wizard(seeded: dict[str, str]) -> None:
-    """The cockpit mechanic: typing an objective at the prompt and enter opens
-    the wizard with the objective pre-filled (and remembers last-used repo +
-    plan for the next launch)."""
+async def test_prompt_sends_message_to_the_orchestrator(seeded: dict[str, str]) -> None:
+    """Mission creation is a CONVERSATION (owner: 'rework works by u talking
+    to an orchestrator and the orchestrator decides'). Enter on the prompt
+    must send a chat turn — there is no form any more."""
     from textual.widgets import Input
 
-    from rework.tui.app import NewMissionModal
+    from conftest import ScriptedProvider, role_catalog
+    from rework.kernel.llm.types import ChatResult
+    from rework.orchestrator.chat import OrchestratorChat
+    from rework.tui.app import WorkPane
 
+    scripted = ScriptedProvider()
+    scripted.route("orchestrator", [ChatResult(text="Which repo should I use?")])
+    WorkPane._build_chat = lambda self: OrchestratorChat(  # type: ignore[method-assign]
+        scripted, role_catalog(), "flash", context="test"
+    )
     app = ReworkApp()
     async with app.run_test(size=(120, 32)) as pilot:
         await pilot.pause()
@@ -319,39 +327,13 @@ async def test_prompt_bar_free_text_opens_prefilled_wizard(seeded: dict[str, str
         prompt.focus()
         prompt.insert_text_at_cursor("fix the resize glitch")
         await pilot.press("enter")
-        await pilot.pause()
-        await pilot.pause()
-        modal = app.screen
-        assert isinstance(modal, NewMissionModal)
-        assert modal.query_one("#f-objective", Input).value == "fix the resize glitch"
-        await pilot.press("escape")
-        await pilot.pause()
+        for _ in range(4):
+            await pilot.pause()
         assert prompt.value == ""
-
-
-async def test_wizard_remembers_last_used_repo_and_plan(seeded: dict[str, str]) -> None:
-    from textual.widgets import Input, Select
-
-    from rework.tui.app import NewMissionModal
-
-    app = ReworkApp()
-    async with app.run_test(size=(120, 32)) as pilot:
-        await pilot.pause()
-        await pilot.pause()
-        shell = await _shell(app)
-        app._mission_defaults = {
-            "repo": "https://github.com/roowus/rework",
-            "repo_dir": None,
-            "project_id": None,
-            "plan": "fix-pr",
-        }
-        shell.run_worker(shell.new_mission_flow(objective="second thing"), exclusive=True)
-        await pilot.pause()
-        await pilot.pause()
-        modal = app.screen
-        assert isinstance(modal, NewMissionModal)
-        assert modal.query_one("#f-repo", Input).value == "https://github.com/roowus/rework"
-        assert str(modal.query_one("#f-plan", Select).value) == "fix-pr"
+        # no modal: the Work tab owns the conversation
+        assert isinstance(app.screen, Shell)
+        chat_lines = " ".join(line.text for line in shell.query_one("#chat").lines)
+        assert "fix the resize glitch" in chat_lines
 
 
 async def test_slash_commands_route(seeded: dict[str, str]) -> None:
@@ -695,7 +677,7 @@ async def test_menu_dropdown_opens_stays_and_acts(seeded: dict[str, str]) -> Non
     """The owner's 'top toolbar dropdowns dont work': the bar blurred into the
     dropdown and closed it instantly, and MenuAction never reached a handler
     (messages stop at the screen). Click File, pick New mission, wizard opens."""
-    from rework.tui.app import MenuBar, NewMissionModal
+    from rework.tui.app import MenuBar
 
     app = ReworkApp()
     async with app.run_test(size=(120, 32)) as pilot:
@@ -715,12 +697,12 @@ async def test_menu_dropdown_opens_stays_and_acts(seeded: dict[str, str]) -> Non
         await pilot.click(offset=(content.x + 6, content.y))  # New mission…
         for _ in range(8):
             await pilot.pause()
-        assert bar._open_menu is None
-        assert isinstance(app.screen, NewMissionModal), "MenuAction never dispatched"
+        assert bar._open_menu is None, "menu did not close after a pick"
+        # File > New mission lands on the Work tab with the prompt focused
+        from rework.tui.app import TabBar
 
-        await pilot.press("escape")
-        await pilot.pause()
-        assert isinstance(app.screen, Shell)
+        assert shell.query_one("#tab-bar", TabBar)._active == "work"
+        assert shell.query_one("#prompt").has_focus
 
 
 async def test_menu_view_switches_tabs(seeded: dict[str, str]) -> None:
@@ -1166,3 +1148,87 @@ async def test_selection_screen_picking_a_project(seeded: dict[str, str], tui_en
         for _ in range(5):
             await pilot.pause()
         assert app._mission_defaults["project_id"] is None
+
+
+async def test_chat_propose_then_confirm_creates_mission(
+    seeded: dict[str, str], tui_env: Path
+) -> None:
+    """The whole point: talk, get a proposal, say yes, the mission exists."""
+    from conftest import ScriptedProvider, role_catalog
+    from rework.kernel.llm.types import ChatResult, ToolCall
+    from rework.kernel.state.records import Project
+    from rework.kernel.state.sqlite import open_sqlite
+    from rework.orchestrator.chat import OrchestratorChat
+    from rework.tui.app import WorkPane
+
+    store = await open_sqlite(str(tui_env))
+    try:
+        await store.create_project(Project(id="p-rw", name="rework", settings={}))
+    finally:
+        await store.aclose()
+
+    scripted = ScriptedProvider()
+    scripted.route(
+        "orchestrator",
+        [
+            ChatResult(
+                tool_calls=[
+                    ToolCall(
+                        id="c1",
+                        name="propose_mission",
+                        arguments={
+                            "objective": "fix the glitch",
+                            "plan": "echo",  # echo needs no repo
+                            "project": "rework",
+                        },
+                    )
+                ]
+            )
+        ],
+    )
+    WorkPane._build_chat = lambda self: OrchestratorChat(  # type: ignore[method-assign]
+        scripted, role_catalog(), "flash", context="test"
+    )
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        chat = shell.query_one("#chat")
+        prompt = shell.query_one("#prompt")
+
+        prompt.focus()
+        prompt.insert_text_at_cursor("fix the glitch")
+        await pilot.press("enter")
+        for _ in range(6):
+            await pilot.pause()
+        transcript = " ".join(line.text for line in chat.lines)
+        assert "objective: fix the glitch" in transcript
+        assert "launch?" in transcript
+
+        # nothing exists yet — a proposal is not a mission
+        store = await open_sqlite(str(tui_env))
+        try:
+            before = [
+                m for m in await store.list_missions(limit=20) if m.objective == "fix the glitch"
+            ]
+        finally:
+            await store.aclose()
+        assert before == [], "the proposal launched itself"
+
+        prompt.focus()
+        prompt.insert_text_at_cursor("y")
+        await pilot.press("enter")
+        for _ in range(10):
+            await pilot.pause()
+
+        store = await open_sqlite(str(tui_env))
+        try:
+            after = [
+                m for m in await store.list_missions(limit=20) if m.objective == "fix the glitch"
+            ]
+        finally:
+            await store.aclose()
+        assert len(after) == 1, "confirming the proposal did not create the mission"
+        assert after[0].project_id == "p-rw"
