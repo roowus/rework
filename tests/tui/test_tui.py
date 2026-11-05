@@ -160,10 +160,15 @@ async def test_command_palette_lists_actions(seeded: dict[str, str]) -> None:
     app = ReworkApp()
     async with app.run_test(size=(100, 30)) as pilot:
         await pilot.pause()
-        # the registry check: the app's COMMANDS includes our provider factory
-        from rework.tui.app import rework_commands_provider
+        # the registry check: COMMANDS holds provider CLASSES (textual
+        # instantiates them itself); ours must be present
+        from rework.tui.app import ReworkCommands
 
-        assert rework_commands_provider in app.COMMANDS
+        assert ReworkCommands in app.COMMANDS
+        # and instantiating the way textual does must work (the live crash:
+        # a factory function got called with zero args)
+        provider = ReworkCommands(app.screen, None)
+        assert provider is not None
 
 
 async def test_pressing_n_opens_wizard_not_crash(seeded: dict[str, str]) -> None:

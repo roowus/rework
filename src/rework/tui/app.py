@@ -365,6 +365,7 @@ class Dashboard(ReworkScreen):
                 yield ListView(id="projects")
                 yield Label("[dim]p new project[/dim]", id="sidebar-hint")
             with Vertical(id="mid"):
+                yield Label("[b]all missions[/b]", id="mid-title")
                 yield DataTable(id="missions")
         with Vertical(id="detail"):
             yield Label("Select a mission", id="mission-head")
@@ -417,8 +418,16 @@ class Dashboard(ReworkScreen):
         name = event.item.name or "__all__"
         self._selected_project = None if name == "__all__" else str(name)
         await self.reload_missions()
+        # focus follows into the missions table: arrows work immediately
+        self.query_one("#missions", DataTable).focus()
 
     async def reload_missions(self) -> None:
+        title = self.query_one("#mid-title", Label)
+        if self._selected_project:
+            pname = self.rw._project_cache.get(self._selected_project)
+            title.update(f"[b]{pname.name if pname else self._selected_project}[/b]")
+        else:
+            title.update("[b]all missions[/b]")
         table = self.query_one("#missions", DataTable)
         cursor_before = table.cursor_row
         selected_id = self._selected_mission
@@ -537,6 +546,7 @@ class Dashboard(ReworkScreen):
             self.notify(f"mission {mission.id} created")
             self._selected_mission = mission.id
             self._last_event_seq = 0
+            await self.rw.load_project_cache()
             await self.reload_projects()
             await self.reload_missions()
         except Exception as exc:
@@ -552,6 +562,7 @@ class Dashboard(ReworkScreen):
         try:
             project = await self.rw.data.create_project(**result)
             self.notify(f"project {project.name} created ({project.id})")
+            await self.rw.load_project_cache()
             await self.reload_projects()
         except Exception as exc:
             self.notify(f"create failed: {exc}", severity="error")
@@ -618,16 +629,13 @@ class ReworkCommands(Provider):
                 )
 
 
-def rework_commands_provider(screen: Screen) -> Provider:
-    return ReworkCommands(screen)
-
-
 class ReworkApp(App[None]):
     TITLE = "rework"
     SUB_TITLE = "missions on the daemon"
-    # textual's own default provider is also a (Screen) -> Provider callable;
-    # the stub types COMMANDS more strictly than the runtime accepts
-    COMMANDS = App.COMMANDS | {rework_commands_provider}  # type: ignore[arg-type]
+    # providers are CLASSES here (textual instantiates with screen + match
+    # style itself); a factory function gets called with zero args and crashes
+    # the palette on open (found live)
+    COMMANDS = App.COMMANDS | {ReworkCommands}
 
     CSS = """
     #main { height: 3fr; }
