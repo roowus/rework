@@ -34,6 +34,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.command import Hit, Hits, Provider
 from textual.containers import Horizontal, HorizontalGroup, Vertical, VerticalScroll
+from textual.message import Message
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
@@ -42,8 +43,6 @@ from textual.widgets import (
     Header,
     Input,
     Label,
-    ListItem,
-    ListView,
     RichLog,
     Select,
     Static,
@@ -672,8 +671,119 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
 )
 
 
+class ProjectBand(Static, can_focus=True):
+    """The top of the screen: PROJECTS are the primary axis (owner: 'projects
+    should be the top'). One row of chips — all, then each project with its
+    mission counts — navigable with arrows, enter (or a click) filters the
+    missions table below. `p` on it creates a project."""
+
+    class ProjectPicked(Message):
+        """The highlighted project changed (id, or None for all)."""
+
+        def __init__(self, project_id: str | None) -> None:
+            super().__init__()
+            self.project_id = project_id
+
+    class NewProjectRequested(Message):
+        pass
+
+    BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
+        Binding("left", "prev", "◀", show=False),
+        Binding("right", "next", "▶", show=False),
+        Binding("enter", "pick", "Open", show=False),
+        Binding("p", "new", "New project", show=False),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__(id="project-band")
+        self._projects: list[Any] = []
+        self._counts: dict[str, tuple[int, int]] = {}  # pid -> (total, running)
+        self._index = 0  # 0 = all, 1..n = projects
+        self._chip_cols: list[tuple[int, int, str | None]] = []  # (start,end,pid) for clicks
+
+    # -- data ---------------------------------------------------------------
+
+    def update_projects(self, projects: list[Any], counts: dict[str, tuple[int, int]]) -> None:
+        self._projects = projects
+        self._counts = counts
+        self._index = min(self._index, len(projects))
+        self.refresh(layout=True)
+
+    def current_project_id(self) -> str | None:
+        if self._index == 0:
+            return None
+        if self._index <= len(self._projects):
+            return str(self._projects[self._index - 1].id)
+        return None
+
+    # -- render -------------------------------------------------------------
+
+    def render(self) -> Any:
+        def chip_text(label: str, detail: str) -> tuple[str, str]:
+            """(plain, highlighted-markup) for one chip."""
+            plain = f" {label} {detail} "
+            hi = f"[reverse] {label} [/reverse] [b]{detail}[/b]"
+            return plain, hi
+
+        texts: list[tuple[str, str, str | None]] = []
+        texts.append((*chip_text("all", ""), None))
+        for project in self._projects:
+            total, running = self._counts.get(project.id, (0, 0))
+            detail = f"{running}●/{total}" if running else str(total)
+            texts.append((*chip_text(project.name, detail), str(project.id)))
+        texts.append((*chip_text("+ new", ""), "__new__"))
+
+        # column map for mouse clicks + marked-up render
+        self._chip_cols = []
+        out: list[str] = []
+        col = 1  # leading space
+        for plain, hi, pid in texts:
+            width = len(plain)
+            self._chip_cols.append((col, col + width, pid))
+            out.append(
+                hi if (pid == "__new__" and False) or (pid == self.current_project_id()) else plain
+            )
+            col += width + 1
+        return " " + " ".join(out)
+
+    # -- keys / mouse ---------------------------------------------------------
+
+    def action_prev(self) -> None:
+        self._index = max(0, self._index - 1)
+        self.refresh(layout=True)
+        self.post_message(self.ProjectPicked(self.current_project_id()))
+
+    def action_next(self) -> None:
+        self._index = min(len(self._projects), self._index + 1)
+        self.refresh(layout=True)
+        self.post_message(self.ProjectPicked(self.current_project_id()))
+
+    def action_pick(self) -> None:
+        self.post_message(self.ProjectPicked(self.current_project_id()))
+
+    def action_new(self) -> None:
+        self.post_message(self.NewProjectRequested())
+
+    def on_click(self, event: Any) -> None:
+        for start, end, pid in self._chip_cols:
+            if start <= event.x < end:
+                if pid == "__new__":
+                    self.action_new()
+                    return
+                self._index = (
+                    0
+                    if pid is None
+                    else next((i for i, p in enumerate(self._projects, 1) if str(p.id) == pid), 0)
+                )
+                self.refresh(layout=True)
+                self.post_message(self.ProjectPicked(self.current_project_id()))
+                return
+
+
 class Dashboard(ReworkScreen):
-    """Projects sidebar + missions table + live detail pane + prompt bar."""
+    """PROJECTS band on top (the primary axis), missions full-width below for
+    the selection, live detail strip, prompt bar. One context label — no
+    duplicated 'all missions' anywhere."""
 
     BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
         Binding("n", "new_mission", "New mission", show=True),
@@ -694,15 +804,11 @@ class Dashboard(ReworkScreen):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
-        with Horizontal(id="main"):
-            with Vertical(id="sidebar"):
-                yield ListView(id="projects")
-                yield Label("[dim]p new project[/dim]", id="sidebar-hint")
-            with Vertical(id="mid"):
-                yield Label("[b]all missions[/b]", id="mid-title")
-                yield DataTable(id="missions")
+        yield ProjectBand()
+        yield Label("[b]missions[/b]", id="mid-title")
+        yield DataTable(id="missions")
         with Vertical(id="detail"):
-            yield Label("Select a mission", id="mission-head")
+            yield Label("enter opens a mission · type below to launch one", id="mission-head")
             yield RichLog(id="events", markup=True, highlight=False, wrap=True, max_lines=600)
             yield Static("", id="gate-box")
         with Horizontal(id="prompt-row"):
@@ -712,16 +818,25 @@ class Dashboard(ReworkScreen):
     def on_mount(self) -> None:
         missions = self.query_one("#missions", DataTable)
         missions.cursor_type = "row"
-        missions.add_columns("mission", "status", "plan", "project", "age")
-        projects = self.query_one("#projects", ListView)
-        projects.append(ListItem(Label("[b]all missions[/b]"), name="__all__"))
+        missions.add_columns("mission", "status", "plan", "age")
+        self.query_one("#project-band", ProjectBand).focus()
         self.set_interval(POLL_SECONDS, self.tick)
         self.run_worker(self.initial_load(), exclusive=True)
 
     async def initial_load(self) -> None:
         await self.rw.load_project_cache()
-        await self.reload_projects()
         await self.reload_missions()
+
+    @on(ProjectBand.ProjectPicked)
+    async def project_picked(self, event: ProjectBand.ProjectPicked) -> None:
+        self._selected_project = event.project_id
+        await self.reload_missions()
+        # projects are the entry point: choosing one hands control to missions
+        self.query_one("#missions", DataTable).focus()
+
+    @on(ProjectBand.NewProjectRequested)
+    async def project_new_requested(self) -> None:
+        await self.action_new_project()
 
     # -- polling -----------------------------------------------------------
 
@@ -739,37 +854,19 @@ class Dashboard(ReworkScreen):
 
     # -- data ---------------------------------------------------------------
 
-    async def reload_projects(self) -> None:
-        projects_list = self.query_one("#projects", ListView)
-        projects_list.clear()
-        projects_list.append(ListItem(Label("[b]all missions[/b]"), name="__all__"))
-        for project in self.rw._project_cache.values():
-            projects_list.append(ListItem(Label(project.name), name=project.id))
-        hint = self.query_one("#sidebar-hint", Label)
-        count = len(self.rw._project_cache)
-        hint.update(f"{count} project{'s' if count != 1 else ''} · p to create")
-
-    @on(ListView.Selected, "#projects")
-    async def project_selected(self, event: ListView.Selected) -> None:
-        name = event.item.name or "__all__"
-        self._selected_project = None if name == "__all__" else str(name)
-        await self.reload_missions()
-        # focus follows into the missions table: arrows work immediately
-        self.query_one("#missions", DataTable).focus()
-
     async def reload_missions(self) -> None:
-        title = self.query_one("#mid-title", Label)
-        if self._selected_project:
-            pname = self.rw._project_cache.get(self._selected_project)
-            title.update(f"[b]{pname.name if pname else self._selected_project}[/b]")
-        else:
-            title.update("[b]all missions[/b]")
         table = self.query_one("#missions", DataTable)
         selected_id = self._selected_mission
         table.clear()
-        projects = {p.id: p.name for p in self.rw._project_cache.values()}
         missions = await self.rw.data.missions()
         self.rw._mission_cache = {m.id: m for m in missions}
+
+        # per-project counts feed the band: total + running per project
+        counts: dict[str, tuple[int, int]] = {}
+        for m in missions:
+            total, running = counts.get(m.project_id or "", (0, 0))
+            counts[m.project_id or ""] = (total + 1, running + (m.status.value == "running"))
+
         # running/awaiting-gate first (the cockpit shows live work up top),
         # then newest first within each group
         rank = {
@@ -782,6 +879,8 @@ class Dashboard(ReworkScreen):
             "cancelled": 4,
         }
         missions.sort(key=lambda m: (rank.get(m.status.value, 5), -m.created_at))
+        shown = 0
+        running_shown = 0
         for mission in missions:
             if self._selected_project and mission.project_id != self._selected_project:
                 continue
@@ -789,16 +888,36 @@ class Dashboard(ReworkScreen):
                 mission.id,
                 status_rich(mission.status.value),
                 (mission.plan or {}).get("kind", "echo"),
-                projects.get(mission.project_id or "", "·"),
                 human_age(mission.created_at),
                 key=mission.id,
             )
+            shown += 1
+            running_shown += mission.status.value == "running"
+
+        # ONE context line (the old sidebar + title duplicated this)
+        band = self.query_one("#project-band", ProjectBand)
+        band.update_projects(list(self.rw._project_cache.values()), counts)
+        name = "all projects"
+        if self._selected_project:
+            p = self.rw._project_cache.get(self._selected_project)
+            name = p.name if p else self._selected_project
+        gate_note = ""
+        open_gates = await self.rw.data.open_gates()
+        if open_gates:
+            n = len(open_gates)
+            gate_note = f" · [bold yellow]{n} gate{'s' if n != 1 else ''} waiting[/bold yellow]"
+        title = self.query_one("#mid-title", Label)
+        title.update(
+            f"[b]{name}[/b] · {shown} mission{'s' if shown != 1 else ''}"
+            + (f" · {running_shown} running" if running_shown else "")
+            + gate_note
+        )
         if selected_id is not None:
             for row, key in enumerate(table.rows):
                 if str(key.value) == selected_id:
                     table.move_cursor(row=row)
                     break
-        self.rw.set_gates_badge(await self.rw.data.open_gates())
+        self.rw.set_gates_badge(open_gates)
 
     @on(DataTable.RowSelected, "#missions")
     async def mission_selected(self, event: DataTable.RowSelected) -> None:
@@ -923,7 +1042,6 @@ class Dashboard(ReworkScreen):
             self._selected_mission = mission.id
             self._last_event_seq = 0
             await self.rw.load_project_cache()
-            await self.reload_projects()
             await self.reload_missions()
         except Exception as exc:
             self.notify(f"create failed: {exc}", severity="error")
@@ -939,7 +1057,7 @@ class Dashboard(ReworkScreen):
             project = await self.rw.data.create_project(**result)
             self.notify(f"project {project.name} created ({project.id})")
             await self.rw.load_project_cache()
-            await self.reload_projects()
+            await self.reload_missions()  # the band re-renders from this
         except Exception as exc:
             self.notify(f"create failed: {exc}", severity="error")
 
@@ -1032,12 +1150,13 @@ class ReworkApp(App[None]):
     COMMANDS = App.COMMANDS | {ReworkCommands}
 
     CSS = """
-    #main { height: 3fr; }
-    #sidebar { width: 32; min-width: 20; border-right: round $panel; padding: 0 1; }
-    #mid { width: 1fr; }
+    #project-band { height: 3; border-bottom: round $panel; padding: 0 1;
+                    background: $surface-darken-1; }
+    #mid-title { height: 1; padding: 0 1; color: $text-muted; }
     #missions { height: 1fr; }
-    #detail { height: 2fr; border-top: round $panel; padding: 0 1; }
-    #events { height: 1fr; border: round $panel-lighten-2; padding: 0 1; }
+    #detail { height: 8; border-top: round $panel; padding: 0 1; }
+    #detail #events { height: 1fr; border: none; }
+    #mission-head { height: 1; color: $text-muted; }
     #gate-box { height: auto; padding: 0 1; }
     #prompt-row { height: 3; border-top: round $accent; padding: 0 1; }
     #prompt { width: 1fr; border: none; background: transparent; }
@@ -1046,7 +1165,6 @@ class ReworkApp(App[None]):
     #modal-actions { height: auto; padding-top: 1; }
     #body-viewer { width: 90%; height: 90%; border: round $accent;
                    padding: 1 2; background: $surface; }
-    #projects { height: 1fr; }
     #lib-split { height: 1fr; }
     #lib-list-pane { width: 2fr; min-width: 30; border-right: round $panel; padding: 0 1; }
     #lib-table { height: 1fr; }

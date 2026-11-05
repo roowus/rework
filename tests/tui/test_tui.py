@@ -77,13 +77,69 @@ async def test_dashboard_renders_missions(seeded: dict[str, str]) -> None:
         await app.load_project_cache()
         dash = app.get_screen("dashboard")
         assert isinstance(dash.__class__.__name__, str)
-        from textual.widgets import DataTable
+        from textual.widgets import DataTable, Label
 
         table = dash.query_one("#missions", DataTable)
         await dash.reload_missions()
         await pilot.pause()
         assert table.row_count == 2
         assert "gate(s) waiting" in app.sub_title
+        # ONE context line: the band holds projects on top (owner: projects
+        # are the primary axis), the title names the selection exactly once
+        title = str(dash.query_one("#mid-title", Label).content)
+        assert title.count("missions") == 1 or "all projects" in title
+        band_text = str(dash.query_one("#project-band").render())
+        assert "all" in band_text
+
+
+async def test_project_band_filters_missions(seeded: dict[str, str], tui_env: Path) -> None:
+    """Projects are the TOP axis: picking a chip filters the missions table;
+    back to 'all' restores. Driven through the band's real key path."""
+    from textual.widgets import DataTable, Label
+
+    from rework.kernel.state.sqlite import open_sqlite
+    from rework.tui.app import Dashboard
+
+    # one project owning a fresh mission (create with project_id: the domain
+    # way; update_mission doesn't retag projects)
+    store = await open_sqlite(str(tui_env))
+    try:
+        from rework.kernel.state.records import Mission, MissionStatus, Project
+
+        project = await store.create_project(Project(id=new_id("p"), name="rework", settings={}))
+        mine = await store.create_mission(
+            Mission(
+                id=new_id("m"),
+                objective="the tagged one",
+                status=MissionStatus.PENDING,
+                plan={"kind": "fix"},
+                project_id=project.id,
+            )
+        )
+    finally:
+        await store.aclose()
+
+    app = ReworkApp()
+    async with app.run_test(size=(110, 30)) as pilot:
+        await pilot.pause()
+        await app.load_project_cache()
+        dash = app.get_screen("dashboard")
+        assert isinstance(dash, Dashboard)
+        await dash.reload_missions()
+        await pilot.pause()
+        band = dash.query_one("#project-band")
+        band.action_next()  # all -> first project
+        await pilot.pause()
+        await pilot.pause()
+        table = dash.query_one("#missions", DataTable)
+        assert table.row_count == 1
+        assert str(mine.id) in {str(k.value) for k in table.rows}
+        title = str(dash.query_one("#mid-title", Label).content)
+        assert "rework" in title
+        band.action_prev()  # back to all
+        await pilot.pause()
+        await pilot.pause()
+        assert table.row_count == 3
 
 
 async def test_mission_detail_streams_events(seeded: dict[str, str]) -> None:
