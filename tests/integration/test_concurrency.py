@@ -97,9 +97,15 @@ async def test_two_missions_run_concurrently(world: dict[str, Any]) -> None:
         f"missions did not overlap: {[r.status if r else None for r in mid_flight]}"
     )
 
-    for task in tasks:
+    finished_at: list[float] = []
+
+    async def _timed(task: Any) -> None:
         await asyncio.wait_for(task, timeout=10)
+        finished_at.append(asyncio.get_event_loop().time())
+
+    await asyncio.gather(*(_timed(t) for t in tasks))
     elapsed = asyncio.get_event_loop().time() - started_at
+    finish_spread = max(finished_at) - min(finished_at)
 
     for mid in ids:
         mission = await store.get_mission(mid)
@@ -107,8 +113,12 @@ async def test_two_missions_run_concurrently(world: dict[str, Any]) -> None:
         run = await store.get_run(f"{mid}:do:slow:1")
         assert run is not None
         assert (run.artifact or {}).get("mission") == mid  # no cross-mission bleed
-    # 2 x 0.4s serialized = 0.8s+; overlapped = ~0.4s + scheduling slack
-    assert elapsed < 0.75, f"missions appear serialized ({elapsed:.2f}s)"
+    # Wall-clock bounds flake on loaded CI runners (absolute time includes
+    # scheduling overhead). What actually distinguishes overlap is the SPREAD
+    # between the two finishes: concurrent missions end together, serialized
+    # ones are a full role-duration apart (~0.4s).
+    assert elapsed < 2.0, f"both missions took absurdly long ({elapsed:.2f}s)"
+    assert finish_spread < 0.30, f"missions appear serialized: finishes {finish_spread:.2f}s apart"
 
 
 async def test_shared_store_survives_parallel_writes(world: dict[str, Any]) -> None:
