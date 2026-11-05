@@ -59,6 +59,21 @@ at the daemon; the workspace API is tailnet-only when the daemon binds its
 tailnet IP). Results return as a branch (open_pr gate) or via `rework fetch
 <mission-id>`.
 
+## The TUI: just type `rework`
+
+With no arguments, `rework` opens a full-screen dashboard (mouse + keyboard):
+
+- **Left**: projects (select one to filter; create with `p`)
+- **Right**: missions with live status (`n` opens the new-mission wizard:
+  objective, repo URL / local path / folder upload, plan)
+- **Bottom**: the selected mission's event timeline, streaming every 2 s;
+  when a gate is waiting on you it shows an approve/reject box (`a` / `x`)
+- **`g`** the gates queue across all missions · **`l`** the Library browser ·
+  **`ctrl+p`** the command palette (find any action by typing) · **`q`** quit
+
+The TUI is a client like every other command: it reads `REWORK_DB`, so from
+your laptop it shows and controls the missions running on the daemon.
+
 ## Eval + complaints
 
 ```bash

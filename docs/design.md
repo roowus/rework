@@ -86,6 +86,18 @@ with a continue/abort gate; approving doubles the cap and resumes, rejecting can
 Steps that FAIL get exactly one in-mission retry (the 429-storm lesson) before the
 plan moves on; synthesis counts only the latest attempt per step.
 
+### The TUI (owner ask, post-M5)
+
+Bare `rework` opens a Textual dashboard: projects sidebar, missions table,
+live detail pane (2s event tail + inline gate approve/reject), gates queue,
+library browser, new-mission wizard + create-project modal, ctrl+p command
+palette. It is a CLIENT (own store connection from REWORK_DB), the
+scriptable command surface is unchanged underneath, and the quality bar is
+Claude-Code-grade: no blocking IO on the UI loop, one in-flight refresh
+guard, notify-not-crash on store hiccups, layout survives resizes
+(verified 60x20 to 140x44). An in-app assistant model (back burner) would
+live here.
+
 ### The Library
 
 Items (skills/tools/reports/memories) live as files in a dedicated git repo (canonical
