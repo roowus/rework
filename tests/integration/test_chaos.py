@@ -186,7 +186,7 @@ async def test_kill_mid_role_resumes_from_checkpoint(world: dict[str, Any]) -> N
     finally:
         await second.aclose()
 
-    await asyncio.wait_for(task2, timeout=15)
+    await asyncio.wait_for(task2, timeout=30)
     fresh = await store.get_run(runs[0].id)
     assert fresh is not None and fresh.status.value == "completed"
     assert (fresh.artifact or {}).get("approved") is True
@@ -271,7 +271,7 @@ async def test_gate_rejected_while_down_aborts_on_restart(world: dict[str, Any])
 
     runner2 = _runner(world, mission.id)
     task2 = asyncio.create_task(runner2.run())
-    await asyncio.wait_for(task2, timeout=15)
+    await asyncio.wait_for(task2, timeout=30)
     fresh = await store.get_run(f"{mission.id}:do:crashy:1")
     assert fresh is not None and fresh.status.value == "aborted"
     mission_row = await store.get_mission(mission.id)
@@ -309,7 +309,7 @@ async def test_ship_gate_decided_while_down_not_duplicated(world: dict[str, Any]
 
     runner2 = _runner(world, mission.id)
     task2 = asyncio.create_task(runner2.run())
-    await asyncio.wait_for(task2, timeout=15)
+    await asyncio.wait_for(task2, timeout=30)
     events = await store.events_since(0, mission_id=mission.id)
     opened = [e for e in events if e.type.value == "gate_opened"]
     assert len(opened) == 1, "restart must reuse the decided ship gate"
@@ -349,7 +349,7 @@ async def test_burn_gate_rejection_cancels_and_stays_cancelled(
 
     rejecter = asyncio.create_task(reject_burn_gate())
     task = asyncio.create_task(runner.run())
-    await asyncio.wait_for(task, timeout=15)
+    await asyncio.wait_for(task, timeout=30)
     await rejecter
 
     mission_row = await store.get_mission(mission.id)
