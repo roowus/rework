@@ -642,7 +642,7 @@ class SqliteStore:
 
 
 async def open_sqlite(path: str) -> SqliteStore:
-    db = await aiosqlite.connect(path)
+    db = await aiosqlite.connect(path, isolation_level=None)
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode = WAL")
     await db.execute("PRAGMA foreign_keys = ON")
