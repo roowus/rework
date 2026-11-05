@@ -257,46 +257,164 @@ class Pane(Static):
 
 
 class WorkPane(Pane):
-    """The typing surface: a big prompt, the MODEL and EFFORT the mission will
-    run at, recent missions, wizard one enter away.
+    """The typing surface: quick-action BUTTONS pinned at the top, the prompt
+    with command AUTocomplete, the project you are working in, the model and
+    effort the mission runs at, then recent missions.
 
-    Owner ask: 'i should be able to see which model im using as an orchestrator
-    and be able to change that as well as the effort'. The pickers read the
-    live catalog (REWORK_MODELS) so they always list what is actually usable;
-    the choice lands in the mission plan and every role inherits it."""
+    Owner asks folded in here: 'commands should have autocomplete', the quick
+    actions should be visible buttons rather than memorized slash commands,
+    and 'i should be able to choose which project im working in and see that'.
+    """
 
     BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
         # ctrl+m IS enter (CR) and ctrl+e is end-of-line inside Input —
         # both were eaten. alt keys do not collide with editing.
         Binding("alt+m", "cycle_model", "Model", show=False),
         Binding("alt+e", "cycle_effort", "Effort", show=False),
+        Binding("alt+p", "cycle_project", "Project", show=False),
     ]
 
     EFFORTS: ClassVar[tuple[str, ...]] = ("default", "low", "medium", "high")
 
+    # the quick actions, in display order: (id, label, hint, action)
+    ACTIONS: ClassVar[tuple[tuple[str, str, str, str], ...]] = (
+        ("act-new", "new mission", "start a mission from the prompt", "new_mission"),
+        ("act-gates", "gates", "review decisions waiting on you", "gates"),
+        ("act-library", "library", "search what missions learned", "library"),
+        ("act-fetch", "fetch", "pull a finished mission's result", "fetch"),
+        ("act-project", "new project", "create a project label", "new_project"),
+    )
+
     def compose(self) -> ComposeResult:
-        yield Label("[b]Work[/b]", id="work-title")
+        # pinned quick actions (owner: the actions should be buttons you can
+        # see, always, at the top)
+        with Horizontal(id="work-actions"):
+            for action_id, label, _hint, _action in self.ACTIONS:
+                yield Button(label, id=action_id, classes="work-action")
         yield Input(
             placeholder="what should rework do?  (type / for commands, enter to launch)",
             id="prompt",
         )
         with Horizontal(id="work-settings"):
+            yield Label("", id="work-project")
             yield Label("", id="work-model")
             yield Label("", id="work-effort")
         yield Label("[dim]recent missions[/dim]", id="recent-head")
         yield ListView(id="recent")
         yield Label(
-            "[dim]enter on a mission opens it · /gates /library /fetch /new /projects"
-            " · alt+m model · alt+e effort[/dim]",
+            "[dim]enter on a mission opens it · tab completes a command"
+            " · alt+p project · alt+m model · alt+e effort[/dim]",
             id="work-hint",
         )
 
     def on_mount(self) -> None:
-        self.query_one("#prompt", Input).focus()
         self._model_ids: list[str] = []
         self._effort_index = 0
+        self._project_ids: list[str] = []
+        self._project_index = 0
         self._load_models()
-        self.run_worker(self.reload_recents(), exclusive=True)
+        self._install_suggestions()
+        self.query_one("#prompt", Input).focus()
+        # ONE worker: two exclusive run_worker calls share the default group,
+        # so the second cancels the first and leaves an unawaited coroutine
+        # (found live: the Work tab hung on mount).
+        self.run_worker(self._initial_load(), exclusive=True)
+
+    async def _initial_load(self) -> None:
+        await self.reload_projects()
+        await self.reload_recents()
+
+    # -- quick action buttons ------------------------------------------------
+
+    @on(Button.Pressed, ".work-action")
+    async def action_button(self, event: Button.Pressed) -> None:
+        which = str(event.button.id or "")
+        action = next((a for i, _l, _h, a in self.ACTIONS if i == which), "")
+        if action == "new_mission":
+            self.run_worker(self.shell.new_mission_flow(), exclusive=True)
+        elif action == "new_project":
+            self.run_worker(self.shell.new_project_flow(), exclusive=True)
+        elif action == "gates":
+            self.shell.switch_tab("gates")
+        elif action == "library":
+            self.shell.switch_tab("library")
+        elif action == "fetch":
+            await self.shell.fetch_selected()
+
+    # -- command autocomplete ------------------------------------------------
+
+    def _command_list(self) -> list[str]:
+        """Everything the prompt can complete to: the slash commands, plus a
+        readable name for each current project (so /fetch <id> completes)."""
+        from rework.tui.app import SLASH_COMMANDS
+
+        commands = [c for c, _ in SLASH_COMMANDS]
+        return commands
+
+    def _install_suggestions(self) -> None:
+        from textual.suggester import SuggestFromList
+
+        prompt = self.query_one("#prompt", Input)
+        # Suggestions are recomputed when this is called again; the command set
+        # is static, project ids change so reload_projects refreshes it.
+        prompt.suggester = SuggestFromList(self._suggestions(), case_sensitive=False)
+
+    def _suggestions(self) -> list[str]:
+        from rework.tui.app import SLASH_COMMANDS
+
+        out = [c for c, _ in SLASH_COMMANDS]
+        # completing /fetch with a live mission id is the useful case; the
+        # recent list supplies them cheaply
+        out.extend(getattr(self, "_recent_ids", []))
+        out.extend(getattr(self, "_project_names", []))
+        return out
+
+    def _refresh_suggestions(self) -> None:
+        from textual.suggester import SuggestFromList
+
+        prompt = self.query_one("#prompt", Input)
+        prompt.suggester = SuggestFromList(self._suggestions(), case_sensitive=False)
+
+    # -- project selection ---------------------------------------------------
+
+    def _current_project(self) -> str | None:
+        return self.shell.rw._mission_defaults.get("project_id")
+
+    def _project_name(self, project_id: str | None) -> str:
+        if not project_id:
+            return "no project"
+        project = self.shell.rw._project_cache.get(project_id)
+        return project.name if project else project_id
+
+    def _update_project_label(self) -> None:
+        self.query_one("#work-project", Label).update(
+            f"[dim]project[/dim] [b]{self._project_name(self._current_project())}[/b]"
+            " [dim]alt+p[/dim]"
+        )
+
+    async def reload_projects(self) -> None:
+        await self.shell.rw.load_project_cache()
+        projects = list(self.shell.rw._project_cache.values())
+        self._project_ids = [str(p.id) for p in projects]
+        self._project_names = [p.name for p in projects]
+        current = self._current_project()
+        if current in self._project_ids:
+            self._project_index = self._project_ids.index(current)
+        self._update_project_label()
+        self._refresh_suggestions()
+
+    def action_cycle_project(self) -> None:
+        """Cycle through: no project -> each project. The choice is visible in
+        the settings row and prefills the mission wizard."""
+        options: list[str | None] = [None, *self._project_ids]
+        current = self._current_project()
+        index = options.index(current) if current in options else 0
+        chosen = options[(index + 1) % len(options)]
+        self.shell.rw._mission_defaults["project_id"] = chosen
+        if chosen and chosen in self._project_ids:
+            self._project_index = self._project_ids.index(chosen)
+        self._update_project_label()
+        self.notify(f"project: {self._project_name(chosen)}")
 
     def _load_models(self) -> None:
         from rework.config import load_catalog
@@ -331,6 +449,8 @@ class WorkPane(Pane):
         self.query_one("#work-effort", Label).update(
             f"[dim]effort[/dim] [b]{effort}[/b] [dim]alt+e[/dim]"
         )
+        if self.is_mounted:
+            self._update_project_label()
 
     def action_cycle_model(self) -> None:
         if not self._model_ids:
@@ -361,6 +481,8 @@ class WorkPane(Pane):
                 ListItem(Label(f"{m.id}  {status_rich(m.status.value)}  {m.objective[:60]}"))
             )
             self._recent_ids.append(m.id)
+        # mission ids feed /fetch completion, so refresh the suggester
+        self._refresh_suggestions()
 
     @on(ListView.Selected, "#recent")
     async def recent_opened(self, event: ListView.Selected) -> None:
@@ -1762,8 +1884,11 @@ class ReworkApp(App[None]):
     #pane-work #prompt { border: none; background: transparent;
                          border-bottom: round $accent; height: 3; }
     #work-settings { height: 1; }
-    #work-model { width: auto; }
+    #work-project { width: auto; }
+    #work-model { width: auto; margin-left: 3; }
     #work-effort { width: auto; margin-left: 3; }
+    #work-actions { height: 3; margin-bottom: 1; }
+    .work-action { min-width: 10; margin-right: 1; }
     #recent { height: 1fr; }
     #recent-head, #work-title, #work-hint { height: 1; }
     #pane-dashboard { height: 1fr; padding: 0 1; }

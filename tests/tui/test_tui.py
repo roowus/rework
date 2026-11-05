@@ -982,3 +982,90 @@ async def test_mission_model_and_effort_reach_the_plan(seeded: dict[str, str], t
         assert all("model" not in s for s in mission.plan["steps"])
     finally:
         await store.aclose()
+
+
+# ------------------------------ round 7: autocomplete, buttons, project picker
+
+
+async def test_prompt_command_autocomplete(seeded: dict[str, str]) -> None:
+    """Owner: 'commands should have autocomplete'."""
+    from textual.widgets import Input
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        prompt = shell.query_one("#prompt", Input)
+        suggester = prompt.suggester
+        assert suggester is not None
+        assert await suggester.get_suggestion("/ga") == "/gates"
+        assert await suggester.get_suggestion("/li") == "/library"
+        assert await suggester.get_suggestion("/zzz") is None
+
+
+async def test_quick_action_buttons_are_visible_and_work(seeded: dict[str, str]) -> None:
+    """The actions are pinned, clickable buttons at the top of Work."""
+    from textual.widgets import Button
+
+    from rework.tui.app import TabBar
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 36)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        work = shell.query_one("#pane-work")
+        for button_id in ("act-new", "act-gates", "act-library", "act-fetch", "act-project"):
+            assert work.query_one(f"#{button_id}", Button).display
+        # clicking "library" switches tabs (the visible action path)
+        await pilot.click("#act-library")
+        for _ in range(4):
+            await pilot.pause()
+        assert shell.query_one("#tab-bar", TabBar)._active == "library"
+        # and "gates" goes back
+        app.action_tab_work()
+        await pilot.pause()
+        await pilot.pause()
+        await pilot.click("#act-gates")
+        for _ in range(4):
+            await pilot.pause()
+        assert shell.query_one("#tab-bar", TabBar)._active == "gates"
+
+
+async def test_work_tab_project_selector_visible_and_cycles(
+    seeded: dict[str, str], tui_env: Path
+) -> None:
+    """Owner: 'in the work tab u should be able to choose which project ur
+    working in and also see that'."""
+    from textual.widgets import Label
+
+    from rework.kernel.state.records import Project
+    from rework.kernel.state.sqlite import open_sqlite
+
+    store = await open_sqlite(str(tui_env))
+    try:
+        await store.create_project(Project(id="p-one", name="rework", settings={}))
+        await store.create_project(Project(id="p-two", name="capstone", settings={}))
+    finally:
+        await store.aclose()
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        work = shell.query_one("#pane-work")
+        assert "project" in str(work.query_one("#work-project", Label).content)
+        # cycle: none -> each project (in the store's order) -> none
+        work.action_cycle_project()
+        first = app._mission_defaults["project_id"]
+        assert first in {"p-one", "p-two"}
+        work.action_cycle_project()
+        second = app._mission_defaults["project_id"]
+        assert second in {"p-one", "p-two"} and second != first
+        label = str(work.query_one("#work-project", Label).content)
+        assert "capstone" in label or "rework" in label
+        work.action_cycle_project()
+        assert app._mission_defaults["project_id"] is None
+        assert "no project" in str(work.query_one("#work-project", Label).content)
