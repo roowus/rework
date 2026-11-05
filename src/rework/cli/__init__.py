@@ -770,6 +770,36 @@ def complaints(
         typer.echo(f"{cid}  [{ckind}]  {role}:  {summary}")
 
 
+@app.command("complaints-triage")
+def complaints_triage_cmd(
+    min_cluster: int = typer.Option(2, help="Complaints that must stack up before an issue opens."),
+) -> None:
+    """Cluster similar OPEN complaints and file ONE GitHub issue per loud
+    cluster (ADR 0004). Members flip to issue_open with the issue URL. Run
+    from a repo checkout so gh targets the right repo."""
+    import asyncio as _asyncio
+
+    from rework.config import Config, open_store_from_config
+    from rework.library.triage import triage as _triage
+
+    async def go() -> list[dict]:
+        store = await open_store_from_config(Config.from_env())
+        try:
+            return await _triage(store, min_cluster=min_cluster)
+        finally:
+            await store.aclose()
+
+    results = _asyncio.run(go())
+    if not results:
+        typer.echo("nothing loud enough to triage")
+        return
+    for r in results:
+        if r.get("issue"):
+            typer.echo(f"issue {r['issue']} <- {', '.join(r['cluster'])}")
+        else:
+            typer.secho(f"{r.get('note')} ({', '.join(r['cluster'])})", fg=typer.colors.RED)
+
+
 @app.command()
 def approve(
     gate_id: str,
