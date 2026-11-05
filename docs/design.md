@@ -86,17 +86,31 @@ with a continue/abort gate; approving doubles the cap and resumes, rejecting can
 Steps that FAIL get exactly one in-mission retry (the 429-storm lesson) before the
 plan moves on; synthesis counts only the latest attempt per step.
 
-### The TUI (owner ask, post-M5)
+### The TUI (owner ask, post-M5; cockpit redesign owner-grilled 2026-11-05)
 
-Bare `rework` opens a Textual dashboard: projects sidebar, missions table,
-live detail pane (2s event tail + inline gate approve/reject), gates queue,
-library browser, new-mission wizard + create-project modal, ctrl+p command
-palette. It is a CLIENT (own store connection from REWORK_DB), the
-scriptable command surface is unchanged underneath, and the quality bar is
-Claude-Code-grade: no blocking IO on the UI loop, one in-flight refresh
-guard, notify-not-crash on store hiccups, layout survives resizes
-(verified 60x20 to 140x44). An in-app assistant model (back burner) would
-live here.
+Bare `rework` opens a Textual COCKPIT: projects sidebar, missions table
+(running/awaiting-gate first), live detail pane, and a persistent PROMPT BAR
+along the bottom that drives everything. Free text + enter opens the
+new-mission wizard pre-filled with the objective and the LAST-USED
+repo/project/plan (one-keypress launches after the first); `/` offers
+commands (/gates /library /fetch /new /projects). Enter on a mission opens
+the full-screen DEEP VIEW with tabs (Feed / Findings / Diff / Report);
+gates are actionable there, f fetches the result. The LIBRARY is
+search-first: the cursor lands in the search box, typing filters live
+(hybrid when embeddings are configured), list on the left, rendered body on
+the right, a/d activate/retire. One navigation rule everywhere:
+enter = deeper, esc = back, a/x = gate, f = fetch. Bare `rework` opens
+blank: nothing auto-opens, nothing auto-resumes (owner decision).
+
+Visible ARTIFACTS land in ~/rework (results/<mission-id>/, reports/), so
+deliverables are never buried in a dot-directory; ~/.rework stays hidden
+and keeps only machinery (env, models.json, checkpoints). Overrides:
+REWORK_RESULTS_DIR / REWORK_REPORTS_DIR. The TUI is a CLIENT (own store
+connection from REWORK_DB), the scriptable command surface is unchanged
+underneath, and the quality bar is Claude-Code-grade: no blocking IO on
+the UI loop, one in-flight refresh guard, notify-not-crash on store
+hiccups, layout survives resizes. An in-app assistant model (back burner)
+would live here.
 
 ### The Library
 

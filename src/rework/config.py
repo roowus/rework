@@ -15,6 +15,22 @@ if TYPE_CHECKING:
     from rework.kernel.state.store import StateStore
 
 DEFAULT_STATE_DIR = Path.home() / ".rework"
+# User-facing artifacts live in a VISIBLE directory on purpose: fetched results
+# and reports are deliverables the owner asked for, not machinery. ~/.rework
+# stays hidden and keeps only internal state (env, checkpoints, caches).
+DEFAULT_USER_DIR = Path.home() / "rework"
+
+
+def default_results_dir() -> Path:
+    return Path(
+        os.environ.get("REWORK_RESULTS_DIR", str(DEFAULT_USER_DIR / "results"))
+    ).expanduser()
+
+
+def default_reports_dir() -> Path:
+    return Path(
+        os.environ.get("REWORK_REPORTS_DIR", str(DEFAULT_USER_DIR / "reports"))
+    ).expanduser()
 
 
 def _default_db() -> str:

@@ -13,6 +13,7 @@ from typing import Any
 import typer
 
 from rework import __version__
+from rework.config import default_results_dir
 from rework.nodes.report_sections import mechanical_verdict
 
 app = typer.Typer(
@@ -189,7 +190,7 @@ def fetch(
     if resp.status_code != 200:
         typer.secho(f"fetch failed ({resp.status_code}): {resp.text[:200]}", fg=typer.colors.RED)
         raise typer.Exit(1)
-    dest = Path(out or mission_id)
+    dest = Path(out or default_results_dir() / mission_id)
     dest.mkdir(parents=True, exist_ok=True)
     import io as _io
 
@@ -615,7 +616,7 @@ def report(
 ) -> None:
     """Render a mission's reports readably: each role's artifact plus the
     mechanical run-stats section (tokens, cache, cost, time). --md writes
-    a markdown file (default ~/.rework/reports/<mission-id>.md)."""
+    a markdown file (default ~/rework/reports/<mission-id>.md)."""
 
     async def go() -> None:
         from rework.config import Config, open_store_from_config
@@ -641,9 +642,9 @@ def report(
             if md or out:
                 from pathlib import Path as _Path
 
-                from rework.config import DEFAULT_STATE_DIR
+                from rework.config import default_reports_dir
 
-                path = _Path(out) if out else DEFAULT_STATE_DIR / "reports" / f"{mission_id}.md"
+                path = _Path(out) if out else default_reports_dir() / f"{mission_id}.md"
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(_render_md(prepared, spend, mission), encoding="utf-8")
                 typer.echo(f"report written: {path}")

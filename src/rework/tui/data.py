@@ -8,7 +8,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-from rework.config import DEFAULT_STATE_DIR, Config, open_store_from_config
+from rework.config import (
+    DEFAULT_STATE_DIR,
+    Config,
+    default_results_dir,
+    open_store_from_config,
+)
 from rework.kernel.state.records import Mission, Project, Run
 from rework.kernel.state.store import StateStore
 from rework.library.store import GitLibrary, LibraryStore, open_library_store
@@ -78,6 +83,60 @@ class TuiData:
         spend = await store.mission_spend(mission_id)
         return spend.spent_usd
 
+    async def get_mission(self, mission_id: str) -> Any:
+        store = await self.store()
+        return await store.get_mission(mission_id)
+
+    async def library_set_status(self, item_id: str, retire: bool) -> bool:
+        """a / d on the library split: activate or retire the selected item."""
+        index, _git = await self.library()
+        item = await index.get_item(item_id)
+        if item is None:
+            return False
+        from rework.library.model import ItemStatus
+
+        item.status = ItemStatus.RETIRED if retire else ItemStatus.ACTIVE
+        item.touch()
+        await index.upsert_item(item)
+        return True
+
+    async def mission_result_path(self, mission_id: str) -> str | None:
+        """Where the daemon says this mission's finished worktree lives (None =
+        nothing to fetch). The repo_path column is daemon-local until fetch
+        pulls it; the CLI fetch result lands in ~/rework/results/<id>/."""
+        store = await self.store()
+        mission = await store.get_mission(mission_id)
+        if mission is None or not mission.repo_path:
+            return None
+        return str(default_results_dir() / mission_id)
+
+    async def fetch_result(self, mission_id: str) -> tuple[str, int]:
+        """Pull the final worktree over the workspace API (same call the CLI
+        makes). Returns (destination, file count). Raises on failure."""
+        import io
+        import os
+        import tarfile
+
+        import httpx
+
+        from rework.orchestrator.workspace import workspace_url_from_env
+
+        token = os.environ.get("REWORK_TOKEN")
+        url = f"{workspace_url_from_env().rstrip('/')}/workspaces/results/{mission_id}"
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        resp = await httpx.AsyncClient(timeout=300.0).get(url, headers=headers)
+        if resp.status_code == 404:
+            raise FileNotFoundError(f"nothing to fetch for {mission_id}")
+        resp.raise_for_status()
+        dest = default_results_dir() / mission_id
+        dest.mkdir(parents=True, exist_ok=True)
+        count = 0
+        with tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
+            for member in tar.getmembers():
+                tar.extract(member, dest, filter="data")
+                count += 1
+        return str(dest), count
+
     async def decide_gate(self, gate_id: str, approved: bool) -> bool:
         store = await self.store()
         gate = await store.decide_gate(gate_id, approved)
@@ -90,6 +149,20 @@ class TuiData:
         if not query.strip():
             return await index.list_items(status=None, limit=100)
         return await index.search(query, limit=50)
+
+    async def library_hybrid_search(self, query: str) -> list[Any]:
+        """Hybrid (embeddings + keyword) when REWORK_EMBEDDINGS_* is set;
+        silently keyword-only otherwise. The TUI stays alive if the embedder
+        errors: HybridSearch already degrades internally."""
+        index, _git = await self.library()
+        from rework.library.embeddings import embeddings_from_env
+        from rework.library.search import HybridSearch
+
+        embedder = embeddings_from_env()
+        hybrid = HybridSearch(index, embedder)
+        if embedder is not None:
+            await hybrid.ensure_indexed()
+        return await hybrid.search(query, limit=50)
 
     async def library_body(self, item_id: str) -> tuple[Any, str | None]:
         index, git = await self.library()
