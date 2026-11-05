@@ -28,6 +28,7 @@ Quality rules this file tries to hold (owner bar: Claude-Code-grade):
 
 from __future__ import annotations
 
+import contextlib
 import os
 import time
 from typing import Any, ClassVar
@@ -197,6 +198,74 @@ class NewMissionModal(ModalScreen[dict[str, Any]]):
         )
 
 
+CHOICE_CANCELLED = object()  # sentinel: esc, not "I picked the None row"
+
+
+class ChoiceModal(ModalScreen[Any]):
+    """A small selection screen: a title, a list of labelled choices, and the
+    current one marked. Click (or arrow + enter) to pick; esc cancels.
+
+    Owner: the Work knobs 'shouldnt be a toggle... it should be a selection
+    screen menu'. Cycling a value on click is a toy; seeing the options and
+    choosing is the real interaction."""
+
+    BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
+        Binding("escape", "cancel", "Cancel", show=True),
+    ]
+
+    def __init__(
+        self,
+        title: str,
+        choices: list[tuple[str, Any]],  # (label, value)
+        current: Any = None,
+        *,
+        footer: str = "",
+    ) -> None:
+        super().__init__()
+        self._title = title
+        self._choices = choices
+        self._current = current
+        self._footer = footer
+        self._values = [value for _label, value in choices]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="modal-form"):
+            yield Label(f"[b]{self._title}[/b]  [dim]enter pick · esc cancel[/dim]")
+            from textual.widgets.option_list import Option
+
+            def marked(label: str, value: Any) -> str:
+                # Rich needs balanced tags; keep the mark self-contained
+                return (
+                    f"[bold green]●[/bold green] {label}"
+                    if value == self._current
+                    else (f"[dim]○[/dim] {label}")
+                )
+
+            options = [Option(marked(label, value)) for label, value in self._choices]
+            yield OptionList(*options, id="choice-list")
+            if self._footer:
+                yield Label(f"[dim]{self._footer}[/dim]")
+
+    def on_mount(self) -> None:
+        listing = self.query_one("#choice-list", OptionList)
+        # land on the current choice, not always the first row
+        if self._current is not None and self._current in self._values:
+            listing.highlighted = self._values.index(self._current)
+        listing.focus()
+
+    @on(OptionList.OptionSelected, "#choice-list")
+    def picked(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        index = event.option_index
+        if 0 <= index < len(self._values):
+            with contextlib.suppress(Exception):
+                self.dismiss(self._values[index])
+
+    def action_cancel(self) -> None:
+        with contextlib.suppress(Exception):
+            self.dismiss(CHOICE_CANCELLED)
+
+
 class CreateProjectModal(ModalScreen[dict[str, Any]]):
     BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
         Binding("escape", "cancel", "Cancel", show=True),
@@ -329,19 +398,63 @@ class WorkPane(Pane):
         except Exception as exc:  # a bad project list must not kill the tab
             self.notify(f"projects unavailable: {exc}", severity="warning")
 
-    # -- the three knob buttons ----------------------------------------------
+    # -- the three knob buttons: each opens a SELECTION screen ----------------
 
     @on(Button.Pressed, "#btn-project")
     def _project_clicked(self) -> None:
-        self.action_cycle_project()
+        self.run_worker(self._pick_project(), exclusive=True, group="knob")
 
     @on(Button.Pressed, "#btn-model")
     def _model_clicked(self) -> None:
-        self.action_cycle_model()
+        self.run_worker(self._pick_model(), exclusive=True, group="knob")
 
     @on(Button.Pressed, "#btn-effort")
     def _effort_clicked(self) -> None:
-        self.action_cycle_effort()
+        self.run_worker(self._pick_effort(), exclusive=True, group="knob")
+
+    async def _pick_project(self) -> None:
+        choices: list[tuple[str, Any]] = [("(no project)", None)]
+        choices += [(p.name, str(p.id)) for p in self.shell.rw._project_cache.values()]
+        chosen = await self.app.push_screen(
+            ChoiceModal("project", choices, self._current_project()),
+            wait_for_dismiss=True,
+        )
+        if chosen is CHOICE_CANCELLED:
+            return
+        self.shell.rw._mission_defaults["project_id"] = chosen
+        self._update_setting_labels()
+        self.notify(f"project: {self._project_name(chosen)}")
+
+    async def _pick_model(self) -> None:
+        if not self._model_ids:
+            self.notify("no models in the catalog (REWORK_MODELS)", severity="warning")
+            return
+        current = self._current_model() or (self._model_ids[0] if self._model_ids else None)
+        choices = [(mid, mid) for mid in self._model_ids]
+        chosen = await self.app.push_screen(
+            ChoiceModal("model", choices, current, footer="from REWORK_MODELS"),
+            wait_for_dismiss=True,
+        )
+        if chosen is CHOICE_CANCELLED or not chosen:
+            return
+        self.shell.rw._mission_defaults["model"] = chosen
+        self._update_setting_labels()
+
+    async def _pick_effort(self) -> None:
+        current = self._current_effort() or "default"
+        choices: list[tuple[str, Any]] = [
+            ("default (provider decides)", None),
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+        ]
+        chosen = await self.app.push_screen(
+            ChoiceModal("effort", choices, current), wait_for_dismiss=True
+        )
+        if chosen is CHOICE_CANCELLED:
+            return
+        self.shell.rw._mission_defaults["effort"] = chosen
+        self._update_setting_labels()
 
     # -- command autocomplete ------------------------------------------------
 

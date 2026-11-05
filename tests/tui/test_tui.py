@@ -944,12 +944,29 @@ async def test_work_tab_shows_model_and_effort_and_cycles(
         assert "flash" in str(work.query_one("#btn-model", Button).label)
         assert "effort" in str(work.query_one("#btn-effort", Button).label)
 
+        from textual.widgets import OptionList
+
+        from rework.tui.app import ChoiceModal
+
         work.query_one("#prompt").focus()
-        await pilot.press("alt+m")
-        await pilot.pause()
+        await pilot.click("#btn-model")
+        for _ in range(5):
+            await pilot.pause()
+        assert isinstance(app.screen, ChoiceModal)
+        listing = app.screen.query_one("#choice-list", OptionList)
+        listing.highlighted = 1  # pro
+        await pilot.press("enter")
+        for _ in range(5):
+            await pilot.pause()
         assert app._mission_defaults["model"] == "pro"
-        await pilot.press("alt+e")
-        await pilot.pause()
+        await pilot.click("#btn-effort")
+        for _ in range(5):
+            await pilot.pause()
+        listing = app.screen.query_one("#choice-list", OptionList)
+        listing.highlighted = 1  # low
+        await pilot.press("enter")
+        for _ in range(5):
+            await pilot.pause()
         assert app._mission_defaults["effort"] == "low"
         assert "pro" in str(work.query_one("#btn-model", Button).label)
 
@@ -1078,17 +1095,74 @@ async def test_cancel_modal_does_not_crash_when_flow_worker_cancelled(
         assert isinstance(app.screen, Shell)
 
 
-async def test_work_knob_buttons_are_clickable(seeded: dict[str, str]) -> None:
-    """Owner: 'make this stuff buttons'. Project/model/effort are Buttons that
-    change the value on click — not hidden key bindings."""
+async def test_work_knobs_open_selection_screens(seeded: dict[str, str]) -> None:
+    """Owner: the knobs must not toggle — each opens a SELECTION screen with
+    the options listed and the current one marked; esc changes nothing."""
+    from textual.widgets import OptionList
+
+    from rework.tui.app import ChoiceModal
+
     app = ReworkApp()
     async with app.run_test(size=(120, 32)) as pilot:
         await pilot.pause()
         await pilot.pause()
-        before = app._mission_defaults.get("model")
-        await pilot.click("#btn-model")
-        await pilot.pause()
-        assert app._mission_defaults.get("model") != before or app._mission_defaults.get("model")
+        before = app._mission_defaults.get("effort")
         await pilot.click("#btn-effort")
+        for _ in range(5):
+            await pilot.pause()
+        assert isinstance(app.screen, ChoiceModal), "knob toggled instead of offering a menu"
+        listing = app.screen.query_one("#choice-list", OptionList)
+        assert listing.option_count == 4  # default / low / medium / high
+        await pilot.press("escape")
+        for _ in range(5):
+            await pilot.pause()
+        assert app._mission_defaults.get("effort") == before, "escape changed the value"
+
+
+async def test_selection_screen_picking_a_project(seeded: dict[str, str], tui_env: Path) -> None:
+    """Picking a row in the project selection screen sets the mission project;
+    choosing '(no project)' explicitly clears it (cancel sentinel differs)."""
+    from textual.widgets import OptionList
+
+    from rework.kernel.state.records import Project
+    from rework.kernel.state.sqlite import open_sqlite
+    from rework.tui.app import ChoiceModal
+
+    store = await open_sqlite(str(tui_env))
+    try:
+        await store.create_project(Project(id="p-one", name="rework", settings={}))
+    finally:
+        await store.aclose()
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
         await pilot.pause()
-        assert app._mission_defaults.get("effort") in ("low", "medium", "high")
+        await pilot.pause()
+        shell = await _shell(app)
+        work = shell.query_one("#pane-work")
+        work.run_worker(work.reload_projects(), exclusive=True, group="test-reload")
+        for _ in range(4):
+            await pilot.pause()
+
+        await pilot.click("#btn-project")
+        for _ in range(5):
+            await pilot.pause()
+        assert isinstance(app.screen, ChoiceModal)
+        listing = app.screen.query_one("#choice-list", OptionList)
+        listing.highlighted = 1  # the project row
+        await pilot.press("enter")
+        for _ in range(5):
+            await pilot.pause()
+        assert app._mission_defaults["project_id"] == "p-one"
+        assert "rework" in str(work.query_one("#btn-project").label)
+
+        # explicit "(no project)" clears it
+        await pilot.click("#btn-project")
+        for _ in range(5):
+            await pilot.pause()
+        listing = app.screen.query_one("#choice-list", OptionList)
+        listing.highlighted = 0
+        await pilot.press("enter")
+        for _ in range(5):
+            await pilot.pause()
+        assert app._mission_defaults["project_id"] is None
