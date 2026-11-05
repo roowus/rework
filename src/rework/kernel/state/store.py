@@ -98,6 +98,8 @@ class StateStore(Protocol):
 
     async def list_open_gates(self, mission_id: str | None = None) -> list[Gate]: ...
 
+    async def list_gates(self, mission_id: str | None = None) -> list[Gate]: ...
+
     # -- events ---------------------------------------------------------------
     async def append_event(self, event: EventRecord) -> EventRecord:
         """Assigns seq and persists; seq order is the attach/replay cursor."""

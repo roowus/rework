@@ -28,9 +28,23 @@ class GateManager:
         self._store = store
         self._bus = bus
 
-    async def request(self, mission_id: str, kind: GateKind, question: str) -> Gate:
-        """Create an OPEN gate row and publish GATE_OPENED. The caller then interrupts."""
-        gate = Gate(id=new_id("gate"), mission_id=mission_id, kind=kind, question=question)
+    async def request(
+        self,
+        mission_id: str,
+        kind: GateKind,
+        question: str,
+        for_run: str | None = None,
+    ) -> Gate:
+        """Create an OPEN gate row and publish GATE_OPENED. The caller then
+        interrupts. `for_run` ties an escalation gate to the run it unblocks,
+        in the SAME row (not a follow-up event: see Gate.for_run)."""
+        gate = Gate(
+            id=new_id("gate"),
+            mission_id=mission_id,
+            kind=kind,
+            question=question,
+            for_run=for_run,
+        )
         await self._store.create_gate(gate)
         await self._bus.publish(
             EventRecord(

@@ -84,6 +84,7 @@ _DDL = [
         question TEXT NOT NULL,
         status TEXT NOT NULL,
         decision_note TEXT,
+        for_run TEXT,
         created_at DOUBLE PRECISION NOT NULL,
         decided_at DOUBLE PRECISION
     )
@@ -184,12 +185,25 @@ class _TaskLock:
 
 
 def _serialized(method: Any) -> Any:
-    """Serialize a store method against the shared connection."""
+    """Serialize a store method against the shared connection, and always
+    leave it in a committed state.
+
+    FOUND LIVE (prod rewvis): a connection whose last statement was a plain
+    SELECT sits "idle in transaction" until someone commits or rolls back. Every
+    read method here is a SELECT with no commit, so the daemon held a
+    transaction open indefinitely (observed: 1h51m) and its locks blocked
+    ALTER TABLE on deploy ("migration could not lock gates within 5s"). Closing
+    the transaction after each call bounds the exposure to one operation.
+    Writers already commit inside; this is a no-op for them (psycopg returns a
+    fresh transaction only when the current one is not idle)."""
 
     @functools.wraps(method)
     async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
         async with self._op_lock:
-            return await method(self, *args, **kwargs)
+            try:
+                return await method(self, *args, **kwargs)
+            finally:
+                await self._end_idle_transaction()
 
     return wrapper
 
@@ -200,6 +214,26 @@ class PostgresStore:
     def __init__(self, conn: psycopg.AsyncConnection[DictRow]) -> None:
         self._conn = conn
         self._op_lock = _TaskLock()
+
+    async def _end_idle_transaction(self) -> None:
+        """Commit (or discard) whatever the last statement opened.
+
+        psycopg's connection exposes the transaction status; only touch the
+        connection when a transaction is genuinely open, so a failed method
+        does not turn its own error into a second one."""
+        info = getattr(self._conn, "info", None)
+        if info is None:
+            return
+        txn = getattr(info, "transaction_status", None)
+        from psycopg.pq import TransactionStatus
+
+        try:
+            if txn == TransactionStatus.INTRANS:
+                await self._conn.commit()
+            elif txn == TransactionStatus.INERROR:
+                await self._conn.rollback()
+        except Exception:  # never let hygiene mask the caller's result
+            pass
 
     async def aclose(self) -> None:
         await self._conn.close()
@@ -274,6 +308,7 @@ class PostgresStore:
             question=row["question"],
             status=GateStatus(row["status"]),
             decision_note=row["decision_note"],
+            for_run=row["for_run"],
             created_at=row["created_at"],
             decided_at=row["decided_at"],
         )
@@ -493,7 +528,8 @@ class PostgresStore:
     async def create_gate(self, gate: Gate) -> Gate:
         await self._conn.execute(
             "INSERT INTO gates (id, mission_id, kind, question, status, decision_note,"
-            " created_at, decided_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            " for_run, created_at, decided_at)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 gate.id,
                 gate.mission_id,
@@ -501,6 +537,7 @@ class PostgresStore:
                 gate.question,
                 gate.status.value,
                 gate.decision_note,
+                gate.for_run,
                 gate.created_at,
                 gate.decided_at,
             ),
@@ -543,6 +580,18 @@ class PostgresStore:
                 "SELECT * FROM gates WHERE status = %s ORDER BY created_at",
                 (GateStatus.OPEN.value,),
             )
+        return [self._gate(r) for r in rows]
+
+    @_serialized
+    async def list_gates(self, mission_id: str | None = None) -> list[Gate]:
+        """Every gate for the mission, any status, oldest first."""
+        if mission_id is not None:
+            rows = await self._fetch_all(
+                "SELECT * FROM gates WHERE mission_id = %s ORDER BY created_at",
+                (mission_id,),
+            )
+        else:
+            rows = await self._fetch_all("SELECT * FROM gates ORDER BY created_at", ())
         return [self._gate(r) for r in rows]
 
     # -- events ---------------------------------------------------------------------
@@ -773,6 +822,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ),
     ("missions", "repo_origin", "ALTER TABLE missions ADD COLUMN repo_origin TEXT"),
     ("missions", "project_id", "ALTER TABLE missions ADD COLUMN project_id TEXT"),
+    ("gates", "for_run", "ALTER TABLE gates ADD COLUMN for_run TEXT"),
 ]
 
 

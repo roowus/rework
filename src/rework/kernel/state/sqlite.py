@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS gates (
     question TEXT NOT NULL,
     status TEXT NOT NULL,
     decision_note TEXT,
+    for_run TEXT,
     created_at REAL NOT NULL,
     decided_at REAL
 );
@@ -196,6 +197,7 @@ class SqliteStore:
             question=row["question"],
             status=GateStatus(row["status"]),
             decision_note=row["decision_note"],
+            for_run=row["for_run"],
             created_at=row["created_at"],
             decided_at=row["decided_at"],
         )
@@ -397,7 +399,7 @@ class SqliteStore:
     async def create_gate(self, gate: Gate) -> Gate:
         await self._db.execute(
             "INSERT INTO gates (id, mission_id, kind, question, status, decision_note,"
-            " created_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " for_run, created_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 gate.id,
                 gate.mission_id,
@@ -405,6 +407,7 @@ class SqliteStore:
                 gate.question,
                 gate.status.value,
                 gate.decision_note,
+                gate.for_run,
                 gate.created_at,
                 gate.decided_at,
             ),
@@ -444,6 +447,17 @@ class SqliteStore:
                 "SELECT * FROM gates WHERE status = ? ORDER BY created_at",
                 (GateStatus.OPEN.value,),
             )
+        return [self._gate(r) for r in rows]
+
+    async def list_gates(self, mission_id: str | None = None) -> list[Gate]:
+        """Every gate for the mission, any status, oldest first."""
+        if mission_id is not None:
+            rows = await self._fetch_all(
+                "SELECT * FROM gates WHERE mission_id = ? ORDER BY created_at",
+                (mission_id,),
+            )
+        else:
+            rows = await self._fetch_all("SELECT * FROM gates ORDER BY created_at", ())
         return [self._gate(r) for r in rows]
 
     # -- events ---------------------------------------------------------------------
@@ -663,5 +677,9 @@ async def open_sqlite(path: str) -> SqliteStore:
         await db.execute("ALTER TABLE missions ADD COLUMN repo_origin TEXT")
     if "project_id" not in names:
         await db.execute("ALTER TABLE missions ADD COLUMN project_id TEXT")
+    cols = await db.execute("PRAGMA table_info(gates)")
+    names = {row[1] for row in await cols.fetchall()}
+    if "for_run" not in names:
+        await db.execute("ALTER TABLE gates ADD COLUMN for_run TEXT")
     await db.commit()
     return SqliteStore(db)

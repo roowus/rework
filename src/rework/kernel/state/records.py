@@ -125,6 +125,13 @@ class Gate(BaseModel):
     question: str
     status: GateStatus = GateStatus.OPEN
     decision_note: str | None = None
+    # the run this gate unblocks (escalations only; mission-level gates leave
+    # it None). DURABLE on the row, not a follow-up event: recovery needs to
+    # answer "which run does this decided gate belong to?" and the event that
+    # carried that answer was published AFTER the row was created, so a kill
+    # in between stranded the gate forever (found live: chaos test timed out
+    # on a 3.13 CI runner).
+    for_run: str | None = None
     created_at: float = Field(default_factory=now)
     decided_at: float | None = None
 

@@ -851,18 +851,14 @@ class MissionRunner:
             # gate when a previous pass opened one (idempotent materialization)
             existing = await self._open_gate_for_run(run)
             if existing is None:
+                # for_run rides ON the row: recovery reads the link from the
+                # gate itself, so a kill between commit and event publish can
+                # no longer orphan the gate (see Gate.for_run)
                 gate = await self._gates.request(
                     self.mission_id,
                     kind=self._gate_kind(payload),
                     question=str(payload.get("question") or payload.get("detail") or "proceed?"),
-                )
-                await self._bus.publish(
-                    EventRecord(
-                        mission_id=self.mission_id,
-                        run_id=run.id,
-                        type=EventType.INFO,
-                        payload={"gate_id": gate.id, "for_run": run.id},
-                    )
+                    for_run=run.id,
                 )
                 gated.append((run, gate.id))
             else:
@@ -899,18 +895,23 @@ class MissionRunner:
                     )
                 )
 
+    async def _gates_for_run(self, run: Run) -> list[Any]:
+        """Every gate row pointing at this run, oldest first.
+
+        The link is the gate row's `for_run` column. It used to be an INFO
+        event published right AFTER the gate row was committed, so a kill in
+        between left a gate nobody could attribute: recovery found no decision,
+        the run stayed HALTED_ESCALATED, the pump looped forever and the
+        mission hung until a 60s test timeout (found live on a slow 3.13 CI
+        runner). The row is written atomically with the gate, so it cannot
+        lose the race."""
+        gates = await self._store.list_gates(self.mission_id)
+        return [g for g in gates if g.for_run == run.id]
+
     async def _open_gate_for_run(self, run: Run) -> Any:
-        """The run's open gate, if a previous pass materialized one (the
-        run-id pointer event written at gate creation is the link)."""
-        events = await self._store.events_since(0, mission_id=self.mission_id, limit=5000)
-        gate_ids = [
-            e.payload.get("gate_id")
-            for e in events
-            if e.type == EventType.INFO and e.payload.get("for_run") == run.id
-        ]
-        for gate_id in reversed(gate_ids):
-            gate = await self._store.get_gate(str(gate_id))
-            if gate is not None and gate.status == GateStatus.OPEN:
+        """The run's open gate, if a previous pass materialized one."""
+        for gate in reversed(await self._gates_for_run(run)):
+            if gate.status == GateStatus.OPEN:
                 return gate
         return None
 
@@ -918,33 +919,19 @@ class MissionRunner:
         """The run's most recent gate ROW, any status. Recovery uses this to
         apply a decision made while the engine was down: resuming the parked
         graph plain would re-fire the interrupt and open a duplicate gate."""
-        events = await self._store.events_since(0, mission_id=self.mission_id, limit=5000)
-        gate_ids = [
-            e.payload.get("gate_id")
-            for e in events
-            if e.type == EventType.INFO and e.payload.get("for_run") == run.id
-        ]
-        for gate_id in reversed(gate_ids):
-            gate = await self._store.get_gate(str(gate_id))
-            if gate is not None:
-                return gate
-        return None
+        gates = await self._gates_for_run(run)
+        return gates[-1] if gates else None
 
     async def _latest_gate_of_kind(self, kind: GateKind) -> Any:
         """The mission's most recent gate of this kind, any status (ship and
         open_pr recovery: a restart must read the EXISTING gate, not open a
-        duplicate for a decision the owner already made)."""
-        events = await self._store.events_since(0, mission_id=self.mission_id, limit=5000)
-        gate_ids = [
-            e.payload.get("gate_id")
-            for e in events
-            if e.type == EventType.GATE_OPENED and e.payload.get("kind") == kind.value
-        ]
-        for gate_id in reversed(gate_ids):
-            gate = await self._store.get_gate(str(gate_id))
-            if gate is not None:
-                return gate
-        return None
+        duplicate for a decision the owner already made).
+
+        Reads the ROWS, not the event stream: the row is committed before any
+        event is published, and a 5000-event scan can also miss a gate on a
+        long mission while the table cannot."""
+        gates = [g for g in await self._store.list_gates(self.mission_id) if g.kind == kind]
+        return gates[-1] if gates else None
 
     async def _promote_and_resume(self, run: Run) -> bool:
         """needs_model policy: promote within the provider (cross-provider is

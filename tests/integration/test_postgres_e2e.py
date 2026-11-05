@@ -42,6 +42,32 @@ async def _purge_checkpoint_threads(url: str, mission_id: str) -> None:
         await conn.close()
 
 
+async def test_reads_do_not_leave_the_connection_idle_in_transaction() -> None:
+    """Found live on rewvis: every store READ (a bare SELECT with no commit)
+    left the shared connection "idle in transaction", observed holding one
+    open for 1h51m. Its locks blocked ALTER TABLE during a deploy
+    ("migration could not lock gates within 5s"). Reads must end their
+    transaction."""
+    from psycopg.pq import TransactionStatus
+
+    from rework.config import Config, open_store_from_config
+
+    url = os.environ["REWORK_TEST_POSTGRES"]
+    store = await open_store_from_config(Config(db=url, checkpoints_db=url))
+    try:
+        await store.reset_for_tests()
+        # both a single-row read and a list read, the two shapes in the store
+        await store.list_missions()
+        await store.list_open_gates()
+        status = store._conn.info.transaction_status
+        assert status == TransactionStatus.IDLE, (
+            f"store left the connection in status {status} (2 = INTRANS: "
+            "an uncommitted SELECT holds locks that block deploys)"
+        )
+    finally:
+        await store.aclose()
+
+
 async def test_engine_runs_end_to_end_on_postgres_state_and_checkpoints() -> None:
     import asyncio
 

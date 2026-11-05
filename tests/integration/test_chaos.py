@@ -241,6 +241,57 @@ async def test_gate_decided_while_down_applied_on_restart(world: dict[str, Any])
     assert mission_row is not None and mission_row.status == MissionStatus.DONE
 
 
+async def test_escalation_gate_links_to_its_run_on_the_row(world: dict[str, Any]) -> None:
+    """The gate->run link is a COLUMN, not a follow-up event.
+
+    Reproduces what timed out on a 3.13 CI runner: the engine used to publish
+    an INFO event carrying {gate_id, for_run} AFTER committing the gate row. A
+    kill between the two left a gate no one could attribute, so recovery never
+    applied the owner's answer and the run sat HALTED_ESCALATED until the test
+    window closed. Here the pointer event is deleted outright: recovery must
+    still find the gate and finish."""
+    store: SqliteStore = world["store"]
+    mission = await store.create_mission(
+        Mission(
+            id=new_id("m"),
+            objective="orphan-proof gate",
+            plan={"steps": [{"step": "do", "role": "crashy"}]},
+        )
+    )
+    runner1 = _runner(world, mission.id)
+    task1 = asyncio.create_task(runner1.run())
+    await _wait_for(lambda: _open_gate(store, mission.id), what="gate to open")
+    task1.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task1, timeout=5)
+    if runner1._supervisor is not None:
+        await runner1._supervisor.aclose()
+
+    run_id_value = f"{mission.id}:do:crashy:1"
+    second: SqliteStore = await open_sqlite(world["db_path"])
+    try:
+        gates = GateManager(second, InProcessEventBus(second))
+        open_gates = await gates.open_gates(mission.id)
+        assert open_gates and open_gates[0].for_run == run_id_value, (
+            "the gate row must name the run it unblocks"
+        )
+        # simulate the lost-write window: no event ever carried the pointer.
+        # (the event table is the store's own substrate; a test reaching into
+        # it is modelling a process that died before the publish, which no
+        # public method can express)
+        await second._db.execute("DELETE FROM events WHERE payload LIKE '%for_run%'")
+        await second._db.commit()
+        await gates.decide(open_gates[0].id, approved=True)
+    finally:
+        await second.aclose()
+
+    runner2 = _runner(world, mission.id)
+    await asyncio.wait_for(asyncio.create_task(runner2.run()), timeout=60)
+    fresh = await store.get_run(run_id_value)
+    assert fresh is not None and fresh.status.value == "completed"
+    assert (fresh.artifact or {}).get("approved") is True
+
+
 async def test_gate_rejected_while_down_aborts_on_restart(world: dict[str, Any]) -> None:
     """Same, but the answer is no: the run aborts from the row's decision and
     the mission still completes (the plan moves on)."""
