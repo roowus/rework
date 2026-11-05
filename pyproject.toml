@@ -20,6 +20,8 @@ dependencies = [
     "psycopg[binary,pool]>=3.1",
     # daemon workspace HTTP API (ADR 0005)
     "aiohttp>=3.9",
+    # library MCP server (M5.3): any MCP client mounts the same library
+    "mcp>=1.2,<2",  # 2.x renamed FastMCP -> MCPServer; migrate deliberately later
     "aiosqlite>=0.20",
     # model providers
     "anthropic>=0.40",

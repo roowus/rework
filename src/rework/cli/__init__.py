@@ -1390,3 +1390,11 @@ def library_search(
 
     for line in asyncio.run(go()):
         typer.echo(line)
+
+
+@app.command("library-mcp")
+def library_mcp() -> None:
+    """Serve the Library over MCP stdio (mount from any MCP client)."""
+    from rework.library.mcp import run_stdio
+
+    run_stdio()
