@@ -226,7 +226,9 @@ async def test_gate_decided_while_down_applied_on_restart(world: dict[str, Any])
 
     runner2 = _runner(world, mission.id)
     task2 = asyncio.create_task(runner2.run())
-    await asyncio.wait_for(task2, timeout=15)
+    # the resumed runner replays grind's 0.6s sleep; slow CI runners have
+    # burned 15s on this already (lock contention from sibling jobs)
+    await asyncio.wait_for(task2, timeout=30)
 
     # exactly ONE gate ever existed: no duplicate was opened for the answer
     events = await store.events_since(0, mission_id=mission.id)
