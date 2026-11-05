@@ -149,6 +149,9 @@ happens when the owner picks them back up.
   their workdir is empty by design (they get a repo map, not the repo).
   Candidate workflow improvement (mount the repo read-only or index richer
   context); evaluate now that the Library landed.
+- **In-app rework assistant**: an AI helper inside the TUI that manages
+  rework for you (create a project, draft a mission, organize/curate the
+  Library on request). Owner raised 2026-11-05; needs its own design pass.
 - **Library repo mirror sync**: the library git repo is daemon-canonical
   (rewvis); other devices share the INDEX via the state DB, but body fetches
   need the daemon until the repo is mirrored (GitHub per the owner plan) and
