@@ -27,6 +27,27 @@ log = logging.getLogger("rework.nodes")
 
 DEFAULT_GUARD_ITERATIONS = 64
 
+
+def _short_args(args: dict[str, Any], limit: int = 160) -> str:
+    """One-line rendering of tool arguments for the trajectory view."""
+    parts = []
+    for key, value in (args or {}).items():
+        text = str(value).replace("\n", " ")
+        if len(text) > 60:
+            text = text[:57] + "..."
+        parts.append(f"{key}={text}")
+    joined = ", ".join(parts)
+    return joined[:limit]
+
+
+def _is_error(output: str | None) -> bool:
+    """Heuristic: executors return error text, not exceptions."""
+    if not output:
+        return False
+    head = output[:200].lower()
+    return head.startswith("error") or "traceback" in head or "not found" in head
+
+
 ToolLoopNode = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
@@ -43,8 +64,26 @@ def make_toolloop_node(
     max_iterations: int = DEFAULT_GUARD_ITERATIONS,
     temperature: float | None = None,
     effort: str | None = None,
+    bus: Any | None = None,
 ) -> ToolLoopNode:
+    """`bus` (optional) turns on TRAJECTORY events: one per model turn and one
+    per tool call, so the UI can show the agent loop the way Claude Code and
+    pi do instead of a bare 'running'. Without it the loop is silent (tests)."""
     entry = catalog.resolve(catalog_id)
+
+    async def emit(kind: str, payload: dict[str, Any]) -> None:
+        if bus is None:
+            return
+        from rework.kernel.state.records import EventRecord, EventType
+
+        await bus.publish(
+            EventRecord(
+                mission_id=mission_id,
+                run_id=run_id,
+                type=EventType.PROGRESS,
+                payload={"trajectory": kind, **payload},
+            )
+        )
 
     async def charge(result_usage, model: str) -> None:
         await store.charge(
@@ -84,6 +123,15 @@ def make_toolloop_node(
             )
             await charge(result.usage, entry.model)
             turns += 1
+            await emit(
+                "turn",
+                {
+                    "turn": turns,
+                    "text": (result.text or "")[:400],
+                    "tools": [tc.name for tc in result.tool_calls],
+                    "tokens": result.usage.input_tokens + result.usage.output_tokens,
+                },
+            )
             messages.append(
                 {
                     "role": "assistant",
@@ -97,7 +145,19 @@ def make_toolloop_node(
             if not result.tool_calls:
                 return {"messages": messages, "loop_turns": turns, "final_text": result.text}
             for tc in result.tool_calls:
+                await emit(
+                    "tool_call",
+                    {"name": tc.name, "arguments": _short_args(tc.arguments)},
+                )
                 out = await executor.execute(tc.name, dict(tc.arguments))
+                await emit(
+                    "tool_result",
+                    {
+                        "name": tc.name,
+                        "result": (out or "")[:400],
+                        "error": out[:200] if _is_error(out) else "",
+                    },
+                )
                 messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "name": tc.name, "content": out}
                 )

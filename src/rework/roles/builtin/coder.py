@@ -185,6 +185,7 @@ class CoderSpec(RoleSpec):
             run_id=ctx.run.id,
             budget=ctx.budget,
             effort=ctx.run.model_ref.get("effort"),
+            bus=ctx.bus,
         )
 
         graph = StateGraph(CoderState)

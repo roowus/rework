@@ -63,6 +63,52 @@ def notify_mode() -> str:
     return raw if raw in ("toast", "bell", "both", "none") else "toast"
 
 
+def format_event_line(event: Any, role: str) -> str:
+    """One trajectory line, Claude-Code style.
+
+    Trajectory events (payload["trajectory"]) are the agent loop itself —
+    model turn, tool call, tool result — rendered compactly and indented under
+    the role so the run reads like a transcript instead of a status log."""
+    stamp = time.strftime("%H:%M:%S", time.localtime(event.ts))
+    payload = event.payload or {}
+    kind = payload.get("trajectory")
+
+    if kind == "turn":
+        num = payload.get("turn", "?")
+        text = str(payload.get("text") or "").replace("\n", " ").strip()
+        tools = payload.get("tools") or []
+        toks = payload.get("tokens") or 0
+        head = f"[dim]{stamp}[/dim] [b]{role or 'agent'}[/b] [dim]turn {num}[/dim]"
+        if text:
+            head += f"  {text[:160]}"
+        if tools:
+            head += f"  [cyan]→ {', '.join(tools)}[/cyan]"
+        head += f"  [dim]{toks:,} tok[/dim]"
+        return head
+    if kind == "tool_call":
+        return (
+            f"[dim]          ↳[/dim] [cyan]{payload.get('name', '?')}[/cyan]"
+            f"[dim]({payload.get('arguments', '')})[/dim]"
+        )
+    if kind == "tool_result":
+        text = str(payload.get("result") or payload.get("error") or "").replace("\n", " ")
+        text = text.strip()
+        if payload.get("error"):
+            return f"[dim]          ↳[/dim] [red]{text[:160]}[/red]"
+        return f"[dim]          = {text[:160]}[/dim]"
+
+    detail = ""
+    if payload.get("note"):
+        detail = str(payload["note"])
+    elif payload.get("error"):
+        detail = f"[red]{payload['error']}[/red]"
+    elif payload.get("question"):
+        detail = str(payload["question"])
+    elif event.type.value == "mission_created":
+        detail = str(payload.get("objective", ""))[:100]
+    return f"[dim]{stamp}[/dim] {event.type.value:<15} {role} {detail}".rstrip()
+
+
 class SelectableLog(RichLog):
     """RichLog with working text selection.
 
@@ -857,21 +903,10 @@ class DashboardPane(Pane):
             log.clear()
             events = events[-EVENT_TAIL:]
         for event in events:
-            stamp = time.strftime("%H:%M:%S", time.localtime(event.ts))
             role = ""
             if event.run_id and event.run_id in runs:
                 role = runs[event.run_id].step
-            detail = ""
-            payload = event.payload or {}
-            if payload.get("note"):
-                detail = str(payload["note"])
-            elif payload.get("error"):
-                detail = f"[red]{payload['error']}[/red]"
-            elif payload.get("question"):
-                detail = str(payload["question"])
-            elif event.type.value == "mission_created":
-                detail = str(payload.get("objective", ""))[:100]
-            log.write(f"[dim]{stamp}[/dim] {event.type.value:<15} {role} {detail}".rstrip())
+            log.write(format_event_line(event, role))
             self._last_event_seq = max(self._last_event_seq, event.seq or 0)
         m = self.shell.rw._mission_cache.get(mission_id)
         if m is not None:
@@ -1821,19 +1856,8 @@ class MissionDeepView(ModalScreen[None]):
             log.clear()
             events = events[-EVENT_TAIL:]
         for event in events:
-            stamp = time.strftime("%H:%M:%S", time.localtime(event.ts))
             role = runs[event.run_id].step if event.run_id in runs else ""
-            detail = ""
-            payload = event.payload or {}
-            if payload.get("note"):
-                detail = str(payload["note"])
-            elif payload.get("error"):
-                detail = f"[red]{payload['error']}[/red]"
-            elif payload.get("question"):
-                detail = str(payload["question"])
-            elif event.type.value == "mission_created":
-                detail = str(payload.get("objective", ""))[:100]
-            log.write(f"[dim]{stamp}[/dim] {event.type.value:<15} {role} {detail}".rstrip())
+            log.write(format_event_line(event, role))
             self._last_event_seq = max(self._last_event_seq, event.seq or 0)
 
     async def _render_findings(self) -> None:

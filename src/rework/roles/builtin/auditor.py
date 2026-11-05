@@ -129,6 +129,7 @@ class AuditorSpec(RoleSpec):
             run_id=ctx.run.id,
             budget=ctx.budget,
             effort=ctx.run.model_ref.get("effort"),
+            bus=ctx.bus,
         )
 
         report = make_report_writer_node(
