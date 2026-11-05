@@ -38,7 +38,6 @@ from textual.widgets import (
     RichLog,
     Select,
     Static,
-    TextArea,
 )
 
 from rework.tui.data import TuiData, human_age, status_rich
@@ -78,14 +77,10 @@ class NewMissionModal(ModalScreen[dict[str, Any]]):
             (f"{p.name} ({p.id})", p.id) for p in self._projects
         ]
         with Vertical(id="modal-form"):
-            yield Label("[b]New mission[/b]")
-            yield Label("Objective")
-            yield TextArea(id="f-objective", soft_wrap=True)
-            yield Label("Repo (git URL or local path; optional when a folder is given)")
-            yield Input(id="f-repo", placeholder="https://github.com/you/repo.git")
-            yield Label("Local folder of working files to upload (non-git)")
-            yield Input(id="f-repodir", placeholder="~/Documents/some-folder")
-            yield Label("Plan")
+            yield Label("[b]New mission[/b]  [dim]ctrl+s create · esc cancel[/dim]")
+            yield Input(id="f-objective", placeholder="Objective (what should happen)")
+            yield Input(id="f-repo", placeholder="Repo: git URL or local path")
+            yield Input(id="f-repodir", placeholder="Folder to upload (non-git files), optional")
             yield Select(
                 [
                     ("echo (no roles)", "echo"),
@@ -96,14 +91,13 @@ class NewMissionModal(ModalScreen[dict[str, Any]]):
                 id="f-plan",
                 allow_blank=False,
             )
-            yield Label("Project")
             yield Select(choices, value="__none__", id="f-project", allow_blank=False)
             with HorizontalGroup(id="modal-actions"):
-                yield Button("Create (ctrl+s)", id="btn-create", variant="success")
-                yield Button("Cancel (esc)", id="btn-cancel")
+                yield Button("Create", id="btn-create", variant="success")
+                yield Button("Cancel", id="btn-cancel")
 
     def on_mount(self) -> None:
-        self.query_one("#f-objective", TextArea).focus()
+        self.query_one("#f-objective", Input).focus()
 
     @on(Button.Pressed, "#btn-cancel")
     def cancel_btn(self) -> None:
@@ -117,7 +111,7 @@ class NewMissionModal(ModalScreen[dict[str, Any]]):
         self.dismiss(None)
 
     def action_submit(self) -> None:
-        objective = self.query_one("#f-objective", TextArea).text.strip()
+        objective = self.query_one("#f-objective", Input).value.strip()
         if not objective:
             self.notify("Objective is required", severity="error")
             return
@@ -148,10 +142,8 @@ class CreateProjectModal(ModalScreen[dict[str, Any]]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="modal-form"):
-            yield Label("[b]New project[/b] (a label that groups missions)")
-            yield Label("Name")
-            yield Input(id="p-name", placeholder="capstone")
-            yield Label("Transport")
+            yield Label("[b]New project[/b]  [dim]ctrl+s create · esc cancel[/dim]")
+            yield Input(id="p-name", placeholder="Project name")
             yield Select(
                 [
                     ("git (daemon clones origins)", "git"),
@@ -162,8 +154,8 @@ class CreateProjectModal(ModalScreen[dict[str, Any]]):
                 allow_blank=False,
             )
             with HorizontalGroup(id="modal-actions"):
-                yield Button("Create (ctrl+s)", id="btn-create", variant="success")
-                yield Button("Cancel (esc)", id="btn-cancel")
+                yield Button("Create", id="btn-create", variant="success")
+                yield Button("Cancel", id="btn-cancel")
 
     def on_mount(self) -> None:
         self.query_one("#p-name", Input).focus()
@@ -370,13 +362,12 @@ class Dashboard(ReworkScreen):
         yield Header(show_clock=False)
         with Horizontal(id="main"):
             with Vertical(id="sidebar"):
-                yield Label("[b]Projects[/b]")
                 yield ListView(id="projects")
-                yield Label("", id="sidebar-hint")
+                yield Label("[dim]p new project[/dim]", id="sidebar-hint")
             with Vertical(id="mid"):
                 yield DataTable(id="missions")
         with Vertical(id="detail"):
-            yield Label("[b]Select a mission[/b]", id="mission-head")
+            yield Label("Select a mission", id="mission-head")
             yield RichLog(id="events", markup=True, highlight=False, wrap=True, max_lines=600)
             yield Static("", id="gate-box")
         yield Footer()
@@ -503,7 +494,7 @@ class Dashboard(ReworkScreen):
                 detail = str(payload["question"])
             elif event.type.value == "mission_created":
                 detail = str(payload.get("objective", ""))[:100]
-            log.write(f"[dim]{stamp}[/dim] {event.type.value:<16} {role} {detail}")
+            log.write(f"[dim]{stamp}[/dim] {event.type.value:<15} {role} {detail}".rstrip())
             self._last_event_seq = max(self._last_event_seq, event.seq or 0)
         m = self.rw._mission_cache.get(mission_id)
         if m is not None:
@@ -529,7 +520,13 @@ class Dashboard(ReworkScreen):
     # -- actions -------------------------------------------------------------
 
     async def action_new_mission(self) -> None:
-        result = await self.app.push_screen(
+        # push_screen(wait_for_dismiss=True) is only legal inside a Textual
+        # worker (a keypress handler is not one; found live: pressing n
+        # crashed). The modal flow becomes a worker; UI stays interactive.
+        self.run_worker(self._new_mission_flow(), exclusive=True)
+
+    async def _new_mission_flow(self) -> None:
+        result = await self.rw.push_screen(
             NewMissionModal(list(self.rw._project_cache.values())), wait_for_dismiss=True
         )
         if not result:
@@ -546,7 +543,10 @@ class Dashboard(ReworkScreen):
             self.notify(f"create failed: {exc}", severity="error")
 
     async def action_new_project(self) -> None:
-        result = await self.app.push_screen(CreateProjectModal(), wait_for_dismiss=True)
+        self.run_worker(self._new_project_flow(), exclusive=True)
+
+    async def _new_project_flow(self) -> None:
+        result = await self.rw.push_screen(CreateProjectModal(), wait_for_dismiss=True)
         if not result:
             return
         try:

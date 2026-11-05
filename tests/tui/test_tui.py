@@ -164,3 +164,36 @@ async def test_command_palette_lists_actions(seeded: dict[str, str]) -> None:
         from rework.tui.app import rework_commands_provider
 
         assert rework_commands_provider in app.COMMANDS
+
+
+async def test_pressing_n_opens_wizard_not_crash(seeded: dict[str, str]) -> None:
+    """Found live: pressing n ran push_screen(wait_for_dismiss=True) outside a
+    worker and crashed the app (NoActiveWorker). A keypress must open the
+    wizard; escape must close it cleanly."""
+    app = ReworkApp()
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await app.load_project_cache()
+        await pilot.press("n")
+        await pilot.pause()
+        from rework.tui.app import NewMissionModal
+
+        assert isinstance(app.screen, NewMissionModal)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, NewMissionModal)
+
+
+async def test_pressing_p_opens_project_modal_not_crash(seeded: dict[str, str]) -> None:
+    app = ReworkApp()
+    async with app.run_test(size=(100, 30)) as pilot:
+        await pilot.pause()
+        await app.load_project_cache()
+        await pilot.press("p")
+        await pilot.pause()
+        from rework.tui.app import CreateProjectModal
+
+        assert isinstance(app.screen, CreateProjectModal)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, CreateProjectModal)
