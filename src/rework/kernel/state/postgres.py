@@ -830,26 +830,65 @@ async def open_postgres(url: str) -> PostgresStore:
     conn = await psycopg.AsyncConnection.connect(
         url, autocommit=False, row_factory=psycopg.rows.dict_row
     )
-    for ddl in _DDL:
-        await conn.execute(ddl)
-    for table, column, alter in _MIGRATIONS:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "SELECT 1 FROM information_schema.columns"
-                " WHERE table_name = %s AND column_name = %s",
-                (table, column),
-            )
-            missing = await cur.fetchone() is None
-        if missing:
-            await conn.execute("SET lock_timeout = '5s'")
+    try:
+        for ddl in _DDL:
+            await conn.execute(ddl)
+        for table, column, alter in _MIGRATIONS:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT 1 FROM information_schema.columns"
+                    " WHERE table_name = %s AND column_name = %s",
+                    (table, column),
+                )
+                missing = await cur.fetchone() is None
+            if not missing:
+                continue
+            # each migration is its own transaction: a LockNotAvailable aborts
+            # the current one, so continuing in it would fail on every later
+            # statement (and did: the cleanup `SET lock_timeout = 0` inside the
+            # aborted txn raised InFailedSqlTransaction and masked the real
+            # error). Commit each successful ALTER, roll back each failure.
+            await conn.execute("SET LOCAL lock_timeout = '5s'")
             try:
                 await conn.execute(alter)
+                await conn.commit()
             except psycopg.errors.LockNotAvailable:
+                await conn.rollback()
+                blockers = await _lock_blockers(conn, table)
                 raise RuntimeError(
-                    f"migration could not lock {table} within 5s (a long-lived"
-                    " reader holds it); retry after stopping attached clients"
+                    f"migration could not lock {table} within 5s; something holds"
+                    f" a lock on it: {blockers}. Stop the daemon (systemctl stop"
+                    " rework) and retry, or kill the listed pids."
                 ) from None
-            finally:
-                await conn.execute("SET lock_timeout = 0")
-    await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+        await conn.commit()
+    except BaseException:
+        await conn.close()  # never leak a half-migrated connection
+        raise
     return PostgresStore(conn)
+
+
+async def _lock_blockers(conn: psycopg.AsyncConnection[Any], table: str) -> str:
+    """A short, actionable description of who is holding locks on `table`."""
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT pid, state, coalesce(client_addr::text, 'local') AS client,"
+                " left(query, 60) AS q FROM pg_stat_activity"
+                " WHERE datname = current_database() AND pid <> pg_backend_pid()"
+                " AND state <> 'idle' ORDER BY xact_start NULLS LAST LIMIT 5"
+            )
+            rows = await cur.fetchall()
+        await conn.rollback()
+    except Exception:
+        return "(could not inspect pg_stat_activity)"
+    if not rows:
+        return "no active sessions found; try again"
+    return "; ".join(
+        f"pid {r['pid']} {r['state']} from {r['client']}: {r['q']}"
+        if isinstance(r, dict)
+        else str(tuple(r))
+        for r in rows
+    )
