@@ -64,6 +64,27 @@ def notify_mode() -> str:
     return raw if raw in ("toast", "bell", "both", "none") else "toast"
 
 
+class SelectableLog(RichLog):
+    """RichLog with working text selection.
+
+    textual 8's RichLog inherits Widget.get_selection, which extracts text via
+    self._render() — a method RichLog never defines (it draws through
+    _render_line). So selecting a log in stock textual yields None and ctrl+c
+    copies nothing; the log is exactly the pane people want to copy from
+    (owner: 'allow copying text from the tui'). This override serializes the
+    log's lines to plain text and lets Selection.extract() slice it."""
+
+    def get_selection(self, selection: Any) -> tuple[str, str] | None:
+        from textual.selection import Selection
+
+        assert isinstance(selection, Selection)
+        lines = [line.text for line in self.lines]
+        if not lines:
+            return None
+        text = "\n".join(lines)
+        return selection.extract(text), "\n"
+
+
 # ---------------------------------------------------------------- modals
 
 
@@ -418,7 +439,7 @@ class DashboardPane(Pane):
         yield DataTable(id="missions")
         with Vertical(id="detail"):
             yield Label("enter opens a mission", id="mission-head")
-            yield RichLog(id="events", markup=True, highlight=False, wrap=True, max_lines=600)
+            yield SelectableLog(id="events", markup=True, highlight=False, wrap=True, max_lines=600)
             yield Static("", id="gate-box")
 
     def on_mount(self) -> None:
@@ -530,7 +551,7 @@ class DashboardPane(Pane):
             return
         self._selected_mission = mission_id
         self._last_event_seq = 0
-        log = self.query_one("#events", RichLog)
+        log = self.query_one("#events", SelectableLog)
         log.clear()
         await self.stream_events(force=True)
 
@@ -544,7 +565,7 @@ class DashboardPane(Pane):
         if not events:
             return
         runs = {r.id: r for r in await self.shell.rw.data.mission_runs(mission_id)}
-        log = self.query_one("#events", RichLog)
+        log = self.query_one("#events", SelectableLog)
         head = self.query_one("#mission-head", Label)
         if force:
             log.clear()
@@ -795,11 +816,16 @@ class LibraryPane(Pane):
 # ---------------------------------------------------------------- band
 
 
+WORDMARK = "rework"
+WORDMARK_PAD = 2  # spaces after the wordmark before the first menu
+
+
 class MenuBar(Static, can_focus=True):
-    """A desktop-style menu bar: File / Edit / View / Help. Click a menu (or
-    focus the bar and press enter) to open a real dropdown. alt+letter jumps
-    straight to a tab. The bar carries the app title and the Gates badge
-    (unread-style, like messaging apps: lights while decisions wait)."""
+    """A desktop-style menu bar: rework wordmark first, then File / Edit /
+    View / Help. Click a menu (or focus the bar and press enter) to open a
+    real dropdown; moving the mouse across the labels highlights the hovered
+    one (owner: mouse should highlight as it goes over things). The far side
+    carries the Gates badge (unread-style)."""
 
     class MenuAction(Message):
         def __init__(self, action: str) -> None:
@@ -812,12 +838,11 @@ class MenuBar(Static, can_focus=True):
             ("New project…", "p", "new_project"),
             ("Fetch result…", "f", "fetch"),
             ("", "", ""),  # separator
-            ("Quit", "q", "quit"),
+            ("Quit", "ctrl+q", "quit"),
         ],
         "Edit": [
-            ("Copy", "ctrl+c", "copy"),
-            ("Paste", "ctrl+v", "paste"),
-            ("Select all", "ctrl+a", "select_all"),
+            ("Copy selection", "ctrl+c", "copy"),
+            ("Select all (pane)", "ctrl+a", "select_all"),
         ],
         "View": [
             ("Work", "alt+1", "tab_work"),
@@ -827,6 +852,7 @@ class MenuBar(Static, can_focus=True):
         ],
         "Help": [
             ("Keys", "", "keys"),
+            ("Copying text", "", "copy_help"),
             ("About rework", "", "about"),
         ],
     }
@@ -836,24 +862,52 @@ class MenuBar(Static, can_focus=True):
         self._open_menu: str | None = None
         self._dropdown: Any | None = None
         self._gate_count = 0
+        self._hover: str | None = None
 
     def set_gate_count(self, count: int) -> None:
         if count != self._gate_count:
             self._gate_count = count
             self.refresh(layout=True)
 
-    def render(self) -> Any:
-        parts = []
+    def _menu_spans(self) -> list[tuple[str, int, int]]:
+        """(name, start_col, width) for each menu label, wordmark included in
+        the offset so hover and click share one geometry."""
+        spans: list[tuple[str, int, int]] = []
+        col = len(WORDMARK) + WORDMARK_PAD
         for name in self.MENUS:
+            width = len(name) + 2  # padded label
+            spans.append((name, col, width))
+            col += width + 1
+        return spans
+
+    def render(self) -> Any:
+        parts = [f"[bold]{WORDMARK}[/bold]".ljust(0)]
+        out = f"[bold]{WORDMARK}[/bold]" + " " * WORDMARK_PAD
+        for name, _start, _width in self._menu_spans():
             label = f" {name} "
-            parts.append(f"[reverse]{label}[/reverse]" if self._open_menu == name else label)
+            active = self._open_menu == name
+            hover = self._hover == name
+            if active:
+                out += f"[reverse]{label}[/reverse]"
+            elif hover:
+                out += f"[on $boost]{label}[/on $boost]"
+            else:
+                out += label
+            out += " "
+        del parts
         badge = ""
         if self._gate_count:
-            badge = f"  [bold yellow][ Gates ●{self._gate_count} ][/bold yellow]"
-        return "  ".join(parts) + badge + "  [dim]rework[/dim]"
+            badge = f"[bold yellow][ Gates ●{self._gate_count} ][/bold yellow]"
+        return out + badge
 
     def _menu_items(self, name: str) -> list[tuple[str, str, str]]:
         return self.MENUS.get(name, [])
+
+    def _menu_at(self, x: int) -> str | None:
+        for name, start, width in self._menu_spans():
+            if start <= x < start + width:
+                return name
+        return None
 
     async def open_dropdown(self, menu: str) -> None:
         await self.close_dropdown()
@@ -869,17 +923,13 @@ class MenuBar(Static, can_focus=True):
                 options.append(Option("[dim]" + "─" * 24 + "[/dim]", disabled=True))
                 self._actions.append("")
                 continue
-            key_part = f"[dim]{key:>8}[/dim]" if key else ""
-            options.append(Option(f"{label:<20}{key_part}"))
+            key_part = f"[dim]{key:>9}[/dim]" if key else ""
+            options.append(Option(f"{label:<22}{key_part}"))
             self._actions.append(action)
         dropdown = OptionList(*options, id="menu-dropdown")
-        col = 0
-        for name in self.MENUS:
-            if name == menu:
-                break
-            col += len(name) + 2
-        dropdown.styles.offset = (col, 1)
-        dropdown.styles.width = 34
+        start = next(s for n, s, _w in self._menu_spans() if n == menu)
+        dropdown.styles.offset = (start + 1, 1)
+        dropdown.styles.width = 36
         dropdown.styles.layer = "overlay"
         self._dropdown = dropdown
         # mount on the SCREEN (absolute coordinates); a child of the bar with
@@ -916,18 +966,126 @@ class MenuBar(Static, can_focus=True):
     def on_blur(self, event: Any) -> None:
         self.run_worker(self.close_dropdown(), exclusive=True)
 
+    def on_mouse_move(self, event: Any) -> None:
+        """Hover highlight (owner ask): light the label under the pointer."""
+        hover = self._menu_at(event.x)
+        if hover != self._hover:
+            self._hover = hover
+            self.refresh()
+
+    def on_leave(self, event: Any) -> None:
+        if self._hover is not None:
+            self._hover = None
+            self.refresh()
+
     def on_click(self, event: Any) -> None:
-        # hit-test the menu labels by column
-        col = 0
-        for name in self.MENUS:
-            start = col
-            col += len(name) + 2
-            if start <= event.x < start + len(name) + 2:
-                if self._open_menu == name:
-                    self.run_worker(self.close_dropdown(), exclusive=True)
-                else:
-                    self.run_worker(self.open_dropdown(name), exclusive=True)
-                return
+        name = self._menu_at(event.x)
+        if name is None:
+            return
+        if self._open_menu == name:
+            self.run_worker(self.close_dropdown(), exclusive=True)
+        else:
+            self.run_worker(self.open_dropdown(name), exclusive=True)
+
+
+class TabBar(Static, can_focus=True):
+    """The visible tab strip under the menu bar (owner: 'idk where to
+    navigate/switch tabs did u add that at all'). Four labeled tabs, the
+    active one raised, hover highlight, the Gates tab carrying its badge.
+    Click a tab, or focus the strip and use left/right/enter."""
+
+    class TabPicked(Message):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+
+    TABS: ClassVar[tuple[tuple[str, str], ...]] = (
+        ("work", "Work"),
+        ("dashboard", "Dashboard"),
+        ("gates", "Gates"),
+        ("library", "Library"),
+    )
+
+    def __init__(self) -> None:
+        super().__init__(id="tab-bar")
+        self._active = "work"
+        self._hover: str | None = None
+        self._gate_count = 0
+
+    def set_active(self, name: str) -> None:
+        if name != self._active:
+            self._active = name
+            self.refresh()
+
+    def set_gate_count(self, count: int) -> None:
+        if count != self._gate_count:
+            self._gate_count = count
+            self.refresh()
+
+    def _spans(self) -> list[tuple[str, int, int]]:
+        spans: list[tuple[str, int, int]] = []
+        col = 1
+        for name, label in self.TABS:
+            width = len(label) + 2 + (4 if name == "gates" and self._gate_count else 0)
+            spans.append((name, col, width))
+            col += width + 1
+        return spans
+
+    def render(self) -> Any:
+        out = " "
+        for name, label in self.TABS:
+            badge = f" ●{self._gate_count}" if (name == "gates" and self._gate_count) else ""
+            text = f" {label}{badge} "
+            if name == self._active:
+                out += f"[reverse]{text}[/reverse]"
+            elif name == self._hover:
+                out += f"[on $boost]{text}[/on $boost]"
+            else:
+                out += f"[dim]{text}[/dim]"
+            out += " "
+        return out
+
+    def _tab_at(self, x: int) -> str | None:
+        for name, start, width in self._spans():
+            if start <= x < start + width:
+                return name
+        return None
+
+    def on_mouse_move(self, event: Any) -> None:
+        hover = self._tab_at(event.x)
+        if hover != self._hover:
+            self._hover = hover
+            self.refresh()
+
+    def on_leave(self, event: Any) -> None:
+        if self._hover is not None:
+            self._hover = None
+            self.refresh()
+
+    def on_click(self, event: Any) -> None:
+        name = self._tab_at(event.x)
+        if name is not None:
+            self.post_message(self.TabPicked(name))
+
+    BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
+        Binding("left", "prev_tab", "◀", show=False),
+        Binding("right", "next_tab", "▶", show=False),
+        Binding("enter", "pick", "Open", show=False),
+    ]
+
+    def _index(self) -> int:
+        return [n for n, _ in self.TABS].index(self._active)
+
+    def action_prev_tab(self) -> None:
+        names = [n for n, _ in self.TABS]
+        self.post_message(self.TabPicked(names[max(0, self._index() - 1)]))
+
+    def action_next_tab(self) -> None:
+        names = [n for n, _ in self.TABS]
+        self.post_message(self.TabPicked(names[min(len(names) - 1, self._index() + 1)]))
+
+    def action_pick(self) -> None:
+        self.post_message(self.TabPicked(self._active))
 
 
 # ---------------------------------------------------------------- shell
@@ -952,6 +1110,7 @@ class Shell(Screen):
 
     def compose(self) -> ComposeResult:
         yield MenuBar()
+        yield TabBar()
         yield WorkPane(id="pane-work")
         yield DashboardPane(id="pane-dashboard")
         yield GatesPane(id="pane-gates")
@@ -962,16 +1121,27 @@ class Shell(Screen):
         # the badge poll: one place, drives badge + notifications
         self.set_interval(POLL_SECONDS, self.poll_badge)
 
+    @on(TabBar.TabPicked)
+    async def tab_picked(self, event: TabBar.TabPicked) -> None:
+        self.show_tab(event.name)
+
     def show_tab(self, name: str) -> None:
         for tab in self.TABS:
             pane = self.query_one(f"#pane-{tab}")
             pane.display = tab == name
+        self.query_one("#tab-bar", TabBar).set_active(name)
         if name == "work":
             self.query_one("#prompt", Input).focus()
         elif name == "gates":
             self.query_one("#pane-gates", GatesPane).run_worker(
                 self.query_one("#pane-gates", GatesPane).refresh_quiet(), exclusive=True
             )
+        elif name == "dashboard":
+            # a hidden pane has zero size and the log drops writes: replay the
+            # selected mission's tail the moment the tab becomes visible
+            dash = self.query_one("#pane-dashboard", DashboardPane)
+            dash._last_event_seq = 0
+            dash.run_worker(dash.stream_events(force=True), exclusive=True)
 
     def switch_tab(self, name: str) -> None:
         self.show_tab(name)
@@ -1077,9 +1247,10 @@ class Shell(Screen):
         self._seen_gates = current
 
     def update_gate_badge(self, gates: list[Any] | None = None) -> None:
-        bar = self.query_one("#menu-bar", MenuBar)
         count = len(gates) if gates is not None else self.rw._open_gate_count
-        bar.set_gate_count(count)
+        self.query_one("#menu-bar", MenuBar).set_gate_count(count)
+        tab_bar = self.query_one("#tab-bar", TabBar)
+        tab_bar.set_gate_count(count)
         self.rw._open_gate_count = count
 
 
@@ -1120,7 +1291,9 @@ class MissionDeepView(ModalScreen[None]):
             for name in self.TABS:
                 yield Label(f" {name} ", id=f"tab-{name}", classes="deep-tab")
         with VerticalScroll(id="deep-content"):
-            yield RichLog(id="deep-feed", markup=True, highlight=False, wrap=True, max_lines=900)
+            yield SelectableLog(
+                id="deep-feed", markup=True, highlight=False, wrap=True, max_lines=900
+            )
             yield Static("", id="deep-findings", markup=True)
             yield Static("", id="deep-diff", markup=False)
             yield Static("", id="deep-report", markup=False)
@@ -1172,7 +1345,7 @@ class MissionDeepView(ModalScreen[None]):
             self._refreshing = False
 
     async def _stream_feed(self, force: bool = False) -> None:
-        log = self.query_one("#deep-feed", RichLog)
+        log = self.query_one("#deep-feed", SelectableLog)
         events = await self.rw.data.events_tail(
             self._mission_id, 0 if force else self._last_event_seq
         )
@@ -1347,6 +1520,7 @@ class ReworkApp(App[None]):
 
     CSS = """
     #menu-bar { height: 1; background: $surface-darken-1; color: $text; padding: 0 1; }
+    #tab-bar { height: 1; background: $surface; padding: 0; }
     #menu-bar > .menu-label { }
     #menu-dropdown { border: round $accent; background: $surface;
                      max-height: 12; width: 34; }
@@ -1385,8 +1559,11 @@ class ReworkApp(App[None]):
     #gates-table { height: 1fr; }
     """
 
+    # ctrl+c is COPY (textual's selection clipboard); quitting is ctrl+q.
+    # Plain ctrl+c used to quit — that ate every copy attempt (owner found it).
     BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
-        Binding("ctrl+c", "quit", "Quit", show=False),
+        Binding("ctrl+q", "quit", "Quit", show=False),
+        Binding("ctrl+c", "copy_text", "Copy", show=False, priority=True),
         Binding("alt+1", "tab_work", "Work", show=False),
         Binding("alt+2", "tab_dashboard", "Dashboard", show=False),
         Binding("alt+3", "tab_gates", "Gates", show=False),
@@ -1394,6 +1571,25 @@ class ReworkApp(App[None]):
         Binding("a", "approve_gate", "Approve", show=False),
         Binding("x", "reject_gate", "Reject", show=False),
     ]
+
+    def action_copy_text(self) -> None:
+        """Copy the current pane's selection (textual tracks it); fall back to
+        a helpful hint when nothing is selected."""
+        selected = self.screen.get_selected_text()
+        if selected:
+            self.copy_to_clipboard(selected)
+            self.notify(f"copied {len(selected)} chars to the clipboard")
+        else:
+            self.notify("drag over text to select it first, then ctrl+c", severity="warning")
+
+    def action_select_all_text(self) -> None:
+        """Select everything in the focused widget (double-click also works)."""
+        focused = self.focused
+        if focused is not None and hasattr(focused, "text_select_all"):
+            focused.text_select_all()
+            self.notify("selected the visible pane text — ctrl+c to copy")
+        else:
+            self.notify("nothing selectable here", severity="warning")
 
     def __init__(self) -> None:
         super().__init__()
@@ -1473,8 +1669,15 @@ class ReworkApp(App[None]):
             shell.switch_tab(action[4:])
         elif action == "keys":
             self.notify(
-                "enter open · esc back · a/x decide · f fetch · alt+1..4 tabs · ctrl+p palette",
+                "drag to select · ctrl+c copies · alt+1..4 tabs · a/x decide · f fetch"
+                " · ctrl+q quits",
                 title="keys",
+            )
+        elif action == "copy_help":
+            self.notify(
+                "drag over any text to select it (shift+drag if a table has focus), "
+                "then ctrl+c to copy. Or double-click a line, triple-click a pane.",
+                title="copying text",
             )
         elif action == "about":
             from rework import __version__
@@ -1482,10 +1685,10 @@ class ReworkApp(App[None]):
             self.notify(
                 f"rework {__version__} — portable multi-agent workflow engine", title="about"
             )
-        elif action in ("copy", "paste", "select_all"):
-            self.notify(
-                "copy/paste works inside text fields (ctrl+c / ctrl+v)", severity="information"
-            )
+        elif action == "copy":
+            self.action_copy_text()
+        elif action == "select_all":
+            self.action_select_all_text()
 
     # -- slash commands ------------------------------------------------------
 

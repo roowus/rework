@@ -590,3 +590,97 @@ async def test_menu_bar_file_dropdown_actions(seeded: dict[str, str]) -> None:
         await bar.close_dropdown()
         await pilot.pause()
         assert bar._open_menu is None
+
+
+# ---------------------------------------------- shell polish (owner round 4)
+
+
+async def test_menu_bar_wordmark_first_and_hover(seeded: dict[str, str]) -> None:
+    """rework wordmark comes BEFORE File (owner's screenshot), and moving the
+    mouse over a label highlights it."""
+    from rework.tui.app import MenuBar
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        bar = shell.query_one("#menu-bar", MenuBar)
+        rendered = str(bar.render())
+        assert rendered.index("rework") < rendered.index("File")
+        # hover File (cols from the spans helper)
+        spans = {n: (s, w) for n, s, w in bar._menu_spans()}
+        start = spans["File"][0]
+
+        class Move:
+            x = start + 1
+
+        bar.on_mouse_move(Move())
+        await pilot.pause()
+        assert bar._hover == "File"
+        # leaving clears it
+        bar.on_leave(None)
+        assert bar._hover is None
+
+
+async def test_visible_tab_bar_switches_panes(seeded: dict[str, str]) -> None:
+    """The owner could not find tab navigation: four labeled tabs are ALWAYS
+    visible under the menu bar; clicking one switches panes."""
+    from rework.tui.app import DashboardPane, TabBar
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        tab_bar = shell.query_one("#tab-bar", TabBar)
+        labels = str(tab_bar.render())
+        for label in ("Work", "Dashboard", "Gates", "Library"):
+            assert label in labels
+        # click the Dashboard tab
+        spans = {n: (s, w) for n, s, w in tab_bar._spans()}
+        start = spans["dashboard"][0]
+
+        class Click:
+            x = start + 1
+
+        tab_bar.on_click(Click())
+        await pilot.pause()
+        await pilot.pause()
+        assert tab_bar._active == "dashboard"
+        assert shell.query_one("#pane-dashboard", DashboardPane).display
+
+
+async def test_ctrl_c_copies_instead_of_quitting(seeded: dict[str, str]) -> None:
+    """The copy bug: our app bound ctrl+c to QUIT, which ate every copy.
+    ctrl+c must copy the selection; ctrl+q quits."""
+    from textual.selection import SELECT_ALL
+
+    from rework.tui.app import SelectableLog, TabBar
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        # make the dashboard visible so its log has a real size
+        shell.query_one("#tab-bar", TabBar).on_click(type("C", (), {"x": 12})())
+        await pilot.pause()
+        await pilot.pause()
+        log = shell.query_one("#pane-dashboard").query_one("#events", SelectableLog)
+        log.write("copy this exact line")
+        await pilot.pause()
+        app.screen.selections = {log: SELECT_ALL}
+        await pilot.pause()
+        copied: list[str] = []
+        app.copy_to_clipboard = lambda t: copied.append(t)  # type: ignore[method-assign]
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert len(copied) == 1 and "copy this exact line" in copied[0]
+        # the app is still alive (ctrl+c did not quit)
+        assert app.is_running
+        # quitting is ctrl+q now
+        ctrl_c = [b for b in app.BINDINGS if str(getattr(b, "key", "")) == "ctrl+c"]
+        assert all("quit" not in str(getattr(b, "action", "")) for b in ctrl_c)
+        ctrl_q = [b for b in app.BINDINGS if str(getattr(b, "key", "")) == "ctrl+q"]
+        assert any("quit" in str(getattr(b, "action", "")) for b in ctrl_q)
