@@ -646,6 +646,11 @@ async def open_sqlite(path: str) -> SqliteStore:
     db.row_factory = aiosqlite.Row
     await db.execute("PRAGMA journal_mode = WAL")
     await db.execute("PRAGMA foreign_keys = ON")
+    # several connections share one file (store + per-run checkpointer
+    # connections + second-store gate decisions): a writer hit by another
+    # writer must WAIT its turn, not raise 'database is locked' (found live
+    # on the slower CI runner); 10s is far above any held-write here
+    await db.execute("PRAGMA busy_timeout = 10000")
     await db.executescript(_DDL)
     # migrations for databases created before a column existed
     cols = await db.execute("PRAGMA table_info(charges)")

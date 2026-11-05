@@ -39,6 +39,14 @@ def sqlite_checkpointer_factory(checkpoints_db: str) -> CheckpointerFactory:
         cm = AsyncSqliteSaver.from_conn_string(checkpoints_db)
         saver = await cm.__aenter__()
         await saver.setup()
+        # the checkpointer holds its own connection to the (shared) file;
+        # teach it the same wait-your-turn rule the store uses
+        conn = getattr(saver, "conn", None)
+        if conn is not None:
+            try:
+                await conn.execute("PRAGMA busy_timeout = 10000")
+            except Exception:  # pragma: no cover - shape varies by version
+                pass
 
         async def close() -> None:
             await cm.__aexit__(None, None, None)

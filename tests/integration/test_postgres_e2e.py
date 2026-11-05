@@ -23,12 +23,22 @@ pytestmark = pytest.mark.skipif(
 async def _purge_checkpoint_threads(url: str, mission_id: str) -> None:
     """Delete this test's checkpoint threads (any run of this mission from any
     earlier attempt). The checkpoints table is the langgraph checkpointer's;
-    only a test setup may touch it."""
+    only a test setup may touch it. The table may not exist yet on a fresh
+    database (the checkpointer's setup() creates it at first use), so run
+    that setup here too."""
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    async with AsyncPostgresSaver.from_conn_string(url) as saver:
+        await saver.setup()
+        await saver.setup()  # idempotent DDL; second call is a no-op
+        # setup() manages its own transaction; delete on a plain connection
     import psycopg
 
     conn = await psycopg.AsyncConnection.connect(url, autocommit=True)
     try:
-        await conn.execute("DELETE FROM checkpoints WHERE thread_id LIKE %s", (f"{mission_id}:%",))
+        await conn.execute(
+            "DELETE FROM checkpoints WHERE thread_id LIKE %s", (f"{mission_id}:%",)
+        )
     finally:
         await conn.close()
 
