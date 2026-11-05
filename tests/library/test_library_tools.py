@@ -197,3 +197,23 @@ async def test_search_serves_active_only(tmp_path, library_index) -> None:
     await handle.index.upsert_item(item)
     assert "no library matches" in await handle.search_text("old")
     assert (await handle.index.list_items())[0].name == "old trick"  # ls still shows it
+
+
+async def test_multiword_natural_search(tmp_path, library_index) -> None:
+    """Agents search like they talk: 'toyrepo planted bug' must hit an item
+    whose name carries those words (found live: the coder's multi-word
+    library_search returned nothing under whole-query substring rules)."""
+    handle = _handle(tmp_path, library_index)
+    await contribute(
+        handle.index,
+        handle.git,
+        type_=ItemType.SKILL,
+        name="toyrepo planted bug recipe",
+        description="one-line add() fix",
+        body="b",
+        tags=[],
+    )
+    out = await handle.search_text("toyrepo planted bug")
+    assert "toyrepo planted bug recipe" in out
+    out = await handle.search_text("how do I fix the toyrepo?")
+    assert "toyrepo planted bug recipe" in out

@@ -96,28 +96,38 @@ class LibraryStore(Protocol):
     async def aclose(self) -> None: ...
 
 
+def _terms(query: str) -> list[str]:
+    """Agents search in natural language ('toyrepo planted bug'), so a query
+    is a bag of terms, not one substring (found live: the coder's multi-word
+    searches matched nothing under whole-query substring rules)."""
+    return [t for t in query.lower().split() if t]
+
+
 def _score(item: LibraryItem, query: str) -> int:
-    q = query.lower()
     score = 0
-    if item.name.lower() == q:
-        score += 100
-    elif item.name.lower().startswith(q):
-        score += 50
-    elif q in item.name.lower():
-        score += 25
-    if q in item.description.lower():
-        score += 10
-    if any(q in t.lower() for t in item.tags):
-        score += 15
+    for q in _terms(query):
+        if item.name.lower() == q:
+            score += 100
+        elif item.name.lower().startswith(q):
+            score += 50
+        elif q in item.name.lower():
+            score += 25
+        if q in item.description.lower():
+            score += 10
+        if any(q in t.lower() for t in item.tags):
+            score += 15
     return score
 
 
 def _matches(item: LibraryItem, query: str) -> bool:
-    q = query.lower()
-    return (
+    terms = _terms(query)
+    if not terms:
+        return False
+    return any(
         q in item.name.lower()
         or q in item.description.lower()
         or any(q in t.lower() for t in item.tags)
+        for q in terms
     )
 
 
