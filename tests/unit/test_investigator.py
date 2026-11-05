@@ -28,8 +28,8 @@ async def inv_ctx(tmp_path: Path) -> AsyncIterator[RoleBuildCtx]:
     """Workspace with a planted bug; requested_sections set on the run."""
     from conftest import make_git_repo, role_catalog
 
-    (tmp_path / "app.py").write_text("def greet(name):\n    return f'hello {name.upper()}'\n")
     repo = make_git_repo(tmp_path)
+    (repo / "app.py").write_text("def greet(name):\n    return f'hello {name.upper()}'\n")
     store: SqliteStore = await open_sqlite(str(tmp_path / "inv.sqlite3"))
     try:
         bus = InProcessEventBus(store)
@@ -127,6 +127,46 @@ async def test_investigator_end_to_end_scripted(inv_ctx: RoleBuildCtx) -> None:
     second = fake.requests[1]
     roles = [m["role"] for m in second.messages]
     assert roles == ["user", "assistant", "tool"]
+
+
+async def test_investigator_reads_the_mission_repo_not_an_empty_box(
+    inv_ctx: RoleBuildCtx, tmp_path: Path
+) -> None:
+    """Live bug (m-c8b72e7734b7): the investigator was jailed to an empty
+    per-run workspace, found nothing, and audited a stale checkout elsewhere
+    while calling it the mission's code. Its jail is the mission repo."""
+    empty_run_dir = tmp_path / "run-workspace"
+    empty_run_dir.mkdir()
+    inv_ctx.workdir = empty_run_dir  # the empty box the engine hands it
+    assert inv_ctx.read_root == Path(inv_ctx.mission.repo_path or "")
+
+    fake = inv_ctx.provider
+    assert isinstance(fake, FakeProvider)
+    fake.push(
+        ChatResult(
+            text="reading",
+            tool_calls=[ToolCall(id="t1", name="read_file", arguments={"path": "app.py"})],
+            usage=Usage(input_tokens=5, output_tokens=2),
+        )
+    )
+    fake.push(ChatResult(text="done", usage=Usage(input_tokens=5, output_tokens=2)))
+    fake.push(
+        ChatResult(
+            text=json.dumps({"summary": "s", "findings": [], "blockers": []}),
+            usage=Usage(input_tokens=5, output_tokens=2),
+        )
+    )
+
+    graph = autodiscover().get("investigator").build_graph(inv_ctx)
+    graph.checkpointer = InMemorySaver()
+    final = await graph.ainvoke(
+        {"objective": "o"}, config={"configurable": {"thread_id": "t-read-root"}}
+    )
+    tool_messages = [m for m in final["messages"] if m.get("role") == "tool"]
+    assert any("name.upper()" in m["content"] for m in tool_messages), (
+        "the planted bug must be readable: the jail is the mission repo"
+    )
+    assert "Workspace root" in fake.requests[0].messages[0]["content"]
 
 
 async def test_report_writer_retry_on_bad_json(inv_ctx: RoleBuildCtx) -> None:

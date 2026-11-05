@@ -63,11 +63,10 @@ class AuditorSpec(RoleSpec):
         sections = resolve_sections(run_ctx.get("requested_sections", list(ASSEMBLY_AUDIT)))
         catalog_id = str(ctx.run.model_ref.get("id") or self.default_model)
 
-        workspace = run_ctx.get("worktree_path") or ctx.mission.repo_path
-        if workspace:
-            executor = LocalExecutor(Path(workspace))
-        else:
-            executor = LocalExecutor(ctx.workdir)  # degenerate: audit with no repo access
+        # worktree_path (the coder's branch checkout) wins; else the mission's
+        # staged repo; else the empty per-run dir (degenerate: no repo access)
+        workspace = run_ctx.get("worktree_path")
+        executor = LocalExecutor(Path(workspace) if workspace else ctx.read_root)
 
         system_prompt = (
             f"GOAL: {self.goal}\n\n"

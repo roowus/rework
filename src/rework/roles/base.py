@@ -79,6 +79,20 @@ class RoleBuildCtx(BaseModel):
     def model_ref(self) -> dict[str, Any]:
         return self.run.model_ref
 
+    @property
+    def read_root(self) -> Path:
+        """Where a READ-ONLY role should look. The mission's staged repo when
+        there is one, else the empty per-run workspace.
+
+        Found live (mission m-c8b72e7734b7): the investigator was jailed to an
+        empty per-run dir, found nothing, then escaped to
+        /home/ubuntu/projects/rework and audited a STALE checkout (39ccc9e)
+        while reporting it as the mission's code. A read-only role has no
+        reason to see an empty box when the real tree is right there."""
+        if self.mission.repo_path:
+            return Path(self.mission.repo_path)
+        return self.workdir
+
 
 class RoleSpec(ABC):
     """Subclass me. One module per role; the registry auto-discovers them.

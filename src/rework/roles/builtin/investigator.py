@@ -73,7 +73,7 @@ class InvestigatorSpec(RoleSpec):
         )
 
         async def prepare(state: InvestigatorState) -> dict[str, Any]:
-            repo_map = await asyncio.to_thread(build_repo_map, ctx.workdir)
+            repo_map = await asyncio.to_thread(build_repo_map, ctx.read_root)
             brief = str(run_ctx.get("brief") or state["objective"])
             await ctx.bus.publish(
                 EventRecord(
@@ -85,6 +85,7 @@ class InvestigatorSpec(RoleSpec):
             )
             first_message = (
                 f"Investigation brief: {brief}\n\n"
+                f"Workspace root (your cwd, the mission's checkout): {ctx.read_root}\n\n"
                 f"Workspace map:\n{repo_map}\n\n"
                 f"Requested report sections: {', '.join(s.key for s in sections)}\n"
                 f"Depth guidance: {depth_note}"
@@ -101,7 +102,7 @@ class InvestigatorSpec(RoleSpec):
             executor=library_executor(
                 ctx,
                 ComplaintAwareExecutor(
-                    LocalExecutor(ctx.workdir),
+                    LocalExecutor(ctx.read_root),
                     ctx.store,
                     ctx.mission.id,
                     ctx.run.id,
