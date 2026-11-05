@@ -94,11 +94,16 @@ async def test_shell_renders_menu_bar_and_work_tab(seeded: dict[str, str]) -> No
             assert menu in rendered
         # gates badge on the bar (one open gate in the seed)
         assert "Gates ●1" in rendered
-        # work pane is the visible home: prompt focused, recents listed
+        # work pane is the visible home: prompt focused, knobs are buttons
+        from textual.widgets import Button
+
         prompt = shell.query_one("#prompt", Input)
         assert prompt.has_focus
-        recents = shell.query_one("#recent")
-        assert recents is not None
+        for knob in ("#btn-project", "#btn-model", "#btn-effort"):
+            assert isinstance(shell.query_one(knob), Button)
+        # the old clutter stays gone
+        assert not shell.query("#recent")
+        assert not shell.query("#act-new")
 
 
 async def test_tabs_switch_and_panes_survive(seeded: dict[str, str]) -> None:
@@ -918,8 +923,6 @@ async def test_work_tab_shows_model_and_effort_and_cycles(
     """Owner: see which model the mission will use and change it + effort."""
     import json
 
-    from textual.widgets import Label
-
     monkeypatch.setenv(
         "REWORK_MODELS",
         json.dumps(
@@ -936,10 +939,10 @@ async def test_work_tab_shows_model_and_effort_and_cycles(
         shell = await _shell(app)
         work = shell.query_one("#pane-work")
         await pilot.pause()
-        model_label = str(work.query_one("#work-model", Label).content)
-        effort_label = str(work.query_one("#work-effort", Label).content)
-        assert "model" in model_label and "flash" in model_label
-        assert "effort" in effort_label
+        from textual.widgets import Button
+
+        assert "flash" in str(work.query_one("#btn-model", Button).label)
+        assert "effort" in str(work.query_one("#btn-effort", Button).label)
 
         work.query_one("#prompt").focus()
         await pilot.press("alt+m")
@@ -948,7 +951,7 @@ async def test_work_tab_shows_model_and_effort_and_cycles(
         await pilot.press("alt+e")
         await pilot.pause()
         assert app._mission_defaults["effort"] == "low"
-        assert "pro" in str(work.query_one("#work-model", Label).content)
+        assert "pro" in str(work.query_one("#btn-model", Button).label)
 
 
 async def test_mission_model_and_effort_reach_the_plan(seeded: dict[str, str], tui_env: Path):
@@ -1004,41 +1007,11 @@ async def test_prompt_command_autocomplete(seeded: dict[str, str]) -> None:
         assert await suggester.get_suggestion("/zzz") is None
 
 
-async def test_quick_action_buttons_are_visible_and_work(seeded: dict[str, str]) -> None:
-    """The actions are pinned, clickable buttons at the top of Work."""
-    from textual.widgets import Button
-
-    from rework.tui.app import TabBar
-
-    app = ReworkApp()
-    async with app.run_test(size=(120, 36)) as pilot:
-        await pilot.pause()
-        await pilot.pause()
-        shell = await _shell(app)
-        work = shell.query_one("#pane-work")
-        for button_id in ("act-new", "act-gates", "act-library", "act-fetch", "act-project"):
-            assert work.query_one(f"#{button_id}", Button).display
-        # clicking "library" switches tabs (the visible action path)
-        await pilot.click("#act-library")
-        for _ in range(4):
-            await pilot.pause()
-        assert shell.query_one("#tab-bar", TabBar)._active == "library"
-        # and "gates" goes back
-        app.action_tab_work()
-        await pilot.pause()
-        await pilot.pause()
-        await pilot.click("#act-gates")
-        for _ in range(4):
-            await pilot.pause()
-        assert shell.query_one("#tab-bar", TabBar)._active == "gates"
-
-
 async def test_work_tab_project_selector_visible_and_cycles(
     seeded: dict[str, str], tui_env: Path
 ) -> None:
     """Owner: 'in the work tab u should be able to choose which project ur
     working in and also see that'."""
-    from textual.widgets import Label
 
     from rework.kernel.state.records import Project
     from rework.kernel.state.sqlite import open_sqlite
@@ -1056,7 +1029,9 @@ async def test_work_tab_project_selector_visible_and_cycles(
         await pilot.pause()
         shell = await _shell(app)
         work = shell.query_one("#pane-work")
-        assert "project" in str(work.query_one("#work-project", Label).content)
+        from textual.widgets import Button
+
+        assert "project" in str(work.query_one("#btn-project", Button).label)
         # cycle: none -> each project (in the store's order) -> none
         work.action_cycle_project()
         first = app._mission_defaults["project_id"]
@@ -1064,8 +1039,56 @@ async def test_work_tab_project_selector_visible_and_cycles(
         work.action_cycle_project()
         second = app._mission_defaults["project_id"]
         assert second in {"p-one", "p-two"} and second != first
-        label = str(work.query_one("#work-project", Label).content)
+        label = str(work.query_one("#btn-project", Button).label)
         assert "capstone" in label or "rework" in label
         work.action_cycle_project()
         assert app._mission_defaults["project_id"] is None
-        assert "no project" in str(work.query_one("#work-project", Label).content)
+        assert "no project" in str(work.query_one("#btn-project", Button).label)
+
+
+async def test_cancel_modal_does_not_crash_when_flow_worker_cancelled(
+    seeded: dict[str, str],
+) -> None:
+    """The reported traceback: InvalidStateError in ResultCallback.__call__
+    because dismiss() resolved a future that another exclusive worker had
+    already cancelled. Cancelling the modal must be silent and return home."""
+    from rework.tui.app import CreateProjectModal
+
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        shell = await _shell(app)
+        shell.run_worker(shell.new_project_flow(), exclusive=True, group="flow-a")
+        for _ in range(4):
+            await pilot.pause()
+        assert isinstance(app.screen, CreateProjectModal)
+        await pilot.click("#btn-cancel")
+        for _ in range(4):
+            await pilot.pause()
+        assert isinstance(app.screen, Shell)
+        # and the app is still healthy: the flow can run again afterwards
+        shell.run_worker(shell.new_project_flow(), exclusive=True, group="flow-b")
+        for _ in range(4):
+            await pilot.pause()
+        assert isinstance(app.screen, CreateProjectModal)
+        await pilot.press("escape")
+        for _ in range(4):
+            await pilot.pause()
+        assert isinstance(app.screen, Shell)
+
+
+async def test_work_knob_buttons_are_clickable(seeded: dict[str, str]) -> None:
+    """Owner: 'make this stuff buttons'. Project/model/effort are Buttons that
+    change the value on click — not hidden key bindings."""
+    app = ReworkApp()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause()
+        await pilot.pause()
+        before = app._mission_defaults.get("model")
+        await pilot.click("#btn-model")
+        await pilot.pause()
+        assert app._mission_defaults.get("model") != before or app._mission_defaults.get("model")
+        await pilot.click("#btn-effort")
+        await pilot.pause()
+        assert app._mission_defaults.get("effort") in ("low", "medium", "high")

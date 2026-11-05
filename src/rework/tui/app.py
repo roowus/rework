@@ -44,8 +44,6 @@ from textual.widgets import (
     DataTable,
     Input,
     Label,
-    ListItem,
-    ListView,
     OptionList,
     RichLog,
     Select,
@@ -154,14 +152,26 @@ class NewMissionModal(ModalScreen[dict[str, Any]]):
 
     @on(Button.Pressed, "#btn-cancel")
     def cancel_btn(self) -> None:
-        self.dismiss(None)
+        self._safe_dismiss()
+
+    def _safe_dismiss(self) -> None:
+        self._safe_dismiss_with(None)
+
+    def _safe_dismiss_with(self, result: Any) -> None:
+        """Dismiss without blowing up when the awaiting future was already
+        cancelled (found live: InvalidStateError in ResultCallback.__call__
+        when another exclusive worker cancelled the modal flow)."""
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            self.dismiss(result)
 
     @on(Button.Pressed, "#btn-create")
     def create_btn(self) -> None:
         self.action_submit()
 
     def action_cancel(self) -> None:
-        self.dismiss(None)
+        self._safe_dismiss()
 
     def action_submit(self) -> None:
         objective = self.query_one("#f-objective", Input).value.strip()
@@ -176,7 +186,7 @@ class NewMissionModal(ModalScreen[dict[str, Any]]):
         plan = self.query_one("#f-plan", Select).value
         project = self.query_one("#f-project", Select).value
         project_id = None if project == "__none__" else str(project)
-        self.dismiss(
+        self._safe_dismiss_with(
             {
                 "objective": objective,
                 "repo": repo,
@@ -215,14 +225,26 @@ class CreateProjectModal(ModalScreen[dict[str, Any]]):
 
     @on(Button.Pressed, "#btn-cancel")
     def cancel_btn(self) -> None:
-        self.dismiss(None)
+        self._safe_dismiss()
+
+    def _safe_dismiss(self) -> None:
+        self._safe_dismiss_with(None)
+
+    def _safe_dismiss_with(self, result: Any) -> None:
+        """Dismiss without blowing up when the awaiting future was already
+        cancelled (found live: InvalidStateError in ResultCallback.__call__
+        when another exclusive worker cancelled the modal flow)."""
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            self.dismiss(result)
 
     @on(Button.Pressed, "#btn-create")
     def create_btn(self) -> None:
         self.action_submit()
 
     def action_cancel(self) -> None:
-        self.dismiss(None)
+        self._safe_dismiss()
 
     def action_submit(self) -> None:
         name = self.query_one("#p-name", Input).value.strip()
@@ -230,7 +252,7 @@ class CreateProjectModal(ModalScreen[dict[str, Any]]):
             self.notify("Project name is required", severity="error")
             return
         transport = str(self.query_one("#p-transport", Select).value)
-        self.dismiss({"name": name, "transport": transport})
+        self._safe_dismiss_with({"name": name, "transport": transport})
 
 
 # ---------------------------------------------------------------- panes
@@ -257,14 +279,13 @@ class Pane(Static):
 
 
 class WorkPane(Pane):
-    """The typing surface: quick-action BUTTONS pinned at the top, the prompt
-    with command AUTocomplete, the project you are working in, the model and
-    effort the mission runs at, then recent missions.
+    """The typing surface: a prompt with command autocomplete, and THREE
+    buttons (project / model / effort) for the knobs a mission runs with.
 
-    Owner asks folded in here: 'commands should have autocomplete', the quick
-    actions should be visible buttons rather than memorized slash commands,
-    and 'i should be able to choose which project im working in and see that'.
-    """
+    Owner asks folded in: 'commands should have autocomplete'; the pickers
+    should be buttons, not hidden key bindings ('make this stuff buttons');
+    and the old action-button row plus the recent-missions list were clutter
+    and were removed ('these buttons are redundant', 'remove them also')."""
 
     BINDINGS: ClassVar[list[Binding | tuple[str, str] | tuple[str, str, str]]] = [
         # ctrl+m IS enter (CR) and ctrl+e is end-of-line inside Input —
@@ -276,34 +297,17 @@ class WorkPane(Pane):
 
     EFFORTS: ClassVar[tuple[str, ...]] = ("default", "low", "medium", "high")
 
-    # the quick actions, in display order: (id, label, hint, action)
-    ACTIONS: ClassVar[tuple[tuple[str, str, str, str], ...]] = (
-        ("act-new", "new mission", "start a mission from the prompt", "new_mission"),
-        ("act-gates", "gates", "review decisions waiting on you", "gates"),
-        ("act-library", "library", "search what missions learned", "library"),
-        ("act-fetch", "fetch", "pull a finished mission's result", "fetch"),
-        ("act-project", "new project", "create a project label", "new_project"),
-    )
-
     def compose(self) -> ComposeResult:
-        # pinned quick actions (owner: the actions should be buttons you can
-        # see, always, at the top)
-        with Horizontal(id="work-actions"):
-            for action_id, label, _hint, _action in self.ACTIONS:
-                yield Button(label, id=action_id, classes="work-action")
         yield Input(
             placeholder="what should rework do?  (type / for commands, enter to launch)",
             id="prompt",
         )
         with Horizontal(id="work-settings"):
-            yield Label("", id="work-project")
-            yield Label("", id="work-model")
-            yield Label("", id="work-effort")
-        yield Label("[dim]recent missions[/dim]", id="recent-head")
-        yield ListView(id="recent")
+            yield Button("", id="btn-project", classes="work-knob")
+            yield Button("", id="btn-model", classes="work-knob")
+            yield Button("", id="btn-effort", classes="work-knob")
         yield Label(
-            "[dim]enter on a mission opens it · tab completes a command"
-            " · alt+p project · alt+m model · alt+e effort[/dim]",
+            "[dim]tab completes a command · click a button to change it[/dim]",
             id="work-hint",
         )
 
@@ -311,45 +315,35 @@ class WorkPane(Pane):
         self._model_ids: list[str] = []
         self._effort_index = 0
         self._project_ids: list[str] = []
-        self._project_index = 0
         self._load_models()
         self._install_suggestions()
         self.query_one("#prompt", Input).focus()
-        # ONE worker: two exclusive run_worker calls share the default group,
-        # so the second cancels the first and leaves an unawaited coroutine
-        # (found live: the Work tab hung on mount).
-        self.run_worker(self._initial_load(), exclusive=True)
+        # ONE worker per mount: two exclusive run_worker calls share the
+        # default worker GROUP, so the second cancels the first and leaves an
+        # unawaited coroutine (the pane froze on mount — found live).
+        self.run_worker(self._initial_load(), exclusive=True, group="work-load")
 
     async def _initial_load(self) -> None:
-        await self.reload_projects()
-        await self.reload_recents()
+        try:
+            await self.reload_projects()
+        except Exception as exc:  # a bad project list must not kill the tab
+            self.notify(f"projects unavailable: {exc}", severity="warning")
 
-    # -- quick action buttons ------------------------------------------------
+    # -- the three knob buttons ----------------------------------------------
 
-    @on(Button.Pressed, ".work-action")
-    async def action_button(self, event: Button.Pressed) -> None:
-        which = str(event.button.id or "")
-        action = next((a for i, _l, _h, a in self.ACTIONS if i == which), "")
-        if action == "new_mission":
-            self.run_worker(self.shell.new_mission_flow(), exclusive=True)
-        elif action == "new_project":
-            self.run_worker(self.shell.new_project_flow(), exclusive=True)
-        elif action == "gates":
-            self.shell.switch_tab("gates")
-        elif action == "library":
-            self.shell.switch_tab("library")
-        elif action == "fetch":
-            await self.shell.fetch_selected()
+    @on(Button.Pressed, "#btn-project")
+    def _project_clicked(self) -> None:
+        self.action_cycle_project()
+
+    @on(Button.Pressed, "#btn-model")
+    def _model_clicked(self) -> None:
+        self.action_cycle_model()
+
+    @on(Button.Pressed, "#btn-effort")
+    def _effort_clicked(self) -> None:
+        self.action_cycle_effort()
 
     # -- command autocomplete ------------------------------------------------
-
-    def _command_list(self) -> list[str]:
-        """Everything the prompt can complete to: the slash commands, plus a
-        readable name for each current project (so /fetch <id> completes)."""
-        from rework.tui.app import SLASH_COMMANDS
-
-        commands = [c for c, _ in SLASH_COMMANDS]
-        return commands
 
     def _install_suggestions(self) -> None:
         from textual.suggester import SuggestFromList
@@ -363,9 +357,6 @@ class WorkPane(Pane):
         from rework.tui.app import SLASH_COMMANDS
 
         out = [c for c, _ in SLASH_COMMANDS]
-        # completing /fetch with a live mission id is the useful case; the
-        # recent list supplies them cheaply
-        out.extend(getattr(self, "_recent_ids", []))
         out.extend(getattr(self, "_project_names", []))
         return out
 
@@ -387,10 +378,10 @@ class WorkPane(Pane):
         return project.name if project else project_id
 
     def _update_project_label(self) -> None:
-        self.query_one("#work-project", Label).update(
-            f"[dim]project[/dim] [b]{self._project_name(self._current_project())}[/b]"
-            " [dim]alt+p[/dim]"
-        )
+        if self.is_mounted:
+            self.query_one(
+                "#btn-project", Button
+            ).label = f"project: {self._project_name(self._current_project())}"
 
     async def reload_projects(self) -> None:
         await self.shell.rw.load_project_cache()
@@ -439,18 +430,15 @@ class WorkPane(Pane):
         return self.shell.rw._mission_defaults.get("effort")
 
     def _update_setting_labels(self) -> None:
+        if not self.is_mounted:
+            return
         model = self._current_model()
         if not model and self._model_ids:
             model = self._model_ids[0]
         effort = self._current_effort() or "default"
-        self.query_one("#work-model", Label).update(
-            f"[dim]model[/dim] [b]{model or 'catalog default'}[/b] [dim]alt+m[/dim]"
-        )
-        self.query_one("#work-effort", Label).update(
-            f"[dim]effort[/dim] [b]{effort}[/b] [dim]alt+e[/dim]"
-        )
-        if self.is_mounted:
-            self._update_project_label()
+        self.query_one("#btn-model", Button).label = f"model: {model or 'catalog default'}"
+        self.query_one("#btn-effort", Button).label = f"effort: {effort}"
+        self._update_project_label()
 
     def action_cycle_model(self) -> None:
         if not self._model_ids:
@@ -470,25 +458,6 @@ class WorkPane(Pane):
 
     def on_show(self) -> None:
         self._update_setting_labels()
-
-    async def reload_recents(self) -> None:
-        recent = self.query_one("#recent", ListView)
-        missions = await self.shell.rw.data.missions(limit=12)
-        recent.clear()
-        self._recent_ids: list[str] = []
-        for m in missions[:10]:
-            recent.append(
-                ListItem(Label(f"{m.id}  {status_rich(m.status.value)}  {m.objective[:60]}"))
-            )
-            self._recent_ids.append(m.id)
-        # mission ids feed /fetch completion, so refresh the suggester
-        self._refresh_suggestions()
-
-    @on(ListView.Selected, "#recent")
-    async def recent_opened(self, event: ListView.Selected) -> None:
-        idx = event.list_view.index
-        if idx is not None and 0 <= idx < len(getattr(self, "_recent_ids", [])):
-            await self.shell.open_mission(self._recent_ids[idx])
 
     @on(Input.Submitted, "#prompt")
     async def prompt_submitted(self, event: Input.Submitted) -> None:
@@ -1467,9 +1436,8 @@ class Shell(Screen):
             dash._last_event_seq = 0
             await rw.load_project_cache()
             await dash.reload_missions()
-            self.query_one("#pane-work", WorkPane).run_worker(
-                self.query_one("#pane-work", WorkPane).reload_recents(), exclusive=True
-            )
+            work = self.query_one("#pane-work", WorkPane)
+            work.run_worker(work.reload_projects(), exclusive=True, group="work-reload")
         except Exception as exc:
             self.notify(f"create failed: {exc}", severity="error")
 
@@ -1883,14 +1851,9 @@ class ReworkApp(App[None]):
     #pane-work { height: 1fr; padding: 1 2; }
     #pane-work #prompt { border: none; background: transparent;
                          border-bottom: round $accent; height: 3; }
-    #work-settings { height: 1; }
-    #work-project { width: auto; }
-    #work-model { width: auto; margin-left: 3; }
-    #work-effort { width: auto; margin-left: 3; }
-    #work-actions { height: 3; margin-bottom: 1; }
-    .work-action { min-width: 10; margin-right: 1; }
-    #recent { height: 1fr; }
-    #recent-head, #work-title, #work-hint { height: 1; }
+    #work-settings { height: 3; }
+    .work-knob { min-width: 16; margin-right: 1; height: 3; }
+    #work-hint { height: 1; color: $text-muted; }
     #pane-dashboard { height: 1fr; padding: 0 1; }
     #pane-gates { height: 1fr; padding: 0 1; }
     #pane-library { height: 1fr; padding: 0 1; }
