@@ -13,9 +13,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from test_vertical_slice import AUDIT_CLEAN, _auditor_script, _coder_script, _investigator_script
 
-from conftest import ScriptedProvider, role_catalog
+from conftest import (
+    AUDIT_CLEAN,
+    ScriptedProvider,
+    _auditor_script,
+    _coder_script,
+    _investigator_script,
+    role_catalog,
+)
 from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.gates import GateManager
 from rework.kernel.state.records import Mission, MissionStatus

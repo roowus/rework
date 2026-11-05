@@ -93,13 +93,12 @@ async def test_failed_step_gets_one_in_mission_retry(tmp_path) -> None:  # type:
     before the plan moves on; a second failure moves on (no infinite loop)."""
     import json as _json
 
-    from test_vertical_slice import (
+    from conftest import (
         AUDIT_CLEAN,
         _auditor_script,
         _coder_script,
         _investigator_script,
     )
-
     from rework.kernel.state.records import Mission as M
     from rework.missions import PLAN_FIX
 
