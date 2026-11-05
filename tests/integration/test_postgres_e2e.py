@@ -20,6 +20,18 @@ pytestmark = pytest.mark.skipif(
     not os.environ.get("REWORK_TEST_POSTGRES"), reason="REWORK_TEST_POSTGRES not set"
 )
 
+async def _purge_checkpoint_threads(url: str, mission_id: str) -> None:
+    """Delete this test's checkpoint threads (any run of this mission from any
+    earlier attempt). The checkpoints table is the langgraph checkpointer's;
+    only a test setup may touch it."""
+    import psycopg
+
+    conn = await psycopg.AsyncConnection.connect(url, autocommit=True)
+    try:
+        await conn.execute("DELETE FROM checkpoints WHERE thread_id LIKE %s", (f"{mission_id}:%",))
+    finally:
+        await conn.close()
+
 
 async def test_engine_runs_end_to_end_on_postgres_state_and_checkpoints() -> None:
     import asyncio
@@ -38,8 +50,11 @@ async def test_engine_runs_end_to_end_on_postgres_state_and_checkpoints() -> Non
     store = await open_store_from_config(config)
     # a leftover run of THIS test (CI retries, an earlier matrix job against a
     # shared service) makes the deterministic mission id resume a COMPLETED
-    # checkpoint: no new gate ever opens and the assert fires. Clean state first.
+    # checkpoint: no new gate ever opens and the assert fires. Clean state:
+    # domain tables via the store, and the run's checkpoint THREADS (owned by
+    # the checkpointer, not the store) directly.
     await store.reset_for_tests()
+    await _purge_checkpoint_threads(url, "pg_e2e_echo")
     bus = InProcessEventBus(store)
     mission_id = "pg_e2e_echo"
     await store.create_mission(Mission(id=mission_id, objective="echo me"))
