@@ -24,7 +24,7 @@ from conftest import (
     _investigator_script,
     role_catalog,
 )
-from rework.cli import PLAN_FIX
+from rework.missions import PLAN_FIX
 from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.gates import GateManager
 from rework.kernel.llm.types import ChatResult, ToolCall, Usage

@@ -16,7 +16,7 @@ import pytest
 from test_vertical_slice import AUDIT_CLEAN, _auditor_script, _coder_script, _investigator_script
 
 from conftest import ScriptedProvider, role_catalog
-from rework.cli import PLAN_FIX_PR
+from rework.missions import PLAN_FIX_PR
 from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.gates import GateManager
 from rework.kernel.state.records import Mission, MissionStatus

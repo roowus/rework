@@ -37,119 +37,6 @@ def version() -> None:
     typer.echo(f"rework {__version__}")
 
 
-PLAN_FIX: dict = {
-    "steps": [
-        {
-            "step": "investigate",
-            "role": "investigator",
-            "model": "flash",
-            "context": {
-                "brief": "$OBJECTIVE",
-                "depth": "quick",
-                "requested_sections": [
-                    "summary",
-                    "findings",
-                    "suggested_fix",
-                    "proposed_tests",
-                    "blockers",
-                ],
-            },
-        },
-        {
-            "step": "code",
-            "role": "coder",
-            "model": "flash",
-            "context": {"brief": "$OBJECTIVE"},
-            "context_from": {"investigation": {"step": "investigate"}},
-        },
-        {
-            "step": "audit",
-            "role": "auditor",
-            "model": "pro",
-            "context": {"brief": "$OBJECTIVE"},
-            "context_from": {
-                "diff": {"step": "code", "field": "diff"},
-                "worktree_path": {"step": "code", "field": "worktree"},
-                "investigation": {"step": "investigate"},
-            },
-            "on_request_changes": {"revise": "code", "max_rounds": 2},
-        },
-    ],
-    "gates": ["ship"],
-}
-
-PLAN_FIX_PR: dict = {
-    "steps": PLAN_FIX["steps"],
-    "gates": ["open_pr"],
-}
-
-
-def _prepare_repo(repo_arg: str, mission_id: str) -> str:
-    """A git repo is used in place; a plain directory is copied into the
-    state workspace and git-initialized, so missions stay self-contained
-    and the example repos are never mutated."""
-    import shutil as _shutil
-    import subprocess as _sp
-    from pathlib import Path as _Path
-
-    src = _Path(repo_arg).expanduser().resolve()
-    if not src.is_dir():
-        raise typer.BadParameter(f"repo not found: {src}")
-    if (src / ".git").exists():
-        return str(src)
-    from rework.config import DEFAULT_STATE_DIR
-
-    dest = DEFAULT_STATE_DIR / "work" / mission_id / "repo"
-    if dest.exists():
-        _shutil.rmtree(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    _shutil.copytree(
-        src,
-        dest,
-        ignore=_shutil.ignore_patterns(".git", "__pycache__", "*.pyc", ".venv", "node_modules"),
-    )
-
-    def _git(*args: str) -> None:
-        _sp.run(["git", *args], cwd=dest, check=True, capture_output=True)
-
-    _git("init", "-b", "main")
-    _git("add", "-A")
-    _git("-c", "user.name=rework", "-c", "user.email=rework@rework.local", "commit", "-m", "init")
-    return str(dest)
-
-
-def _is_git_url(value: str) -> bool:
-    return value.startswith(("http://", "https://", "git@", "ssh://")) or value.endswith(".git")
-
-
-def _upload_repo_dir(dir_arg: str, ws_name: str) -> str:
-    """The upload transport (ADR 0005): pack a local folder and POST it to the
-    daemon's workspace API; the mission carries the daemon-side staged path."""
-    import os as _os
-
-    import httpx as _httpx
-
-    from rework.orchestrator.workspace import pack_directory, workspace_url_from_env
-
-    src = Path(dir_arg).expanduser().resolve()
-    if not src.is_dir():
-        raise typer.BadParameter(f"--repo-dir not found: {src}")
-    token = _os.environ.get("REWORK_TOKEN")
-    url = f"{workspace_url_from_env().rstrip('/')}/workspaces/{ws_name}"
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
-    typer.echo(f"packing {src.name} and uploading to {url} ...")
-    data = pack_directory(src)
-    resp = _httpx.post(url, content=data, headers=headers, timeout=300.0)
-    if resp.status_code != 200:
-        raise typer.BadParameter(
-            f"daemon upload failed ({resp.status_code}): {resp.text[:200]}. "
-            "Is the daemon running, and is REWORK_DAEMON_URL pointed at it?"
-        )
-    staged = resp.json()["path"]
-    typer.echo(f"staged on the daemon: {staged}")
-    return staged
-
-
 @app.command()
 def new(
     objective: str,
@@ -171,92 +58,18 @@ def new(
     ship gate for an open-PR gate (branch push + gh pr create)."""
 
     async def go() -> str:
-        from rework.config import Config, open_store_from_config
-        from rework.kernel.events.bus import InProcessEventBus
-        from rework.kernel.state.records import (
-            EventRecord,
-            EventType,
-            Mission,
-            new_id,
+        from rework.missions import create_mission, resolve_project
+
+        project_id = await resolve_project(project)
+        mission = await create_mission(
+            objective, repo=repo, repo_dir=repo_dir, project_id=project_id, plan=plan
         )
+        return mission.id
 
-        mission_id = new_id("m")
-        repo_path: str | None = None
-        repo_origin: str | None = None
-        project_id: str | None = None
-        if project:
-            store_probe = await open_store_from_config(Config.from_env())
-            try:
-                found = await store_probe.get_project(project)
-            finally:
-                await store_probe.aclose()
-            if found is None:
-                raise typer.BadParameter(f"project not found: {project}")
-            project_id = found.id
-        if repo_dir:
-            repo_path = _upload_repo_dir(repo_dir, f"{mission_id}-files")
-        elif repo:
-            local_exists = await asyncio.to_thread(lambda: Path(repo).expanduser().exists())
-            if _is_git_url(repo):
-                repo_origin = repo  # the daemon clones this itself (ADR 0005)
-            elif local_exists:
-                repo_path = _prepare_repo(repo, mission_id)
-            elif project:
-                # a repo NAME defined on the project: resolve its reference
-                store_probe = await open_store_from_config(Config.from_env())
-                try:
-                    found = await store_probe.get_project(project)
-                finally:
-                    await store_probe.aclose()
-                ref = next(
-                    (
-                        r
-                        for r in ((found.settings if found else {}).get("repos") or [])
-                        if r.get("name") == repo
-                    ),
-                    None,
-                )
-                if ref is None:
-                    raise typer.BadParameter(f"repo {repo!r} not defined on project {project}")
-                if ref.get("kind") == "github":
-                    repo_origin = str(ref.get("url"))
-                else:
-                    repo_path = str(ref.get("url"))  # path kind: daemon must see it
-            else:
-                raise typer.BadParameter(f"repo not found: {repo}")
-        store = await open_store_from_config(Config.from_env())
-        try:
-            bus = InProcessEventBus(store)
-            plan_spec: dict | None = None
-            if plan in ("fix", "fix-pr"):
-                if not repo_path and not repo_origin:
-                    raise typer.BadParameter(f"--plan {plan} requires --repo or --repo-dir")
-                import json as _json
-
-                template = PLAN_FIX_PR if plan == "fix-pr" else PLAN_FIX
-                plan_spec = _json.loads(_json.dumps(template).replace("$OBJECTIVE", objective))
-            mission = await store.create_mission(
-                Mission(
-                    id=mission_id,
-                    objective=objective,
-                    repo_path=repo_path,
-                    repo_origin=repo_origin,
-                    project_id=project_id,
-                    plan=plan_spec,
-                )
-            )
-            await bus.publish(
-                EventRecord(
-                    mission_id=mission.id,
-                    type=EventType.MISSION_CREATED,
-                    payload={"objective": objective, "plan": plan},
-                )
-            )
-            return mission.id
-        finally:
-            await store.aclose()
-
-    typer.echo(asyncio.run(go()))
+    try:
+        typer.echo(asyncio.run(go()))
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 project_app = typer.Typer(no_args_is_help=True, add_completion=False, help="Projects (ADR 0005).")
@@ -282,15 +95,15 @@ def project_create(
     async def go() -> str:
         from rework.config import Config, open_store_from_config
         from rework.kernel.state.records import Project
+        from rework.missions import is_git_url as missions_is_git_url
 
         repos: list[dict] = []
         for spec in repo or []:
             if "=" not in spec:
                 raise typer.BadParameter(f"--repo wants NAME=URL, got {spec!r}")
             rname, url = spec.split("=", 1)
-            repos.append(
-                {"name": rname, "kind": "github" if _is_git_url(url) else "path", "url": url}
-            )
+            kind = "github" if missions_is_git_url(url) else "path"
+            repos.append({"name": rname, "kind": kind, "url": url})
         cfg = Config.from_env()
         store = await open_store_from_config(cfg)
         try:

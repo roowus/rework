@@ -22,6 +22,8 @@ dependencies = [
     "aiohttp>=3.9",
     # library MCP server (M5.3): any MCP client mounts the same library
     "mcp>=1.2,<2",  # 2.x renamed FastMCP -> MCPServer; migrate deliberately later
+    # terminal UI (`rework` with no args): full-screen dashboard, mouse + keys
+    "textual>=1.0",
     "aiosqlite>=0.20",
     # model providers
     "anthropic>=0.40",

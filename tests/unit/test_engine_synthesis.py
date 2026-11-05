@@ -100,7 +100,7 @@ async def test_failed_step_gets_one_in_mission_retry(tmp_path) -> None:  # type:
         _investigator_script,
     )
 
-    from rework.cli import PLAN_FIX
+    from rework.missions import PLAN_FIX
     from rework.kernel.state.records import Mission as M
 
     store = await open_sqlite(str(tmp_path / "rt.sqlite3"))

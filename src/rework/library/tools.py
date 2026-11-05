@@ -68,7 +68,7 @@ class LibraryHandle(BaseModel):
         body = str(args.get("body") or "")
         if not name or not body.strip():
             return "error: name and body are required"
-        item, note = await contribute(
+        _item, note = await contribute(
             self.index,
             self.git,
             type_=type_,
@@ -80,6 +80,7 @@ class LibraryHandle(BaseModel):
             role=str(args.get("role") or "") or None,
             requested_status=ItemStatus.ACTIVE,
         )
+        _ = _item  # the note carries the id/status text the agent sees
         return note
 
 
