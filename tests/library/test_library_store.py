@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from rework.library.model import (
     ItemStatus,
     ItemType,
@@ -107,3 +109,23 @@ def test_git_library_commits(tmp_path) -> None:
     lib.write_body(item, "# recipe v2\n", "library: update skill")
     assert "v2" in (lib.read_body(item) or "")
     assert lib.last_commit(item) is not None
+
+
+async def test_postgres_reads_leave_no_open_transaction(library_index) -> None:  # type: ignore[no-untyped-def]
+    """Every Library read must end its transaction (found live: the TUI's
+    library connection sat idle-in-transaction for hours on prod)."""
+    from rework.library.store import PostgresLibraryStore
+
+    if not isinstance(library_index, PostgresLibraryStore):
+        pytest.skip("transaction hygiene is a Postgres concern")
+    from psycopg.pq import TransactionStatus
+
+    item = LibraryItem(type=ItemType.SKILL, name="hygiene", status=ItemStatus.ACTIVE)
+    await library_index.upsert_item(item)
+    for read in (
+        lambda: library_index.get_item(item.id),
+        lambda: library_index.list_items(),
+        lambda: library_index.search("hygiene"),
+    ):
+        await read()
+        assert library_index._conn.info.transaction_status == TransactionStatus.IDLE

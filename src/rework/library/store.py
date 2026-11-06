@@ -242,7 +242,7 @@ class PostgresLibraryStore:
 
     def __init__(self, conn: Any) -> None:
         self._conn = conn
-        self._op_lock = _LibLock()
+        self._op_lock = _LibLock(conn)
 
     async def aclose(self) -> None:
         await self._conn.close()
@@ -334,18 +334,31 @@ class PostgresLibraryStore:
 
 class _LibLock:
     """Single-connection serialization (same rationale as StateStore's
-    _TaskLock for postgres; sqlite's thread serializes on its own)."""
+    _TaskLock for postgres; sqlite's thread serializes on its own), and
+    transaction hygiene on the way out.
 
-    def __init__(self) -> None:
+    FOUND LIVE (prod rewvis): every Library read was a bare SELECT with no
+    commit, so the TUI's library connection sat "idle in transaction" for
+    hours (1h38m observed), the lock pattern that once blocked deploy
+    migrations. Leaving every operation committed bounds that to one call."""
+
+    def __init__(self, conn: Any = None) -> None:
         import asyncio
 
         self._lock = asyncio.Lock()
+        self._conn = conn
 
     async def __aenter__(self) -> None:
         await self._lock.acquire()
 
     async def __aexit__(self, *exc: object) -> None:
-        self._lock.release()
+        try:
+            if self._conn is not None:
+                from rework.kernel.state.postgres import end_idle_transaction
+
+                await end_idle_transaction(self._conn)
+        finally:
+            self._lock.release()
 
 
 async def apply_library_migrations(conn: Any) -> None:

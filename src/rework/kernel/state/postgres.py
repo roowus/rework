@@ -215,6 +215,28 @@ class _TaskLock:
             self._lock.release()
 
 
+async def end_idle_transaction(conn: Any) -> None:
+    """Commit (or discard) whatever the last statement opened.
+
+    psycopg's connection exposes the transaction status; only touch the
+    connection when a transaction is genuinely open, so a failed method does
+    not turn its own error into a second one. Shared by every Postgres-backed
+    store (the Library index had the same idle-in-transaction leak)."""
+    info = getattr(conn, "info", None)
+    if info is None:
+        return
+    txn = getattr(info, "transaction_status", None)
+    from psycopg.pq import TransactionStatus
+
+    try:
+        if txn == TransactionStatus.INTRANS:
+            await conn.commit()
+        elif txn == TransactionStatus.INERROR:
+            await conn.rollback()
+    except Exception:  # never let hygiene mask the caller's result
+        pass
+
+
 def _serialized(method: Any) -> Any:
     """Serialize a store method against the shared connection, and always
     leave it in a committed state.
@@ -247,24 +269,7 @@ class PostgresStore:
         self._op_lock = _TaskLock()
 
     async def _end_idle_transaction(self) -> None:
-        """Commit (or discard) whatever the last statement opened.
-
-        psycopg's connection exposes the transaction status; only touch the
-        connection when a transaction is genuinely open, so a failed method
-        does not turn its own error into a second one."""
-        info = getattr(self._conn, "info", None)
-        if info is None:
-            return
-        txn = getattr(info, "transaction_status", None)
-        from psycopg.pq import TransactionStatus
-
-        try:
-            if txn == TransactionStatus.INTRANS:
-                await self._conn.commit()
-            elif txn == TransactionStatus.INERROR:
-                await self._conn.rollback()
-        except Exception:  # never let hygiene mask the caller's result
-            pass
+        await end_idle_transaction(self._conn)
 
     async def aclose(self) -> None:
         await self._conn.close()
