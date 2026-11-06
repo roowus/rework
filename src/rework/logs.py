@@ -107,7 +107,7 @@ def setup_logging(component: str, *, console: bool = False) -> Path:
         stream.setLevel(level)
         root.addHandler(stream)
     # third-party chatter: keep request lines at INFO only when asked
-    for noisy in ("httpx", "httpcore", "aiohttp.access", "openai", "anthropic"):
+    for noisy in ("httpx", "httpx2", "httpcore", "aiohttp.access", "openai", "anthropic"):
         logging.getLogger(noisy).setLevel(max(level, logging.WARNING))
     _install_excepthook()
     return path

@@ -10,6 +10,10 @@ Launched from the TUI against the rewvis deployment.
 
 | # | finding | cause | status |
 |---|---|---|---|
+| 12 | An old TUI process (pre-fix code) still holds two connections idle-in-transaction for 2h+ | the library-store fix only helps processes running new code | owner: restart old TUIs |
+| 11 | Cost grows with transcript length: coder at 43k tokens/turn, `cached_tokens` always 0 | every turn resends the full history; no prompt caching on this provider | open: history compaction for long role loops |
+| 10 | Roles cannot ask anything: only the echo stub calls interrupt(); the escalate node in the design never existed | never built; interrupt mid-loop would replay the whole loop | fixed: `ask_orchestrator` blocking tool (M7 P2) |
+| 9 | Runner crashed mid-coder: `cached plan must not change result type` | a client (my monitoring scripts, newer code) applied the gates.spec migration; the daemon's auto-prepared `SELECT *` broke | fixed: `prepare_threshold=None`; mission restored and resumed from its saved conversation |
 | 8 | Investigator report called the exact location "lost" and filed it as a blocker, though the run had printed it | report writer dropped every tool result and reduced calls to names | fixed `report-writer sees the evidence` |
 | 7 | Investigator spent 65 calls / $0.79 prototyping the fix in /tmp and running tests | prompt never said investigating excludes implementing; orchestrator could not set depth | fixed: prompt rule + `spawn_role(depth=)` |
 | 6 | `cd $D` slips past the cd jail (only literal absolute `cd` is refused) | the jail is advisory string matching | known; real fix is container sandboxing (M8) |
@@ -20,7 +24,9 @@ Launched from the TUI against the rewvis deployment.
 | 1 | Owner's TUI pointed at prod, not local | shell exports REWORK_DB for rewvis; plain `rework` uses it | documented `scripts/rework-local`; consider a visible "connected to" label in the TUI |
 
 What worked: the orchestrator read the thin investigation, judged it unreliable
-and wrote the coder a brief treating it as leads rather than facts.
+and wrote the coder a brief treating it as leads rather than facts. Its
+self-chosen 12-minute check-in fired, and after the crash and restore it
+reloaded its conversation, called `check_in` on the coder and carried on.
 
 ## 2026-11-06, mission m-808acff14c50 (local toyrepo, first orchestrated run)
 
