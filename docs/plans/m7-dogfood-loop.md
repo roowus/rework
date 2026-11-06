@@ -31,21 +31,23 @@ agent on the project, so the TUI/backend split is gone.
 Each phase ends green (pytest, ruff, format, mypy), committed, pushed, CI
 checked with `gh run list`, and deployed to rewvis when the daemon changed.
 
-### P0: unblock (no owner input needed)
+### P0: unblock (done 2026-11-06)
 
-- [ ] Fix chat bug B1: tool calls are stored in OpenAI wire format, so any chat
+- [x] Fix chat bug B1: tool calls are stored in OpenAI wire format, so any chat
       that uses a lookup crashes on the next model call (`KeyError: 'name'`).
       Add a test that runs a real chat history through BOTH adapters'
       `translate_request` (the FakeProvider never touched an adapter, which is
       why tests missed it).
-- [ ] Fix chat bug B2: the assistant message that issues look-tool calls is
+- [x] Fix chat bug B2: the assistant message that issues look-tool calls is
       never persisted, so a reopened chat replays orphan tool results.
-- [ ] `Mission.chat_id` (both backends + conformance) so one chat can own many
+- [x] `Mission.chat_id` (both backends + conformance) so one chat can own many
       missions; the TUI reads it instead of note rows.
-- [ ] The production project `rework` has `repos: []`. Give it its repo ref
+- [x] The production project `rework` has `repos: []`. Give it its repo ref
       (`https://github.com/roowus/rework`) so the chat can propose against it.
-- [ ] Docs truth pass: `design.md` stops describing an orchestrator that does
+- [x] Docs truth pass: `design.md` stops describing an orchestrator that does
       not exist; house style (no em dashes) across the new TUI docs.
+- [x] A project-only mission inherits the project's single repo, and a URL
+      ref becomes an origin (found while wiring the rework project).
 
 ### P1: the orchestrator core (ADR 0007 sections 1 to 5)
 
