@@ -65,8 +65,11 @@ BUDGET_HOLD_GRACE_S = 30.0
 # a one-line fix). Past COMPACT_AT characters, tool results older than the last
 # KEEP_RECENT are replaced by a one-line stub. It happens in one step, so the
 # prefix stays identical (prompt-cache friendly) until the next compaction.
-COMPACT_AT = 60_000
-KEEP_RECENT = 6
+# Tuned on dogfood #2: at 60k/6 a coder re-read dashboard.py ~7 times because
+# its earlier reads had been elided; with prompt caching (~85% hits) keeping
+# context is cheap and re-reading is not.
+COMPACT_AT = 160_000
+KEEP_RECENT = 12
 STUB_MIN = 600
 
 

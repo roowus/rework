@@ -23,6 +23,17 @@ same branch after the turn budget, audit on the strong model, revise, audit
 again, both audits approve with zero open findings, ship gate (rejected by me so
 nothing was pushed). The investigator report cited exact file:line evidence.
 
+## 2026-11-06, dogfood #2 m-d454350350af (orchestrator Output tab, local, fix-pr)
+
+| # | finding | cause | status |
+|---|---|---|---|
+| 21 | Coder spent its 40 turns re-reading the same files (dashboard.py ~7 times, seed.py 4) | compaction at 60k chars / keep 6 elided reads the model still needed | tuned to 160k / keep 12 (caching makes kept context cheap) |
+
+What worked: the orchestrator saw the coder run out of turns, continued on the
+same branch with a prioritized "finish and commit" brief.
+
+## 2026-11-06, post-mortem of m-0d75f495121a (continued)
+
 | # | finding | cause | status |
 |---|---|---|---|
 | 20 | The coder wrote 20+ throwaway probe scripts measuring pixel alignment for a one-property CSS change | the brief forwarded speculative side concerns; the coder prompt had no proportionality rule | fixed: coder "smallest change, existing tests, no probes"; orchestrator "scope briefs to the objective" |
