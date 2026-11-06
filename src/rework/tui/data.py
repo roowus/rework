@@ -27,6 +27,44 @@ def library_root() -> Path:
     ).expanduser()
 
 
+def _is_connection_error(exc: BaseException) -> bool:
+    """Whether this looks like the CONNECTION died rather than the query being
+    wrong. Covers psycopg (the deployment reads Postgres over the tailnet),
+    aiosqlite (local file) and any OSError wrapping a socket failure."""
+    import sqlite3
+
+    try:
+        import psycopg
+    except ImportError:  # pragma: no cover - psycopg is a hard dep
+        psycopg = None  # type: ignore[assignment]
+    connection_types: tuple[type[BaseException], ...] = (OSError, TimeoutError, ConnectionError)
+    if psycopg is not None:
+        connection_types = (
+            *connection_types,
+            psycopg.OperationalError,
+            psycopg.InterfaceError,
+        )
+    if isinstance(exc, connection_types):
+        return True
+    if isinstance(exc, sqlite3.OperationalError):
+        text = str(exc).lower()
+        return "locked" in text or "disk i/o" in text or "unable to open" in text
+    return False
+
+
+async def _maybe_await(value: Any) -> Any:
+    """Await it if it is awaitable.
+
+    The query callables here are lambdas returning coroutines, but a caller
+    (or a test) may hand `_resilient` a plain call that raises synchronously.
+    Without this the synchronous exception escapes `await`'s try block
+    uncaught and the reconnect/fallback never runs — and awaiting a non-
+    awaitable raises TypeError, which is not a connection error."""
+    if hasattr(value, "__await__"):
+        return await value
+    return value
+
+
 class TuiData:
     """Lazy single connections + thin query methods. All async; the Textual
     loop is the only caller (single-connection stores are safe here)."""
@@ -35,11 +73,59 @@ class TuiData:
         self._store: StateStore | None = None
         self._index: LibraryStore | None = None
         self._git: GitLibrary | None = None
+        # the last successful result per query, used while the daemon is
+        # unreachable (see `_resilient`)
+        self._last_good: dict[str, Any] = {}
+        # set when a reconnect failed; the shell shows it as an offline note
+        self._reconnecting_hint: str = ""
 
     async def store(self) -> StateStore:
         if self._store is None:
             self._store = await open_store_from_config(Config.from_env())
         return self._store
+
+    async def drop_store(self) -> None:
+        """Throw the connection away so the next call reopens it. A store held
+        across a network drop is dead: every call fails, and holding it only
+        delays the recovery."""
+        if self._store is not None:
+            import contextlib
+
+            with contextlib.suppress(Exception):
+                await self._store.aclose()
+            self._store = None
+
+    async def _call(self, fn: Any) -> Any:
+        """One query against the (possibly reopened) store."""
+        store = await self.store()
+        return await fn(store)
+
+    async def _resilient(self, key: str, call: Any) -> Any:
+        """Run one query; if the connection died, reconnect once and retry.
+
+        The TUI reads a Postgres over the tailnet. A laptop sleeping, a
+        tailnet hiccup or a daemon restart all surface as
+        'consuming input failed' / 'server closed the connection', and an
+        unhandled one used to take the WHOLE app down with a traceback screen
+        (owner's screenshot). Stale data with a visible 'offline' note is the
+        right failure mode for a dashboard, and the last good result keeps the
+        table populated instead of blanking it."""
+        try:
+            result = await _maybe_await(call())
+        except Exception as first:
+            if not _is_connection_error(first):
+                raise
+            await self.drop_store()
+            try:
+                result = await _maybe_await(call())
+            except Exception:
+                self._reconnecting_hint = f"{type(first).__name__}: {first}"[:160]
+                if key in self._last_good:
+                    return self._last_good[key]
+                raise
+        self._reconnecting_hint = ""
+        self._last_good[key] = result
+        return result
 
     async def library(self) -> tuple[LibraryStore, GitLibrary]:
         if self._index is None or self._git is None:
@@ -59,33 +145,43 @@ class TuiData:
     # -- queries ----------------------------------------------------------
 
     async def projects(self) -> list[Project]:
-        store = await self.store()
-        return await store.list_projects()
+        return await self._resilient("projects", lambda: self._call(lambda s: s.list_projects()))
 
     async def missions(self, limit: int = 60) -> list[Mission]:
-        store = await self.store()
-        return await store.list_missions(limit=limit)
+        return await self._resilient(
+            f"missions:{limit}", lambda: self._call(lambda s: s.list_missions(limit=limit))
+        )
 
     async def open_gates(self, mission_id: str | None = None) -> list[Any]:
-        store = await self.store()
-        return await store.list_open_gates(mission_id)
+        return await self._resilient(
+            f"open_gates:{mission_id}",
+            lambda: self._call(lambda s: s.list_open_gates(mission_id)),
+        )
 
     async def events_tail(self, mission_id: str, since: int, limit: int = 500) -> list[Any]:
-        store = await self.store()
-        return await store.events_since(since, mission_id=mission_id, limit=limit)
+        return await self._resilient(
+            f"events:{mission_id}:{since}",
+            lambda: self._call(lambda s: s.events_since(since, mission_id=mission_id, limit=limit)),
+        )
 
     async def mission_runs(self, mission_id: str) -> list[Run]:
-        store = await self.store()
-        return await store.list_runs(mission_id)
+        return await self._resilient(
+            f"runs:{mission_id}", lambda: self._call(lambda s: s.list_runs(mission_id))
+        )
 
     async def mission_spend(self, mission_id: str) -> float:
-        store = await self.store()
-        spend = await store.mission_spend(mission_id)
-        return spend.spent_usd
+        async def _q() -> float:
+            store = await self.store()
+            spend = await store.mission_spend(mission_id)
+            return spend.spent_usd
+
+        return await self._resilient(f"spend:{mission_id}", _q)
 
     async def spend_by_model(self, mission_id: str | None = None) -> list[dict[str, Any]]:
-        store = await self.store()
-        return await store.spend_by_model(mission_id)
+        return await self._resilient(
+            f"spend_by_model:{mission_id}",
+            lambda: self._call(lambda s: s.spend_by_model(mission_id)),
+        )
 
     async def spend_total(self) -> dict[str, float]:
         """Every model's row summed: the number the owner actually wants."""
@@ -98,8 +194,9 @@ class TuiData:
         }
 
     async def get_mission(self, mission_id: str) -> Any:
-        store = await self.store()
-        return await store.get_mission(mission_id)
+        return await self._resilient(
+            f"mission:{mission_id}", lambda: self._call(lambda s: s.get_mission(mission_id))
+        )
 
     async def library_set_status(self, item_id: str, retire: bool) -> bool:
         """a / d on the library split: activate or retire the selected item."""

@@ -107,12 +107,21 @@ it, one full-width pane per section, and a hint row. Five tabs, `alt+1..5`:
 - **Cost** — the charges ledger, grouped by model (calls, input/output tokens,
   USD) plus per-mission totals; `s` toggles all-missions vs the selected one.
 
-Gate keys are `alt+a` / `alt+x` (plain `a`/`x` collide with typing in any
-input and with the Gates table). They act on the VISIBLE context only: the
-deep view's mission, the Gates tab's selected row, or the Dashboard's
-selection — never a stray database-wide approval. The bindings live on the
-app, so the actions must exist there too: they were defined on a pane once,
-the key silently did nothing, and a gate had "no way to answer it".
+Gates are answered by CLICKING, first and always (owner: "dont make thigns
+work soley on keys we nede clicks, tui is for a reason"). Every open gate
+renders as a row with its own Approve / Reject buttons (dashboard and deep
+view), and the Gates tab has action buttons that apply to the selected row.
+Keyboard works as an accelerator (`alt+a` / `alt+x`; plain `a`/`x` collide
+with typing in any input and with the table's own row actions). Both paths
+act on the VISIBLE context only — never a stray database-wide approval.
+
+Resilience rule for a client that lives on a laptop talking to a daemon over
+the tailnet: a dropped connection must NEVER exit the app. TuiData retries
+once on a fresh connection and otherwise serves the last good result with an
+"offline" marker in the tab bar; poll loops catch their own errors; and
+ReworkApp._handle_exception turns anything that still escapes into a toast
+instead of Textual's default full-screen traceback + quit. (Found live: one
+timed-out poll painted a traceback over the whole dashboard.)
 
 Deep view tabs are Feed / Findings / Diff / Report. One navigation rule
 everywhere: enter = deeper, esc = back, alt+a/x = decide, f = fetch.

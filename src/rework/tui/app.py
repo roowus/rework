@@ -430,6 +430,70 @@ class CreateProjectModal(ModalScreen[dict[str, Any]]):
 # ---------------------------------------------------------------- panes
 
 
+class GateActions(Static):
+    """Every open gate with REAL BUTTONS.
+
+    Owner: 'dont make thigns work soley on keys we nede clicks, tui is for a
+    reason.' A gate is the one thing in this app that physically blocks work,
+    and it was answerable only by remembering alt+a. Each gate now carries its
+    own Approve / Reject buttons, so clicking is the primary path and the
+    keyboard stays as an accelerator.
+    """
+
+    class Decided(Message):
+        def __init__(self, gate_id: str, approved: bool) -> None:
+            super().__init__()
+            self.gate_id = gate_id
+            self.approved = approved
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._gate_ids: list[str] = []
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(id=f"{self.id}-rows")
+
+    async def update_gates(self, gates: list[Any]) -> None:
+        """Rebuild the rows for the gates currently open. Cheap: gates are few
+        and this runs on the same poll as everything else."""
+        signature = [g.id for g in gates]
+        if signature == self._gate_ids and self.is_mounted:
+            return
+        self._gate_ids = signature
+        rows = self.query_one(f"#{self.id}-rows", Vertical)
+        await rows.remove_children()
+        if not gates:
+            self.display = False
+            return
+        self.display = True
+        title = Label("[bold yellow]WAITING ON YOU[/bold yellow]", classes="gate-title")
+        await rows.mount(title)
+        for gate in gates:
+            line = Horizontal(classes="gate-row")
+            await rows.mount(line)
+            await line.mount(
+                Label(
+                    f"[b]{gate.kind.value}[/b]  {gate.question}"[:110],
+                    classes="gate-question",
+                )
+            )
+            await line.mount(
+                Button("Approve", id=f"approve-{gate.id}", variant="success", classes="gate-btn")
+            )
+            await line.mount(
+                Button("Reject", id=f"reject-{gate.id}", variant="error", classes="gate-btn")
+            )
+
+    @on(Button.Pressed)
+    def button_pressed(self, event: Button.Pressed) -> None:
+        btn_id = event.button.id or ""
+        for prefix, approved in (("approve-", True), ("reject-", False)):
+            if btn_id.startswith(prefix):
+                event.stop()
+                self.post_message(self.Decided(btn_id[len(prefix) :], approved))
+                return
+
+
 class Pane(Static):
     """A tab section inside the shell. Panes are WIDGETS (not screens): the
     shell keeps one live instance of each so polling and state survive tab
@@ -967,8 +1031,11 @@ class DashboardPane(Pane):
         yield DataTable(id="missions")
         with Vertical(id="detail"):
             yield Label("enter opens a mission", id="mission-head")
+            with Horizontal(id="mission-actions"):
+                yield Button("Open", id="mission-open", variant="primary")
+                yield Button("Fetch result", id="mission-fetch")
             yield SelectableLog(id="events", markup=True, highlight=False, wrap=True, max_lines=600)
-            yield Static("", id="gate-box")
+            yield GateActions(id="gate-box")
 
     def on_mount(self) -> None:
         missions = self.query_one("#missions", DataTable)
@@ -1068,6 +1135,16 @@ class DashboardPane(Pane):
     async def mission_selected(self, event: DataTable.RowSelected) -> None:
         await self.shell.open_mission(str(event.row_key.value))
 
+    @on(Button.Pressed, "#mission-open")
+    async def open_clicked(self) -> None:
+        if self._selected_mission:
+            await self.shell.open_mission(self._selected_mission)
+
+    @on(Button.Pressed, "#mission-fetch")
+    async def fetch_clicked(self) -> None:
+        if self._selected_mission:
+            await self.shell.fetch_selected(self._selected_mission)
+
     @on(DataTable.RowHighlighted, "#missions")
     async def mission_cursor_moved(self, event: DataTable.RowHighlighted) -> None:
         key = event.row_key.value
@@ -1114,16 +1191,13 @@ class DashboardPane(Pane):
         await self.render_gate_box(mission_id)
 
     async def render_gate_box(self, mission_id: str) -> None:
-        box = self.query_one("#gate-box", Static)
         gates = await self.shell.rw.data.open_gates(mission_id)
-        if not gates:
-            box.update("")
-            return
-        lines = ["[bold yellow]WAITING ON YOU[/bold yellow]"]
-        for gate in gates:
-            lines.append(f"  gate {gate.id} [{gate.kind.value}]  {gate.question}")
-        lines.append("  [b]alt+a[/b] approve    [b]alt+x[/b] reject")
-        box.update("\n".join(lines))
+        await self.query_one("#gate-box", GateActions).update_gates(gates)
+
+    @on(GateActions.Decided)
+    async def gate_button_pressed(self, event: GateActions.Decided) -> None:
+        """A gate was answered by CLICKING it (the primary path)."""
+        await self.shell.decide_gate(event.gate_id, event.approved)
 
     async def selected_mission_id(self) -> str | None:
         return self._selected_mission
@@ -1159,6 +1233,11 @@ class GatesPane(Pane):
         yield Label("[b]Open gates[/b] — the human decisions rework is waiting on", id="gates-head")
         yield DataTable(id="gates-table")
         yield Label(id="gates-empty")
+        # clicking is the primary path (owner: 'we nede clicks'); the selected
+        # row's gate can be answered without touching a key
+        with Horizontal(id="gates-actions"):
+            yield Button("Approve selected", id="gates-approve", variant="success")
+            yield Button("Reject selected", id="gates-reject", variant="error")
 
     def on_mount(self) -> None:
         table = self.query_one("#gates-table", DataTable)
@@ -1168,9 +1247,21 @@ class GatesPane(Pane):
         self.call_after_refresh(self.refresh_quiet)
 
     async def refresh_quiet(self) -> None:
-        """Reload without toasts; polls while the tab is mounted."""
+        """Reload without toasts; polls while the tab is mounted.
+
+        EVERY poll is wrapped: this method runs on a timer, and an escaping
+        exception on a timer exits the whole app (the owner's traceback was
+        exactly here — 'consuming input failed: Operation timed out' while
+        reading gates over the tailnet). The data layer already reconnects and
+        falls back; this keeps a surprise from killing the session."""
         if not self.display:
             return
+        try:
+            await self._refresh()
+        except Exception as exc:
+            self.shell.set_offline_note(f"{type(exc).__name__}: {exc}")
+
+    async def _refresh(self) -> None:
         table = self.query_one("#gates-table", DataTable)
         gates = await self.shell.rw.data.open_gates()
         selected = self._selected_gate_id()
@@ -1194,16 +1285,40 @@ class GatesPane(Pane):
             return None
         return self._row_ids[table.cursor_row]
 
+    @on(DataTable.RowHighlighted, "#gates-table")
+    async def row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        """Clicking a row selects it (a single click only moves the cursor in
+        Textual; RowSelected needs a double-click, which nobody discovers).
+        The action buttons below then apply to that row, and a DOUBLE click
+        opens the mission so you can read the context before deciding."""
+        self._refresh_action_buttons()
+
+    @on(DataTable.RowSelected, "#gates-table")
+    async def row_activated(self, event: DataTable.RowSelected) -> None:
+        key = event.row_key.value
+        if key:
+            await self.shell.open_mission(str(key))  # same id as the gate's mission
+
+    @on(Button.Pressed, "#gates-approve")
+    async def approve_clicked(self) -> None:
+        await self._decide(True)
+
+    @on(Button.Pressed, "#gates-reject")
+    async def reject_clicked(self) -> None:
+        await self._decide(False)
+
+    def _refresh_action_buttons(self) -> None:
+        gate_id = self._selected_gate_id()
+        for selector in ("#gates-approve", "#gates-reject"):
+            self.query_one(selector, Button).disabled = gate_id is None
+
     async def _decide(self, approved: bool) -> None:
         gate_id = self._selected_gate_id()
         if gate_id is None:
+            self.notify("select a gate first", severity="warning")
             return
-        ok = await self.shell.rw.data.decide_gate(gate_id, approved)
-        if ok:
-            self.notify(f"gate {gate_id} {'approved' if approved else 'rejected'}")
-            await self.refresh_quiet()
-            self.shell.rw.refresh_dashboard()
-            self.shell.update_gate_badge()
+        await self.shell.decide_gate(gate_id, approved)
+        await self.refresh_quiet()
 
 
 class CostPane(Pane):
@@ -1264,6 +1379,12 @@ class CostPane(Pane):
     async def refresh_quiet(self) -> None:
         if not self.display:
             return
+        try:
+            await self._refresh()
+        except Exception as exc:  # a poll failure must never exit the app
+            self.shell.set_offline_note(f"{type(exc).__name__}: {exc}")
+
+    async def _refresh(self) -> None:
         scope = self._mission_id
         rows = await self.shell.rw.data.spend_by_model(scope)
         total_usd = sum(float(r.get("cost_usd") or 0) for r in rows)
@@ -1663,6 +1784,12 @@ class TabBar(Static, can_focus=True):
             self._gate_count = count
             self.refresh()
 
+    def set_offline(self, note: str) -> None:
+        """Show that the numbers may be stale (the store is unreachable)."""
+        if note != getattr(self, "_offline", ""):
+            self._offline = note
+            self.refresh()
+
     def _spans(self) -> list[tuple[str, int, int]]:
         spans: list[tuple[str, int, int]] = []
         col = 1
@@ -1689,6 +1816,13 @@ class TabBar(Static, can_focus=True):
             else:
                 out += f"[dim]{text}[/dim]"
             out += " "
+        if getattr(self, "_offline", ""):
+            out += "   [on red] offline — showing last known data [/on red]"
+        if self._gate_count:
+            # the loudest thing in the app: work is BLOCKED on the owner
+            n = self._gate_count
+            out += f"   [bold yellow]▲ {n} gate{'s' if n != 1 else ''} need{'s' if n == 1 else ''}"
+            out += " you — click Gates[/bold yellow]"
         # a persistent way out: escape twice, or File > Quit
         out += " [dim]esc esc to quit[/dim]"
         return out
@@ -1957,6 +2091,17 @@ class Shell(Screen):
 
     # -- gate badge + notifications -------------------------------------------
 
+    async def decide_gate(self, gate_id: str, approved: bool) -> bool:
+        """Answer one gate — the single path shared by clicks and keys."""
+        ok = await self.rw.data.decide_gate(gate_id, approved)
+        verb = "approved" if approved else "rejected"
+        if ok:
+            self.notify(f"gate {gate_id} {verb}")
+        else:
+            self.notify(f"gate {gate_id} could not be decided", severity="warning")
+        self.refresh_after_decision()
+        return ok
+
     async def gate_ids_in_context(self) -> list[str]:
         """Which gates 'a'/'x' should decide right now, by visible context.
         Gates tab: the selected row. Otherwise: the dashboard's selected
@@ -1986,10 +2131,15 @@ class Shell(Screen):
         self.run_worker(gates_pane.refresh_quiet(), exclusive=False)
         self.run_worker(self.poll_badge(), exclusive=False)
 
+    def set_offline_note(self, note: str) -> None:
+        """Surface a store problem in the tab bar instead of dying."""
+        self.query_one("#tab-bar", TabBar).set_offline(note)
+
     async def poll_badge(self) -> None:
         try:
             gates = await self.rw.data.open_gates()
-        except Exception:
+        except Exception as exc:
+            self.query_one("#tab-bar", TabBar).set_offline(f"{type(exc).__name__}: {exc}")
             return
         self.update_gate_badge(gates)
         # notifications: NEW gate ids since we last looked
@@ -2011,6 +2161,7 @@ class Shell(Screen):
         self.query_one("#menu-bar", MenuBar).set_gate_count(count)
         tab_bar = self.query_one("#tab-bar", TabBar)
         tab_bar.set_gate_count(count)
+        tab_bar.set_offline(self.rw.data._reconnecting_hint)
         self.rw._open_gate_count = count
 
 
@@ -2061,7 +2212,7 @@ class MissionDeepView(ModalScreen[None]):
                 yield Static("", id="deep-findings", markup=True)
                 yield Static("", id="deep-diff", markup=False)
                 yield Static("", id="deep-report", markup=False)
-            yield Static("", id="deep-gates")
+            yield GateActions(id="deep-gates")
             yield Label(
                 "[dim]esc back[/dim]  ·  tab/←→ switch tabs  ·  "
                 "[dim]a[/dim] approve  [dim]x[/dim] reject  ·  [dim]f[/dim] fetch  "
@@ -2244,16 +2395,14 @@ class MissionDeepView(ModalScreen[None]):
         self.query_one("#deep-report", Static).update(text)
 
     async def _render_gates(self) -> None:
-        box = self.query_one("#deep-gates", Static)
         gates = await self.rw.data.open_gates(self._mission_id)
-        if not gates:
-            box.update("")
-            return
-        lines = ["[bold yellow]WAITING ON YOU[/bold yellow]"]
-        for gate in gates:
-            lines.append(f"  {gate.id} [{gate.kind.value}]  {gate.question}")
-        lines.append("  [b]alt+a[/b] approve    [b]alt+x[/b] reject")
-        box.update("\n".join(lines))
+        await self.query_one("#deep-gates", GateActions).update_gates(gates)
+
+    @on(GateActions.Decided)
+    async def gate_button_pressed(self, event: GateActions.Decided) -> None:
+        await self.rw.data.decide_gate(event.gate_id, event.approved)
+        self.notify(f"gate {event.gate_id} {'approved' if event.approved else 'rejected'}")
+        self.run_worker(self.refresh_all(), exclusive=True)
 
     async def action_approve(self) -> None:
         await self._decide(True)
@@ -2372,6 +2521,11 @@ class ReworkApp(App[None]):
     #detail { height: 8; border-top: round $panel; padding: 0 1; }
     #detail #events { height: 1fr; border: none; }
     #mission-head { height: 1; color: $text-muted; }
+    GateActions { height: auto; padding: 0 1; }
+    .gate-title { height: 1; }
+    .gate-row { height: 3; }
+    .gate-question { width: 1fr; content-align: left middle; }
+    .gate-btn { min-width: 11; margin-left: 1; }
     #gate-box { height: auto; padding: 0 1; }
     #modal-form { width: 72; max-width: 90%; height: auto; max-height: 90%;
                   border: round $accent; padding: 1 2; background: $surface; }
@@ -2452,6 +2606,29 @@ class ReworkApp(App[None]):
         self._mission_cache: dict[str, Any] = {}
         self._open_gate_count = 0
         self._mission_defaults: dict[str, Any] = {}
+        self._last_error: str = ""
+
+    def _handle_exception(self, error: Exception) -> None:
+        """NEVER exit on a background query failure.
+
+        Textual's default is to render a full-screen traceback and quit, so one
+        dropped tailnet packet while polling gates took the whole dashboard
+        down (owner's screenshot: 'consuming input failed: Operation timed
+        out'). A dashboard that goes blank because the network blinked is
+        worse than one showing stale numbers with an offline note. The data
+        layer already retries and falls back; this is the last line of defence
+        for anything that still escapes a worker, timer or message handler."""
+        import logging
+
+        logging.getLogger("rework.tui").exception("unhandled TUI error")
+        with contextlib.suppress(Exception):
+            self.notify(
+                f"{type(error).__name__}: {str(error)[:120]}",
+                title="rework: query failed (still running)",
+                severity="error",
+                timeout=8,
+            )
+        self._last_error = f"{type(error).__name__}: {error}"[:200]
 
     def get_default_screen(self) -> Any:
         return Shell()

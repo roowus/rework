@@ -1398,3 +1398,138 @@ async def test_prompt_attaches_pasted_image_paths(seeded: dict[str, str], tmp_pa
         prompt.attach_path(str(png))
         await pilot.pause()
         assert prompt.attachments == [str(png)]
+
+
+async def test_gate_is_answered_by_clicking_approve(seeded: dict[str, str], tui_env: Path) -> None:
+    """Owner: 'dont make thigns work soley on keys we nede clicks'. Each gate
+    carries real buttons, so the dashboard can be driven with the mouse."""
+    from textual.widgets import Button
+
+    from rework.kernel.state.sqlite import open_sqlite
+
+    app = ReworkApp()
+    async with app.run_test(size=(130, 40)) as pilot:
+        await pilot.pause()
+        shell = await _shell(app)
+        shell.show_tab("dashboard")
+        dash = shell.query_one("#pane-dashboard")
+        await dash.select_mission(seeded["waiting"])
+        for _ in range(6):
+            await pilot.pause(0.2)
+
+        approve = shell.query_one(f"#approve-{seeded['gate']}", Button)
+        await pilot.click(approve)
+        for _ in range(6):
+            await pilot.pause(0.2)
+
+    store = await open_sqlite(str(tui_env))
+    try:
+        gate = await store.get_gate(seeded["gate"])
+        assert gate is not None and gate.status.value == "approved"
+    finally:
+        await store.aclose()
+
+
+async def test_gates_tab_has_clickable_action_buttons(
+    seeded: dict[str, str], tui_env: Path
+) -> None:
+    """The Gates tab answers with a mouse too: the row buttons act on the
+    selected gate."""
+
+    from rework.kernel.state.sqlite import open_sqlite
+
+    app = ReworkApp()
+    async with app.run_test(size=(130, 40)) as pilot:
+        await pilot.pause()
+        shell = await _shell(app)
+        shell.show_tab("gates")
+        for _ in range(6):
+            await pilot.pause(0.2)
+        await pilot.click("#gates-reject")
+        for _ in range(6):
+            await pilot.pause(0.2)
+
+    store = await open_sqlite(str(tui_env))
+    try:
+        gate = await store.get_gate(seeded["gate"])
+        assert gate is not None and gate.status.value == "rejected"
+    finally:
+        await store.aclose()
+
+
+async def test_dashboard_has_clickable_open_and_fetch(
+    seeded: dict[str, str], tui_env: Path
+) -> None:
+    """Open and Fetch are buttons, not things you have to know a key for."""
+    from textual.widgets import Button
+
+    app = ReworkApp()
+    async with app.run_test(size=(130, 40)) as pilot:
+        await pilot.pause()
+        shell = await _shell(app)
+        shell.show_tab("dashboard")
+        dash = shell.query_one("#pane-dashboard")
+        await dash.select_mission(seeded["done"])
+        await pilot.pause(0.3)
+        assert shell.query_one("#mission-open", Button) is not None
+        assert shell.query_one("#mission-fetch", Button) is not None
+        await pilot.click("#mission-open")
+        for _ in range(4):
+            await pilot.pause(0.2)
+        from rework.tui.app import MissionDeepView
+
+        assert isinstance(app.screen, MissionDeepView)
+
+
+async def test_data_layer_reconnects_and_falls_back(
+    seeded: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The owner's crash: 'consuming input failed: Operation timed out' while
+    polling gates over the tailnet exited the whole app. TuiData must drop the
+    dead connection, reconnect once, and if the network is still gone return
+    the LAST GOOD result so the dashboard keeps showing something true-ish
+    instead of blanking or dying.
+
+    (Testing this at the data layer is deliberate: ReworkApp._handle_exception
+    also catches errors, which would mask a missing guard here.)"""
+    import tempfile
+
+    from rework.tui.data import TuiData, _is_connection_error
+
+    assert _is_connection_error(OSError("consuming input failed"))
+    assert _is_connection_error(TimeoutError())
+    assert not _is_connection_error(ValueError("bad sql"))
+
+    from pathlib import Path
+
+    data = TuiData()
+    monkeypatch.setenv("REWORK_DB", str(Path(tempfile.gettempdir()) / "offline-test.sqlite3"))
+    real = await data.open_gates()  # populate last-good
+    assert real == []
+
+    attempts = {"n": 0}
+
+    def boom(_fn: object = None) -> object:
+        attempts["n"] += 1
+        raise OSError("consuming input failed: Operation timed out")
+
+    data._call = boom  # type: ignore[method-assign]
+    data._store = object()  # type: ignore[assignment]  # pretend one is held
+    dropped = {"n": 0}
+
+    async def fake_drop():
+        dropped["n"] += 1
+        data._store = None
+
+    data.drop_store = fake_drop  # type: ignore[method-assign]
+
+    # the first call fails, the retry fails too -> last good result, no raise
+    assert await data.open_gates() == []
+    assert attempts["n"] == 2, "must retry exactly once before falling back"
+    assert dropped["n"] == 1, "the dead connection must be thrown away"
+    assert data._reconnecting_hint  # the UI can say it is showing stale data
+
+    # a connection error on a query with NO cached result would re-raise:
+    # better an honest error than silently inventing empty data
+    with pytest.raises(OSError):
+        await data.spend_by_model("never-loaded")
