@@ -3,6 +3,30 @@
 Issues found by watching real missions (monitoring, not tests). Each entry:
 what happened, why, what was done. Newest first.
 
+## 2026-11-06, post-mortem of m-0d75f495121a (owner: "why no audit loop? why $2?")
+
+**The loop.** It did not loop because the first real audit approved (three
+low-severity notes, mechanical verdict approve); the playbook revised only on
+request-changes. But the orchestrator also said "budget is nearly exhausted, so
+I'll stop rather than burn a revision round": budget must never decide quality.
+Fixed: playbooks revise while the audit requests changes OR has medium+
+findings, ask the owner after three rounds, and the prompt says money is the
+owner's call (the budget gate asks).
+
+**The cost: $3.03** (investigator $0.79, coder $0.85, failed auditor $0.51,
+auditor $0.84, orchestrator $0.05). 8.9M input tokens vs 305k output: input was
+~88% of the bill.
+
+| # | finding | cause | status |
+|---|---|---|---|
+| 19 | Shipping delivered nothing: the commit stayed on rewvis | the project's `results: push_branch` setting (ADR 0005) was never implemented | fixed: ship pushes the branch for git-origin missions; chat prefers fix-pr for git projects |
+| 18 | 6k of 8.9M input tokens cached | no session key, so Fireworks routed each turn to a random replica (its cache is per replica); the orchestrator's system prompt also changed every turn | fixed: `ChatRequest.session_id` -> `user`; static orchestrator system prompt; Anthropic cache breakpoints. Rerun: 76% cached |
+| 17 | 58-80 calls per role, 35-45k tokens resent per call | no turn budget; whole transcript resent forever | fixed: turn budgets per spawn (+ wrap-up warning), compaction of old tool output |
+| 16 | Auditor died on a Fireworks 500 ($0.51) | the retry wrapper did not treat 500 as transient | fixed |
+| 15 | Auditor (after the budget gate) and coder (after the crash) restarted their loops at turn 1 | the whole loop is one checkpointed node | fixed: per-turn transcript saved to the run's workdir, resumed on re-entry |
+| 14 | A revision coder would start from base, redoing everything | each coder run got a fresh worktree | fixed: revisions continue the previous coder's branch (diff base unchanged) |
+| 13 | Cost reports ignored cached-token discounts | estimate_cost had no cached term | fixed: `cost_cached_per_mtok` (default half input) |
+
 ## 2026-11-06, mission m-0d75f495121a (owner's first dogfood task)
 
 Task: "TUI drop-down menus get an outline border; stop at the ship gate."
