@@ -101,9 +101,7 @@ async def test_two_missions_run_concurrently(world: dict[str, Any]) -> None:
     deadline = asyncio.get_event_loop().time() + 5.0
     mid_flight = await _mid_flight()
     while asyncio.get_event_loop().time() < deadline:
-        if all(
-            r is not None and r.status.value in {"running", "completed"} for r in mid_flight
-        ):
+        if all(r is not None and r.status.value in {"running", "completed"} for r in mid_flight):
             break
         await asyncio.sleep(0.02)
         mid_flight = await _mid_flight()
