@@ -90,11 +90,25 @@ async def test_two_missions_run_concurrently(world: dict[str, Any]) -> None:
     # started after the first finished, the store serialized them (regression)
     started_at = asyncio.get_event_loop().time()
     tasks = [asyncio.create_task(r.run()) for r in runners]
-    await asyncio.sleep(0.15)  # both must be mid-flight now (slow takes 0.4s)
 
-    mid_flight = [await store.get_run(f"{mid}:do:slow:1") for mid in ids]
+    # Wait for BOTH to be mid-flight rather than sleeping a fixed 0.15s: on a
+    # loaded runner the graph build alone can outlast that, leaving the rows at
+    # INTENT and failing an assertion about overlap for a reason that has
+    # nothing to do with overlap (found live on a 3.13 CI runner).
+    async def _mid_flight() -> list[Any]:
+        return [await store.get_run(f"{mid}:do:slow:1") for mid in ids]
+
+    deadline = asyncio.get_event_loop().time() + 5.0
+    mid_flight = await _mid_flight()
+    while asyncio.get_event_loop().time() < deadline:
+        if all(
+            r is not None and r.status.value in {"running", "completed"} for r in mid_flight
+        ):
+            break
+        await asyncio.sleep(0.02)
+        mid_flight = await _mid_flight()
     assert all(r is not None and r.status.value in {"running", "completed"} for r in mid_flight), (
-        f"missions did not overlap: {[r.status if r else None for r in mid_flight]}"
+        f"missions never got mid-flight: {[r.status if r else None for r in mid_flight]}"
     )
 
     finished_at: list[float] = []
