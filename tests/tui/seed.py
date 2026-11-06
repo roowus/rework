@@ -219,8 +219,33 @@ async def seed(db_path: str, *, history_days: int = 120) -> dict[str, str]:
                 mission_id=running.id,
                 run_id=cod,
                 type=EventType.ROLE_SPAWNED,
-                payload={"role": "coder"},
+                payload={
+                    "role": "coder",
+                    "graph": {
+                        "nodes": ["__start__", "prepare", "loop", "handoff", "__end__"],
+                        "edges": [
+                            ["__start__", "prepare", False],
+                            ["prepare", "loop", False],
+                            ["loop", "handoff", False],
+                            ["handoff", "__end__", False],
+                        ],
+                    },
+                },
                 ts=t + 82,
+            ),
+            EventRecord(
+                mission_id=running.id,
+                run_id=cod,
+                type=EventType.PROGRESS,
+                payload={"node": "prepare", "phase": "enter"},
+                ts=t + 82.5,
+            ),
+            EventRecord(
+                mission_id=running.id,
+                run_id=cod,
+                type=EventType.PROGRESS,
+                payload={"node": "loop", "phase": "enter"},
+                ts=t + 85,
             ),
             EventRecord(
                 mission_id=running.id,

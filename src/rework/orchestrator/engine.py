@@ -78,6 +78,57 @@ def _json_dump(value: Any) -> str:
         return str(value)
 
 
+def _topology(graph: Any) -> dict[str, Any]:
+    """{"graph": {nodes, edges}} from a compiled LangGraph; {} if unavailable.
+    Rides on ROLE_SPAWNED so any client can draw the role's graph from the
+    event log alone (it must never need to BUILD a role graph)."""
+    try:
+        drawn = graph.get_graph()
+        nodes = [str(n) for n in drawn.nodes]
+        edges = [[str(e.source), str(e.target), bool(e.conditional)] for e in drawn.edges]
+    except Exception:
+        return {}
+    return {"graph": {"nodes": nodes, "edges": edges}}
+
+
+class _NodeEvents:
+    """LangGraph callback: one PROGRESS event per node start. Built lazily on
+    langchain_core's handler base so the engine has no import-time cost."""
+
+    def __new__(cls, bus: Any, mission_id: str, run_id: str) -> Any:
+        from langchain_core.callbacks import AsyncCallbackHandler
+
+        class Handler(AsyncCallbackHandler):
+            async def on_chain_start(
+                self,
+                serialized: Any,
+                inputs: Any,
+                *,
+                run_id: Any,
+                parent_run_id: Any = None,
+                tags: Any = None,
+                metadata: Any = None,
+                **kwargs: Any,
+            ) -> None:
+                node = (metadata or {}).get("langgraph_node")
+                if not node or kwargs.get("name") != node or str(node).startswith("__"):
+                    return  # only the node itself, not the runnables inside it
+                try:
+                    await bus.publish(
+                        EventRecord(
+                            mission_id=mission_id,
+                            run_id=role_run,
+                            type=EventType.PROGRESS,
+                            payload={"node": str(node), "phase": "enter"},
+                        )
+                    )
+                except Exception:
+                    log.debug("node event publish failed", exc_info=True)
+
+        role_run = run_id
+        return Handler()
+
+
 class RunSupervisor:
     """Owns the live asyncio tasks for one mission's runs."""
 
@@ -199,10 +250,10 @@ class RunSupervisor:
                     mission_id=self._mission.id,
                     run_id=run.id,
                     type=EventType.ROLE_SPAWNED,
-                    payload={"role": run.role},
+                    payload={"role": run.role, **_topology(graph)},
                 )
             )
-            config = {"configurable": {"thread_id": run.id}}
+            config = self._run_config(run)
             if resume_from_checkpoint:
                 # input=None resumes from the last checkpoint; but a daemon that
                 # died between the RUNNING flip and the first checkpoint write
@@ -233,6 +284,14 @@ class RunSupervisor:
                     payload={"error": f"{type(exc).__name__}: {exc}"},
                 )
             )
+
+    def _run_config(self, run: Run) -> dict[str, Any]:
+        """Checkpoint thread + a callback that publishes each node start, so a
+        UI can show where the role is inside its own LangGraph (ADR 0007 P3)."""
+        return {
+            "configurable": {"thread_id": run.id},
+            "callbacks": [_NodeEvents(self._bus, self._mission.id, run.id)],
+        }
 
     async def _consume_result(self, run: Run, result: Any) -> None:
         if isinstance(result, dict) and "__interrupt__" in result:
@@ -294,7 +353,7 @@ class RunSupervisor:
         try:
             graph = await self._build_graph(run)
             await self._store.update_run(run.id, status=RunStatus.RUNNING)
-            config = {"configurable": {"thread_id": run.id}}
+            config = self._run_config(run)
             result = await graph.ainvoke(Command(resume=decision), config=config)
             await self._consume_result(run, result)
         except Exception as exc:

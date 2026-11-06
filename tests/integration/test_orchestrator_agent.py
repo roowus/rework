@@ -181,6 +181,17 @@ async def test_orchestrator_runs_the_fix_shape(world: dict[str, Any]) -> None:
     orch = [e for e in events if (e.payload or {}).get("actor") == "orchestrator"]
     assert any((e.payload or {}).get("trajectory") == "tool_call" for e in orch)
     assert any("auditing" in str((e.payload or {}).get("note")) for e in orch)
+    # each role's own LangGraph is visible: topology on spawn, node enters live
+    spawned = [e for e in events if e.type.value == "role_spawned"]
+    coder_graph = next(e for e in spawned if e.run_id == "mo:code:coder:1").payload["graph"]
+    assert {"prepare", "loop", "handoff"} <= set(coder_graph["nodes"])
+    assert ["prepare", "loop", False] in coder_graph["edges"]
+    entered = [
+        e.payload["node"]
+        for e in events
+        if e.run_id == "mo:code:coder:1" and e.payload.get("phase") == "enter"
+    ]
+    assert entered == ["prepare", "loop", "handoff"]
     charges = await store.run_charges(orchestrator_run_id("mo"))
     assert len(charges) == 5 and all(c.input_tokens == 500 for c in charges)
     # the conversation is persisted (that is what makes resume possible)
