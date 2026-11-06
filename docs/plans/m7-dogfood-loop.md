@@ -70,20 +70,20 @@ checked with `gh run list`, and deployed to rewvis when the daemon changed.
       small, recovered from a coder whose model had no key, audited, finished,
       ship gate approved, DONE.
 
-### P2: steering and conversation
+### P2: steering and conversation (done 2026-11-06)
 
-- [ ] `check_in`, `redirect` (role tool loops read `Run.redirect` between
+- [x] `check_in`, `redirect` (role tool loops read `Run.redirect` between
       turns), `cancel_run`.
-- [ ] `answer_escalation` (the orchestrator handles question / needs_context
+- [x] `answer_escalation` (the orchestrator handles question / needs_context
       itself) and `ask_owner` with gate kinds question / choice / permission /
       task, carrying a `spec` the TUI renders (options, placeholder).
-- [ ] Owner messages: a message in the launching chat becomes an
+- [x] Owner messages: a message in the launching chat becomes an
       `owner_message` event that wakes the orchestrator; its `message_owner`
       notes appear in the chat.
 
 ### P3: trust and visibility
 
-- [ ] Verification stays with roles (owner: the orchestrator never does work):
+- [x] Verification stays with roles (owner: the orchestrator never does work):
       the auditor re-runs the tests; a revision coder continues on the previous
       coder's branch instead of starting from base.
 - [ ] Role graph topology on `ROLE_SPAWNED` and node enter events, so the
@@ -98,8 +98,13 @@ checked with `gh run list`, and deployed to rewvis when the daemon changed.
       `docs/ops.md` and `scripts/rework-local` (done); first real PR pending.
 - [ ] Then deploy to rewvis and run the same loop there.
 - [ ] Run three real rework changes end to end from the TUI: bugs found along
-      the way, TUI work, workflow features.
-- [ ] Fix what breaks, record findings, switch the default plan to `auto`.
+      the way, TUI work, workflow features. (1/3: the dropdown border,
+      m-0d75f495121a, shipped; delivery fixed afterwards, see findings #19.)
+- [x] Cost pass after the first dogfood mission: caching, turn budgets,
+      compaction, loop resume, branch continuation ($3.03 -> $0.92 for the same
+      task with more work done).
+- [x] Default plan is `auto` (orchestrated) since P1; findings are recorded in
+      `docs/plans/m7-findings.md`.
 
 ## Not in M7
 

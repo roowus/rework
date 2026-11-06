@@ -88,8 +88,11 @@ class MenuBar(Horizontal):
             return "rework"
         return None
 
+    target = ""  # which database this TUI talks to ("local", "rewvis", a host)
+
     def set_status(self, *, online: bool, gates: int, spend_today: float, error: str = "") -> None:
-        conn = f"[{OK}]●[/] [{MUTED}]live[/]" if online else f"[{WARN}]○ offline[/]"
+        where = f" {esc(self.target)}" if self.target else " live"
+        conn = f"[{OK}]●[/][{MUTED}]{where}[/]" if online else f"[{WARN}]○ offline{where}[/]"
         gate = f"[{WARN}]◆ {gates}[/]" if gates else f"[{FAINT}]◆ 0[/]"
         spend = f"[{MUTED}]{esc(money(spend_today))} today[/]"
         status = self.query_one("#menubar-status", _Status)

@@ -175,10 +175,24 @@ async def test_status_bar_counts_open_gates(ids: dict[str, str]) -> None:
         await _settle(pilot)
         status = str(app.query_one("#menubar-status").render())
         assert "◆ 2" in status
-        assert "live" in status
+        assert "local" in status, "the bar says which database this TUI talks to"
 
 
 # -- resilience ----------------------------------------------------------------
+
+
+def test_target_label_names_the_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    from rework.tui.app import target_label
+
+    monkeypatch.delenv("REWORK_TARGET_NAME", raising=False)
+    monkeypatch.setenv("REWORK_DB", "/tmp/x.sqlite3")
+    assert target_label() == "local"
+    monkeypatch.setenv("REWORK_DB", "postgresql://u:p@100.107.125.118:5433/rework_state")
+    assert target_label() == "rewvis"
+    monkeypatch.setenv("REWORK_DB", "postgresql://u:p@db.example.com/x")
+    assert target_label() == "db.example.com"
+    monkeypatch.setenv("REWORK_TARGET_NAME", "staging")
+    assert target_label() == "staging"
 
 
 async def test_a_dead_database_never_exits_the_app(ids: dict[str, str]) -> None:

@@ -143,6 +143,8 @@ class ReworkApp(App[None]):
     def on_mount(self) -> None:
         from rework.logs import asyncio_exception_handler
 
+        self.query_one(MenuBar).target = target_label()
+
         asyncio.get_running_loop().set_exception_handler(asyncio_exception_handler)
         self.hub.subscribe(self._on_snapshot)
         self.query_one(TabBar).set_active("work")
@@ -452,6 +454,23 @@ class ReworkApp(App[None]):
 
     async def on_unmount(self) -> None:
         await self.hub.aclose()
+
+
+def target_label() -> str:
+    """Which database this TUI is connected to, for the status bar (found
+    live: the owner's TUI pointed at production while they meant local).
+    REWORK_TARGET_NAME overrides; SQLite is 'local'; Postgres shows its host."""
+    import os
+    from urllib.parse import urlparse
+
+    named = os.environ.get("REWORK_TARGET_NAME")
+    if named:
+        return named
+    db = os.environ.get("REWORK_DB", "")
+    if not db.startswith(("postgres://", "postgresql://")):
+        return "local"
+    host = urlparse(db).hostname or "postgres"
+    return {"100.107.125.118": "rewvis"}.get(host, host)
 
 
 def _osa(text: str) -> str:

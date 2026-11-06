@@ -18,10 +18,12 @@ async def attach_run_stats(
 ) -> dict[str, Any]:
     charges = await store.run_charges(run_id)
     run = await store.get_run(run_id)
-    elapsed = 0.0
-    if run is not None:
-        end = run.updated_at or time.time()
-        elapsed = max(0.0, end - run.created_at)
+    # stamped at completion, so wall time is now - created (found live:
+    # updated_at-based elapsed reported 0.1s for a 65-call run); the active
+    # span (first to last model call) excludes pauses and restarts' downtime
+    elapsed = max(0.0, time.time() - run.created_at) if run is not None else 0.0
+    stamps = sorted(c.ts for c in charges)
+    active = (stamps[-1] - stamps[0]) if len(stamps) > 1 else 0.0
     artifact["run_stats"] = {
         "model_calls": len(charges),
         "input_tokens": sum(c.input_tokens for c in charges),
@@ -29,6 +31,7 @@ async def attach_run_stats(
         "cached_tokens": sum(c.cached_tokens for c in charges),
         "cost_usd": round(sum(c.cost_usd for c in charges), 6),
         "elapsed_seconds": round(elapsed, 1),
+        "active_seconds": round(active, 1),
         "models": sorted({c.model for c in charges}),
     }
     return artifact
