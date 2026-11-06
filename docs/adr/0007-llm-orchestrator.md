@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (2026-11-06). Open questions at the bottom need the owner.
+Accepted (2026-11-06; owner answers folded in, see the end).
 
 ## Context
 
@@ -43,16 +43,29 @@ The orchestrator's tools:
 | tool | effect |
 |---|---|
 | `spawn_role(role, step, brief, context_from, model?, effort?, sections?)` | creates a Run row (deterministic id, idempotent) and starts it; several calls in one turn run in parallel |
-| `wait()` | NOT a model call: the engine blocks until a run finishes, escalates or halts, a gate is decided, the owner sends a message, or a check-in is due, then returns what happened |
+| `wait(minutes?)` | NOT a model call: the engine blocks until a run finishes, escalates or halts, a gate is decided, the owner sends a message, or the orchestrator's own timeout passes, then returns what happened |
 | `read_artifact(run_id)` | the role's typed handoff (findings, diff summary, verdict) |
 | `check_in(run_id)` | the role's recent trajectory (turns, tool calls, results) |
 | `redirect(run_id, instruction)` | writes `Run.redirect`; the role's tool loop injects it at its next turn |
 | `cancel_run(run_id)` | stops a role that is going nowhere |
 | `answer_escalation(run_id, answer)` | resolves a role's `question` / `needs_context` escalation without bothering the owner |
 | `ask_owner(question, kind, options?)` | opens a gate (question / choice / permission / task) and waits for it |
-| `verify(run_id, command)` | runs a command (e.g. the test suite) in a role's worktree; the orchestrator checks mechanical claims itself (CLAUDE.md rule 6) |
 | `message_owner(text)` | a progress note shown in the chat that launched the mission |
 | `finish(outcome, summary)` | ends the loop; the plan's final gates (ship / open_pr) then run mechanically, as today |
+
+The orchestrator only orchestrates. It never does mission work itself (no
+editing, no running tests, no investigating): every piece of work is a role.
+Verification of a role's claims is also delegated (the auditor re-runs the
+tests; a dedicated verifier role can come later), never performed by the
+orchestrator.
+
+Roles run asynchronously and report back when they finish. Check-ins are the
+orchestrator's choice, not a cadence: it decides per mission whether and when
+to look in on a running role (`wait(minutes)` then `check_in`), more often for
+hard or failure-prone work, not at all for easy work.
+
+It also picks each role's model and effort from the catalog (costs and tiers
+are in its prompt), so a cheap model can investigate while a strong one audits.
 
 ### 2. Plans become playbooks
 
@@ -69,8 +82,13 @@ investigator. Playbooks can later live in the Library as skills.
 The model decides; the engine enforces. Limits the orchestrator cannot talk
 its way past:
 
-- budget: `plan.budget.max_usd` and the existing burn gate (ON_HOLD)
-- a cap on total runs per mission and on concurrent runs
+- budget: `plan.budget.max_usd` (default $2) and the burn gate: past it the
+  mission goes ON_HOLD and asks the owner; approving extends the cap by
+  `plan.budget.ask_every_usd` (default $2), so a long mission asks again every
+  step. Both are configurable per mission and by env.
+- no hard cap on parallel roles; the prompt tells the orchestrator to be
+  conservative and the budget rail bounds the damage
+- a high cap on orchestrator turns (runaway protection only)
 - final gates are fixed by the plan, not by the model: a mission targeting the
   rework repo always ends at `open_pr` (agents push branches, humans merge)
 - `needs_model` escalations keep their mechanical promotion policy
@@ -113,15 +131,15 @@ audit" or "focus on the parser" reaches the agent that is running the mission.
   mid-mission); a live toyrepo eval on a real model gates the switch of the
   default plan from `fix-pr` to `auto`.
 
-## Open questions for the owner
+## Owner answers (2026-11-06)
 
-1. **Default once it works:** should new missions use the LLM orchestrator by
-   default (`auto`), with `fix` / `fix-pr` kept only as fallbacks? Proposed:
-   yes, after it passes the toyrepo eval and one real rework mission.
-2. **Check-in cadence:** proposed v1 = event-driven (role finished, escalated,
-   owner message) plus a check-in every 10 role turns. Faster check-ins cost
-   more tokens.
-3. **Parallel roles in v1:** proposed yes, capped at 3 concurrent runs.
-4. **Orchestrator model:** proposed = the model picked in the chat; check-ins
-   use the same model (no separate cheap tier yet).
-5. **Default mission budget:** proposed $2 per mission (burn gate past that).
+1. The orchestrator always orchestrates; it never performs tasks. The canned
+   runner survives only as a scripted-test fixture and a legacy CLI path.
+2. No check-in cadence: roles report back when done; the orchestrator chooses
+   whether and when to check in, by difficulty and failure risk.
+3. Parallel roles: yes, no hard limit, prompt says be conservative.
+4. The orchestrator runs on the model picked in the chat and picks the roles'
+   models itself.
+5. Budget: $2 per mission, then ask; ask again every configurable step.
+6. Dogfood targets: bugs found along the way, TUI work, workflow features.
+7. Make it work locally first (Mac daemon + local DB), then rewvis.

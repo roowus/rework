@@ -65,6 +65,50 @@ PLAN_FIX_PR: dict = {"steps": PLAN_FIX["steps"], "gates": ["open_pr"]}
 
 PLANS = ("echo", "fix", "fix-pr")
 
+PLAYBOOK_GATES: dict[str, list[str]] = {"echo": [], "fix": ["ship"], "fix-pr": ["open_pr"]}
+
+
+def default_budget() -> tuple[float, float]:
+    """(max_usd, ask_every_usd): $2 then ask again every $2 unless the
+    deployment says otherwise (REWORK_BUDGET_USD / REWORK_BUDGET_STEP_USD)."""
+    import os
+
+    cap = float(os.environ.get("REWORK_BUDGET_USD", "2"))
+    step = float(os.environ.get("REWORK_BUDGET_STEP_USD", str(cap)))
+    return cap, step
+
+
+def orchestrated_plan(
+    playbook: str,
+    orchestrator_model: str,
+    orchestrator_effort: str | None = None,
+    *,
+    model: str | None = None,
+    effort: str | None = None,
+    budget_usd: float | None = None,
+    budget_step_usd: float | None = None,
+) -> dict[str, Any]:
+    """The plan of an orchestrated mission (ADR 0007): which model runs the
+    orchestrator, the playbook it follows by default, the fixed final gates
+    and the budget rail. `model` / `effort` are the default role model the
+    orchestrator may override per spawn."""
+    cap, step = default_budget()
+    spec: dict[str, Any] = {
+        "kind": "auto",
+        "playbook": playbook,
+        "orchestrator": {"model": orchestrator_model, "effort": orchestrator_effort},
+        "gates": list(PLAYBOOK_GATES.get(playbook, [])),
+        "budget": {
+            "max_usd": cap if budget_usd is None else budget_usd,
+            "ask_every_usd": step if budget_step_usd is None else budget_step_usd,
+        },
+    }
+    if model:
+        spec["model"] = model
+    if effort:
+        spec["effort"] = effort
+    return spec
+
 
 def is_git_url(value: str) -> bool:
     return value.startswith(("http://", "https://", "git@", "ssh://")) or value.endswith(".git")
@@ -219,6 +263,10 @@ async def create_mission(
     effort: str | None = None,
     store: StateStore | None = None,
     chat_id: str | None = None,
+    orchestrator_model: str | None = None,
+    orchestrator_effort: str | None = None,
+    budget_usd: float | None = None,
+    budget_step_usd: float | None = None,
 ) -> Mission:
     """Create a mission row (+ created event) and return it. When `store` is
     given it is used and NOT closed (the TUI holds one open); otherwise a
@@ -232,10 +280,24 @@ async def create_mission(
     resolved = await resolve_repo(
         repo=repo, repo_dir=repo_dir, project_id=project_id, mission_id=mission_id
     )
+    if plan not in PLANS:
+        raise ValueError(f"unknown plan {plan!r}; plans: {', '.join(PLANS)}")
+    if plan in ("fix", "fix-pr") and not resolved["repo_path"] and not resolved["repo_origin"]:
+        raise ValueError(f"--plan {plan} requires a repo (URL, path, folder, or project ref)")
     plan_spec: dict | None = None
-    if plan in ("fix", "fix-pr"):
-        if not resolved["repo_path"] and not resolved["repo_origin"]:
-            raise ValueError(f"--plan {plan} requires a repo (URL, path, folder, or project ref)")
+    if orchestrator_model:
+        # ADR 0007: an LLM orchestrator runs the mission; the plan name is the
+        # playbook it follows by default, the gates and budget are rails
+        plan_spec = orchestrated_plan(
+            plan,
+            orchestrator_model,
+            orchestrator_effort,
+            model=model,
+            effort=effort,
+            budget_usd=budget_usd,
+            budget_step_usd=budget_step_usd,
+        )
+    elif plan in ("fix", "fix-pr"):
         template = PLAN_FIX_PR if plan == "fix-pr" else PLAN_FIX
         plan_spec = json.loads(json.dumps(template).replace("$OBJECTIVE", objective))
         plan_spec["kind"] = plan

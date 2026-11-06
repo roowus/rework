@@ -51,17 +51,18 @@ checked with `gh run list`, and deployed to rewvis when the daemon changed.
 
 ### P1: the orchestrator core (ADR 0007 sections 1 to 5)
 
-- [ ] Plan kind `auto`: `create_mission` accepts the orchestrator model/effort
-      and writes `plan["orchestrator"]`, plus the playbook name and final gates.
-- [ ] `Orchestrator` loop in `MissionRunner`: tools `spawn_role`, `wait`,
+- [x] Plan kind `auto`: `create_mission` accepts the orchestrator model/effort
+      and writes `plan["orchestrator"]`, plus the playbook name, final gates and
+      budget (`max_usd` $2, `ask_every_usd` $2, both configurable).
+- [x] `Orchestrator` loop in `MissionRunner`: tools `spawn_role`, `wait`,
       `read_artifact`, `finish`; playbooks for fix / fix-pr; rails (budget, run
       caps, concurrency cap, fixed final gates).
-- [ ] Persistence and recovery: conversation persisted per turn, state digest
+- [x] Persistence and recovery: conversation persisted per turn, state digest
       rebuilt from store rows every turn, idempotent spawns; a chaos test that
       kills the daemon mid-mission and resumes.
-- [ ] Orchestrator trajectory events (`actor="orchestrator"`), rendered in the
+- [x] Orchestrator trajectory events (`actor="orchestrator"`), rendered in the
       Dashboard and the chat's mission card.
-- [ ] The chat proposes `auto` missions and hands its own model/effort to the
+- [x] The chat proposes `auto` missions and hands its own model/effort to the
       mission orchestrator.
 - [ ] Scripted tests through the real engine (sequential, parallel, revise
       loop, failure retry by choice), then a live toyrepo run on a real model.
@@ -79,8 +80,9 @@ checked with `gh run list`, and deployed to rewvis when the daemon changed.
 
 ### P3: trust and visibility
 
-- [ ] `verify`: the orchestrator runs the tests in the coder's worktree itself
-      before it calls `finish`.
+- [ ] Verification stays with roles (owner: the orchestrator never does work):
+      the auditor re-runs the tests; a revision coder continues on the previous
+      coder's branch instead of starting from base.
 - [ ] Role graph topology on `ROLE_SPAWNED` and node enter events, so the
       Graph tab shows where each role is inside its own LangGraph.
 - [ ] Run timing (`started_at` / `ended_at`) and compute time in the Cost tab.
@@ -88,8 +90,12 @@ checked with `gh run list`, and deployed to rewvis when the daemon changed.
 
 ### P4: dogfood
 
-- [ ] Deploy to rewvis; write the deploy runbook in `docs/ops.md`.
-- [ ] Run three real rework changes end to end from the TUI (owner picks them).
+- [ ] Local first (owner): daemon + TUI on the Mac against a local SQLite DB,
+      missions clone rework from GitHub and open real PRs. Runbook in
+      `docs/ops.md`.
+- [ ] Then deploy to rewvis and run the same loop there.
+- [ ] Run three real rework changes end to end from the TUI: bugs found along
+      the way, TUI work, workflow features.
 - [ ] Fix what breaks, record findings, switch the default plan to `auto`.
 
 ## Not in M7

@@ -275,3 +275,30 @@ def test_approve_accepts_a_typed_answer(rework_db: Path) -> None:
     # bad JSON is a usage error, not a crash
     bad = runner.invoke(app, ["approve", gid2, "--answer-json", "{nope"])
     assert bad.exit_code != 0
+
+
+def test_new_creates_an_orchestrated_mission_by_default(rework_db: Path) -> None:
+    """ADR 0007: missions are run by an LLM orchestrator; the plan is its
+    playbook, the final gate and budget are rails."""
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(
+        app, ["new", "fix it", "--repo", url, "--plan", "fix-pr", "--budget", "3"]
+    )
+    assert result.exit_code == 0, result.output
+    mission = _get_mission(rework_db, result.output.strip())
+    assert mission is not None
+    plan = mission.plan or {}
+    assert plan["kind"] == "auto" and plan["playbook"] == "fix-pr"
+    assert plan["gates"] == ["open_pr"]
+    assert plan["orchestrator"]["model"]
+    assert plan["budget"]["max_usd"] == 3.0
+
+
+def test_new_mechanical_keeps_the_legacy_pipeline(rework_db: Path) -> None:
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(app, ["new", "fix it", "--repo", url, "--plan", "fix", "--mechanical"])
+    assert result.exit_code == 0, result.output
+    mission = _get_mission(rework_db, result.output.strip())
+    assert mission is not None
+    assert "orchestrator" not in (mission.plan or {})
+    assert [s["step"] for s in (mission.plan or {})["steps"]] == ["investigate", "code", "audit"]

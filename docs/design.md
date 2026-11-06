@@ -59,13 +59,25 @@ at a time. Escalations are handled by mechanical policy or become human gates,
 and synthesis is mechanical. The only LLM that talks to the owner is the
 pre-mission chat (`orchestrator/chat.py`), which proposes missions.
 
-**Target (ADR 0007, Proposed; M7):** each mission gets an LLM orchestrator, a
-tool-calling agent on the model chosen in the launching chat. It spawns roles
-(in parallel when useful), waits on store-derived events, reads handoffs,
-checks in on and redirects running roles, answers escalations or asks the
-owner, verifies mechanical claims itself, and finishes into the plan's fixed
-final gates. `fix` / `fix-pr` become playbooks it follows by default. Budget,
-run caps and final gates stay mechanical rails.
+**Orchestrated missions (ADR 0007, M7; core landed):** `plan.kind == "auto"`
+missions are run by `orchestrator/agent.py::MissionOrchestrator`, a
+tool-calling agent on the model chosen in the launching chat (or `rework new
+--orchestrator`). It only orchestrates: `spawn_role` (roles in parallel when
+useful, model and effort chosen per role, inputs wired automatically or
+explicitly), `wait` (engine-side, store-derived: a role finished, failed or
+escalated, or the orchestrator's own timeout for a check-in), `read_artifact`,
+`check_in`, `cancel_run`, `message_owner`, `finish`. `fix` / `fix-pr` / `echo`
+are playbooks in its prompt, not pipelines. Rails stay mechanical: the burn gate
+(`plan.budget.max_usd`, then ask again every `ask_every_usd`), a runaway turn
+cap, owner pause/cancel, escalation policies, and the plan's fixed final gates
+(`_final_gates`, shared with the mechanical runner). Its conversation persists
+as chat `orch-<mission>`, each turn's system prompt carries a digest rebuilt
+from store rows, spawns are idempotent by tool-call id, and a restart re-runs
+an interrupted turn's unanswered calls. Its events and charges carry the pseudo
+run id `<mission>:orchestrate:orchestrator:1`. `rework new` creates orchestrated
+missions by default; `--mechanical` keeps the canned runner. Still to come
+(M7 P2): redirect, answering escalations itself, asking the owner, and owner
+messages to a running mission.
 
 The engine (`orchestrator/engine.py`) is the heart: MissionRunner streams the graph,
 materializes interrupts as gate rows, waits on store-derived wake conditions, resumes with

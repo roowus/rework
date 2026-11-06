@@ -52,18 +52,41 @@ def new(
         " to the daemon (ADR 0005 upload transport).",
     ),
     project: str | None = typer.Option(None, help="Project id (p-...) to attach."),
-    plan: str = typer.Option("echo", help="echo | fix | fix-pr"),
+    plan: str = typer.Option("echo", help="Playbook: echo | fix | fix-pr"),
+    orchestrator: str | None = typer.Option(
+        None,
+        help="Catalog id for the mission's orchestrator (default: the strongest tier).",
+    ),
+    effort: str | None = typer.Option(None, help="Orchestrator effort: low | medium | high"),
+    budget: float | None = typer.Option(
+        None, help="USD cap before the mission pauses to ask (default $2, REWORK_BUDGET_USD)."
+    ),
+    mechanical: bool = typer.Option(
+        False,
+        "--mechanical",
+        help="Legacy: run the canned step pipeline instead of an LLM orchestrator.",
+    ),
 ) -> None:
-    """Create a mission; the daemon picks it up. `--plan fix` runs the
-    investigate -> code -> audit pipeline with a ship gate; `fix-pr` swaps the
-    ship gate for an open-PR gate (branch push + gh pr create)."""
+    """Create a mission; the daemon picks it up. An LLM orchestrator runs it
+    (ADR 0007), following the plan as a playbook: `fix` = investigate, code,
+    audit, then a ship gate; `fix-pr` ends at an open-PR gate instead."""
 
     async def go() -> str:
         from rework.missions import create_mission, resolve_project
 
+        orch_model = None
+        if not mechanical:
+            orch_model = orchestrator or default_orchestrator_model()
         project_id = await resolve_project(project)
         mission = await create_mission(
-            objective, repo=repo, repo_dir=repo_dir, project_id=project_id, plan=plan
+            objective,
+            repo=repo,
+            repo_dir=repo_dir,
+            project_id=project_id,
+            plan=plan,
+            orchestrator_model=orch_model,
+            orchestrator_effort=effort,
+            budget_usd=budget,
         )
         return mission.id
 
@@ -71,6 +94,16 @@ def new(
         typer.echo(asyncio.run(go()))
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+
+
+def default_orchestrator_model() -> str:
+    """The strongest real tier in the catalog (the orchestrator decides for a
+    whole mission; it is the last place to save tokens)."""
+    from rework.config import load_catalog
+
+    entries = load_catalog().all()
+    real = [e for e in entries if e.provider != "fake"] or entries
+    return max(real, key=lambda e: (e.tier, -e.cost_in_per_mtok)).id
 
 
 project_app = typer.Typer(no_args_is_help=True, add_completion=False, help="Projects (ADR 0005).")

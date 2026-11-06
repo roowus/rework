@@ -115,6 +115,19 @@ def mission_nodes(
         if not any((s.get("step") or s.get("role")) == step_name for s in steps):
             steps.append({"step": step_name, "role": by_step[step_name][0].role})
     nodes: list[GNode] = []
+    orch = plan.get("orchestrator") or {}
+    if orch:
+        live = status_value(mission.status) in {"pending", "running", "awaiting_gate", "on_hold"}
+        st = "running" if live else status_value(mission.status)
+        nodes.append(
+            GNode(
+                key="orchestrator",
+                title="orchestrator",
+                status={"done": "completed"}.get(st, st),
+                sub=f"{orch.get('model') or 'default'} · playbook {plan.get('playbook', '?')}",
+                run_id=f"{mission.id}:orchestrate:orchestrator:1",
+            )
+        )
     for step in steps:
         name = str(step.get("step") or step.get("role"))
         attempts = sorted(by_step.get(name, []), key=lambda r: r.attempt)

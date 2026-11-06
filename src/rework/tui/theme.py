@@ -200,3 +200,11 @@ def m(colour: str, text: object) -> str:
 
 
 SEP = f" [{FAINT}]·[/] "
+
+
+def plan_label(plan: dict | None) -> str:
+    """'fix-pr' for a canned plan; 'fix-pr · orchestrated' for ADR 0007 plans."""
+    plan = plan or {}
+    if plan.get("orchestrator"):
+        return f"{plan.get('playbook') or 'auto'} · orchestrated"
+    return str(plan.get("kind") or "echo")

@@ -361,7 +361,12 @@ class MissionRunner:
             self._library,
         )
         try:
-            await self._run_steps(mission)
+            if (mission.plan or {}).get("orchestrator"):
+                from rework.orchestrator.agent import MissionOrchestrator
+
+                await MissionOrchestrator(self, mission).run()
+            else:
+                await self._run_steps(mission)
         finally:
             await self._supervisor.aclose()
 
@@ -478,6 +483,19 @@ class MissionRunner:
                         ]
             index += 1
 
+        ship_decision, pr_url = await self._final_gates(mission, results, last_audit_artifact)
+        self._pr_url = pr_url
+        await self._synthesize(mission.id, ship_decision)
+
+    async def _final_gates(
+        self,
+        mission: Mission,
+        results: dict[str, Run],
+        last_audit_artifact: dict[str, Any] | None,
+    ) -> tuple[bool | None, str | None]:
+        """The plan's fixed final human decisions (ship / open_pr), shared by
+        the mechanical runner and the orchestrator (ADR 0007: the model never
+        decides these). Returns (ship_decision, pr_url)."""
         # ship gate: the plan's final human decision before synthesis. An
         # existing row (open or decided) is REUSED: a restart after the owner
         # already decided must not open a duplicate gate (chaos-test finding)
@@ -532,8 +550,7 @@ class MissionRunner:
             if pr_approved:
                 pr_url = await self._create_pr(mission, results)
 
-        self._pr_url = pr_url
-        await self._synthesize(mission.id, ship_decision)
+        return ship_decision, pr_url
 
     def _pr_body(
         self, mission: Mission, coder_artifact: dict[str, Any], audit_run: Run | None
@@ -597,6 +614,21 @@ class MissionRunner:
         from rework.nodes.git_ops import push_branch
 
         coder_run = results.get("code")
+        if coder_run is None or not (coder_run.artifact or {}).get("branch"):
+            coders = [
+                r
+                for r in await self._store.list_runs(mission.id)
+                if r.role == "coder" and (r.artifact or {}).get("branch")
+            ]
+            coder_run = coders[-1] if coders else coder_run
+        if results.get("audit") is None:
+            audits = [
+                r
+                for r in await self._store.list_runs(mission.id)
+                if r.role == "auditor" and r.artifact
+            ]
+            if audits:
+                results = {**results, "audit": audits[-1]}
         if coder_run is None or coder_run.artifact is None:
             await self._bus.publish(
                 EventRecord(
@@ -621,7 +653,16 @@ class MissionRunner:
         )
         return url
 
-    async def _synthesize(self, mission_id: str, ship_decision: bool | None) -> None:
+    async def _synthesize(
+        self,
+        mission_id: str,
+        ship_decision: bool | None,
+        outcome: str | None = None,
+        summary: str = "",
+    ) -> None:
+        """`outcome` (the orchestrator's finish) overrides the mechanical
+        latest-attempt rule: an orchestrator may abandon a failed run and
+        still succeed another way."""
         runs = await self._store.list_runs(mission_id)
         artifacts = {f"{r.role}:{r.step}": r.artifact for r in runs if r.artifact is not None}
         # mission outcome counts only the LATEST attempt per step: a failed
@@ -632,6 +673,11 @@ class MissionRunner:
             latest[(r.step, r.role)] = r
         failed = [r for r in latest.values() if r.status == RunStatus.FAILED]
         result: dict[str, Any] = {"artifacts": artifacts}
+        if summary:
+            result["summary"] = summary
+        if outcome is not None:
+            result["outcome"] = outcome
+            failed = [] if outcome == "done" else list(latest.values())
         pr_url = getattr(self, "_pr_url", None)
         if pr_url:
             result["pr_url"] = pr_url
@@ -701,37 +747,8 @@ class MissionRunner:
                 RunStatus.HALTED_ESCALATED,
             }:
                 # recovery: this step's latest attempt is still in flight
-                assert self._supervisor is not None
                 for run in prior:
-                    if run.status == RunStatus.HALTED_ESCALATED:
-                        gate = await self._latest_gate_for_run(run)
-                        if gate is not None and gate.status == GateStatus.APPROVED:
-                            # decided while the engine was down: resume with
-                            # the row's decision (a plain resume would re-fire
-                            # the interrupt and open a duplicate gate)
-                            await self._supervisor.resume_with_decision(
-                                run, self._resume_value(gate)
-                            )
-                            continue
-                        if gate is not None and gate.status == GateStatus.REJECTED:
-                            if gate.decision:
-                                # rejected WITH feedback, decided while we were
-                                # down: deliver the answer instead of aborting
-                                await self._supervisor.resume_with_decision(
-                                    run, self._resume_value(gate)
-                                )
-                                continue
-                            await self._store.update_run(run.id, status=RunStatus.ABORTED)
-                            await self._bus.publish(
-                                EventRecord(
-                                    mission_id=self.mission_id,
-                                    run_id=run.id,
-                                    type=EventType.CANCELLED,
-                                    payload={"reason": "gate rejected while engine was down"},
-                                )
-                            )
-                            continue
-                    await self._supervisor.ensure_started(run)
+                    await self._recover_run(run)
                 return [prior[-1]]
         attempt = len(prior) + 1
         # Model/effort resolution: a step override wins, then the plan-level
@@ -759,6 +776,38 @@ class MissionRunner:
         assert self._supervisor is not None
         await self._supervisor.ensure_started(created)
         return [created]
+
+    async def _recover_run(self, run: Run) -> None:
+        """Bring one in-flight run back after a restart. A HALTED run whose
+        gate was decided while the engine was down resumes with the row's
+        decision (a plain resume would re-fire the interrupt and open a
+        duplicate gate); a rejection without feedback aborts it; anything else
+        not terminal is (re)started from its checkpoint."""
+        assert self._supervisor is not None
+        if _terminal(run):
+            return
+        if run.status == RunStatus.HALTED_ESCALATED:
+            gate = await self._latest_gate_for_run(run)
+            if gate is not None and gate.status == GateStatus.APPROVED:
+                await self._supervisor.resume_with_decision(run, self._resume_value(gate))
+                return
+            if gate is not None and gate.status == GateStatus.REJECTED:
+                if gate.decision:
+                    # rejected WITH feedback: deliver the answer, don't abort
+                    await self._supervisor.resume_with_decision(run, self._resume_value(gate))
+                    return
+                await self._store.update_run(run.id, status=RunStatus.ABORTED)
+                await self._bus.publish(
+                    EventRecord(
+                        mission_id=self.mission_id,
+                        run_id=run.id,
+                        type=EventType.CANCELLED,
+                        payload={"reason": "gate rejected while engine was down"},
+                    )
+                )
+                return
+            return  # still waiting on its gate: the pump re-materializes it
+        await self._supervisor.ensure_started(run)
 
     async def _resolve_context(self, mission: Mission, step: dict[str, Any]) -> dict[str, Any]:
         """Static step context plus wiring: context_from pulls a prior step's
@@ -881,12 +930,14 @@ class MissionRunner:
         mission = await self._store.get_mission(self.mission_id)
         if mission is None or mission.status != MissionStatus.RUNNING:
             return "ok"  # already held, or not ours to hold
+        step = ((self._plan or {}).get("budget") or {}).get("ask_every_usd")
+        new_cap = float(cap) + float(step) if step else float(cap) * 2
         gate = await self._gates.request(
             self.mission_id,
             kind=GateKind.GENERIC,
             question=(
-                f"Burn cap hit: ${spend.spent_usd:.2f} spent > ${float(cap):.2f} cap."
-                f" Continue (cap raised to ${float(cap) * 2:.2f}) or cancel?"
+                f"Burn cap hit: ${spend.spent_usd:.2f} spent (cap ${float(cap):.2f})."
+                f" Continue up to ${new_cap:.2f}, or cancel?"
             ),
         )
         await self._store.update_mission(self.mission_id, status=MissionStatus.ON_HOLD)
@@ -913,7 +964,7 @@ class MissionRunner:
             )
             return "cancelled"
         budget = (self._plan or {}).get("budget") or {}
-        budget["max_usd"] = float(cap) * 2
+        budget["max_usd"] = new_cap
         if isinstance(self._plan, dict):
             self._plan["budget"] = budget
             await self._store.update_mission(
@@ -925,7 +976,7 @@ class MissionRunner:
             EventRecord(
                 mission_id=self.mission_id,
                 type=EventType.INFO,
-                payload={"note": f"burn cap raised to ${float(cap) * 2:.2f}; continuing"},
+                payload={"note": f"budget raised to ${new_cap:.2f}; continuing"},
             )
         )
         return "ok"

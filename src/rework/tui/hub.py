@@ -109,9 +109,11 @@ class Hub:
 
     async def _chats(self) -> list[Any]:
         try:
-            return await self.data.chats(limit=200)
+            chats = await self.data.chats(limit=200)
         except AttributeError:  # store without chat support
             return []
+        # a mission orchestrator's own conversation is machinery, not a chat
+        return [c for c in chats if not str(c.id).startswith("orch-")]
 
     async def _spend_today(self) -> float:
         try:

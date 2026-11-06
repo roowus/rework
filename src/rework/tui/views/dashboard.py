@@ -32,6 +32,7 @@ from rework.tui.theme import (
     esc,
     glyph,
     money,
+    plan_label,
     status_text,
     status_value,
     tokens,
@@ -298,7 +299,7 @@ class DashboardView(View):
         bits = []
         if self.project == ALL and m.project_id:
             bits.append(self.snap.project_name(m.project_id))
-        bits.append(str((m.plan or {}).get("kind") or "echo"))
+        bits.append(plan_label(m.plan))
         role = self.mission_role.get(m.id)
         if role and st in actions.ACTIVE:
             bits.append(role)
@@ -497,11 +498,14 @@ class DashboardView(View):
             return
         st = status_value(mission.status)
         plan = mission.plan or {}
-        bits = [str(plan.get("kind") or "echo")]
+        bits = [plan_label(plan)]
+        orch = plan.get("orchestrator") or {}
+        if orch.get("model"):
+            bits.append(f"orchestrator {orch['model']}")
         if mission.project_id:
             bits.append(self.snap.project_name(mission.project_id))
         if plan.get("model"):
-            bits.append(f"model {plan['model']}")
+            bits.append(f"roles {plan['model']}")
         if plan.get("effort"):
             bits.append(f"effort {plan['effort']}")
         if self.budget is not None:
@@ -535,6 +539,20 @@ class DashboardView(View):
 
     def _paint_runs(self) -> None:
         rows = [RowData(ALL, f"[b]All activity[/b]\n[{FAINT}]{len(self.events)} events[/]")]
+        orch_id = self._orchestrator_id()
+        if orch_id:
+            mission = self.snap.mission(self.mission_id)
+            st = status_value(mission.status) if mission else "running"
+            model = ((mission.plan or {}).get("orchestrator") or {}).get("model") if mission else ""
+            cost = self.run_cost.get(orch_id, 0.0)
+            sub = " · ".join(x for x in (str(model or ""), money(cost) if cost else "") if x)
+            rows.append(
+                RowData(
+                    orch_id,
+                    f"{glyph('running' if st in actions.ACTIVE else st)} [b]orchestrator[/b]\n"
+                    f"  [{FAINT}]{esc(sub)}[/]",
+                )
+            )
         for run in self.runs:
             rows.append(
                 RowData(
@@ -547,6 +565,13 @@ class DashboardView(View):
         lst = self.query_one("#run-list", RowList)
         lst.set_rows(rows)
         lst.select(self.run_id or ALL)
+
+    def _orchestrator_id(self) -> str | None:
+        """The orchestrator's pseudo run id (its events and charges carry it)."""
+        mission = self.snap.mission(self.mission_id)
+        if mission is None or not (mission.plan or {}).get("orchestrator"):
+            return None
+        return f"{mission.id}:orchestrate:orchestrator:1"
 
     # -- trajectory ---------------------------------------------------------------------------
 
