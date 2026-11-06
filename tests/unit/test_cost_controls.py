@@ -59,12 +59,14 @@ def test_anthropic_usage_counts_cache_reads_as_input() -> None:
 
 def test_compaction_elides_old_tool_output_but_keeps_recent() -> None:
     msgs = [{"role": "user", "content": "brief"}]
-    for i in range(12):
+    n = toolloop.KEEP_RECENT + 8
+    size = toolloop.COMPACT_AT // toolloop.KEEP_RECENT
+    for i in range(n):
         msgs.append({"role": "assistant", "content": "", "tool_calls": [{"id": str(i)}]})
-        msgs.append({"role": "tool", "name": "read_file", "content": f"file {i}\n" + "x" * 8_000})
+        msgs.append({"role": "tool", "name": "read_file", "content": f"file {i}\n" + "x" * size})
     elided = toolloop._compact(msgs)
     tools = [m for m in msgs if m["role"] == "tool"]
-    assert elided == 12 - toolloop.KEEP_RECENT
+    assert elided == n - toolloop.KEEP_RECENT
     assert tools[0]["content"].startswith("[elided") and "file 0" in tools[0]["content"]
     assert all(not t["content"].startswith("[elided") for t in tools[-toolloop.KEEP_RECENT :])
     assert toolloop._compact(msgs) == 0, "stable after one compaction (cache-friendly)"
