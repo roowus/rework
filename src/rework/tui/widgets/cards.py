@@ -53,10 +53,12 @@ class ProposalCard(Vertical):
             meta.append(f"model {esc(p.model)}")
         if p.effort:
             meta.append(f"effort {esc(p.effort)}")
+        title = getattr(p, "title", "") or ""
+        heading = (
+            f"[b]{esc(title)}[/b]\n{esc(p.objective)}" if title else f"[b]{esc(p.objective)}[/b]"
+        )
         yield Static(
-            f"[{ACCENT}]PROPOSAL[/]\n[b]{esc(p.objective)}[/b]\n[{MUTED}]"
-            + "  ·  ".join(meta)
-            + "[/]",
+            f"[{ACCENT}]PROPOSAL[/]\n{heading}\n[{MUTED}]" + "  ·  ".join(meta) + "[/]",
             classes="card-body",
         )
         with Horizontal(classes="card-actions"):
@@ -155,11 +157,12 @@ class MissionCard(Vertical):
             if self.spend:
                 bits.append(money(self.spend))
             bits.append(ago(m.created_at))
-            head.update(
-                f"{status_text(status)}  [{MUTED}]"
-                + "  ·  ".join(bits)
-                + f"[/]\n[b]{esc(clip(m.objective, 200))}[/b]"
+            name = (
+                f"[b]{esc(m.title)}[/b]  [{MUTED}]{esc(clip(m.objective, 140))}[/]"
+                if getattr(m, "title", None)
+                else f"[b]{esc(clip(m.objective, 200))}[/b]"
             )
+            head.update(f"{status_text(status)}  [{MUTED}]" + "  ·  ".join(bits) + f"[/]\n{name}")
             for cls in ("-accent", "-warn", "-ok", "-danger"):
                 self.remove_class(cls)
             self.add_class(

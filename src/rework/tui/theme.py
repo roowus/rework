@@ -208,3 +208,10 @@ def plan_label(plan: dict | None) -> str:
     if plan.get("orchestrator"):
         return f"{plan.get('playbook') or 'auto'} · orchestrated"
     return str(plan.get("kind") or "echo")
+
+
+def mission_name(mission: object, width: int = 60) -> str:
+    """The mission's title when the orchestrator gave it one, else its
+    objective, clipped (plain text; escape before rendering)."""
+    title = getattr(mission, "title", None)
+    return clip(str(title or getattr(mission, "objective", "") or ""), width)

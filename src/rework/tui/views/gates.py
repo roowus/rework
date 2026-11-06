@@ -27,6 +27,7 @@ from rework.tui.theme import (
     clip,
     esc,
     glyph,
+    mission_name,
     status_text,
 )
 from rework.tui.views.base import View
@@ -156,7 +157,7 @@ class GatesView(View):
         rows = []
         for g in gates:
             mission = self.snap.mission(g.mission_id)
-            where = clip(mission.objective, 40) if mission else g.mission_id
+            where = mission_name(mission, 40) if mission else g.mission_id
             kind = KIND_LABEL.get(g.kind.value, g.kind.value)
             mark = glyph(g.status.value)
             rows.append(

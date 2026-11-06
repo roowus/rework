@@ -267,6 +267,7 @@ async def create_mission(
     orchestrator_effort: str | None = None,
     budget_usd: float | None = None,
     budget_step_usd: float | None = None,
+    title: str | None = None,
 ) -> Mission:
     """Create a mission row (+ created event) and return it. When `store` is
     given it is used and NOT closed (the TUI holds one open); otherwise a
@@ -320,6 +321,7 @@ async def create_mission(
                 repo_origin=resolved["repo_origin"],
                 project_id=project_id,
                 chat_id=chat_id,
+                title=(title or "").strip()[:80] or None,
                 plan=plan_spec,
             )
         )

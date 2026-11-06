@@ -69,6 +69,10 @@ PROPOSE_TOOL = ToolSpec(
                 "type": "string",
                 "description": "What should happen, in the owner's words.",
             },
+            "title": {
+                "type": "string",
+                "description": "A short name for lists, 3 to 6 words.",
+            },
             "plan": {"type": "string", "enum": ["echo", "fix", "fix-pr"]},
             "project": {"type": "string", "description": "Project name, or empty for none."},
             "repo": {
@@ -159,6 +163,7 @@ LOOK_TOOLS: list[ToolSpec] = [
 @dataclass
 class Proposal:
     objective: str
+    title: str = ""
     plan: str = "fix"
     project: str = ""
     repo: str = ""
@@ -502,6 +507,7 @@ class OrchestratorChat:
             if call.name == "propose_mission":
                 proposal = Proposal(
                     objective=str(args.get("objective", "")).strip(),
+                    title=str(args.get("title", "")).strip(),
                     plan=str(args.get("plan", "fix")).strip() or "fix",
                     project=str(args.get("project", "")).strip(),
                     repo=str(args.get("repo", "")).strip(),

@@ -49,6 +49,7 @@ def proposal_from_args(args: dict[str, Any]) -> Any:
 
     return Proposal(
         objective=str(args.get("objective", "")).strip(),
+        title=str(args.get("title", "")).strip(),
         plan=str(args.get("plan", "fix")).strip() or "fix",
         project=str(args.get("project", "")).strip(),
         repo=str(args.get("repo", "")).strip(),
@@ -243,6 +244,8 @@ class Conversation:
             kwargs["orchestrator_effort"] = self.chat.effort
         if _accepts(create_mission, "chat_id"):
             kwargs["chat_id"] = self.id
+        if getattr(proposal, "title", "") and _accepts(create_mission, "title"):
+            kwargs["title"] = proposal.title
         mission = await self.data.create_mission(**kwargs)
         await self.data.append_chat_note(self.id, f"{LAUNCH_PREFIX}{mission.id}")
         await self.data.update_chat(self.id, mission_id=mission.id)

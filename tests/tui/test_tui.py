@@ -314,7 +314,8 @@ async def test_chat_proposes_then_launch_creates_mission(
     ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     provider = script_provider(
-        monkeypatch, [propose(objective="say hello", plan="echo", project="polystats")]
+        monkeypatch,
+        [propose(objective="say hello", plan="echo", project="polystats", title="Greeting")],
     )
     from rework.tui.widgets.cards import MissionCard, ProposalCard
 
@@ -345,6 +346,7 @@ async def test_chat_proposes_then_launch_creates_mission(
         assert len(new) == 1
         assert new[0].objective == "say hello"
         assert new[0].project_id == ids["project"], "project NAME resolves to the id"
+        assert new[0].title == "Greeting", "the proposal's title names the mission"
         chat = await store.get_chat(chat_id)
         assert chat is not None and chat.mission_id == new[0].id
         msgs = await store.chat_messages(chat_id)

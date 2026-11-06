@@ -90,6 +90,7 @@ class Mission(BaseModel):
     repo_origin: str | None = None  # git URL the daemon clones at run start (ADR 0005)
     project_id: str | None = None  # label grouping; missions may be project-less
     chat_id: str | None = None  # the conversation that launched it (one chat, many missions)
+    title: str | None = None  # a few words for lists (the orchestrator proposes it)
     status: MissionStatus = MissionStatus.PENDING
     plan: dict[str, Any] | None = None
     result: dict[str, Any] | None = None

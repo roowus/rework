@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS missions (
     repo_origin TEXT,
     project_id TEXT,
     chat_id TEXT,
+    title TEXT,
     status TEXT NOT NULL,
     plan TEXT,
     result TEXT,
@@ -181,6 +182,7 @@ class SqliteStore:
             repo_origin=row["repo_origin"],
             project_id=row["project_id"],
             chat_id=row["chat_id"],
+            title=row["title"],
             status=MissionStatus(row["status"]),
             plan=_uj(row["plan"]) or None,
             result=_uj(row["result"]) or None,
@@ -235,8 +237,8 @@ class SqliteStore:
     async def create_mission(self, mission: Mission) -> Mission:
         await self._db.execute(
             "INSERT INTO missions (id, objective, repo_path, repo_origin, project_id,"
-            " chat_id, status, plan, result, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " chat_id, title, status, plan, result, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 mission.id,
                 mission.objective,
@@ -244,6 +246,7 @@ class SqliteStore:
                 mission.repo_origin,
                 mission.project_id,
                 mission.chat_id,
+                mission.title,
                 mission.status.value,
                 _j(mission.plan),
                 _j(mission.result),
@@ -914,6 +917,8 @@ async def open_sqlite(path: str) -> SqliteStore:
         await db.execute("ALTER TABLE missions ADD COLUMN project_id TEXT")
     if "chat_id" not in names:
         await db.execute("ALTER TABLE missions ADD COLUMN chat_id TEXT")
+    if "title" not in names:
+        await db.execute("ALTER TABLE missions ADD COLUMN title TEXT")
     cols = await db.execute("PRAGMA table_info(gates)")
     names = {row[1] for row in await cols.fetchall()}
     if "for_run" not in names:

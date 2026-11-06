@@ -315,6 +315,16 @@ async def test_gate_spec_roundtrips(store: StateStore) -> None:
     assert (await store.get_gate(plain.id)).spec is None  # type: ignore[union-attr]
 
 
+async def test_mission_title_roundtrips(store: StateStore) -> None:
+    m = await store.create_mission(
+        Mission(id=new_id("m"), objective="make the menus have borders", title="Dropdown border")
+    )
+    got = await store.get_mission(m.id)
+    assert got is not None and got.title == "Dropdown border"
+    plain = await store.create_mission(Mission(id=new_id("m"), objective="x"))
+    assert (await store.get_mission(plain.id)).title is None  # type: ignore[union-attr]
+
+
 async def test_one_chat_owns_many_missions(store: StateStore) -> None:
     """Missions remember the chat that launched them, and a chat lists its
     missions (one conversation can launch several)."""
