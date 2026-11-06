@@ -97,7 +97,12 @@ class CoderSpec(RoleSpec):
             " stage diffs this worktree and anything done elsewhere is lost."
             " Run the test suite (or build/lint) and include the actual"
             " result in your final summary; state plainly what passes and what"
-            " does not; if blocked, stop and say why instead of pretending."
+            " does not; if blocked, stop and say why instead of pretending.\n\n"
+            "Keep it proportionate: make the smallest change that fully meets the"
+            " brief. Read the code and use the existing tests; do not write"
+            " throwaway probe scripts or experiments unless the brief asks for a"
+            " measurement. Run the relevant tests after your change, and again"
+            " only if you changed something."
         )
 
         async def ensure_attached() -> None:

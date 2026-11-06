@@ -17,8 +17,15 @@ owner's call (the budget gate asks).
 auditor $0.84, orchestrator $0.05). 8.9M input tokens vs 305k output: input was
 ~88% of the bill.
 
+**Rerun of the same task after the fixes** (local, m-7537920472d4): $0.92 vs
+$3.03, 84% of input cached, and it did MORE: investigate, code, continue on the
+same branch after the turn budget, audit on the strong model, revise, audit
+again, both audits approve with zero open findings, ship gate (rejected by me so
+nothing was pushed). The investigator report cited exact file:line evidence.
+
 | # | finding | cause | status |
 |---|---|---|---|
+| 20 | The coder wrote 20+ throwaway probe scripts measuring pixel alignment for a one-property CSS change | the brief forwarded speculative side concerns; the coder prompt had no proportionality rule | fixed: coder "smallest change, existing tests, no probes"; orchestrator "scope briefs to the objective" |
 | 19 | Shipping delivered nothing: the commit stayed on rewvis | the project's `results: push_branch` setting (ADR 0005) was never implemented | fixed: ship pushes the branch for git-origin missions; chat prefers fix-pr for git projects |
 | 18 | 6k of 8.9M input tokens cached | no session key, so Fireworks routed each turn to a random replica (its cache is per replica); the orchestrator's system prompt also changed every turn | fixed: `ChatRequest.session_id` -> `user`; static orchestrator system prompt; Anthropic cache breakpoints. Rerun: 76% cached |
 | 17 | 58-80 calls per role, 35-45k tokens resent per call | no turn budget; whole transcript resent forever | fixed: turn budgets per spawn (+ wrap-up warning), compaction of old tool output |

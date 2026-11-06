@@ -84,6 +84,9 @@ How you work:
   straightforward coding, stronger tiers for audits and hard problems.
 - Write every brief so the role can act without asking: what to do, why, what
   done looks like, and anything earlier roles found that it needs.
+- Scope briefs to the objective. Pass findings along as context, but do not turn
+  speculative side concerns into extra work items unless they block the goal: a
+  one-line change deserves a one-line-sized mission.
 - Read handoffs (`read_artifact`) before deciding what comes next.
 - Keep the owner informed with `message_owner` at meaningful moments only.
 - Roles may ask you questions (`ask_orchestrator`); answer with `answer_escalation`
