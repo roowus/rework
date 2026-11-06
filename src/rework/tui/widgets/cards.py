@@ -178,8 +178,18 @@ class MissionCard(Vertical):
         gate.display = self.gate is not None
         if self.gate is not None:
             gate.update(f"[{WARN}]◆ needs you[/]  {esc(self.gate.question)}")
-        for btn in self.query(".mc-gatebtn"):
-            btn.display = self.gate is not None
+        yes_no = self.gate is not None and self.gate.kind.value in (
+            "ship",
+            "open_pr",
+            "generic",
+            "spawn",
+            "permission",
+        )
+        for btn in self.query(".mc-gatebtn").results(Btn):
+            if btn.action == "answer":
+                btn.display = self.gate is not None
+            else:
+                btn.display = yes_no  # questions and choices need the Gates tab
         status = self.status
         for verb in ("pause", "resume", "cancel"):
             for btn in self.query(Btn):

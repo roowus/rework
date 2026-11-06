@@ -110,6 +110,7 @@ class GatesView(View):
                         yield Static("", id="gate-steps", classes="section")
                         yield Static("", id="gate-decided", classes="section")
                     with Vertical(id="gate-answer"):
+                        yield Horizontal(id="gate-choices")
                         yield TextArea(
                             "",
                             id="gate-text",
@@ -230,9 +231,16 @@ class GatesView(View):
         self.query_one("#gate-head", Static).update(
             f"[b]{esc(kind.capitalize())}[/b]  {state}  [{FAINT}]{esc(gate.id)}[/]"
         )
-        self.query_one("#gate-question", Static).update(f"[b]{esc(gate.question)}[/b]")
+        spec = getattr(gate, "spec", None) or {}
+        extra = ""
+        if spec.get("detail"):
+            extra += f"\n[{MUTED}]{esc(spec['detail'])}[/]"
+        if spec.get("asked_by") == "orchestrator":
+            extra += f"\n[{FAINT}]asked by the mission's orchestrator[/]"
+        self.query_one("#gate-question", Static).update(f"[b]{esc(gate.question)}[/b]{extra}")
         is_open = gate.status.value == "open"
         self.query_one("#gate-answer").display = is_open
+        self._paint_choices(gate if is_open else None)
         yes, no = ACTION_LABELS.get(gate.kind.value, ("Approve", "Reject"))
         for btn in self.query("#gate-answer Btn").results(Btn):
             if btn.action == "approve":
@@ -318,9 +326,39 @@ class GatesView(View):
         self.query_one("#gate-steps-label").display = steps_box.display = bool(lines)
         steps_box.update("\n".join(lines))
 
+    def _paint_choices(self, gate: Any) -> None:
+        box = self.query_one("#gate-choices", Horizontal)
+        box.remove_children()
+        options = ((getattr(gate, "spec", None) or {}).get("options") or []) if gate else []
+        is_choice = gate is not None and gate.kind.value == "choice" and options
+        box.display = bool(is_choice)
+        if is_choice:
+            box.mount_all(
+                [Btn(str(opt), "choice", variant="primary", payload=str(opt)) for opt in options]
+            )
+        for btn in self.query("#gate-answer .gate-actions Btn").results(Btn):
+            if btn.action == "approve":
+                btn.display = not is_choice  # a choice is answered by its buttons
+        area = self.query_one("#gate-text", TextArea)
+        placeholder = (getattr(gate, "spec", None) or {}).get("placeholder") if gate else None
+        if gate is not None and gate.kind.value == "question":
+            area.placeholder = placeholder or "Your answer (required)"
+        elif gate is not None and gate.kind.value == "task":
+            area.placeholder = "Optional note about what you did"
+        else:
+            area.placeholder = "Optional answer or feedback (the agent receives it)"
+
     # -- deciding -----------------------------------------------------------
 
     def on_btn_pressed(self, event: Btn.Pressed) -> None:
+        if event.action == "choice" and self.selected is not None:
+            event.stop()
+            text = self.query_one("#gate-text", TextArea).text.strip()
+            decision: dict[str, Any] = {"choice": str(event.btn.payload)}
+            if text:
+                decision["note"] = text
+            self._decide(self.selected, True, text or str(event.btn.payload), decision)
+            return
         if event.action in ("approve", "reject"):
             event.stop()
             self.action_decide(event.action == "approve")
@@ -334,8 +372,15 @@ class GatesView(View):
             self.toast("Select an open gate first", severity="warning")
             return
         text = self.query_one("#gate-text", TextArea).text.strip()
+        kind = gate.kind.value
         decision: dict[str, Any] | None = None
-        if text:
+        if kind == "question" and approved and not text:
+            self.toast("Type your answer first", severity="warning")
+            self.query_one("#gate-text", TextArea).focus()
+            return
+        if kind == "task":
+            decision = {"done": approved, "note": text}
+        elif text:
             decision = {"answer": text} if approved else {"feedback": text}
         self._decide(gate, approved, text or None, decision)
 

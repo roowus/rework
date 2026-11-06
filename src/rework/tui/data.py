@@ -384,6 +384,16 @@ class TuiData:
 
         return await self._resilient(f"run_spend:{run_id}", _q)
 
+    async def send_owner_message(self, mission_id: str, text: str) -> Any:
+        """Talk to a running mission's orchestrator (ADR 0007): it is woken and
+        sees the message before its next turn."""
+        from rework.kernel.state.records import EventRecord, EventType
+
+        store = await self.store()
+        return await store.append_event(
+            EventRecord(mission_id=mission_id, type=EventType.OWNER_MESSAGE, payload={"text": text})
+        )
+
     async def mission_budget(self, mission_id: str) -> Any:
         """BudgetState (spent_usd, input/output/cached tokens)."""
         return await self._resilient(

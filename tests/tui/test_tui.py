@@ -613,3 +613,113 @@ async def test_resize_survives(ids: dict[str, str]) -> None:
             await pilot.resize_terminal(200, 60)
             await pilot.pause()
         assert app.is_running and not app.swallowed
+
+
+# -- steering (M7 P2) ------------------------------------------------------------
+
+
+async def test_choice_gate_is_answered_by_clicking_an_option(
+    ids: dict[str, str], env: Path
+) -> None:
+    store = await _store(env)
+    try:
+        await store.create_gate(
+            Gate(
+                id="gate-choice0001",
+                mission_id=ids["running"],
+                kind=GateKind.CHOICE,
+                question="Old parser or new parser?",
+                spec={"options": ["old", "new"], "asked_by": "orchestrator"},
+            )
+        )
+    finally:
+        await store.aclose()
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot, 0.8)
+        await pilot.press("alt+3")
+        await _settle(pilot)
+        app.query_one("#gate-list", RowList).activate("gate-choice0001", via_mouse=True)
+        await _settle(pilot)
+        choices = [b for b in app.query("#gate-choices Btn").results(Btn)]
+        assert [b.payload for b in choices] == ["old", "new"]
+        await pilot.click(choices[1])
+        await _settle(pilot, 0.8)
+    store = await _store(env)
+    try:
+        gate = await store.get_gate("gate-choice0001")
+        assert gate is not None and gate.status.value == "approved"
+        assert (gate.decision or {}).get("choice") == "new"
+    finally:
+        await store.aclose()
+
+
+async def test_question_gate_requires_an_answer(ids: dict[str, str], env: Path) -> None:
+    from textual.widgets import TextArea
+
+    store = await _store(env)
+    try:
+        await store.create_gate(
+            Gate(
+                id="gate-quest0002",
+                mission_id=ids["running"],
+                kind=GateKind.QUESTION,
+                question="Which test file?",
+            )
+        )
+    finally:
+        await store.aclose()
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot, 0.8)
+        await pilot.press("alt+3")
+        await _settle(pilot)
+        app.query_one("#gate-list", RowList).activate("gate-quest0002", via_mouse=True)
+        await _settle(pilot)
+        await pilot.press("alt+a")  # no text yet: refused
+        await _settle(pilot, 0.5)
+        store = await _store(env)
+        try:
+            assert (await store.get_gate("gate-quest0002")).status.value == "open"  # type: ignore[union-attr]
+        finally:
+            await store.aclose()
+        app.query_one("#gate-text", TextArea).text = "tests/test_stats.py"
+        await pilot.press("alt+a")
+        await _settle(pilot, 0.8)
+    store = await _store(env)
+    try:
+        gate = await store.get_gate("gate-quest0002")
+        assert gate is not None and gate.status.value == "approved"
+        assert (gate.decision or {}).get("answer") == "tests/test_stats.py"
+    finally:
+        await store.aclose()
+
+
+async def test_chat_messages_go_to_the_running_mission(ids: dict[str, str], env: Path) -> None:
+    """A chat whose mission is running sends the owner's words to that
+    mission's orchestrator (an OWNER_MESSAGE event), not to the chat model."""
+    store = await _store(env)
+    try:
+        await store.update_chat(ids["chat"], mission_id=ids["running"])
+    finally:
+        await store.aclose()
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.query_one("#chat-list", RowList).activate(ids["chat"], via_mouse=True)
+        await _settle(pilot, 1.0)
+        work = app.view("work")
+        assert work.target == ids["running"], "defaults to the running mission"
+        knob = next(k for k in app.query(".knob") if getattr(k, "knob", "") == "to")
+        assert knob.display and "mission" in str(knob.render())
+        for ch in "add a test":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        await _settle(pilot, 0.8)
+    store = await _store(env)
+    try:
+        events = await store.events_since(0, mission_id=ids["running"], limit=500)
+        owner = [e for e in events if e.type.value == "owner_message"]
+        assert owner and owner[-1].payload["text"] == "add a test"
+    finally:
+        await store.aclose()

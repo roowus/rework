@@ -259,6 +259,7 @@ MarkdownH1, MarkdownH2, MarkdownH3 { background: transparent; color: $fg; }
     border-top: solid $line;
     background: $surface;
 }
+#gate-choices { height: auto; margin-bottom: 1; }
 #gate-text { height: 4; background: $raised; border: none; margin-bottom: 1; }
 #gate-text:focus { background: $overlay; }
 .gate-actions { height: 1; }

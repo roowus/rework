@@ -81,6 +81,10 @@ class WorkView(View):
         self._sending = False
         self._streamed: list[Step] = []
         self._loading_chat: str | None = None
+        # where the next message goes: None = the chat orchestrator (proposes
+        # missions); a mission id = that mission's orchestrator (ADR 0007)
+        self.target: str | None = None
+        self._target_auto = True
 
     # -- layout -------------------------------------------------------------
 
@@ -104,6 +108,7 @@ class WorkView(View):
                         yield Static("", id="composer-attach")
                         yield Prompt(id="prompt", placeholder="Message the orchestrator…")
                     with Horizontal(id="composer-knobs"):
+                        yield Knob("to")
                         yield Knob("project")
                         yield Knob("model")
                         yield Knob("effort")
@@ -173,12 +178,41 @@ class WorkView(View):
             f"[b]{esc(clip(chat.title or 'untitled', 60))}[/b]  [{FAINT}]{esc(project)}[/]"
         )
 
+    def active_missions(self) -> list[str]:
+        """This chat's missions that are still running, newest last."""
+        if self.convo is None:
+            return []
+        ids = [m.id for m in self.snap.missions if getattr(m, "chat_id", None) == self.convo.id]
+        ids += [c.mission_id for c in self.query(MissionCard) if c.mission_id not in ids]
+        live = []
+        for mid in ids:
+            m = self.snap.mission(mid)
+            if m is not None and m.status.value in actions.ACTIVE:
+                live.append((m.created_at, mid))
+        return [mid for _, mid in sorted(live)]
+
+    def _resolve_target(self) -> None:
+        live = self.active_missions()
+        if self._target_auto:
+            self.target = live[-1] if live else None
+        elif self.target is not None and self.target not in live:
+            self.target = None  # that mission ended; talk to the chat again
+
     def _paint_knobs(self) -> None:
+        self._resolve_target()
+        prompt = self.query_one("#prompt", Prompt)
+        if self.target:
+            prompt.placeholder = f"Message {self.target}'s orchestrator…"
+        else:
+            prompt.placeholder = "Message the orchestrator…"
         project = self.snap.project_name(self.project_id) if self.project_id else "none"
         model = self.model_id or self._default_model()
         effort = self.effort or "default"
+        to = f"mission {self.target}" if self.target else "chat"
         for knob in self.query(Knob):
-            value = {"project": project, "model": model, "effort": effort}[knob.knob]
+            if knob.knob == "to":
+                knob.display = bool(self.active_missions())
+            value = {"project": project, "model": model, "effort": effort, "to": to}[knob.knob]
             knob.update(f"[{FAINT}]{knob.knob}[/] {esc(value)} [{FAINT}]▾[/]")
 
     def _default_model(self) -> str:
@@ -223,6 +257,7 @@ class WorkView(View):
         if self._loading_chat != chat_id:
             return
         self.convo = convo
+        self._target_auto = True
         self.project_id = chat.project_id
         self.model_id = chat.model_id or self.model_id
         self.effort = chat.effort or ""
@@ -239,6 +274,8 @@ class WorkView(View):
 
     def new_chat(self) -> None:
         self.convo = None
+        self._target_auto = True
+        self.target = None
         self.query_one("#chat-log", Trajectory).clear()
         self._show_chat(False)
         self._paint_head()
@@ -306,7 +343,29 @@ class WorkView(View):
         if self._sending:
             self.toast("Still waiting for the orchestrator…", severity="warning")
             return
+        self._resolve_target()
+        if self.target:
+            self._message_mission(self.target, event.text)
+            return
         self._send(event.text, event.attachments)
+
+    @work(group="send")
+    async def _message_mission(self, mission_id: str, text: str) -> None:
+        prompt = self.query_one("#prompt", Prompt)
+        log = self.query_one("#chat-log", Trajectory)
+        try:
+            await self.hub.data.send_owner_message(mission_id, text)
+        except Exception as exc:
+            self.toast(f"Could not reach the mission: {clip(str(exc), 200)}", severity="error")
+            return
+        prompt.accept()
+        log.add(user_step(text))
+        log.add(Step(f"  [{FAINT}]→ sent to {esc(mission_id)}'s orchestrator[/]", kind="meta"))
+        if self.convo is not None:
+            try:
+                await self.hub.data.append_chat_note(self.convo.id, f"you → {mission_id}: {text}")
+            except Exception:
+                pass
 
     @work(group="send")
     async def _send(self, text: str, attachments: list[str]) -> None:
@@ -578,6 +637,23 @@ class WorkView(View):
         await self.hub.refresh()
 
     def pick(self, knob: str) -> None:
+        if knob == "to":
+            options = [Option("", "chat", "the chat orchestrator: propose new missions")]
+            for mid in reversed(self.active_missions()):
+                m = self.snap.mission(mid)
+                options.append(Option(mid, f"mission {mid}", clip(m.objective, 50) if m else ""))
+            current = self.target or ""
+
+            def chose(value: str | None) -> None:
+                if value is None:
+                    return
+                self._target_auto = False
+                self.target = value or None
+                self._paint_knobs()
+                self.focus_prompt()
+
+            self.rw.push_screen(Picker("Send messages to", options, current), chose)
+            return
         if knob == "project":
             options = [Option("", "No project", "missions can be project-less")]
             for p in self.snap.projects:
