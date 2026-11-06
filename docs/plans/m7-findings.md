@@ -27,6 +27,7 @@ nothing was pushed). The investigator report cited exact file:line evidence.
 
 | # | finding | cause | status |
 |---|---|---|---|
+| 22 | Four coders in a row each spent ~35 of 40 turns re-learning the same code before continuing | continuation kept the branch but not the knowledge: a budget-stopped coder handed over only "stopped: turn budget reached" | fixed: budget-stopped roles write a handoff note (tools-free final call); a continuation coder starts from it |
 | 21 | Coder spent its 40 turns re-reading the same files (dashboard.py ~7 times, seed.py 4) | compaction at 60k chars / keep 6 elided reads the model still needed | tuned to 160k / keep 12 (caching makes kept context cheap) |
 
 What worked: the orchestrator saw the coder run out of turns, continued on the

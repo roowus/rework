@@ -142,6 +142,12 @@ class CoderSpec(RoleSpec):
                     f" previous attempt's changes (branch {continue_branch}). Change only"
                     " what the brief asks for; do not start over."
                 )
+            if run_ctx.get("previous_attempt"):
+                parts.append(
+                    "The previous attempt's handoff note (trust it; do not re-read files"
+                    " it already summarized unless you must edit them):\n"
+                    + str(run_ctx["previous_attempt"])[:6000]
+                )
             if investigation:
                 parts.append(
                     "Investigator's findings (context from the orchestrator):\n"

@@ -512,6 +512,7 @@ async def test_revision_coder_continues_the_previous_branch(world: dict[str, Any
     branch = (first.artifact or {}).get("branch")
     assert second.context.get("continue_branch") == branch, "revision builds on round one"
     assert second.context.get("base_sha") == (first.artifact or {}).get("base_sha")
+    assert "first" in str(second.context.get("previous_attempt")), "round one's note travels"
     assert "+    return a + b" in (second.artifact or {}).get("diff", ""), "full diff kept"
     first_msg = next(
         m["content"]
@@ -547,7 +548,8 @@ async def test_turn_budget_stops_a_role(world: dict[str, Any]) -> None:
     ]
     from conftest import INV_REPORT
 
-    provider.route("Investigate any brief", [*reads[:3], ChatResult(text=INV_REPORT)])
+    handoff = ChatResult(text="HANDOFF: calc.py:2 subtracts; run pytest -q", usage=Usage())
+    provider.route("Investigate any brief", [*reads[:3], handoff, ChatResult(text=INV_REPORT)])
     await asyncio.wait_for(runner(world).run(), timeout=30)
     run = await store.get_run("mo:look:investigator:1")
     assert run is not None and run.status == RunStatus.COMPLETED
@@ -561,6 +563,10 @@ async def test_turn_budget_stops_a_role(world: dict[str, Any]) -> None:
     assert len(loop_reqs) == 3, "the loop stopped at its budget"
     assert "Turn budget: about 3" in str(loop_reqs[0].messages[0]["content"])
     assert any("wrap up" in str(m.get("content")) for m in loop_reqs[-1].messages)
+    note_req = next(r for r in role_reqs if not r.tools and "handoff note" in str(r.messages[-1]))
+    assert "out of turns" in str(note_req.messages[-1]["content"])
+    writer_input = str(role_reqs[-1].messages)
+    assert "HANDOFF: calc.py:2 subtracts" in writer_input, "the note reaches the report"
 
 
 def _git(args: list[str], cwd: Path | None = None) -> str:

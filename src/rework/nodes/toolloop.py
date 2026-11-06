@@ -249,6 +249,35 @@ def make_toolloop_node(
             )
         )
 
+    async def _handoff_note(messages: list[dict[str, Any]]) -> str:
+        ask = [
+            *messages,
+            {
+                "role": "user",
+                "content": "You are out of turns. Write a handoff note for whoever "
+                "continues this work (no tool calls): 1) what you changed (files), "
+                "2) what you learned that they need (exact files, line numbers, "
+                "functions, how to run the relevant tests), 3) what remains, in order.",
+            },
+        ]
+        try:
+            _compact(ask)
+            result = await provider.complete(
+                ChatRequest(
+                    model=entry.model,
+                    system=system_prompt,
+                    messages=ask,
+                    temperature=temperature,
+                    max_tokens=min(entry.max_output, 2048),
+                    session_id=run_id,
+                )
+            )
+            await charge(result.usage, entry.model)
+            return (result.text or "").strip()
+        except Exception as exc:  # the note is a courtesy; never fail the run
+            log.warning("handoff note failed: %s", exc)
+            return ""
+
     async def node(state: dict[str, Any]) -> dict[str, Any]:
         # RESUME HOOK: a graph resumed from a checkpoint re-enters at the node
         # AFTER the one that did setup, so one-time binding (e.g. the coder's
@@ -361,6 +390,15 @@ def make_toolloop_node(
             _save_loop(resume_file, messages, turns)
         if stop_note is None:
             stop_note = f"stopped: turn budget ({limit}) reached"
+            # HANDOFF NOTE (found on dogfood #2): a role cut off at its budget
+            # handed over only this stop line, so every continuation started
+            # by re-reading the same files. One tools-free call turns what it
+            # learned into a note the next attempt starts from.
+            handoff = await _handoff_note(messages)
+            if handoff:
+                stop_note = f"{stop_note}\n\n{handoff}"
+                # in the transcript too: report writers read messages, not this
+                messages.append({"role": "assistant", "content": handoff})
         _clear_loop(resume_file)
         return {"messages": messages, "loop_turns": turns, "final_text": stop_note}
 

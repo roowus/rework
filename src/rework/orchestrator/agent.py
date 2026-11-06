@@ -688,6 +688,10 @@ class MissionOrchestrator:
                 context["continue_branch"] = prev["branch"]
                 if prev.get("base_sha"):
                     context["base_sha"] = prev["base_sha"]
+                if prev.get("summary"):
+                    # what the last attempt learned, so this one does not
+                    # re-read the same files (dogfood #2)
+                    context["previous_attempt"] = str(prev["summary"])[:6000]
         context["_call"] = call_id
         model_ref: dict[str, Any] = {}
         if model:
