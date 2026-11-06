@@ -45,7 +45,13 @@ Plans you can choose:
 - fix     — investigate, code, audit, then a ship gate
 - fix-pr  — same, but finishes by opening a pull request
 
-Available context is provided in the conversation as system notes. Use it."""
+Available context is provided in the conversation as system notes. Use it.
+
+You can also LOOK before you leap: list_projects, list_missions, get_mission and
+library_search read the owner's real state. Call them when the answer depends on
+what already exists (which missions ran, what a project's repos are, whether a
+skill already covers this). Do not narrate the lookups; act on them. You cannot
+change anything from here — only a confirmed proposal creates a mission."""
 
 PROPOSE_TOOL = ToolSpec(
     name="propose_mission",
@@ -85,6 +91,66 @@ ASK_TOOL = ToolSpec(
         "required": ["question"],
     },
 )
+
+
+# Read-only tools for the conversation. The orchestrator may LOOK at the
+# owner's world before proposing; it may never change anything from here —
+# mutations stay behind the proposal-then-consent path. Keeping the set
+# read-only is what lets these run without a gate.
+LOOK_TOOLS: list[ToolSpec] = [
+    ToolSpec(
+        name="list_projects",
+        description="List the owner's projects with their repo references.",
+        input_schema={"type": "object", "properties": {}},
+    ),
+    ToolSpec(
+        name="list_missions",
+        description=(
+            "Recent missions (newest first): id, status, objective, project. "
+            "Use this to answer 'what have I been running' or to find a mission "
+            "the owner is referring to."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 10},
+                "status": {
+                    "type": "string",
+                    "description": (
+                        "filter: pending|running|awaiting_gate|on_hold|done|failed|cancelled"
+                    ),
+                },
+            },
+        },
+    ),
+    ToolSpec(
+        name="get_mission",
+        description=(
+            "Full detail for one mission: status, plan steps and roles, spend, "
+            "and every run with its status and what it produced."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {"mission_id": {"type": "string"}},
+            "required": ["mission_id"],
+        },
+    ),
+    ToolSpec(
+        name="library_search",
+        description=(
+            "Search the Library (cross-project skills, tools, reports, memories) "
+            "for prior art before proposing a mission."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "type": {"type": "string", "description": "skill|tool|report|memory"},
+            },
+            "required": ["query"],
+        },
+    ),
+]
 
 
 @dataclass
@@ -127,6 +193,93 @@ class ChatResult:
     transcript: list[Turn] = field(default_factory=list)
 
 
+class ChatTools:
+    """Executes the read-only LOOK_TOOLS against the store.
+
+    Every result is bounded and shaped for a model, not a human: ids first (the
+    model will need to quote them back), then the few fields that decide a
+    proposal. Errors are returned as text, never raised — a failed lookup is
+    information the model should see and work around, not a dead conversation."""
+
+    def __init__(self, store: Any, library: Any | None = None) -> None:
+        self._store = store
+        self._library = library
+
+    async def execute(self, name: str, args: dict[str, Any]) -> str:
+        try:
+            if name == "list_projects":
+                projects = await self._store.list_projects()
+                if not projects:
+                    return "(no projects yet)"
+                lines = []
+                for p in projects:
+                    repos = (p.settings or {}).get("repos") or []
+                    refs = ", ".join(f"{r.get('name')} ({r.get('kind') or 'local'})" for r in repos)
+                    lines.append(f"{p.id}  {p.name}" + (f"  repos: {refs}" if refs else ""))
+                return "\n".join(lines)
+            if name == "list_missions":
+                from rework.kernel.state.records import MissionStatus
+
+                limit = int(args.get("limit") or 10)
+                status = args.get("status")
+                statuses = [MissionStatus(status)] if status else [None]
+                rows = []
+                for st in statuses:
+                    rows.extend(await self._store.list_missions(status=st, limit=limit))
+                if not rows:
+                    return "(no missions)"
+                return "\n".join(
+                    f"{m.id}  [{m.status.value}]  {m.objective[:70]}"
+                    + (f"  (project {m.project_id})" if m.project_id else "")
+                    for m in rows[:limit]
+                )
+            if name == "get_mission":
+                mission = await self._store.get_mission(str(args.get("mission_id") or ""))
+                if mission is None:
+                    return f"no mission {args.get('mission_id')!r}"
+                spend = await self._store.mission_spend(mission.id)
+                runs = await self._store.list_runs(mission.id)
+                steps = [
+                    f"{s.get('step') or s.get('role')}:{s.get('role')}"
+                    for s in ((mission.plan or {}).get("steps") or [])
+                ]
+                out = [
+                    f"mission {mission.id} [{mission.status.value}]",
+                    f"objective: {mission.objective}",
+                    f"plan steps: {', '.join(steps) or '(none)'}",
+                    f"spend: ${spend.spent_usd:.4f}"
+                    f" ({spend.input_tokens} in / {spend.output_tokens} out)",
+                ]
+                for r in runs:
+                    artifact = r.artifact or {}
+                    summary = str(artifact.get("summary") or artifact.get("kind") or "")[:120]
+                    out.append(
+                        f"  run {r.step}:{r.role}:{r.attempt} [{r.status.value}]"
+                        + (f" — {summary}" if summary else "")
+                    )
+                    for finding in (artifact.get("findings") or [])[:3]:
+                        if isinstance(finding, dict):
+                            out.append(
+                                f"      finding ({finding.get('severity', 'info')}):"
+                                f" {finding.get('title') or finding.get('summary') or '?'}"
+                            )
+                return "\n".join(out)
+            if name == "library_search":
+                if self._library is None:
+                    return "(the Library is not configured on this deployment)"
+                hits = await self._library.search_items(
+                    str(args.get("query") or ""), args.get("type")
+                )
+                if not hits:
+                    return "(no library matches)"
+                return "\n".join(
+                    f"{i.id}  [{i.type.value}] {i.name}: {i.description}" for i in hits
+                )
+            return f"unknown tool {name!r}"
+        except Exception as exc:  # a lookup failure is info, not a crash
+            return f"error: {type(exc).__name__}: {exc}"
+
+
 class OrchestratorChat:
     """A conversation that ends in a mission proposal, never in a silent launch."""
 
@@ -141,6 +294,9 @@ class OrchestratorChat:
         store: Any | None = None,
         chat_id: str | None = None,
         on_turn: Any | None = None,
+        library: Any | None = None,
+        tools_enabled: bool = True,
+        max_tool_rounds: int = 4,
     ) -> None:
         """`store` + `chat_id` turn persistence ON: every user and assistant
         message is appended to the chat row as it happens, and `load()` can
@@ -160,6 +316,9 @@ class OrchestratorChat:
         self._store = store
         self.chat_id = chat_id
         self._on_turn = on_turn
+        self._tools_enabled = tools_enabled and store is not None
+        self._max_tool_rounds = max_tool_rounds
+        self._toolbox = ChatTools(store, library) if self._tools_enabled else None
         self._history: list[dict[str, Any]] = []
         self._display: list[tuple[str, str]] = []  # (who, text) replay for the UI
         self.proposal: Proposal | None = None
@@ -256,17 +415,80 @@ class OrchestratorChat:
         chips = " ".join(f"📎 {p.split('/')[-1]}" for p in images)
         self._display.append(("you", f"{text}  {chips}".strip() if chips else text))
         await self._record("user", user_msg, self._display[-1][1])
-        request = ChatRequest(
-            model=self._entry.model,
-            system=self._system(),
-            messages=self._history,
-            tools=[PROPOSE_TOOL, ASK_TOOL],
-            max_tokens=min(self._entry.max_output, 2_048),
-            effort=self._effort,
-        )
-        result = await self._provider.complete(request)
-        usage = result.usage
-        cost = self._entry.estimate_cost(usage.input_tokens, usage.output_tokens)
+        specs = [PROPOSE_TOOL, ASK_TOOL]
+        if self._toolbox is not None:
+            specs = [*specs, *LOOK_TOOLS]
+
+        # BOUNDED TOOL LOOP: the orchestrator may look at the owner's world
+        # (projects, missions, library) before it proposes. Every round is a
+        # model call, so the loop is capped: a chat that keeps calling
+        # list_missions instead of answering is a bug, not persistence.
+        total_in = 0
+        total_out = 0
+        rounds = 0
+        while True:
+            request = ChatRequest(
+                model=self._entry.model,
+                system=self._system(),
+                messages=self._history,
+                tools=specs,
+                max_tokens=min(self._entry.max_output, 2_048),
+                effort=self._effort,
+            )
+            result = await self._provider.complete(request)
+            total_in += result.usage.input_tokens
+            total_out += result.usage.output_tokens
+
+            look_calls = [tc for tc in result.tool_calls if tc.name in {t.name for t in LOOK_TOOLS}]
+            if not look_calls or self._toolbox is None or rounds >= self._max_tool_rounds:
+                break
+            rounds += 1
+            # the assistant's tool-call turn, then one tool result per call
+            call_msg: dict[str, Any] = {
+                "role": "assistant",
+                "content": result.text or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.arguments or {}),
+                        },
+                    }
+                    for tc in result.tool_calls
+                ],
+            }
+            self._history.append(call_msg)
+            for tc in result.tool_calls:
+                if tc.name in {t.name for t in LOOK_TOOLS}:
+                    if self._on_turn is not None:
+                        self._on_turn("tool_call", {"name": tc.name, "arguments": tc.arguments})
+                    out = await self._toolbox.execute(tc.name, dict(tc.arguments))
+                    if self._on_turn is not None:
+                        self._on_turn(
+                            "tool_result",
+                            {
+                                "name": tc.name,
+                                "result": out[:300],
+                                "error": out[:200] if out.startswith("error") else "",
+                            },
+                        )
+                else:
+                    out = "not executed here"
+                self._history.append(
+                    {"role": "tool", "tool_call_id": tc.id, "name": tc.name, "content": out}
+                )
+                if self._record is not None:
+                    await self._record(
+                        "tool",
+                        {"role": "tool", "tool_call_id": tc.id, "name": tc.name, "content": out},
+                        "",
+                    )
+            if self._on_turn is not None:
+                self._on_turn("turn", {"turn": rounds, "tools": [c.name for c in look_calls]})
+
+        cost = self._entry.estimate_cost(total_in, total_out)
 
         # Record the assistant turn (including any tool call) in history so
         # follow-ups keep context.
@@ -322,7 +544,7 @@ class OrchestratorChat:
             reply=reply,
             proposal=proposal,
             asked=asked,
-            turn_tokens=usage.input_tokens + usage.output_tokens,
+            turn_tokens=total_in + total_out,
             turn_cost_usd=cost,
             transcript=transcript,
         )

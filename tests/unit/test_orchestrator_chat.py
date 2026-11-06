@@ -128,3 +128,118 @@ async def test_conversation_persists_and_reloads(store) -> None:
     # the replayed history reached the provider: 4 rows before + the new user turn
     assert len(provider.seen[-1]) == 5
     assert provider.seen[-1][0]["content"] == "audit the parser"
+
+
+async def test_orchestrator_looks_before_it_proposes(store) -> None:
+    """The chat can call read-only tools, and the result feeds the next round.
+
+    This is what makes a Work-tab trajectory worth rendering: the orchestrator
+    checks the owner's actual missions instead of guessing, then proposes."""
+    from rework.kernel.llm.catalog import ModelCatalog, ModelEntry
+    from rework.kernel.llm.types import ChatResult, ToolCall
+    from rework.kernel.state.records import Mission, MissionStatus
+    from rework.orchestrator.chat import OrchestratorChat
+
+    await store.create_mission(
+        Mission(id="m-look", objective="fix the parser", status=MissionStatus.DONE)
+    )
+
+    class _P:
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        async def complete(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                return ChatResult(
+                    tool_calls=[
+                        ToolCall(id="t1", name="list_missions", arguments={"limit": 5})
+                    ]
+                )
+            return ChatResult(
+                tool_calls=[
+                    ToolCall(
+                        id="t2",
+                        name="propose_mission",
+                        arguments={"objective": "fix the parser", "plan": "fix"},
+                    )
+                ]
+            )
+
+    provider = _P()
+    turns: list[tuple[str, dict]] = []
+    chat = OrchestratorChat(
+        provider,
+        ModelCatalog([ModelEntry(id="flash", provider="fake", model="f")]),
+        "flash",
+        store=store,
+        on_turn=lambda kind, payload: turns.append((kind, payload)),
+    )
+    result = await chat.send("what should I run next?")
+
+    # the tool actually ran against the store, and its output reached the model
+    second = provider.requests[1].messages
+    tool_rows = [m for m in second if m.get("role") == "tool"]
+    assert tool_rows and "m-look" in tool_rows[0]["content"]
+    assert "fix the parser" in tool_rows[0]["content"]
+
+    # the trajectory sink saw the call and its result, for the UI to render
+    assert [k for k, _ in turns] == ["tool_call", "tool_result", "turn"]
+    assert turns[1][1]["result"].startswith("m-look")
+
+    # and the proposal still came through
+    assert result.proposal is not None
+    assert result.proposal.objective == "fix the parser"
+
+
+async def test_tool_loop_is_bounded(store) -> None:
+    """A model that keeps calling tools forever must be cut off, not loop."""
+    from rework.kernel.llm.catalog import ModelCatalog, ModelEntry
+    from rework.kernel.llm.types import ChatResult, ToolCall
+    from rework.orchestrator.chat import OrchestratorChat
+
+    class _Loop:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, request):
+            self.calls += 1
+            return ChatResult(
+                tool_calls=[ToolCall(id="t", name="list_projects", arguments={})]
+            )
+
+    provider = _Loop()
+    chat = OrchestratorChat(
+        provider,
+        ModelCatalog([ModelEntry(id="flash", provider="fake", model="f")]),
+        "flash",
+        store=store,
+        max_tool_rounds=2,
+    )
+    await chat.send("go")
+    # 1 initial call + 2 tool rounds, then it stops regardless of the model
+    assert provider.calls == 3
+
+
+async def test_tools_are_off_without_a_store() -> None:
+    """A chat with no store (CLI/test) keeps the old single-call behaviour."""
+    from rework.kernel.llm.catalog import ModelCatalog, ModelEntry
+    from rework.kernel.llm.types import ChatResult
+    from rework.orchestrator.chat import OrchestratorChat
+
+    class _P:
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        async def complete(self, request):
+            self.requests.append(request)
+            return ChatResult(text="hi")
+
+    provider = _P()
+    chat = OrchestratorChat(
+        provider, ModelCatalog([ModelEntry(id="flash", provider="fake", model="f")]), "flash"
+    )
+    await chat.send("hello")
+    names = {t.name for t in provider.requests[0].tools}
+    assert "list_missions" not in names  # no toolbox, no look tools
+    assert {"propose_mission", "ask"} <= names

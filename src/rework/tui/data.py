@@ -198,6 +198,17 @@ class TuiData:
             f"mission:{mission_id}", lambda: self._call(lambda s: s.get_mission(mission_id))
         )
 
+    async def library_handle(self) -> Any:
+        """A LibraryHandle for the chat's tool loop (search from a conversation).
+        None when the deployment has no library configured."""
+        try:
+            from rework.library.tools import LibraryHandle
+
+            index, git = await self.library()
+            return LibraryHandle(index=index, git=git)
+        except Exception:
+            return None
+
     async def library_set_status(self, item_id: str, retire: bool) -> bool:
         """a / d on the library split: activate or retire the selected item."""
         index, _git = await self.library()
