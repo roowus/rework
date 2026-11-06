@@ -199,6 +199,7 @@ async def create_mission(
     model: str | None = None,
     effort: str | None = None,
     store: StateStore | None = None,
+    chat_id: str | None = None,
 ) -> Mission:
     """Create a mission row (+ created event) and return it. When `store` is
     given it is used and NOT closed (the TUI holds one open); otherwise a
@@ -237,6 +238,7 @@ async def create_mission(
                 repo_path=resolved["repo_path"],
                 repo_origin=resolved["repo_origin"],
                 project_id=project_id,
+                chat_id=chat_id,
                 plan=plan_spec,
             )
         )

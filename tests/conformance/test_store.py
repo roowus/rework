@@ -291,6 +291,24 @@ async def test_mission_carries_project_and_origin(store: StateStore) -> None:
     assert got.repo_path is None  # daemon resolves the path itself
 
 
+async def test_one_chat_owns_many_missions(store: StateStore) -> None:
+    """Missions remember the chat that launched them, and a chat lists its
+    missions (one conversation can launch several)."""
+    a = Mission(id=new_id("m"), objective="first", chat_id="chat-1", created_at=1.0)
+    b = Mission(id=new_id("m"), objective="second", chat_id="chat-1", created_at=2.0)
+    other = Mission(id=new_id("m"), objective="elsewhere", chat_id="chat-2")
+    loose = Mission(id=new_id("m"), objective="cli")
+    for m in (a, b, other, loose):
+        await store.create_mission(m)
+    got = await store.get_mission(a.id)
+    assert got is not None and got.chat_id == "chat-1"
+    assert (await store.get_mission(loose.id)).chat_id is None  # type: ignore[union-attr]
+    mine = await store.list_missions(chat_id="chat-1")
+    assert [m.id for m in mine] == [b.id, a.id]
+    running = await store.list_missions(status=MissionStatus.PENDING, chat_id="chat-2")
+    assert [m.id for m in running] == [other.id]
+
+
 async def test_spend_history_buckets_and_groups(store: StateStore) -> None:
     """Cost history: a time series, plus grouping by project / role / model.
 

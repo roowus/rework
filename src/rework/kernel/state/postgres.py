@@ -45,6 +45,7 @@ _DDL = [
         repo_path TEXT,
         repo_origin TEXT,
         project_id TEXT,
+        chat_id TEXT,
         status TEXT NOT NULL,
         plan TEXT,
         result TEXT,
@@ -295,6 +296,7 @@ class PostgresStore:
             repo_path=row["repo_path"],
             repo_origin=row["repo_origin"],
             project_id=row["project_id"],
+            chat_id=row["chat_id"],
             status=MissionStatus(row["status"]),
             plan=_uj(row["plan"]) or None,
             result=_uj(row["result"]) or None,
@@ -349,14 +351,15 @@ class PostgresStore:
     async def create_mission(self, mission: Mission) -> Mission:
         await self._conn.execute(
             "INSERT INTO missions (id, objective, repo_path, repo_origin, project_id,"
-            " status, plan, result, created_at, updated_at)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            " chat_id, status, plan, result, created_at, updated_at)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 mission.id,
                 mission.objective,
                 mission.repo_path,
                 mission.repo_origin,
                 mission.project_id,
+                mission.chat_id,
                 mission.status.value,
                 _j(mission.plan),
                 _j(mission.result),
@@ -408,17 +411,24 @@ class PostgresStore:
 
     @_serialized
     async def list_missions(
-        self, status: MissionStatus | None = None, limit: int = 50
+        self,
+        status: MissionStatus | None = None,
+        limit: int = 50,
+        chat_id: str | None = None,
     ) -> list[Mission]:
+        where: list[str] = []
+        params: list[Any] = []
         if status is not None:
-            rows = await self._fetch_all(
-                "SELECT * FROM missions WHERE status = %s ORDER BY created_at DESC LIMIT %s",
-                (status.value, limit),
-            )
-        else:
-            rows = await self._fetch_all(
-                "SELECT * FROM missions ORDER BY created_at DESC LIMIT %s", (limit,)
-            )
+            where.append("status = %s")
+            params.append(status.value)
+        if chat_id is not None:
+            where.append("chat_id = %s")
+            params.append(chat_id)
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
+        params.append(limit)
+        rows = await self._fetch_all(
+            f"SELECT * FROM missions{clause} ORDER BY created_at DESC LIMIT %s", tuple(params)
+        )
         return [self._mission(r) for r in rows]
 
     # -- projects (ADR 0005) --------------------------------------------------
@@ -1090,6 +1100,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ),
     ("missions", "repo_origin", "ALTER TABLE missions ADD COLUMN repo_origin TEXT"),
     ("missions", "project_id", "ALTER TABLE missions ADD COLUMN project_id TEXT"),
+    ("missions", "chat_id", "ALTER TABLE missions ADD COLUMN chat_id TEXT"),
     ("gates", "for_run", "ALTER TABLE gates ADD COLUMN for_run TEXT"),
     ("gates", "decision", "ALTER TABLE gates ADD COLUMN decision TEXT"),
 ]

@@ -52,7 +52,10 @@ class StateStore(Protocol):
     ) -> Mission | None: ...
 
     async def list_missions(
-        self, status: MissionStatus | None = None, limit: int = 50
+        self,
+        status: MissionStatus | None = None,
+        limit: int = 50,
+        chat_id: str | None = None,
     ) -> list[Mission]: ...
 
     # -- projects (ADR 0005) ------------------------------------------------

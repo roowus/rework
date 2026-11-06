@@ -83,6 +83,7 @@ class Mission(BaseModel):
     repo_path: str | None = None  # a path the DAEMON can see (ADR 0005)
     repo_origin: str | None = None  # git URL the daemon clones at run start (ADR 0005)
     project_id: str | None = None  # label grouping; missions may be project-less
+    chat_id: str | None = None  # the conversation that launched it (one chat, many missions)
     status: MissionStatus = MissionStatus.PENDING
     plan: dict[str, Any] | None = None
     result: dict[str, Any] | None = None

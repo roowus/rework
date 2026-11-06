@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS missions (
     repo_path TEXT,
     repo_origin TEXT,
     project_id TEXT,
+    chat_id TEXT,
     status TEXT NOT NULL,
     plan TEXT,
     result TEXT,
@@ -178,6 +179,7 @@ class SqliteStore:
             repo_path=row["repo_path"],
             repo_origin=row["repo_origin"],
             project_id=row["project_id"],
+            chat_id=row["chat_id"],
             status=MissionStatus(row["status"]),
             plan=_uj(row["plan"]) or None,
             result=_uj(row["result"]) or None,
@@ -231,14 +233,15 @@ class SqliteStore:
     async def create_mission(self, mission: Mission) -> Mission:
         await self._db.execute(
             "INSERT INTO missions (id, objective, repo_path, repo_origin, project_id,"
-            " status, plan, result, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " chat_id, status, plan, result, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 mission.id,
                 mission.objective,
                 mission.repo_path,
                 mission.repo_origin,
                 mission.project_id,
+                mission.chat_id,
                 mission.status.value,
                 _j(mission.plan),
                 _j(mission.result),
@@ -286,17 +289,24 @@ class SqliteStore:
         return await self.get_mission(mission_id)
 
     async def list_missions(
-        self, status: MissionStatus | None = None, limit: int = 50
+        self,
+        status: MissionStatus | None = None,
+        limit: int = 50,
+        chat_id: str | None = None,
     ) -> list[Mission]:
+        where: list[str] = []
+        params: list[Any] = []
         if status is not None:
-            rows = await self._fetch_all(
-                "SELECT * FROM missions WHERE status = ? ORDER BY created_at DESC LIMIT ?",
-                (status.value, limit),
-            )
-        else:
-            rows = await self._fetch_all(
-                "SELECT * FROM missions ORDER BY created_at DESC LIMIT ?", (limit,)
-            )
+            where.append("status = ?")
+            params.append(status.value)
+        if chat_id is not None:
+            where.append("chat_id = ?")
+            params.append(chat_id)
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
+        params.append(limit)
+        rows = await self._fetch_all(
+            f"SELECT * FROM missions{clause} ORDER BY created_at DESC LIMIT ?", tuple(params)
+        )
         return [self._mission(r) for r in rows]
 
     # -- projects (ADR 0005) --------------------------------------------------
@@ -899,6 +909,8 @@ async def open_sqlite(path: str) -> SqliteStore:
         await db.execute("ALTER TABLE missions ADD COLUMN repo_origin TEXT")
     if "project_id" not in names:
         await db.execute("ALTER TABLE missions ADD COLUMN project_id TEXT")
+    if "chat_id" not in names:
+        await db.execute("ALTER TABLE missions ADD COLUMN chat_id TEXT")
     cols = await db.execute("PRAGMA table_info(gates)")
     names = {row[1] for row in await cols.fetchall()}
     if "for_run" not in names:
