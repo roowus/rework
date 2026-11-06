@@ -12,6 +12,57 @@ Status legend: ✅ landed · 🟡 partial · ⬜ not started (as of writing)
 
 ---
 
+## 🔴 Bugs found by live verification (fix first)
+
+Found by driving the rebuilt Work tab against a real model (Fireworks
+deepseek `flash`, tmp SQLite). Both live in `orchestrator/chat.py`.
+
+**B1. Any chat that uses a look tool crashes on the next model call.**
+`OrchestratorChat.send()` appends tool calls to `_history` in OpenAI WIRE
+format (`{"id", "type": "function", "function": {"name", "arguments"}}`), but
+every adapter expects rework's provider-neutral shape (`{"id", "name",
+"arguments"}` — what `nodes/toolloop.py` writes). `translate_request` raises
+`KeyError: 'name'`. Repro (no network):
+
+```python
+from rework.kernel.llm.adapters.openai_compat import translate_request
+from rework.kernel.llm.types import ChatRequest
+
+bad = {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+        {"id": "c1", "type": "function", "function": {"name": "list_missions", "arguments": "{}"}}
+    ],
+}
+translate_request(
+    ChatRequest(
+        model="m",
+        messages=[
+            {"role": "user", "content": "x"},
+            bad,
+            {"role": "tool", "tool_call_id": "c1", "name": "list_missions", "content": "ok"},
+        ],
+    )
+)
+# KeyError: 'name'
+```
+
+Fix: build `call_msg` / `assistant_msg` tool calls as
+`{"id": tc.id, "name": tc.name, "arguments": tc.arguments}`. The FakeProvider
+tests did not catch it because they never go through an adapter (house lesson:
+a fake sharing the production assumption proves nothing). Worth a test that
+runs `translate_request` (both adapters) over a real chat history.
+
+**B2. Reloaded chats replay orphan tool results.** In the look-tool loop the
+assistant `call_msg` is appended to `_history` but never `_record`ed; only the
+`tool` rows are persisted. `load()` then rebuilds a history where `tool`
+messages have no preceding assistant `tool_calls`, which OpenAI-compatible
+providers reject. Fix: `_record("assistant", call_msg, "")` before the tool
+rows. (The TUI renders tool rows either way.)
+
+---
+
 ## 0. ⬜ The mission orchestrator is not an LLM today (biggest gap)
 
 The owner's mental model (verbatim intent): *the orchestrator manages the whole
@@ -51,7 +102,10 @@ Gap: `Chat.mission_id` is a single value, but one chat launches several
 missions. Suggested: `Mission.chat_id` column + `list_missions(chat_id=...)`
 (keep `Chat.mission_id` as "most recent" if useful).
 
-## 2. ⬜ The chat orchestrator needs real tools, streamed
+## 2. 🟡 The chat orchestrator needs real tools, streamed
+
+Landed: read-only look tools + `on_turn` streaming (rendered live in Work). ✅
+Missing: the act tools below (pause/cancel/retry/create project/message mission).
 
 The Work tab is "Claude Code for rework": you talk to the orchestrator, and it
 acts, with its tool calls visible inline. Today it has only `propose_mission`
@@ -86,8 +140,8 @@ its next check-in; it answers via an event the UI shows in the chat.
 
 ## 4. 🟡 Mission and run controls
 
-In progress (uncommitted at time of writing): pause / resume / cancel via mission
-status. Needed in addition:
+Landed: pause / resume / cancel via mission status (wired to buttons in
+Work cards and the Dashboard). ✅ Needed in addition:
 - one shared module (e.g. `rework.missions.control`) with
   `pause_mission`, `resume_mission`, `cancel_mission`, `retry_step(mission_id,
   step)`, `cancel_run(run_id)`, each appending an event describing who asked —
@@ -130,13 +184,17 @@ heatmap). Needed: `Run.started_at` / `Run.ended_at` (or `run_stats.wall_s`
 reliably on every terminal run), and ideally `compute_seconds` in
 `spend_history` rows.
 
-## 8. ⬜ Library add from a client
+## 8. ✅ Library add from a client
 
-The Library tab can add items. Needed: one function (shared with
-`rework library add`) that takes type, title, body, tags, provenance and does
-the git write + index upsert, e.g. `rework.library.curation.add_item(...)`.
+`library.curation.contribute` is the single write path; the TUI calls it via
+`TuiData.library_add` (same curation rules as `rework library add`).
 
 ## 9. Nice to have
+
+- `spend_history(group_by="mission")` — the Cost tab's "top missions" currently
+  does one `mission_spend` query per mission (capped at 30).
+- `update_chat(project_id=None)` cannot clear a chat's project (None means
+  "unchanged"); a sentinel or `clear_project=True` would let the knob unset it.
 
 - `Mission.title`: a short name for lists (the orchestrator can write it when
   proposing). The UI truncates the objective until then.

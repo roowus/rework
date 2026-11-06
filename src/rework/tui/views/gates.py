@@ -38,6 +38,17 @@ from rework.tui.widgets.artifacts import (
 from rework.tui.widgets.base import Btn, ChipGroup, Empty, Label, RowData, RowList
 from rework.tui.widgets.trajectory import event_step, role_of
 
+# (approve label, reject label) per gate kind: buttons speak the gate's language
+ACTION_LABELS = {
+    "ship": ("Ship it", "Don't ship"),
+    "open_pr": ("Open the PR", "Don't open"),
+    "spawn": ("Allow", "Deny"),
+    "permission": ("Allow", "Deny"),
+    "task": ("Done", "Can't do it"),
+    "generic": ("Approve", "Reject"),
+    "question": ("Send answer", "Decline"),
+}
+
 KIND_LABEL = {
     "ship": "ship it?",
     "open_pr": "open a PR?",
@@ -222,6 +233,12 @@ class GatesView(View):
         self.query_one("#gate-question", Static).update(f"[b]{esc(gate.question)}[/b]")
         is_open = gate.status.value == "open"
         self.query_one("#gate-answer").display = is_open
+        yes, no = ACTION_LABELS.get(gate.kind.value, ("Approve", "Reject"))
+        for btn in self.query("#gate-answer Btn").results(Btn):
+            if btn.action == "approve":
+                btn.set_label(f"{yes}  alt+a")
+            elif btn.action == "reject":
+                btn.set_label(f"{no}  alt+x")
         decided = self.query_one("#gate-decided", Static)
         decided.display = not is_open
         if not is_open:

@@ -100,7 +100,7 @@ MenuScreen { background: transparent; align: left top; }
 }
 .row:hover { background: $raised; }
 .row.-selected { background: $overlay; border-left: outer $accent; }
-.rowlist:focus .row.-selected { background: $accent-dim; }
+.rowlist:focus .row.-selected { background: $accent-dim 70%; }
 .row.-gap { margin-top: 1; }
 .row.-dim { color: $muted; }
 
@@ -292,14 +292,14 @@ MarkdownH1, MarkdownH2, MarkdownH3 { background: transparent; color: $fg; }
     height: auto;
     border: round $line-strong;
     padding: 0 1;
-    background: $surface;
+    background: transparent;
 }
-.gnode:hover { background: $raised; }
+.gnode:hover { border: round $muted; }
 .gnode.-s-running { border: round $accent; }
 .gnode.-s-completed, .gnode.-s-done, .gnode.-s-approved { border: round $ok 60%; }
 .gnode.-s-failed, .gnode.-s-rejected { border: round $danger; }
 .gnode.-s-halted_escalated, .gnode.-s-open { border: round $warn; }
-.gnode.-selected { background: $accent-dim; }
+.gnode.-selected { background: $accent-dim 50%; }
 .gedge { width: 64; height: 2; content-align: center top; text-align: center; color: $faint; }
 
 /* ---------------------------------------------------------------- library */

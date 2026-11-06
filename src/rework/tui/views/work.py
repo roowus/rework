@@ -344,7 +344,12 @@ class WorkView(View):
                 result = await engine.send(text, images=attachments or None)
             except Exception as exc:
                 self._clear_thinking()
-                log.add(Step(f"[{DANGER}]✗ {esc(clip(str(exc), 400))}[/]", kind="error"))
+                log.add(
+                    Step(
+                        f"[{DANGER}]✗ {esc(type(exc).__name__)}: {esc(clip(str(exc), 400))}[/]",
+                        kind="error",
+                    )
+                )
                 prompt.text = text  # never lose input
                 return
             self._clear_thinking()
