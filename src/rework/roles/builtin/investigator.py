@@ -69,7 +69,11 @@ class InvestigatorSpec(RoleSpec):
             "Rules: evidence over claims (cite file:line you actually read);"
             " never invent paths, symbols, or findings; run read-only commands"
             " (grep, git log, tests) as needed; if you cannot answer something,"
-            " say so plainly so it becomes a blocker instead of a guess."
+            " say so plainly so it becomes a blocker instead of a guess.\n\n"
+            "Stay in your lane: do not implement, prototype or test a fix (no"
+            " scratch copies, no edited files): that is the coder's job, and an"
+            " auditor checks it. Describe the fix in words with exact locations"
+            " and stop once the brief is answered."
         )
 
         async def prepare(state: InvestigatorState) -> dict[str, Any]:

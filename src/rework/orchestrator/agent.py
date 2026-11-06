@@ -112,6 +112,12 @@ TOOLS: list[ToolSpec] = [
                 },
                 "model": {"type": "string", "description": "Catalog id (default: role's)."},
                 "effort": {"type": "string", "enum": ["low", "medium", "high"]},
+                "depth": {
+                    "type": "string",
+                    "enum": ["quick", "deep"],
+                    "description": "Investigators only: quick (default) answers the brief and "
+                    "stops; deep chases hypotheses to ground truth (costs more).",
+                },
             },
             "required": ["role", "brief"],
         },
@@ -575,6 +581,8 @@ class MissionOrchestrator:
         for key, ref in (args.get("inputs") or {}).items():
             context[str(key)] = await self._resolve_ref(str(ref), runs)
         context["brief"] = brief
+        if args.get("depth") in ("quick", "deep"):
+            context["depth"] = args["depth"]
         context["_call"] = call_id
         model_ref: dict[str, Any] = {}
         if model:
