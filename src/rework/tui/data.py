@@ -263,6 +263,29 @@ class TuiData:
         gate = await store.decide_gate(gate_id, approved, note, decision)
         return gate is not None and gate.status.value == ("approved" if approved else "rejected")
 
+    async def set_mission_status(self, mission_id: str, status: str) -> Any:
+        """Owner controls: cancel / pause / resume. The daemon reads the row, so
+        this works from any machine — no daemon RPC needed."""
+        from rework.kernel.state.records import MissionStatus
+
+        store = await self.store()
+        return await store.update_mission(mission_id, status=MissionStatus(status))
+
+    async def cancel_mission(self, mission_id: str) -> Any:
+        return await self.set_mission_status(mission_id, "cancelled")
+
+    async def pause_mission(self, mission_id: str) -> Any:
+        return await self.set_mission_status(mission_id, "on_hold")
+
+    async def resume_mission(self, mission_id: str) -> Any:
+        return await self.set_mission_status(mission_id, "running")
+
+    async def spend_history(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return await self._resilient(
+            f"spend_history:{sorted(kwargs.items())}",
+            lambda: self._call(lambda s: s.spend_history(**kwargs)),
+        )
+
     # -- chats -------------------------------------------------------------
 
     async def chats(self, limit: int = 50, include_missions: bool = True) -> list[Any]:
@@ -304,6 +327,70 @@ class TuiData:
     async def delete_chat(self, chat_id: str) -> None:
         store = await self.store()
         await store.delete_chat(chat_id)
+
+    async def chat_messages(self, chat_id: str) -> list[Any]:
+        return await self._resilient(
+            f"chat_messages:{chat_id}", lambda: self._call(lambda s: s.chat_messages(chat_id))
+        )
+
+    async def update_chat(self, chat_id: str, **fields: Any) -> Any:
+        store = await self.store()
+        return await store.update_chat(chat_id, **fields)
+
+    async def append_chat_note(self, chat_id: str, display: str) -> Any:
+        """A UI-only transcript row (e.g. 'launched m-…'). `body` stays empty so
+        the row is never replayed into the model's history."""
+        from rework.kernel.state.records import ChatMessage
+
+        store = await self.store()
+        return await store.append_chat_message(
+            ChatMessage(chat_id=chat_id, role="note", body={}, display=display)
+        )
+
+    async def gates(self, mission_id: str | None = None) -> list[Any]:
+        """Every gate (open and decided), for history views."""
+        return await self._resilient(
+            f"gates:{mission_id}", lambda: self._call(lambda s: s.list_gates(mission_id))
+        )
+
+    async def mission_events(self, mission_id: str, since: int = 0, limit: int = 2000) -> list[Any]:
+        """Events after `since` for one mission, paging until caught up."""
+        out: list[Any] = []
+        cursor = since
+        while True:
+            batch = await self.events_tail(mission_id, cursor, limit=500)
+            out.extend(batch)
+            if len(batch) < 500 or len(out) >= limit:
+                return out
+            cursor = max(int(e.seq or 0) for e in batch)
+
+    async def library_add(
+        self,
+        *,
+        type_: str,
+        name: str,
+        description: str,
+        body: str,
+        tags: list[str],
+        project: str | None = None,
+    ) -> tuple[Any, str]:
+        """Same path as `rework library add`: git body + index row, curation
+        rules applied (tools start proposed)."""
+        from rework.library.curation import contribute
+        from rework.library.model import ItemType
+
+        index, git = await self.library()
+        return await contribute(
+            index,
+            git,
+            type_=ItemType(type_),
+            name=name,
+            description=description,
+            body=body,
+            tags=tags,
+            mission_id=None,
+            project=project,
+        )
 
     # -- library ----------------------------------------------------------
 

@@ -729,6 +729,49 @@ def gates(mission_id: str | None = None) -> None:
 
 
 @app.command()
+def cancel(mission_id: str) -> None:
+    """Cancel a mission. Works from any machine: the daemon notices the status
+    and stops the roles within one poll; spent money stays spent."""
+    _set_mission_status(mission_id, "cancelled")
+
+
+@app.command()
+def pause(mission_id: str) -> None:
+    """Pause a mission: stop spending, keep everything resumable.
+
+    Live roles are stopped; their checkpoints survive, so `rework resume` (or
+    the UI) continues from where they were."""
+    _set_mission_status(mission_id, "on_hold")
+
+
+@app.command()
+def resume(mission_id: str) -> None:
+    """Resume a paused mission (or un-cancel one that never got far)."""
+    _set_mission_status(mission_id, "running")
+
+
+def _set_mission_status(mission_id: str, status: str) -> None:
+    from rework.kernel.state.records import MissionStatus
+
+    async def go() -> str:
+        from rework.config import Config, open_store_from_config
+
+        store = await open_store_from_config(Config.from_env())
+        try:
+            mission = await store.get_mission(mission_id)
+            if mission is None:
+                typer.echo(f"unknown mission {mission_id}", err=True)
+                raise typer.Exit(1)
+            updated = await store.update_mission(mission_id, status=MissionStatus(status))
+            assert updated is not None
+            return updated.status.value
+        finally:
+            await store.aclose()
+
+    typer.echo(f"{mission_id}: {asyncio.run(go())}")
+
+
+@app.command()
 def complaints(
     status: str | None = typer.Option(
         None, help="filter: open|triaged|issue_open|resolved|wontfix"

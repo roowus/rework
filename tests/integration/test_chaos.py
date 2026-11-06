@@ -24,6 +24,7 @@ from rework.kernel.state.records import (
     Charge,
     Mission,
     MissionStatus,
+    RunStatus,
     new_id,
 )
 from rework.kernel.state.sqlite import SqliteStore, open_sqlite
@@ -95,11 +96,34 @@ class QuickSpec(RoleSpec):
         return graph.compile()
 
 
+class SlowSpec(RoleSpec):
+    """Slow enough to be paused or cancelled mid-flight."""
+
+    name = "slow"
+    description = "test role: sleeps, then completes"
+    goal = "sleep"
+    default_model = "flash"
+
+    def build_graph(self, ctx: RoleBuildCtx):  # type: ignore[no-untyped-def]
+        from langgraph.graph import END, START, StateGraph
+
+        async def work(state: dict) -> dict:  # type: ignore[no-untyped-def]
+            await asyncio.sleep(0.5)
+            return {"artifact": {"kind": "slow"}}
+
+        graph = StateGraph(dict)  # type: ignore[arg-type]
+        graph.add_node("work", work)
+        graph.add_edge(START, "work")
+        graph.add_edge("work", END)
+        return graph.compile()
+
+
 @pytest.fixture
 def registry() -> RoleRegistry:
     reg = RoleRegistry()
     reg.register(CrashySpec)
     reg.register(QuickSpec)
+    reg.register(SlowSpec)
     return reg
 
 
@@ -580,3 +604,52 @@ async def test_plain_gate_still_resumes_with_a_bool(world: dict[str, Any]) -> No
     run = await store.get_run(f"{mission.id}:do:crashy:1")
     assert run is not None and run.artifact is not None
     assert run.artifact["approved"] is True  # bool(decision) is True
+
+
+async def test_owner_cancel_stops_an_in_flight_mission(world: dict[str, Any]) -> None:
+    """Cancel written straight to the store (what `rework cancel` and the UI do)
+    must stop a running mission and leave it CANCELLED."""
+    store: SqliteStore = world["store"]
+    mission = await store.create_mission(
+        Mission(
+            id=new_id("m"),
+            objective="cancel me",
+            plan={"steps": [{"step": "do", "role": "slow"}]},
+        )
+    )
+    task = asyncio.create_task(_runner(world, mission.id).run())
+    await _wait_for(lambda: _run_status_is(store, mission.id, "running"), what="run started")
+
+    await store.update_mission(mission.id, status=MissionStatus.CANCELLED)
+    await asyncio.wait_for(task, timeout=60)  # returns, does not hang
+
+    fresh = await store.get_mission(mission.id)
+    assert fresh is not None and fresh.status == MissionStatus.CANCELLED
+
+
+async def test_owner_pause_holds_and_resume_finishes(world: dict[str, Any]) -> None:
+    """Pause stops the roles without losing the mission; flipping the status back
+    to running lets it finish. This is the pause/resume loop a UI needs."""
+    store: SqliteStore = world["store"]
+    mission = await store.create_mission(
+        Mission(
+            id=new_id("m"),
+            objective="pause then resume",
+            plan={"steps": [{"step": "do", "role": "slow"}]},
+        )
+    )
+    task = asyncio.create_task(_runner(world, mission.id).run())
+    await _wait_for(lambda: _run_status_is(store, mission.id, "running"), what="run started")
+
+    await store.update_mission(mission.id, status=MissionStatus.ON_HOLD)
+    # while held, nothing may advance to completion
+    await asyncio.sleep(0.8)
+    held = await store.get_mission(mission.id)
+    assert held is not None and held.status == MissionStatus.ON_HOLD
+    run = await store.get_run(f"{mission.id}:do:slow:1")
+    assert run is not None and run.status != RunStatus.COMPLETED
+
+    await store.update_mission(mission.id, status=MissionStatus.RUNNING)
+    await asyncio.wait_for(task, timeout=60)
+    fresh = await store.get_mission(mission.id)
+    assert fresh is not None and fresh.status == MissionStatus.DONE

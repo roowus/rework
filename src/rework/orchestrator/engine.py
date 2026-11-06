@@ -399,6 +399,14 @@ class MissionRunner:
         index = 0
         step_retries: dict[str, int] = {}
         while index < len(steps):
+            signal = await self._owner_signal()
+            if signal == "cancelled":
+                await self._synthesize(mission.id, ship_decision=None)
+                return
+            if signal == "paused":
+                if await self._pause_until_resumed() == "cancelled":
+                    await self._synthesize(mission.id, ship_decision=None)
+                    return
             step = steps[index]
             step_name = str(step.get("step") or step["role"])
             runs = await self._dispatch_step(mission, step)
@@ -776,12 +784,79 @@ class MissionRunner:
         context.update(step.get("context") or {})
         return context
 
+    async def _owner_signal(self) -> str:
+        """What the OWNER asked for, read from the store (the UI's cancel/pause
+        writes the mission status; this is how the engine learns of it).
+
+        Returns "cancelled" (stop now), "paused" (stop touching runs, stay
+        resumable) or "ok". The mission row is the source of truth, so this works
+        whether the request came from the TUI, the CLI, or a different machine."""
+        mission = await self._store.get_mission(self.mission_id)
+        if mission is None:
+            return "ok"
+        if mission.status == MissionStatus.CANCELLED:
+            return "cancelled"
+        if mission.status == MissionStatus.ON_HOLD:
+            return "paused"
+        return "ok"
+
+    async def _pause_until_resumed(self) -> str:
+        """Block while the mission is ON_HOLD. Returns "cancelled" if the owner
+        cancels instead of resuming, "ok" when it is running again.
+
+        Live role tasks are cancelled first: leaving them running would keep
+        spending money on a mission the owner paused. They are resumable from
+        their checkpoints, which is exactly what pause means here."""
+        assert self._supervisor is not None
+        for task in list(self._supervisor.tasks.values()):
+            if not task.done():
+                task.cancel()
+        await self._bus.publish(
+            EventRecord(
+                mission_id=self.mission_id,
+                type=EventType.INFO,
+                payload={"note": "mission paused by owner; roles stopped, state kept"},
+            )
+        )
+        while True:
+            mission = await self._store.get_mission(self.mission_id)
+            if mission is None:
+                return "cancelled"
+            if mission.status == MissionStatus.CANCELLED:
+                return "cancelled"
+            if mission.status != MissionStatus.ON_HOLD:
+                await self._bus.publish(
+                    EventRecord(
+                        mission_id=self.mission_id,
+                        type=EventType.INFO,
+                        payload={"note": "mission resumed by owner"},
+                    )
+                )
+                return "ok"
+            await asyncio.sleep(max(self._poll, 0.2))
+
     async def _pump_until_terminal(self, runs: list[Run]) -> str:
         """Pump until every run is terminal. Returns "cancelled" when the burn
         gate cancelled the mission (the caller skips to synthesis). The burn
         gate is checked BEFORE handling halts: a spend-cap hold must not sit
         behind an unanswered escalation gate."""
         while True:
+            signal = await self._owner_signal()
+            if signal == "cancelled":
+                return "cancelled"
+            if signal == "paused":
+                if await self._pause_until_resumed() == "cancelled":
+                    return "cancelled"
+                # RESUMED. Pausing cancelled the live role tasks; their rows are
+                # still RUNNING, so nothing will restart them on its own. Kick
+                # each one (ensure_started resumes from its checkpoint) before
+                # going back to the top of the loop.
+                assert self._supervisor is not None
+                for run in runs:
+                    latest = await self._store.get_run(run.id)
+                    if latest is not None and not _terminal(latest):
+                        await self._supervisor.ensure_started(latest)
+                continue
             fetched = [await self._store.get_run(r.id) for r in runs]
             fresh: list[Run] = [r for r in fetched if r is not None]
             if await self._burn_gate_hit() == "cancelled":

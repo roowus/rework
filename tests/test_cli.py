@@ -184,3 +184,94 @@ def test_report_missing_mission_md_flag(rework_db: Path) -> None:
     assert result.exit_code == 1
     assert "no such mission: m-nope" in result.output
     assert "Traceback" not in result.output
+
+
+def test_cancel_pause_resume_commands(rework_db: Path) -> None:
+    """`rework cancel|pause|resume <id>` write the mission status; that row is
+    what the daemon reads, so the commands work from any machine."""
+
+    async def seed() -> str:
+        store = await open_sqlite(str(rework_db))
+        try:
+            m = await store.create_mission(
+                Mission(id="m-ctl", objective="control me", status=MissionStatus.RUNNING)
+            )
+            return m.id
+        finally:
+            await store.aclose()
+
+    mid = asyncio.run(seed())
+    runner = CliRunner()
+
+    def status() -> str:
+        async def read() -> str:
+            store = await open_sqlite(str(rework_db))
+            try:
+                m = await store.get_mission(mid)
+                assert m is not None
+                return m.status.value
+            finally:
+                await store.aclose()
+
+        return asyncio.run(read())
+
+    assert runner.invoke(app, ["cancel", mid]).exit_code == 0
+    assert status() == "cancelled"
+
+    assert runner.invoke(app, ["pause", mid]).exit_code == 0
+    assert status() == "on_hold"
+
+    assert runner.invoke(app, ["resume", mid]).exit_code == 0
+    assert status() == "running"
+
+    # unknown ids fail loudly rather than silently succeeding
+    assert runner.invoke(app, ["cancel", "m-nope"]).exit_code == 1
+
+
+def test_approve_accepts_a_typed_answer(rework_db: Path) -> None:
+    """--answer / --answer-json put a typed decision on the gate row, which is
+    what the paused role receives."""
+
+    counter = {"n": 0}
+
+    async def seed() -> str:
+        counter["n"] += 1
+        n = counter["n"]
+        store = await open_sqlite(str(rework_db))
+        try:
+            mid = f"m-g{n}"
+            await store.create_mission(Mission(id=mid, objective="gate me"))
+            gate = await store.create_gate(
+                Gate(id=f"gate-typed-{n}", mission_id=mid, kind=GateKind.GENERIC, question="fix?")
+            )
+            return gate.id
+        finally:
+            await store.aclose()
+
+    gid = asyncio.run(seed())
+    runner = CliRunner()
+    result = runner.invoke(app, ["approve", gid, "--reject", "--answer", "don't touch the parser"])
+    assert result.exit_code == 0, result.output
+
+    async def read(gate_id: str):
+        store = await open_sqlite(str(rework_db))
+        try:
+            return await store.get_gate(gate_id)
+        finally:
+            await store.aclose()
+
+    gate = asyncio.run(read(gid))
+    assert gate is not None
+    assert gate.status == GateStatus.REJECTED
+    assert gate.decision == {"feedback": "don't touch the parser"}
+
+    # structured form
+    gid2 = asyncio.run(seed())
+    out = runner.invoke(app, ["approve", gid2, "--answer-json", '{"changes": ["a"], "n": 2}'])
+    assert out.exit_code == 0, out.output
+    gate2 = asyncio.run(read(gid2))
+    assert gate2 is not None and gate2.decision == {"changes": ["a"], "n": 2}
+
+    # bad JSON is a usage error, not a crash
+    bad = runner.invoke(app, ["approve", gid2, "--answer-json", "{nope"])
+    assert bad.exit_code != 0

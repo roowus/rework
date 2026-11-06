@@ -131,7 +131,14 @@ class Daemon:
             await self._store.release_lock(self._owner)
 
     async def _recover(self) -> None:
-        for status in (MissionStatus.RUNNING, MissionStatus.AWAITING_GATE):
+        for status in (
+            MissionStatus.RUNNING,
+            MissionStatus.AWAITING_GATE,
+            # a paused mission is not abandoned: its runner must come back and
+            # sit in the hold loop, or a resume from another machine would be
+            # ignored until someone restarted the daemon twice
+            MissionStatus.ON_HOLD,
+        ):
             for mission in await self._store.list_missions(status=status, limit=100):
                 log.info("recovering mission %s (%s)", mission.id, status.value)
                 await self._spawn_runner(mission.id)
