@@ -41,7 +41,7 @@ checked with `gh run list`, and deployed to rewvis when the daemon changed.
 - [x] Fix chat bug B2: the assistant message that issues look-tool calls is
       never persisted, so a reopened chat replays orphan tool results.
 - [x] `Mission.chat_id` (both backends + conformance) so one chat can own many
-      missions; the TUI reads it instead of note rows.
+      missions; the TUI passes it on launch.
 - [x] The production project `rework` has `repos: []`. Give it its repo ref
       (`https://github.com/roowus/rework`) so the chat can propose against it.
 - [x] Docs truth pass: `design.md` stops describing an orchestrator that does
