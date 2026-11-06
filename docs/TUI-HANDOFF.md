@@ -178,6 +178,29 @@ A completed `Run.artifact` is a plain dict whose keys depend on the role:
 `rework.cli._render_md(runs, spend, mission)` renders a full markdown report from
 `[(run, artifact), …]` — reusable if you want the report view for free.
 
+### 3.5b Chats are persisted (you can list and reopen them)
+
+`chats` + `chat_messages` tables exist in both backends. A conversation survives
+closing the app, and the Work surface can offer a list of them.
+
+```python
+data.chats(limit=50, include_missions=True)  -> list[Chat]
+data.new_chat(title=..., project_id=..., model_id=..., effort=...) -> Chat
+data.chat(chat_id)                            -> Chat | None
+data.rename_chat(chat_id, title)              -> Chat
+data.attach_chat_to_mission(chat_id, mission_id)
+data.delete_chat(chat_id)                     # cascades to messages
+```
+
+`Chat` = id, title, project_id, model_id, effort, mission_id, timestamps.
+`mission_id` is set once a proposal from that chat launched, so
+`include_missions=False` hides finished conversations.
+
+To restore a conversation, construct `OrchestratorChat(..., store=store,
+chat_id=<id>)` and `await chat.load()` — that replays the stored history into
+the model AND returns `[(who, text)]` for rendering, where `who` is `"you"` or
+`"orchestrator"`.
+
 ### 3.6 Mission creation is a CONVERSATION (**architectural requirement**)
 
 Owner's principle, verbatim: *"rework works by u talking to an orchestrator and
@@ -208,6 +231,12 @@ Key semantics you must preserve:
 - A `Proposal` carries `objective, plan, project, repo, model, effort`.
 - `chat.supports_images` is False for catalog entries without `"vision"` in
   `capabilities` — refuse attachments rather than silently dropping them.
+- The orchestrator has **read-only tools** when a store is supplied:
+  `list_projects`, `list_missions`, `get_mission`, `library_search`. It runs them
+  in a bounded loop before proposing (max 4 rounds). `on_turn(kind, payload)`
+  streams `turn` / `tool_call` / `tool_result` live — render that to give the
+  Work surface a real agent trajectory (same vocabulary as §3.4). It cannot
+  change anything from the conversation; only a confirmed proposal creates rows.
 - `context` is a string of facts you feed in (project names, their repo refs, the
   plan menu) so the orchestrator proposes instead of interrogating.
 
@@ -227,6 +256,34 @@ await data.create_mission(
 `plan="fix"` / `"fix-pr"` raise `ValueError` when there is no repo — that is the
 one case worth asking the user a follow-up instead of showing an error.
 `plan="echo"` takes no repo.
+
+### 3.6b Gate answers can carry structured feedback
+
+A gate decision is not only yes/no. `Gate.decision` is an arbitrary dict handed
+to the paused role as its `interrupt()` result:
+
+```python
+data.decide_gate(gate_id, approved=False, note="needs work",
+                 decision={"feedback": "don't touch the parser"})   -> bool
+```
+
+The engine resumes the role with `{**decision, "approved": bool}` when a typed
+answer exists, else the plain bool (roles written before this keep working). A
+REJECTION with feedback also resumes the role rather than aborting the run, so
+the agent can act on what you said. CLI: `rework approve <gate> --answer "text"`
+or `--answer-json '{...}'`.
+
+### 3.6c Cancel and pause
+
+```python
+data.cancel_mission(mission_id)   # stops it; stays cancelled
+data.pause_mission(mission_id)    # stops spending, keeps everything resumable
+data.resume_mission(mission_id)   # continues from the checkpoints
+data.set_mission_status(mission_id, "on_hold")   # generic
+```
+
+These write the mission row; the daemon reads it, so they work from any machine
+and survive restarts. CLI: `rework cancel|pause|resume <mission>`.
 
 ### 3.7 Fetching a finished mission
 
@@ -360,6 +417,7 @@ yours to decide; this list is the scope.
 
 **Missions**
 - list missions (running and awaiting-gate ones matter most), filter by project
+- cancel / pause / resume a mission (§3.6c)
 - see per-mission: objective, status, plan kind, age, current cost, which role is
   active, and the live trajectory (turns / tool calls / results)
 - open a mission to inspect: findings, the coder's diff, the rendered report,
@@ -371,6 +429,8 @@ yours to decide; this list is the scope.
 - see every open gate across missions, and per mission
 - read the question, the kind, which run it unblocks
 - approve / reject; the mission resumes from the store row, from any machine
+- optionally send a typed answer (free text feedback or structured data) that
+  the paused role receives — see §3.6b
 - know when one appears without polling with your eyes; how you notify is your
   call, but the owner asked for it to be **configurable** (the previous build used
   `REWORK_NOTIFY=toast|bell|both|none`)
@@ -379,7 +439,13 @@ yours to decide; this list is the scope.
 **Cost**
 - spend across all missions and per model; per-mission spend
 - token counts (input / output); call counts
-- the source is the `charges` table via `spend_by_model` — exact accounting
+- **history over time**: `data.spend_history(bucket="day"|"hour"|"week"|"total",
+  since=, until=, mission_id=, group_by="none"|"project"|"role"|"model")`
+  returns rows of `bucket_start, bucket_label, group_key, calls, input_tokens,
+  output_tokens, cost_usd`. Labels are UTC and identical on both backends.
+  A charge with no run groups under `""` ("unattributed") — show it rather than
+  dropping it, or your totals will not reconcile.
+- the source is the `charges` table — exact accounting
 
 **Library**
 - search (keyword or hybrid), read an item's body, activate/retire an item
