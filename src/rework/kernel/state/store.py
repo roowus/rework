@@ -12,6 +12,8 @@ from typing import Any, Protocol, runtime_checkable
 from rework.kernel.state.records import (
     BudgetState,
     Charge,
+    Chat,
+    ChatMessage,
     Complaint,
     ComplaintKind,
     ComplaintStatus,
@@ -126,6 +128,69 @@ class StateStore(Protocol):
     async def run_charges(self, run_id: str) -> list[Charge]:
         """Per-run charge rows, oldest first: feeds the mechanical run_stats
         section stamped onto every report artifact."""
+        ...
+
+    async def spend_history(
+        self,
+        *,
+        bucket: str = "day",
+        since: float | None = None,
+        until: float | None = None,
+        mission_id: str | None = None,
+        group_by: str = "none",
+    ) -> list[dict[str, Any]]:
+        """The ledger as a TIME SERIES — the one question a single total cannot
+        answer: "am I spending faster this week than last?", or "which project
+        or role is eating the budget?".
+
+        bucket:   "day" | "hour" | "week" | "total"
+        group_by: "none" | "project" | "role" | "model"
+        Returns rows of {bucket_start (epoch float), bucket_label (str),
+        group_key (str), calls, input_tokens, output_tokens, cost_usd},
+        ordered oldest bucket first then group_key.
+
+        `project` and `role` are not columns on `charges`; they are joined from
+        missions (project_id) and runs (role) via charge.run_id. A charge with
+        no run (the orchestrator chat, which is billed to a session before any
+        mission exists) groups under "" — callers should label that "unattributed"
+        rather than dropping it, or the totals silently fail to reconcile.
+        """
+        ...
+
+    # -- chats (the orchestrator conversation; how missions get created) ------
+    async def create_chat(self, chat: Chat) -> Chat:
+        """Insert a chat. Returns the stored row."""
+        ...
+
+    async def get_chat(self, chat_id: str) -> Chat | None: ...
+
+    async def update_chat(
+        self,
+        chat_id: str,
+        *,
+        title: str | None = None,
+        project_id: str | None = None,
+        model_id: str | None = None,
+        effort: str | None = None,
+        mission_id: str | None = None,
+    ) -> Chat | None:
+        """Patch a chat row; `updated_at` always moves."""
+        ...
+
+    async def list_chats(self, limit: int = 50, include_missions: bool = True) -> list[Chat]:
+        """Chats newest-first. `include_missions=False` hides chats that already
+        launched a mission (they are done as conversations); the default keeps
+        everything so a chat can always be reopened."""
+        ...
+
+    async def delete_chat(self, chat_id: str) -> None:
+        """Delete a chat and its messages."""
+        ...
+
+    async def append_chat_message(self, message: ChatMessage) -> ChatMessage: ...
+
+    async def chat_messages(self, chat_id: str) -> list[ChatMessage]:
+        """Full transcript, oldest first."""
         ...
 
     # -- leader lock (one daemon per database; atomic-upsert hardened in M3) --

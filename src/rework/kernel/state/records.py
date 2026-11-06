@@ -193,6 +193,41 @@ class Complaint(BaseModel):
     created_at: float = Field(default_factory=now)
 
 
+class Chat(BaseModel):
+    """A conversation with the orchestrator (how missions get created).
+
+    Persisted so a chat can be closed and reopened, and so the Work surface can
+    offer a list of conversations instead of one ephemeral in-memory thread.
+    A chat is NOT a mission: it becomes one only when the owner confirms a
+    proposal, and then `mission_id` records which mission it produced."""
+
+    id: str = Field(default_factory=lambda: new_id("chat"))
+    title: str = ""  # derived from the first user message when blank
+    project_id: str | None = None  # the project the conversation is scoped to
+    model_id: str | None = None  # catalog id the conversation was held on
+    effort: str | None = None
+    mission_id: str | None = None  # set once a proposal from this chat launched
+    created_at: float = Field(default_factory=now)
+    updated_at: float = Field(default_factory=now)
+
+
+class ChatMessage(BaseModel):
+    """One row of a chat transcript.
+
+    `body` is the provider-neutral message dict (role, content, tool_calls,
+    images, …) stored as JSON so a reloaded chat replays byte-identically into
+    the model, including tool calls. `display` is the human-facing text for the
+    UI (what the owner typed, what the orchestrator said), which is not always
+    the same thing: an assistant turn may carry tool calls and no prose."""
+
+    id: int | None = None  # assigned by the store
+    chat_id: str
+    role: str  # "user" | "assistant" | "tool"
+    body: dict[str, Any] = Field(default_factory=dict)
+    display: str = ""
+    ts: float = Field(default_factory=now)
+
+
 class Budget(BaseModel):
     max_usd: float | None = None
     max_input_tokens: int | None = None
@@ -215,3 +250,26 @@ class BudgetExceeded(Exception):
             if budget.max_usd is not None
             else "budget exceeded (token cap)"
         )
+
+
+def bucket_label(bucket: int | float | None, kind: str) -> str:
+    """Human label for a spend-history bucket, from the bucket NUMBER.
+
+    Backends compute buckets with different SQL (SQLite divides the epoch
+    column, Postgres uses date_trunc), so the label is derived once here from
+    the bucket index and always reads in UTC. Every backend therefore returns
+    the same labels for the same rows, which is what the conformance suite
+    asserts."""
+    import datetime as _dt
+
+    if kind == "total":
+        return "total"
+    if bucket is None:
+        return ""
+    seconds = {"hour": 3600, "day": 86400, "week": 604800}.get(kind, 86400)
+    start = _dt.datetime.fromtimestamp(float(bucket) * seconds, tz=_dt.UTC)
+    if kind == "hour":
+        return start.strftime("%Y-%m-%d %H:00")
+    if kind == "week":
+        return f"week of {start.strftime('%Y-%m-%d')}"
+    return start.strftime("%Y-%m-%d")

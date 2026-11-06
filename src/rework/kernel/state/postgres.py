@@ -19,6 +19,8 @@ from psycopg.rows import DictRow
 from rework.kernel.state.records import (
     BudgetState,
     Charge,
+    Chat,
+    ChatMessage,
     Complaint,
     ComplaintKind,
     ComplaintStatus,
@@ -32,6 +34,7 @@ from rework.kernel.state.records import (
     Project,
     Run,
     RunStatus,
+    bucket_label,
 )
 
 _DDL = [
@@ -137,9 +140,35 @@ _DDL = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_complaints_status ON complaints(status)",
+    """
+    CREATE TABLE IF NOT EXISTS chats (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL DEFAULT '',
+        project_id TEXT,
+        model_id TEXT,
+        effort TEXT,
+        mission_id TEXT,
+        created_at DOUBLE PRECISION NOT NULL,
+        updated_at DOUBLE PRECISION NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_chats_updated ON chats(updated_at)",
+    """
+    CREATE TABLE IF NOT EXISTS chat_messages (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        body TEXT NOT NULL DEFAULT '{}',
+        display TEXT NOT NULL DEFAULT '',
+        ts DOUBLE PRECISION NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_chat_messages_chat ON chat_messages(chat_id, id)",
 ]
 
 _TABLES = [
+    "chat_messages",
+    "chats",
     "events",
     "charges",
     "gates",
@@ -679,6 +708,99 @@ class PostgresStore:
         ]
 
     @_serialized
+    async def spend_history(
+        self,
+        *,
+        bucket: str = "day",
+        since: float | None = None,
+        until: float | None = None,
+        mission_id: str | None = None,
+        group_by: str = "none",
+    ) -> list[dict[str, Any]]:
+        """Ledger as a time series (see StateStore.spend_history).
+
+        Bucketing uses date_trunc on to_timestamp(ts) so calendar months and
+        DST boundaries behave; the resulting timestamp is converted back to a
+        bucket START epoch and the label is derived from that number by the
+        shared helper, so SQLite and Postgres return identical labels.
+        """
+        if bucket not in ("day", "hour", "week", "total"):
+            raise ValueError(f"unknown bucket {bucket!r}")
+        if group_by not in ("none", "project", "role", "model"):
+            raise ValueError(f"unknown group_by {group_by!r}")
+
+        unit = {"hour": "hour", "day": "day", "week": "week"}.get(bucket)
+        group_expr = {
+            "none": "''",
+            "project": "COALESCE(m.project_id, '')",
+            "role": "COALESCE(r.role, '')",
+            "model": "c.model",
+        }[group_by]
+
+        if unit is None:  # total
+            sql = (
+                "SELECT 0::double precision AS bucket_start,"
+                f" {group_expr} AS group_key, COUNT(*) AS calls,"
+                " COALESCE(SUM(c.input_tokens), 0) AS input_tokens,"
+                " COALESCE(SUM(c.output_tokens), 0) AS output_tokens,"
+                " COALESCE(SUM(c.cost_usd), 0) AS cost_usd"
+                " FROM charges c"
+                " LEFT JOIN runs r ON r.id = c.run_id"
+                " LEFT JOIN missions m ON m.id = c.mission_id"
+                " WHERE 1 = 1"
+            )
+        else:
+            sql = (
+                "SELECT date_trunc(%s, to_timestamp(c.ts)) AS bucket_ts,"
+                f" {group_expr} AS group_key, COUNT(*) AS calls,"
+                " COALESCE(SUM(c.input_tokens), 0) AS input_tokens,"
+                " COALESCE(SUM(c.output_tokens), 0) AS output_tokens,"
+                " COALESCE(SUM(c.cost_usd), 0) AS cost_usd"
+                " FROM charges c"
+                " LEFT JOIN runs r ON r.id = c.run_id"
+                " LEFT JOIN missions m ON m.id = c.mission_id"
+                " WHERE 1 = 1"
+            )
+        params: list[Any] = [] if unit is None else [unit]
+        if since is not None:
+            sql += " AND c.ts >= %s"
+            params.append(since)
+        if until is not None:
+            sql += " AND c.ts < %s"
+            params.append(until)
+        if mission_id is not None:
+            sql += " AND c.mission_id = %s"
+            params.append(mission_id)
+        if unit is None:
+            sql += " GROUP BY group_key ORDER BY group_key"
+        else:
+            sql += " GROUP BY bucket_ts, group_key ORDER BY bucket_ts, group_key"
+        rows = await self._fetch_all(sql, tuple(params))
+        divisor = {"hour": 3600, "day": 86400, "week": 604800}.get(bucket, 0)
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            if unit is None:
+                start = 0.0
+                bucket_num: float | None = None
+            else:
+                start = float(r["bucket_ts"].timestamp())  # bucket START epoch
+                bucket_num = start / divisor if divisor else None
+            out.append(
+                {
+                    "bucket_start": start,
+                    "bucket_label": bucket_label(
+                        None if bucket_num is None else round(bucket_num), bucket
+                    ),
+                    "group_key": str(r["group_key"] or ""),
+                    "calls": int(r["calls"] or 0),
+                    "input_tokens": int(r["input_tokens"] or 0),
+                    "output_tokens": int(r["output_tokens"] or 0),
+                    "cost_usd": float(r["cost_usd"] or 0.0),
+                }
+            )
+        return out
+
+    @_serialized
     async def spend_by_model(self, mission_id: str | None = None) -> list[dict[str, Any]]:
         """Ledger grouped by model (optionally scoped to one mission)."""
         sql = (
@@ -695,6 +817,121 @@ class PostgresStore:
         sql += " GROUP BY model ORDER BY cost_usd DESC"
         rows = await self._fetch_all(sql, params)
         return [dict(r) for r in rows]
+
+    # -- chats --------------------------------------------------------------
+    @staticmethod
+    def _chat(row: DictRow) -> Chat:
+        return Chat(
+            id=row["id"],
+            title=row["title"] or "",
+            project_id=row["project_id"],
+            model_id=row["model_id"],
+            effort=row["effort"],
+            mission_id=row["mission_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+        )
+
+    @staticmethod
+    def _chat_message(row: DictRow) -> ChatMessage:
+        return ChatMessage(
+            id=row["id"],
+            chat_id=row["chat_id"],
+            role=row["role"],
+            body=_uj(row["body"]),
+            display=row["display"] or "",
+            ts=row["ts"],
+        )
+
+    @_serialized
+    async def create_chat(self, chat: Chat) -> Chat:
+        await self._conn.execute(
+            "INSERT INTO chats (id, title, project_id, model_id, effort, mission_id,"
+            " created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            (
+                chat.id,
+                chat.title,
+                chat.project_id,
+                chat.model_id,
+                chat.effort,
+                chat.mission_id,
+                chat.created_at,
+                chat.updated_at,
+            ),
+        )
+        await self._conn.commit()
+        return chat
+
+    @_serialized
+    async def get_chat(self, chat_id: str) -> Chat | None:
+        row = await self._fetch_one("SELECT * FROM chats WHERE id = %s", (chat_id,))
+        return self._chat(row) if row else None
+
+    @_serialized
+    async def update_chat(
+        self,
+        chat_id: str,
+        *,
+        title: str | None = None,
+        project_id: str | None = None,
+        model_id: str | None = None,
+        effort: str | None = None,
+        mission_id: str | None = None,
+    ) -> Chat | None:
+        sets = ["updated_at = %s"]
+        params: list[Any] = [time.time()]
+        for column, value in (
+            ("title", title),
+            ("project_id", project_id),
+            ("model_id", model_id),
+            ("effort", effort),
+            ("mission_id", mission_id),
+        ):
+            if value is not None:
+                sets.append(f"{column} = %s")
+                params.append(value)
+        params.append(chat_id)
+        await self._conn.execute(f"UPDATE chats SET {', '.join(sets)} WHERE id = %s", tuple(params))
+        await self._conn.commit()
+        return await self.get_chat(chat_id)
+
+    @_serialized
+    async def list_chats(self, limit: int = 50, include_missions: bool = True) -> list[Chat]:
+        sql = "SELECT * FROM chats"
+        if not include_missions:
+            sql += " WHERE mission_id IS NULL"
+        sql += " ORDER BY updated_at DESC LIMIT %s"
+        rows = await self._fetch_all(sql, (limit,))
+        return [self._chat(r) for r in rows]
+
+    @_serialized
+    async def delete_chat(self, chat_id: str) -> None:
+        await self._conn.execute("DELETE FROM chat_messages WHERE chat_id = %s", (chat_id,))
+        await self._conn.execute("DELETE FROM chats WHERE id = %s", (chat_id,))
+        await self._conn.commit()
+
+    @_serialized
+    async def append_chat_message(self, message: ChatMessage) -> ChatMessage:
+        async with self._conn.cursor() as cur:
+            await cur.execute(
+                "INSERT INTO chat_messages (chat_id, role, body, display, ts)"
+                " VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                (message.chat_id, message.role, _j(message.body) or "{}",
+                 message.display, message.ts),
+            )
+            row = await cur.fetchone()
+        await self._conn.execute(
+            "UPDATE chats SET updated_at = %s WHERE id = %s", (message.ts, message.chat_id)
+        )
+        await self._conn.commit()
+        return message.model_copy(update={"id": row["id"] if row else None})
+
+    @_serialized
+    async def chat_messages(self, chat_id: str) -> list[ChatMessage]:
+        rows = await self._fetch_all(
+            "SELECT * FROM chat_messages WHERE chat_id = %s ORDER BY id", (chat_id,)
+        )
+        return [self._chat_message(r) for r in rows]
 
     @_serialized
     async def mission_spend(self, mission_id: str) -> BudgetState:

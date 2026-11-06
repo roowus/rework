@@ -288,3 +288,118 @@ async def test_mission_carries_project_and_origin(store: StateStore) -> None:
     assert got.project_id == p.id
     assert got.repo_origin == "https://github.com/roowus/rework.git"
     assert got.repo_path is None  # daemon resolves the path itself
+
+
+async def test_spend_history_buckets_and_groups(store: StateStore) -> None:
+    """Cost history: a time series, plus grouping by project / role / model.
+
+    Fixed timestamps, so both backends must return identical labels — that is
+    the point of deriving the label from the bucket number rather than from
+    each backend's own timestamp formatting."""
+    import time as _t
+
+    day = 86400
+    # three fixed days, deliberately mid-day so bucketing cannot straddle
+    base = float(int(_t.time() // day) * day) - 2 * day + day // 2
+    proj = await store.create_project(Project(name="proj-a"))
+    other = await store.create_project(Project(name="proj-b"))
+    m1 = await store.create_mission(
+        Mission(id=new_id("m"), objective="one", project_id=proj.id)
+    )
+    m2 = await store.create_mission(
+        Mission(id=new_id("m"), objective="two", project_id=other.id)
+    )
+    run1 = await store.create_run(Run(id="r1", mission_id=m1.id, role="coder", step="code"))
+    run2 = await store.create_run(Run(id="r2", mission_id=m2.id, role="auditor", step="audit"))
+
+    await store.charge(Charge(mission_id=m1.id, run_id=run1.id, model="flash",
+                              input_tokens=10, output_tokens=1, cost_usd=0.10, ts=base))
+    await store.charge(Charge(mission_id=m1.id, run_id=run1.id, model="flash",
+                              input_tokens=10, output_tokens=1, cost_usd=0.10, ts=base + 60))
+    await store.charge(Charge(mission_id=m2.id, run_id=run2.id, model="pro",
+                              input_tokens=20, output_tokens=2, cost_usd=0.50, ts=base + day))
+
+    rows = await store.spend_history(bucket="day")
+    assert [r["bucket_label"] for r in rows] == sorted(r["bucket_label"] for r in rows)
+    assert len(rows) == 2, rows
+    assert round(rows[0]["cost_usd"], 6) == 0.20
+    assert rows[0]["calls"] == 2
+    assert round(rows[1]["cost_usd"], 6) == 0.50
+    assert len({r["bucket_label"] for r in rows}) == 2  # distinct days
+
+    by_project = await store.spend_history(bucket="total", group_by="project")
+    got = {r["group_key"]: round(r["cost_usd"], 6) for r in by_project}
+    assert got == {proj.id: 0.20, other.id: 0.50}, got
+
+    by_role = await store.spend_history(bucket="total", group_by="role")
+    got = {r["group_key"]: round(r["cost_usd"], 6) for r in by_role}
+    assert got == {"coder": 0.20, "auditor": 0.50}, got
+
+    by_model = await store.spend_history(bucket="total", group_by="model")
+    got = {r["group_key"]: round(r["cost_usd"], 6) for r in by_model}
+    assert got == {"flash": 0.20, "pro": 0.50}, got
+
+    # windowing: only the first day
+    windowed = await store.spend_history(bucket="day", since=base, until=base + day)
+    assert len(windowed) == 1
+    assert round(windowed[0]["cost_usd"], 6) == 0.20
+
+    # mission filter
+    scoped = await store.spend_history(bucket="total", mission_id=m2.id)
+    assert len(scoped) == 1 and round(scoped[0]["cost_usd"], 6) == 0.50
+
+    # a charge with NO run (orchestrator chat) groups under "", never dropped
+    await store.charge(Charge(model="flash", input_tokens=1, output_tokens=1, cost_usd=0.01))
+    unattributed = await store.spend_history(bucket="total", group_by="role")
+    assert any(r["group_key"] == "" for r in unattributed), unattributed
+
+
+async def test_chat_roundtrip(store: StateStore) -> None:
+    """A chat and its transcript survive a reload: open, append, reopen, list."""
+    from rework.kernel.state.records import Chat, ChatMessage
+
+    chat = await store.create_chat(Chat(title="audit rework", project_id="p-1"))
+    assert await store.get_chat(chat.id) == chat
+    assert (await store.get_chat("nope")) is None
+
+    first = await store.append_chat_message(
+        ChatMessage(chat_id=chat.id, role="user", body={"role": "user", "content": "hi"},
+                    display="hi", ts=100.0)
+    )
+    assert first.id is not None
+    second = await store.append_chat_message(
+        ChatMessage(chat_id=chat.id, role="assistant", body={"role": "assistant", "content": "yo"},
+                    display="yo", ts=101.0)
+    )
+    assert second.id != first.id
+
+    loaded = await store.chat_messages(chat.id)
+    assert [m.role for m in loaded] == ["user", "assistant"]
+    assert loaded[0].body == {"role": "user", "content": "hi"}
+    assert loaded[1].display == "yo"
+
+    # update patches only what it is given and bumps updated_at
+    before = await store.get_chat(chat.id)
+    assert before is not None
+    await asyncio.sleep(0.01)
+    updated = await store.update_chat(chat.id, title="renamed", mission_id="m-9")
+    assert updated is not None
+    assert updated.title == "renamed"
+    assert updated.mission_id == "m-9"
+    assert updated.project_id == "p-1"  # untouched
+    assert updated.updated_at > before.updated_at  # append/update moved it
+
+    # listing: newest first, and the launched-only filter
+    older = await store.create_chat(Chat(title="older"))
+    await store.update_chat(older.id, project_id="x")  # bump it? no: newest wins by ts
+    chats = await store.list_chats()
+    assert chat.id in [c.id for c in chats]
+    assert older.id in [c.id for c in chats]
+    unlaunched = await store.list_chats(include_missions=False)
+    assert chat.id not in [c.id for c in unlaunched]  # has a mission
+    assert older.id in [c.id for c in unlaunched]
+
+    # delete cascades to messages
+    await store.delete_chat(chat.id)
+    assert await store.get_chat(chat.id) is None
+    assert await store.chat_messages(chat.id) == []

@@ -138,15 +138,74 @@ class OrchestratorChat:
         *,
         effort: str | None = None,
         context: str = "",
+        store: Any | None = None,
+        chat_id: str | None = None,
+        on_turn: Any | None = None,
     ) -> None:
+        """`store` + `chat_id` turn persistence ON: every user and assistant
+        message is appended to the chat row as it happens, and `load()` can
+        replay the transcript into a new instance (the Work surface lists saved
+        chats and reopens them). Without them the conversation is in-memory
+        only, exactly as before — tests and CLI callers are unaffected.
+
+        `on_turn(kind, payload)` is an optional sink for the tool loop, so a
+        caller can render the trajectory live instead of waiting for the turn
+        to end (mirrors the node trajectory events: turn / tool_call /
+        tool_result)."""
         self._provider = provider
         self._catalog = catalog
         self._entry = catalog.resolve(catalog_id)
         self._effort = effort
         self._context = context
+        self._store = store
+        self.chat_id = chat_id
+        self._on_turn = on_turn
         self._history: list[dict[str, Any]] = []
+        self._display: list[tuple[str, str]] = []  # (who, text) replay for the UI
         self.proposal: Proposal | None = None
         self.launched = False
+
+    async def _record(self, role: str, body: dict[str, Any], display: str) -> None:
+        """Persist one transcript row (no-op when persistence is off)."""
+        if self._store is None or self.chat_id is None:
+            return
+        from rework.kernel.state.records import ChatMessage
+
+        try:
+            await self._store.append_chat_message(
+                ChatMessage(chat_id=self.chat_id, role=role, body=body, display=display)
+            )
+        except Exception:  # a storage hiccup must not lose the conversation turn
+            import logging
+
+            logging.getLogger("rework.chat").exception("could not persist chat turn")
+
+    async def _note(self, user_text: str, reply: str) -> None:
+        """Record a turn that never reached the model (a bare yes/no)."""
+        self._display.append(("you", user_text))
+        await self._record("user", {"role": "user", "content": user_text}, user_text)
+        self._display.append(("orchestrator", reply))
+        await self._record("assistant", {"role": "assistant", "content": reply}, reply)
+
+    async def load(self) -> list[tuple[str, str]]:
+        """Rehydrate the transcript from the store. Returns [(who, text)] for the
+        UI, oldest first. Call once after constructing with a chat_id."""
+        if self._store is None or self.chat_id is None:
+            return []
+        messages = await self._store.chat_messages(self.chat_id)
+        self._history = [m.body for m in messages if m.body]
+        # stored roles are provider-neutral ("user"/"assistant"); the display
+        # vocabulary used throughout the UI is "you"/"orchestrator"
+        who = {"user": "you", "assistant": "orchestrator"}
+        self._display = [
+            (who.get(m.role, m.role), m.display) for m in messages if m.display
+        ]
+        return list(self._display)
+
+    @property
+    def transcript(self) -> list[tuple[str, str]]:
+        """The conversation so far, as (who, text), for rendering."""
+        return list(self._display)
 
     @property
     def model_label(self) -> str:
@@ -184,18 +243,21 @@ class OrchestratorChat:
         # A bare yes after a proposal launches it — the owner's confirm gate.
         if self.proposal is not None and text.lower() in YES_WORDS:
             self.launched = True
+            await self._note(text, "Launching.")
             return ChatResult(reply="Launching.", transcript=[Turn("you", text)])
         if self.proposal is not None and text.lower() in NO_WORDS:
             self.proposal = None
-            return ChatResult(
-                reply="Scrapped it. Tell me what to change and I'll propose again.",
-                transcript=[Turn("you", text)],
-            )
+            reply = "Scrapped it. Tell me what to change and I'll propose again."
+            await self._note(text, reply)
+            return ChatResult(reply=reply, transcript=[Turn("you", text)])
 
         user_msg: dict[str, Any] = {"role": "user", "content": text}
         if images:
             user_msg["images"] = images
         self._history.append(user_msg)
+        chips = " ".join(f"📎 {p.split('/')[-1]}" for p in images)
+        self._display.append(("you", f"{text}  {chips}".strip() if chips else text))
+        await self._record("user", user_msg, self._display[-1][1])
         request = ChatRequest(
             model=self._entry.model,
             system=self._system(),
@@ -253,6 +315,10 @@ class OrchestratorChat:
         else:
             reply = reply or "(no reply)"
             transcript.append(Turn("orchestrator", reply))
+
+        shown = transcript[-1].text if transcript else reply
+        self._display.append(("orchestrator", shown))
+        await self._record("assistant", assistant_msg, shown)
 
         return ChatResult(
             reply=reply,

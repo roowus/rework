@@ -253,6 +253,42 @@ class TuiData:
         gate = await store.decide_gate(gate_id, approved)
         return gate is not None and gate.status.value == ("approved" if approved else "rejected")
 
+    # -- chats -------------------------------------------------------------
+
+    async def chats(self, limit: int = 50, include_missions: bool = True) -> list[Any]:
+        return await self._resilient(
+            f"chats:{limit}:{include_missions}",
+            lambda: self._call(
+                lambda s: s.list_chats(limit=limit, include_missions=include_missions)
+            ),
+        )
+
+    async def chat(self, chat_id: str) -> Any:
+        return await self._resilient(
+            f"chat:{chat_id}", lambda: self._call(lambda s: s.get_chat(chat_id))
+        )
+
+    async def new_chat(self, *, title: str = "", project_id: str | None = None,
+                       model_id: str | None = None, effort: str | None = None) -> Any:
+        from rework.kernel.state.records import Chat
+
+        store = await self.store()
+        return await store.create_chat(
+            Chat(title=title, project_id=project_id, model_id=model_id, effort=effort)
+        )
+
+    async def rename_chat(self, chat_id: str, title: str) -> Any:
+        store = await self.store()
+        return await store.update_chat(chat_id, title=title)
+
+    async def attach_chat_to_mission(self, chat_id: str, mission_id: str) -> Any:
+        store = await self.store()
+        return await store.update_chat(chat_id, mission_id=mission_id)
+
+    async def delete_chat(self, chat_id: str) -> None:
+        store = await self.store()
+        await store.delete_chat(chat_id)
+
     # -- library ----------------------------------------------------------
 
     async def library_search(self, query: str) -> list[Any]:
