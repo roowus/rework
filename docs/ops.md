@@ -1,0 +1,66 @@
+# Running rework
+
+## Local (the Mac): the dogfood loop, step one
+
+Everything runs on your machine against a local SQLite state file
+(`~/.rework/local.sqlite3`). Your shell's `REWORK_DB` (which points at rewvis)
+is overridden for these processes only, so nothing touches the deployment.
+
+```bash
+scripts/rework-local serve      # terminal 1: the daemon (leave it running)
+scripts/rework-local            # terminal 2: the TUI
+```
+
+In the TUI, Work tab: pick project `rework`, pick the orchestrator model, and
+describe the change. The orchestrator proposes; Launch starts it. The local
+daemon clones `github.com/roowus/rework`, runs the roles in
+`~/.rework/work/`, and stops at the final gate (open_pr for fix-pr). Approving
+it pushes the branch and opens the PR with your local `gh` login.
+
+Any CLI command works the same way: `scripts/rework-local ls`,
+`scripts/rework-local gates`, `scripts/rework-local new --plan fix-pr --project
+rework "..."`.
+
+One-time setup, already done on this Mac:
+
+```bash
+scripts/rework-local project create rework --repo rework=https://github.com/roowus/rework
+```
+
+Requirements: model keys in your env (`REWORK_FIREWORKS_KEY` for the default
+catalog), `gh auth status` logged in for PR missions. The orchestrator only
+offers models whose key is present (`ModelEntry.has_credentials`).
+
+Stop the daemon with ctrl+c in its terminal. Never leave a local daemon
+running against the deployment DB: it holds the leader lock and idle
+transactions that block migrations (this happened once, for 1d20h).
+
+## rewvis (the deployment)
+
+The daemon runs as `rework.service` (systemd, User=ubuntu) on rewvis
+(tailnet 100.107.125.118), state in Postgres `rework_state` on the
+`rework-dev-pg` container (:5433), env in `~/.rework/rework.env`.
+
+Deploy:
+
+```bash
+ssh ubuntu@100.107.125.118 'cd ~/projects/rework && git pull --ff-only && uv sync \
+  && sudo systemctl restart rework && sleep 3 && systemctl is-active rework \
+  && curl -s http://100.107.125.118:8941/healthz'
+```
+
+A `DaemonLocked` right after a restart is benign: the old heartbeat is still
+fresh; systemd's restart retry wins after one stale window.
+
+Health checks:
+
+```bash
+# idle-in-transaction connections block migrations; look before deploying
+ssh ubuntu@100.107.125.118 "docker exec rework-dev-pg psql -U postgres -d rework_state \
+  -c \"SELECT client_addr, state, count(*) FROM pg_stat_activity \
+       WHERE datname='rework_state' GROUP BY 1,2\""
+```
+
+Tests never touch `rework_state`. Postgres tests use the dedicated
+`rework_test` database:
+`REWORK_TEST_POSTGRES=postgresql://postgres:rework@100.107.125.118:5433/rework_test`.

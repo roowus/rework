@@ -80,7 +80,9 @@ Tabs are `alt+1..5`, `ctrl+n` starts a chat, `alt+a` / `alt+x` answer a gate,
 `docs/tui/DESIGN.md`.
 
 The TUI is a client like every other command: it reads `REWORK_DB`, so from
-your laptop it shows and controls the missions running on the daemon.
+your laptop it shows and controls the missions running on the daemon. To run
+the whole loop on one machine against local state, use
+`scripts/rework-local serve` and `scripts/rework-local` (see `docs/ops.md`).
 
 ## Eval + complaints
 

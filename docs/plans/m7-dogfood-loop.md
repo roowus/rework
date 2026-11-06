@@ -64,8 +64,11 @@ checked with `gh run list`, and deployed to rewvis when the daemon changed.
       Dashboard and the chat's mission card.
 - [x] The chat proposes `auto` missions and hands its own model/effort to the
       mission orchestrator.
-- [ ] Scripted tests through the real engine (sequential, parallel, revise
-      loop, failure retry by choice), then a live toyrepo run on a real model.
+- [x] Scripted tests through the real engine (sequential, parallel, kill and
+      resume, owner cancel), then a live toyrepo run on a real model: mission
+      m-808acff14c50 (local, $0.04, ~3 min) skipped the investigator as too
+      small, recovered from a coder whose model had no key, audited, finished,
+      ship gate approved, DONE.
 
 ### P2: steering and conversation
 
@@ -92,7 +95,7 @@ checked with `gh run list`, and deployed to rewvis when the daemon changed.
 
 - [ ] Local first (owner): daemon + TUI on the Mac against a local SQLite DB,
       missions clone rework from GitHub and open real PRs. Runbook in
-      `docs/ops.md`.
+      `docs/ops.md` and `scripts/rework-local` (done); first real PR pending.
 - [ ] Then deploy to rewvis and run the same loop there.
 - [ ] Run three real rework changes end to end from the TUI: bugs found along
       the way, TUI work, workflow features.
