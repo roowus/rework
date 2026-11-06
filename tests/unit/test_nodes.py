@@ -223,3 +223,34 @@ async def _store(tmp_path: Path):
     from rework.kernel.state.sqlite import open_sqlite
 
     return await open_sqlite(str(tmp_path / "nodes.sqlite3"))
+
+
+def test_report_transcript_keeps_the_evidence() -> None:
+    """The writer must see tool arguments and tool RESULTS (found live: they
+    were dropped, so a report called a location it had printed 'lost')."""
+    from rework.nodes.report_writer import render_transcript
+
+    messages = [
+        {"role": "user", "content": "find the menu border"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "name": "run_command",
+                    "arguments": {"command": "grep -n menu app.tcss"},
+                }
+            ],
+        },
+        {"role": "tool", "name": "run_command", "content": "53:#menu {\n58:    border: none;"},
+    ]
+    text = render_transcript(messages)
+    assert "grep -n menu app.tcss" in text
+    assert "58:    border: none;" in text
+
+    huge = [{"role": "tool", "name": "read_file", "content": "x" * 50_000}] * 10
+    shrunk = render_transcript(messages + huge + messages, budget=20_000)
+    assert len(shrunk) <= 20_100
+    assert "find the menu border" in shrunk, "the start survives"
+    assert shrunk.rstrip().endswith("border: none;"), "the end survives"

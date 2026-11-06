@@ -24,6 +24,48 @@ log = logging.getLogger("rework.nodes")
 ReportWriterNode = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
+TRANSCRIPT_BUDGET = 90_000  # characters handed to the writer
+
+
+def render_transcript(messages: list[dict[str, Any]], budget: int = TRANSCRIPT_BUDGET) -> str:
+    """The work as the writer sees it: narration, tool calls WITH arguments,
+    and tool results (the evidence), shrunk to fit the budget.
+
+    Found live (mission m-0d75f495121a): tool results were filtered out and
+    calls reduced to bare names, so the writer never saw a single file the
+    investigator read. The report called the exact location 'lost' and filed
+    it as a blocker, although the run had printed it verbatim. Results shrink
+    first (2000, 800, then 300 chars each); if that still overflows, the
+    middle of the transcript is elided, keeping the start and the end."""
+
+    def render(per_result: int) -> list[str]:
+        out: list[str] = []
+        for m in messages:
+            role = m.get("role")
+            if role == "tool":
+                body = str(m.get("content") or "")
+                if len(body) > per_result:
+                    body = body[:per_result] + f" … [{len(body) - per_result} more chars]"
+                out.append(f"[tool result: {m.get('name', '?')}] {body}")
+                continue
+            line = f"[{role}]"
+            if m.get("content"):
+                line += f" {m['content']}"
+            for tc in m.get("tool_calls") or []:
+                args = json.dumps(tc.get("arguments") or {}, default=str)
+                line += f"\n  -> {tc.get('name')}({args[:400]})"
+            out.append(line)
+        return out
+
+    for per_result in (2000, 800, 300):
+        entries = render(per_result)
+        text = "\n".join(entries)
+        if len(text) <= budget:
+            return text
+    head, tail = budget // 4, budget - budget // 4
+    return text[:head] + "\n… [middle of the transcript elided] …\n" + text[-tail:]
+
+
 def make_report_writer_node(
     provider: ModelProvider,
     catalog: ModelCatalog,
@@ -82,18 +124,7 @@ def make_report_writer_node(
         return artifact, ""
 
     async def node(state: dict[str, Any]) -> dict[str, Any]:
-        transcript = state.get("messages") or []
-        transcript_text = "\n".join(
-            f"[{m.get('role')}]"
-            + (f" {m['content']}" if m.get("content") else "")
-            + (
-                " tool_calls: " + ", ".join(tc["name"] for tc in m.get("tool_calls", []))
-                if m.get("tool_calls")
-                else ""
-            )
-            for m in transcript
-            if m.get("role") != "tool"
-        )
+        transcript_text = render_transcript(state.get("messages") or [])
         prompt = build_report_prompt(sections)
         messages: list[dict[str, Any]] = [
             {
@@ -101,7 +132,7 @@ def make_report_writer_node(
                 "content": (
                     f"Produce the report artifact.\n\nReport sections:\n{prompt}\n\n"
                     f"JSON schema your output must satisfy:\n{json.dumps(schema)}\n\n"
-                    f"Transcript of the work:\n{transcript_text[:60000]}"
+                    f"Transcript of the work:\n{transcript_text}"
                 ),
             }
         ]
