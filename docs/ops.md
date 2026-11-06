@@ -35,6 +35,29 @@ Stop the daemon with ctrl+c in its terminal. Never leave a local daemon
 running against the deployment DB: it holds the leader lock and idle
 transactions that block migrations (this happened once, for 1d20h).
 
+## Logs
+
+Every process writes JSON lines to `~/.rework/logs/<component>.log`
+(`REWORK_LOG_DIR` overrides; 10 MB x 5 rotation): `daemon` (runners, roles,
+the orchestrator, every model call with latency and tokens, every tool call
+with its duration, crashes with tracebacks), `tui` (swallowed UI errors,
+offline transitions, chat model calls) and `cli`. Records inside a role or the
+orchestrator are tagged with `mission`, `run` and `role` automatically.
+
+```bash
+rework logs                          # last 100 records, all components
+rework logs daemon -f                # follow the engine
+rework logs -m m-0d75f495121a        # one mission
+rework logs -l warning               # problems only
+rework logs tui -g offline           # substring filter
+```
+
+On rewvis the daemon's console lines also go to journald
+(`journalctl -u rework`), and the JSON file is on the VM:
+`ssh ubuntu@100.107.125.118 'cd ~/projects/rework && uv run rework logs -l warning'`.
+
+`REWORK_LOG_LEVEL=DEBUG` adds detail. Prompts and keys are never logged.
+
 ## rewvis (the deployment)
 
 The daemon runs as `rework.service` (systemd, User=ubuntu) on rewvis

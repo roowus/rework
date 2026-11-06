@@ -18,6 +18,7 @@ plan/dispatch/check-in nodes land with the M2 vertical slice.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -43,9 +44,12 @@ from rework.kernel.state.records import (
     run_id as make_run_id,
 )
 from rework.kernel.state.store import StateStore
+from rework.logs import bind
 from rework.nodes.report_sections import mechanical_verdict
 from rework.roles.base import EscalationKind, RoleBuildCtx
 from rework.roles.registry import RoleRegistry
+
+log = logging.getLogger("rework.engine")
 
 DEFAULT_PLAN: dict[str, Any] = {"steps": [{"step": "echo", "role": "echo"}]}
 
@@ -183,6 +187,8 @@ class RunSupervisor:
 
     async def _execute(self, run: Run, resume_from_checkpoint: bool) -> None:
         """Run one role graph to its next stop: completion or interrupt."""
+        bind(mission=self._mission.id, run=run.id, role=run.role)
+        log.info("role %s started%s", run.role, " (resume)" if resume_from_checkpoint else "")
         try:
             graph = await self._build_graph(run)
             await self._store.update_run(run.id, status=RunStatus.RUNNING)
@@ -211,7 +217,11 @@ class RunSupervisor:
                 spec = self._registry.get(run.role)
                 result = await graph.ainvoke(spec.initial_state(self._ctxs[run.id]), config=config)
             await self._consume_result(run, result)
+        except asyncio.CancelledError:
+            log.info("role %s cancelled", run.role)
+            raise
         except Exception as exc:
+            log.exception("role %s failed", run.role)
             await self._store.update_run(run.id, status=RunStatus.FAILED)
             await self._bus.publish(
                 EventRecord(
@@ -225,6 +235,7 @@ class RunSupervisor:
     async def _consume_result(self, run: Run, result: Any) -> None:
         if isinstance(result, dict) and "__interrupt__" in result:
             payload = result["__interrupt__"][0].value
+            log.info("role %s halted: %s", run.role, str(payload)[:200])
             await self._store.update_run(
                 run.id, status=RunStatus.HALTED_ESCALATED, escalation=payload
             )
@@ -238,6 +249,7 @@ class RunSupervisor:
             )
         else:
             artifact = result.get("artifact") if isinstance(result, dict) else None
+            log.info("role %s completed", run.role)
             await self._store.update_run(
                 run.id, status=RunStatus.COMPLETED, artifact=artifact or {}
             )
@@ -275,6 +287,8 @@ class RunSupervisor:
         self.tasks[run.id] = asyncio.create_task(self._execute_resume(run, decision))
 
     async def _execute_resume(self, run: Run, decision: Any) -> None:
+        bind(mission=self._mission.id, run=run.id, role=run.role)
+        log.info("role %s resuming with a decision", run.role)
         try:
             graph = await self._build_graph(run)
             await self._store.update_run(run.id, status=RunStatus.RUNNING)
@@ -282,6 +296,7 @@ class RunSupervisor:
             result = await graph.ainvoke(Command(resume=decision), config=config)
             await self._consume_result(run, result)
         except Exception as exc:
+            log.exception("role %s resume failed", run.role)
             await self._store.update_run(run.id, status=RunStatus.FAILED)
             await self._bus.publish(
                 EventRecord(
@@ -340,6 +355,7 @@ class MissionRunner:
         self._supervisor: RunSupervisor | None = None
 
     async def run(self) -> None:
+        bind(mission=self.mission_id)
         mission = await self._store.get_mission(self.mission_id)
         if mission is None:
             raise ValueError(f"mission {self.mission_id} not found")
@@ -696,6 +712,7 @@ class MissionRunner:
         else:
             status = MissionStatus.DONE
         await self._store.update_mission(mission_id, status=status, result=result)
+        log.info("mission %s: %s", mission_id, status.value)
         event = EventType.MISSION_DONE if status == MissionStatus.DONE else EventType.MISSION_FAILED
         await self._bus.publish(
             EventRecord(mission_id=mission_id, type=event, payload={"runs": len(runs)})

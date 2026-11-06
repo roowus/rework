@@ -141,6 +141,9 @@ class ReworkApp(App[None]):
         yield HintBar()
 
     def on_mount(self) -> None:
+        from rework.logs import asyncio_exception_handler
+
+        asyncio.get_running_loop().set_exception_handler(asyncio_exception_handler)
         self.hub.subscribe(self._on_snapshot)
         self.query_one(TabBar).set_active("work")
         self.query_one(MenuBar).set_status(online=True, gates=0, spend_today=0.0)
@@ -469,4 +472,9 @@ async def _pbcopy(text: str) -> None:
 
 
 def run_tui() -> None:
+    from rework.logs import setup_logging
+
+    setup_logging("tui")  # file only: the TUI owns the terminal
+    log.info("tui start")
     ReworkApp().run()
+    log.info("tui exit")

@@ -20,6 +20,16 @@ __all__ = [
 
 
 def build_provider(entry: ModelEntry, extra: dict[str, Any] | None = None) -> ModelProvider:
+    """Build the adapter an entry names, wrapped so every call is logged."""
+    provider = _build(entry, extra)
+    if entry.provider == "fake":
+        return provider
+    from rework.kernel.llm.adapters.logged import LoggedProvider
+
+    return LoggedProvider(provider)
+
+
+def _build(entry: ModelEntry, extra: dict[str, Any] | None = None) -> ModelProvider:
     """Build the adapter an entry names. Keys come from the entry's api_key_env or
     provider defaults (ANTHROPIC_API_KEY / OPENAI_API_KEY). extra carries env-independent
     credentials (e.g. per-endpoint keys for openai-compatible providers)."""

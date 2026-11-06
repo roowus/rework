@@ -970,10 +970,12 @@ def attach(mission_id: str, follow: bool = True) -> None:
 @app.command()
 def serve() -> None:
     """Run the headless daemon (one per database; leader-locked)."""
-    import logging
     from pathlib import Path
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+    from rework.logs import setup_logging
+
+    log_path = setup_logging("daemon", console=True)
+    typer.echo(f"logs: {log_path}")
 
     from rework.config import DEFAULT_STATE_DIR, Config, load_catalog, open_store_from_config
 
@@ -984,6 +986,9 @@ def serve() -> None:
         workroot = Path(config.db).expanduser().parent / "work"
 
     async def go() -> None:
+        from rework.logs import asyncio_exception_handler
+
+        asyncio.get_running_loop().set_exception_handler(asyncio_exception_handler)
         from rework.kernel.events.bus import InProcessEventBus
         from rework.orchestrator.daemon import (
             Daemon,
@@ -1137,7 +1142,42 @@ def main() -> None:
 
         run_tui()
         return
+    if sys.argv[1] not in ("serve", "logs", "library-mcp"):
+        from rework.logs import setup_logging
+
+        setup_logging("cli")
     app()
+
+
+@app.command()
+def logs(
+    component: str | None = typer.Argument(None, help="daemon | tui | cli (default: all)"),
+    mission: str | None = typer.Option(None, "--mission", "-m", help="Only this mission."),
+    level: str | None = typer.Option(None, "--level", "-l", help="Minimum level, e.g. warning."),
+    grep: str | None = typer.Option(None, "--grep", "-g", help="Substring filter."),
+    lines: int = typer.Option(100, "--lines", "-n"),
+    follow: bool = typer.Option(False, "--follow", "-f", help="Keep printing new records."),
+) -> None:
+    """Read the structured logs in ~/.rework/logs (REWORK_LOG_DIR): every model
+    call with latency and tokens, tool calls, role lifecycles, crashes."""
+    import time as _time
+
+    from rework.logs import format_record, read_logs
+
+    seen = 0.0
+    for rec in read_logs(component, mission=mission, level=level, grep=grep, limit=lines):
+        typer.echo(format_record(rec))
+        seen = max(seen, float(rec.get("ts", 0)))
+    while follow:
+        _time.sleep(1.0)
+        fresh = [
+            r
+            for r in read_logs(component, mission=mission, level=level, grep=grep, limit=500)
+            if float(r.get("ts", 0)) > seen
+        ]
+        for rec in fresh:
+            typer.echo(format_record(rec))
+            seen = max(seen, float(rec.get("ts", 0)))
 
 
 if __name__ == "__main__":

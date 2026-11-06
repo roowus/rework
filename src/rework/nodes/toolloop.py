@@ -13,6 +13,7 @@ normal use (ADR 0003: no hardcoded turn steering; the budget ledger enforces).
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -155,7 +156,14 @@ def make_toolloop_node(
                     "tool_call",
                     {"name": tc.name, "arguments": _short_args(tc.arguments)},
                 )
+                started = time.perf_counter()
                 out = await executor.execute(tc.name, dict(tc.arguments))
+                log.info(
+                    "tool %s%s",
+                    tc.name,
+                    " (error)" if _is_error(out) else "",
+                    extra={"tool": tc.name, "ms": int((time.perf_counter() - started) * 1000)},
+                )
                 await emit(
                     "tool_result",
                     {

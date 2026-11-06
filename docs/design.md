@@ -89,6 +89,17 @@ before the first astream call).
 Roles are NOT subgraphs of the orchestrator checkpoint; each Run is an independent
 asyncio task with its own checkpointer thread. Parallelism = N run rows for one step.
 
+### Logs
+
+`rework/logs.py`: JSON lines per component in `~/.rework/logs/` with
+rotation. A contextvar (`logs.bind`) tags every record inside a role run or
+the orchestrator with mission / run / role; `build_provider` wraps real
+providers in `LoggedProvider` (model, latency, tokens, failures); the tool
+loop logs each tool call with its duration; role and mission lifecycles,
+runner crashes and uncaught exceptions (sys + asyncio hooks) are logged with
+tracebacks. Mission events in the store remain the product record the UI
+shows; logs are the operational record. `rework logs` reads and follows them.
+
 ### Roles
 
 Code-first `RoleSpec` subclasses; a registry auto-discovers role modules; standard

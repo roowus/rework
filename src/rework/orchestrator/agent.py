@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -34,6 +35,9 @@ from rework.kernel.state.records import (
     RunStatus,
 )
 from rework.kernel.state.records import run_id as make_run_id
+from rework.logs import bind
+
+log = logging.getLogger("rework.orchestrator")
 
 if TYPE_CHECKING:
     from rework.orchestrator.engine import MissionRunner
@@ -330,6 +334,8 @@ class MissionOrchestrator:
     # -- main loop ---------------------------------------------------------
 
     async def run(self) -> None:
+        bind(mission=self.mid, run=self.run_id, role="orchestrator")
+        log.info("orchestrator start: model=%s playbook=%s", self.entry.id, self.playbook)
         await self._load()
         await self._recover_runs()
         if not self.history:
@@ -413,6 +419,7 @@ class MissionOrchestrator:
         try:
             result = await self.provider().complete(request)
         except Exception as exc:
+            log.exception("orchestrator model call failed")
             await self.bus.publish(
                 EventRecord(
                     mission_id=self.mid,
@@ -457,13 +464,21 @@ class MissionOrchestrator:
         ordered = sorted(calls, key=lambda c: c.name in ("wait", "finish"))
         for call in ordered:
             args = dict(call.arguments or {})
+            log.info(
+                "orchestrator %s %s",
+                call.name,
+                _short(_args_line(args), 200),
+                extra={"tool": call.name},
+            )
             await self._emit("tool_call", name=call.name, arguments=_short(_args_line(args), 300))
             try:
                 output = await self._dispatch(call.id, call.name, args)
                 error = ""
             except ToolError as exc:
                 output, error = f"error: {exc}", str(exc)
+                log.info("orchestrator tool error: %s", exc)
             except Exception as exc:  # a tool bug must not kill the mission
+                log.exception("orchestrator tool %s crashed", call.name)
                 output = f"error: {type(exc).__name__}: {exc}"
                 error = output
             await self._emit(
