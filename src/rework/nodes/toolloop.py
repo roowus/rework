@@ -52,6 +52,58 @@ def _is_error(output: str | None) -> bool:
 ToolLoopNode = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 
 
+# how long a role at the budget cap waits for the burn gate to put the mission
+# on hold before giving up (the gate is checked on the engine's poll interval)
+BUDGET_HOLD_GRACE_S = 30.0
+
+
+async def _current_budget(store: StateStore, mission_id: str, budget: Budget) -> Budget:
+    """The role's cap, raised to the mission's CURRENT plan cap: the owner can
+    extend a mission's budget at the burn gate after this role was built."""
+    mission = await store.get_mission(mission_id)
+    cap = (((mission.plan if mission else None) or {}).get("budget") or {}).get("max_usd")
+    if cap is None or budget.max_usd is None or float(cap) <= budget.max_usd:
+        return budget
+    return Budget(
+        max_usd=float(cap),
+        max_input_tokens=budget.max_input_tokens,
+        max_output_tokens=budget.max_output_tokens,
+    )
+
+
+async def _budget_exceeded(store: StateStore, mission_id: str, budget: Budget) -> str | None:
+    spend = await store.mission_spend(mission_id)
+    try:
+        guard(spend, await _current_budget(store, mission_id, budget))
+    except Exception as exc:
+        return str(exc)
+    return None
+
+
+async def _wait_for_budget(store: StateStore, mission_id: str, budget: Budget) -> bool:
+    """At the cap, PAUSE instead of quitting: the burn gate puts the mission on
+    hold and asks the owner. Returns True when the budget was raised (carry
+    on), False when the mission was cancelled or nobody held it within the
+    grace period (the old stop behaviour). Found while monitoring a live
+    mission: roles quitting at the cap raced the gate meant to ask first."""
+    import asyncio
+
+    from rework.kernel.state.records import MissionStatus
+
+    waited = 0.0
+    while True:
+        if await _budget_exceeded(store, mission_id, budget) is None:
+            return True
+        mission = await store.get_mission(mission_id)
+        if mission is None or mission.status == MissionStatus.CANCELLED:
+            return False
+        if mission.status != MissionStatus.ON_HOLD:
+            waited += 1.0
+            if waited > BUDGET_HOLD_GRACE_S:
+                return False
+        await asyncio.sleep(1.0)
+
+
 def make_toolloop_node(
     provider: ModelProvider,
     catalog: ModelCatalog,
@@ -111,11 +163,9 @@ def make_toolloop_node(
         specs = executor.specs()
 
         for _ in range(max_iterations):
-            spend = await store.mission_spend(mission_id)
-            try:
-                guard(spend, budget)
-            except Exception as exc:
-                stop_note = f"stopped: {exc}"
+            exceeded = await _budget_exceeded(store, mission_id, budget)
+            if exceeded is not None and not await _wait_for_budget(store, mission_id, budget):
+                stop_note = f"stopped: {exceeded}"
                 break
             result = await provider.complete(
                 ChatRequest(

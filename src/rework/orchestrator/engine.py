@@ -141,9 +141,11 @@ class RunSupervisor:
             await self._store.update_run(run.id, model_ref=resolved)
             run = run.model_copy(update={"model_ref": resolved})
 
-        # plan-level mission budget overrides the spec default cap
+        # plan-level mission budget overrides the spec default cap; read the
+        # row, not the mission object from start-up (the burn gate raises it)
         budget = spec.budget
-        plan_cap = ((self._mission.plan or {}).get("budget") or {}).get("max_usd")
+        fresh_mission = await self._store.get_mission(self._mission.id) or self._mission
+        plan_cap = ((fresh_mission.plan or {}).get("budget") or {}).get("max_usd")
         if plan_cap is not None:
             budget = Budget(
                 max_usd=float(plan_cap),
@@ -958,13 +960,19 @@ class MissionRunner:
             ),
         )
         await self._store.update_mission(self.mission_id, status=MissionStatus.ON_HOLD)
+        # stop spending while the owner decides: live roles are cancelled and
+        # resume from their checkpoints if the budget is extended
+        assert self._supervisor is not None
+        for task in list(self._supervisor.tasks.values()):
+            if not task.done():
+                task.cancel()
         await self._bus.publish(
             EventRecord(
                 mission_id=self.mission_id,
                 type=EventType.INFO,
                 payload={
                     "note": f"burn cap hit (${spend.spent_usd:.2f} > ${float(cap):.2f}); "
-                    f"mission ON_HOLD, gate {gate.id}"
+                    f"mission ON_HOLD, roles paused, gate {gate.id}"
                 },
             )
         )
@@ -989,6 +997,9 @@ class MissionRunner:
                 plan=self._plan,
             )
         await self._store.update_mission(self.mission_id, status=MissionStatus.RUNNING)
+        for run in await self._store.list_runs(self.mission_id):
+            if not _terminal(run) and run.status != RunStatus.HALTED_ESCALATED:
+                await self._supervisor.ensure_started(run)
         await self._bus.publish(
             EventRecord(
                 mission_id=self.mission_id,
