@@ -540,6 +540,8 @@ class MissionRunner:
             if gate.status == GateStatus.OPEN:
                 await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
             ship_decision = await self._gate_decision(mission.id, gate.id)
+            if ship_decision:
+                await self._deliver_branch(mission, results)
 
         # open_pr gate: human approves publishing the branch as a PR, then the
         # push + PR creation are mechanical (agents never merge; ADR 0003)
@@ -569,6 +571,55 @@ class MissionRunner:
                 pr_url = await self._create_pr(mission, results)
 
         return ship_decision, pr_url
+
+    async def _deliver_branch(self, mission: Mission, results: dict[str, Run]) -> None:
+        """Honor the project's `results` setting on ship (ADR 0005): for a
+        git-origin mission, push the final coder branch so the owner can review
+        and merge it. Found live: the first dogfood mission was approved at the
+        ship gate and its commit stayed on the daemon's disk, delivered nowhere."""
+        if not mission.repo_origin:
+            return  # local / uploaded repos: `rework fetch` brings the result back
+        mode = "push_branch"
+        if mission.project_id:
+            project = await self._store.get_project(mission.project_id)
+            mode = str(((project.settings if project else {}) or {}).get("results") or mode)
+        if mode not in ("push_branch", "both"):
+            return
+        coder = results.get("code")
+        if coder is None or not (coder.artifact or {}).get("branch"):
+            coders = [
+                r
+                for r in await self._store.list_runs(mission.id)
+                if r.role == "coder"
+                and r.status == RunStatus.COMPLETED
+                and (r.artifact or {}).get("branch")
+            ]
+            coder = coders[-1] if coders else None
+        if coder is None:
+            return
+        art = coder.artifact or {}
+        from rework.nodes.git_ops import push_branch
+
+        try:
+            await push_branch(Path(str(art.get("worktree") or mission.repo_path)), art["branch"])
+        except Exception as exc:
+            log.warning("ship: pushing %s failed: %s", art.get("branch"), exc)
+            await self._bus.publish(
+                EventRecord(
+                    mission_id=mission.id,
+                    type=EventType.INFO,
+                    payload={"error": f"shipped, but pushing {art.get('branch')} failed: {exc}"},
+                )
+            )
+            return
+        self._shipped_branch = str(art["branch"])
+        await self._bus.publish(
+            EventRecord(
+                mission_id=mission.id,
+                type=EventType.INFO,
+                payload={"note": f"shipped: pushed branch {art['branch']} to origin"},
+            )
+        )
 
     def _pr_body(
         self, mission: Mission, coder_artifact: dict[str, Any], audit_run: Run | None
@@ -699,6 +750,9 @@ class MissionRunner:
         pr_url = getattr(self, "_pr_url", None)
         if pr_url:
             result["pr_url"] = pr_url
+        shipped = getattr(self, "_shipped_branch", None)
+        if shipped:
+            result["branch"] = shipped
         current = await self._store.get_mission(mission_id)
         if current is not None and current.status == MissionStatus.CANCELLED:
             # the burn gate (or an owner cancel) already set the verdict while

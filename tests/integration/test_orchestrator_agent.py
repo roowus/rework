@@ -550,3 +550,63 @@ async def test_turn_budget_stops_a_role(world: dict[str, Any]) -> None:
     assert len(loop_reqs) == 3, "the loop stopped at its budget"
     assert "Turn budget: about 3" in str(loop_reqs[0].messages[0]["content"])
     assert any("wrap up" in str(m.get("content")) for m in loop_reqs[-1].messages)
+
+
+def _git(args: list[str], cwd: Path | None = None) -> str:
+    return subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True).stdout
+
+
+async def test_ship_pushes_the_branch_for_a_git_origin_mission(
+    tmp_path: Path, toy_repo: Path
+) -> None:
+    """Found live: a shipped mission's commit stayed on the daemon's disk.
+    Approving ship on a git-origin mission pushes the final coder branch."""
+    bare = tmp_path / "origin.git"
+    await asyncio.to_thread(_git, ["git", "clone", "--bare", str(toy_repo), str(bare)])
+    clone = tmp_path / "clone"
+    await asyncio.to_thread(_git, ["git", "clone", str(bare), str(clone)])
+    db = str(tmp_path / "ship.sqlite3")
+    store = await open_sqlite(db)
+    try:
+        await store.create_mission(
+            Mission(
+                id="ms",
+                objective=OBJECTIVE,
+                repo_path=str(clone),
+                repo_origin=str(bare),
+                plan=orchestrated_plan("fix", "pro"),
+            )
+        )
+        provider = ScriptedProvider()
+        provider.route(
+            MARKER,
+            [
+                turn(
+                    call("spawn_role", "s1", role="coder", step="code", brief="fix add()"),
+                    call("wait", "s2"),
+                ),
+                turn(call("finish", "s3", outcome="done", summary="fixed")),
+            ],
+        )
+        provider.route("Fulfill the task", _coder_script("tests pass"))
+        world = {
+            "db": db,
+            "store": store,
+            "provider": provider,
+            "mission": await store.get_mission("ms"),
+            "ck": str(tmp_path / "ck.sqlite3"),
+            "workroot": tmp_path / "work",
+            "registry": autodiscover(),
+            "catalog": role_catalog(),
+        }
+        task = asyncio.create_task(runner(world).run())
+        await approve_next_gate(world)
+        await asyncio.wait_for(task, timeout=30)
+        mission = await store.get_mission("ms")
+        assert mission is not None and mission.status == MissionStatus.DONE
+        branch = (mission.result or {}).get("branch")
+        assert branch == "rework/ms-code-coder-1"
+        out = await asyncio.to_thread(_git, ["git", "branch", "--list", branch], bare)
+        assert branch in out, "the branch reached origin"
+    finally:
+        await store.aclose()

@@ -44,6 +44,10 @@ Plans you can choose:
 - fix     — investigate, code, audit, then a ship gate
 - fix-pr  — same, but finishes by opening a pull request
 
+For a project backed by a git repo, prefer fix-pr: the owner reviews the change
+as a pull request, and the PR gate still lets them stop first. Use fix when they
+only want the result held for inspection.
+
 Available context is provided in the conversation as system notes. Use it.
 
 You can also LOOK before you leap: list_projects, list_missions, get_mission and
