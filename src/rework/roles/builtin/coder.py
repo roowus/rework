@@ -113,7 +113,13 @@ class CoderSpec(RoleSpec):
 
         async def prepare(state: CoderState) -> dict[str, Any]:
             run_ctx = ctx.run.context or {}
-            worktree, base_sha = await ensure_worktree(repo, worktree_path, branch)
+            # a revision continues the previous coder's branch (its changes are
+            # already in the tree); base_sha stays the ORIGINAL base so the
+            # auditor sees the whole change, not just this round's delta
+            continue_branch = run_ctx.get("continue_branch") or None
+            worktree, base_sha = await ensure_worktree(
+                repo, worktree_path, branch, start_point=continue_branch
+            )
             if run_ctx.get("base_sha"):
                 base_sha = str(run_ctx["base_sha"])  # resume: keep the original base
             else:
@@ -125,6 +131,12 @@ class CoderSpec(RoleSpec):
             investigation = run_ctx.get("investigation")
             brief = str(run_ctx.get("brief") or state["objective"])
             parts = [f"Implementation brief: {brief}"]
+            if continue_branch:
+                parts.append(
+                    "You are continuing earlier work: your worktree already contains the"
+                    f" previous attempt's changes (branch {continue_branch}). Change only"
+                    " what the brief asks for; do not start over."
+                )
             if investigation:
                 parts.append(
                     "Investigator's findings (context from the orchestrator):\n"
@@ -198,6 +210,7 @@ class CoderSpec(RoleSpec):
             budget=ctx.budget,
             effort=ctx.run.model_ref.get("effort"),
             bus=ctx.bus,
+            resume_file=ctx.workdir / "loop.json",
             on_start=ensure_attached,
         )
 

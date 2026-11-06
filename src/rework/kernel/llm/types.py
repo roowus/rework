@@ -47,6 +47,11 @@ class ChatRequest(BaseModel):
     # adapter's business (Anthropic thinking budget, OpenAI reasoning_effort);
     # adapters that cannot express it ignore it. None = provider default.
     effort: str | None = None
+    # Sticky routing key for prompt caching (one per role run / orchestrator).
+    # Providers cache by exact prefix but only within one replica; without a
+    # session key consecutive turns land on random replicas and miss (found
+    # live: 6k of 8.9M input tokens cached). Adapters that cannot use it ignore it.
+    session_id: str | None = None
 
 
 class ChatResult(BaseModel):

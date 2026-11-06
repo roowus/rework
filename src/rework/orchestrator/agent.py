@@ -54,17 +54,20 @@ PLAYBOOKS: dict[str, str] = {
     "fix": (
         "Usual shape: an investigator finds out what is going on (cheap model, quick "
         "depth unless the problem is unclear); a coder implements the change in its "
-        "own worktree and runs the tests; an auditor reviews the coder's diff (strong "
-        "model). If the auditor requests changes, spawn the coder again with the "
-        "findings in its brief, then audit again; stop after two revision rounds and "
-        "finish with what you have. Skip the investigator when the change is small "
+        "own worktree and runs the tests; an auditor reviews the coder's diff. Then "
+        "LOOP: while the audit requests changes or reports any medium-or-higher "
+        "finding, spawn the coder again with those findings in its brief (it continues "
+        "on the previous coder's branch automatically) and audit again. Low-severity "
+        "notes alone do not need a revision. If three rounds have not converged, "
+        "ask_owner whether to continue. Skip the investigator when the change is small "
         "and obvious. After you finish, the owner decides whether to ship."
     ),
     "fix-pr": (
-        "Same shape as fix: investigate (optional for small changes), code, audit, "
-        "revise on request-changes (at most two rounds). After you finish, the owner "
-        "decides whether to open a pull request from the last coder's branch; "
-        "agents never merge."
+        "Same shape and same revise-until-clean loop as fix: investigate (optional for "
+        "small changes), code, audit, revise while the audit requests changes or has "
+        "medium-or-higher findings (ask_owner after three rounds). After you finish, "
+        "the owner decides whether to open a pull request from the last coder's "
+        "branch; agents never merge."
     ),
 }
 
@@ -88,6 +91,10 @@ How you work:
   can decide. Never leave a role waiting.
 - The owner may message you mid-mission; treat it as the latest word on intent.
 - Steer a role that is drifting with `redirect` instead of cancelling it.
+- Cost: give every role a turn budget (`max_turns`) sized to the work, prefer quick
+  investigations, and keep briefs tight. But money is the owner's call: never skip
+  a needed revision or audit to save budget. The budget gate asks the owner before
+  the cap is passed.
 - Call `finish` when the mission's goal is met, or when it cannot be met (say why).
   Final gates (ship / open a PR) happen after you finish; you do not open them.
 - Respond with tool calls. Text without a tool call wastes a turn."""
@@ -117,6 +124,16 @@ TOOLS: list[ToolSpec] = [
                 },
                 "model": {"type": "string", "description": "Catalog id (default: role's)."},
                 "effort": {"type": "string", "enum": ["low", "medium", "high"]},
+                "max_turns": {
+                    "type": "integer",
+                    "description": "Tool-round budget for this role (cost control). "
+                    "Defaults: investigator 20 (deep 45), coder 40, auditor 25.",
+                },
+                "fresh": {
+                    "type": "boolean",
+                    "description": "Coders only: start from the original base instead of "
+                    "continuing the previous coder's branch.",
+                },
                 "depth": {
                     "type": "string",
                     "enum": ["quick", "deep"],
@@ -467,13 +484,19 @@ class MissionOrchestrator:
         return "ok"
 
     async def _think(self) -> Any:
+        # the system prompt is STATIC for the whole mission (prompt caching
+        # works on exact prefixes); the live state rides in a trailing message
+        # that is never persisted
+        state = f"CURRENT STATE (rebuilt from the database for this turn):\n{await self._state()}"
+        messages = [*self.history, {"role": "user", "content": state}]
         request = ChatRequest(
             model=self.entry.model,
             system=await self._system_prompt(),
-            messages=self.history,
+            messages=messages,
             tools=TOOLS,
             max_tokens=min(int(self.entry.max_output or 4096), 4096),
             effort=self.effort,
+            session_id=self.run_id,
         )
         try:
             result = await self.provider().complete(request)
@@ -497,8 +520,10 @@ class MissionOrchestrator:
                 model=self.entry.model,
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
-                cached_tokens=getattr(usage, "cached_tokens", 0) or 0,
-                cost_usd=self.entry.estimate_cost(usage.input_tokens, usage.output_tokens),
+                cached_tokens=usage.cached_tokens,
+                cost_usd=self.entry.estimate_cost(
+                    usage.input_tokens, usage.output_tokens, usage.cached_tokens
+                ),
             )
         )
         message: dict[str, Any] = {"role": "assistant", "content": result.text or ""}
@@ -644,6 +669,22 @@ class MissionOrchestrator:
         context["brief"] = brief
         if args.get("depth") in ("quick", "deep"):
             context["depth"] = args["depth"]
+        context["max_turns"] = _turn_budget(role, args)
+        if role == "coder" and not args.get("fresh"):
+            # a revision continues the last finished coder's branch; the diff
+            # base stays the original, so the auditor still sees the whole change
+            done = [
+                r
+                for r in runs
+                if r.role == "coder"
+                and r.status == RunStatus.COMPLETED
+                and (r.artifact or {}).get("branch")
+            ]
+            if done:
+                prev = done[-1].artifact or {}
+                context["continue_branch"] = prev["branch"]
+                if prev.get("base_sha"):
+                    context["base_sha"] = prev["base_sha"]
         context["_call"] = call_id
         model_ref: dict[str, Any] = {}
         if model:
@@ -987,12 +1028,10 @@ class MissionOrchestrator:
             + (f", {', '.join(sorted(e.capabilities))}" if e.capabilities else "")
             for e in self._usable()
         ]
-        spend = await self.store.mission_spend(self.mid)
         budget = plan.get("budget") or {}
         cap = budget.get("max_usd")
         repo = mission.repo_origin or mission.repo_path or "none (no code changes possible)"
         gates = plan.get("gates") or []
-        state = await self._digest()
         return "\n\n".join(
             [
                 f"{MARKER} for rework, a multi-agent workflow engine. You run one "
@@ -1007,11 +1046,19 @@ class MissionOrchestrator:
                 "MISSION:\n"
                 f"- id: {mission.id}\n- objective: {mission.objective}\n- repo: {repo}\n"
                 f"- final gates after you finish: {', '.join(gates) or 'none'}\n"
-                f"- spend so far: ${spend.spent_usd:.3f}"
-                + (f" of a ${float(cap):.2f} budget" if cap else ""),
-                "CURRENT STATE (rebuilt from the database every turn):\n" + state,
+                + (
+                    f"- budget: ${float(cap):.2f} (the owner is asked before it is exceeded)"
+                    if cap
+                    else "- budget: none"
+                ),
+                "The CURRENT STATE message at the end of the conversation is rebuilt from "
+                "the database every turn; trust it over your memory.",
             ]
         )
+
+    async def _state(self) -> str:
+        spend = await self.store.mission_spend(self.mid)
+        return f"- spend so far: ${spend.spent_usd:.3f}\n" + await self._digest()
 
     async def _digest(self) -> str:
         runs = await self.store.list_runs(self.mid)
@@ -1038,6 +1085,18 @@ class MissionOrchestrator:
         if mission is not None and mission.status != MissionStatus.RUNNING:
             lines.append(f"- mission status: {mission.status.value}")
         return "\n".join(lines)
+
+
+DEFAULT_TURNS = {"investigator": 20, "coder": 40, "auditor": 25}
+
+
+def _turn_budget(role: str, args: dict[str, Any]) -> int:
+    asked = args.get("max_turns")
+    if isinstance(asked, int | float) and asked > 0:
+        return max(3, min(int(asked), 64))
+    if role == "investigator" and args.get("depth") == "deep":
+        return 45
+    return DEFAULT_TURNS.get(role, 40)
 
 
 def _open_question(run: Run) -> bool:

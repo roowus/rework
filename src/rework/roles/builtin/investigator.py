@@ -121,6 +121,7 @@ class InvestigatorSpec(RoleSpec):
             budget=ctx.budget,
             effort=ctx.run.model_ref.get("effort"),
             bus=ctx.bus,
+            resume_file=ctx.workdir / "loop.json",
         )
 
         report = make_report_writer_node(

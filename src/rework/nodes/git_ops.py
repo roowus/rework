@@ -75,7 +75,9 @@ async def make_worktree(repo: Path, worktree_path: Path, branch: str) -> Path:
     return worktree_path
 
 
-async def ensure_worktree(repo: Path, worktree_path: Path, branch: str) -> tuple[Path, str]:
+async def ensure_worktree(
+    repo: Path, worktree_path: Path, branch: str, start_point: str | None = None
+) -> tuple[Path, str]:
     """Create-or-reuse. Returns (worktree, base_sha). The base sha is the branch
     point on first creation; callers persist it (run context) so a resumed run
     diffs against the same base it started with."""
@@ -89,7 +91,10 @@ async def ensure_worktree(repo: Path, worktree_path: Path, branch: str) -> tuple
                 raise RuntimeError(f"git rev-parse failed: {sha}")
             return worktree_path, sha
         raise RuntimeError(f"{worktree_path} exists but is not worktree branch {branch}")
-    code, out = await _run(repo, "worktree", "add", "-B", branch, str(worktree_path))
+    args = ["worktree", "add", "-B", branch, str(worktree_path)]
+    if start_point:
+        args.append(start_point)  # e.g. the previous coder's branch (revisions)
+    code, out = await _run(repo, *args)
     if code != 0:
         raise RuntimeError(f"git worktree add failed: {out}")
     code, sha = await _run(worktree_path, "rev-parse", "HEAD")

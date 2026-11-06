@@ -95,6 +95,7 @@ def make_report_writer_node(
                 messages=messages,
                 temperature=temperature,
                 max_tokens=entry.max_output,
+                session_id=run_id,
             )
         )
         await store.charge(
@@ -104,7 +105,12 @@ def make_report_writer_node(
                 model=entry.model,
                 input_tokens=result.usage.input_tokens,
                 output_tokens=result.usage.output_tokens,
-                cost_usd=entry.estimate_cost(result.usage.input_tokens, result.usage.output_tokens),
+                cached_tokens=result.usage.cached_tokens,
+                cost_usd=entry.estimate_cost(
+                    result.usage.input_tokens,
+                    result.usage.output_tokens,
+                    result.usage.cached_tokens,
+                ),
             )
         )
         text = result.text.strip()

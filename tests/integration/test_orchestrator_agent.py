@@ -471,3 +471,82 @@ async def test_redirect_and_owner_message_reach_their_targets(world: dict[str, A
     ), "the owner's message woke the orchestrator and is in its next turn"
     role_msgs = [m for r in provider.requests_for_role for m in r.messages]  # type: ignore[attr-defined]
     assert any("[Orchestrator redirect] check mul too" in str(m.get("content")) for m in role_msgs)
+
+
+# -- cost controls ------------------------------------------------------------------
+
+
+async def test_revision_coder_continues_the_previous_branch(world: dict[str, Any]) -> None:
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call("spawn_role", "v1", role="coder", step="code", brief="fix add()"),
+                call("wait", "v2"),
+            ),
+            turn(
+                call("spawn_role", "v3", role="coder", step="code", brief="also tidy it"),
+                call("wait", "v4"),
+            ),
+            turn(call("finish", "v5", outcome="failed", summary="two coders")),
+        ],
+    )
+    provider.route("Fulfill the task", _coder_script("first") + _coder_script("second"))
+    await asyncio.wait_for(runner(world).run(), timeout=30)
+    first = await store.get_run("mo:code:coder:1")
+    second = await store.get_run("mo:code:coder:2")
+    assert first is not None and second is not None
+    branch = (first.artifact or {}).get("branch")
+    assert second.context.get("continue_branch") == branch, "revision builds on round one"
+    assert second.context.get("base_sha") == (first.artifact or {}).get("base_sha")
+    assert "+    return a + b" in (second.artifact or {}).get("diff", ""), "full diff kept"
+    first_msg = next(
+        m["content"]
+        for r in provider.requests
+        if "Fulfill the task" in (r.system or "") and MARKER not in (r.system or "")
+        for m in r.messages[:1]
+        if "continuing earlier work" in str(m.get("content"))
+    )
+    assert branch in first_msg
+
+
+async def test_turn_budget_stops_a_role(world: dict[str, Any]) -> None:
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call(
+                    "spawn_role", "t1", role="investigator", step="look", brief="look", max_turns=3
+                ),
+                call("wait", "t2"),
+            ),
+            turn(call("finish", "t3", outcome="failed", summary="budgeted")),
+        ],
+    )
+    reads = [
+        ChatResult(
+            tool_calls=[ToolCall(id=f"r{i}", name="read_file", arguments={"path": "calc.py"})],
+            usage=Usage(input_tokens=10, output_tokens=5),
+        )
+        for i in range(10)
+    ]
+    from conftest import INV_REPORT
+
+    provider.route("Investigate any brief", [*reads[:3], ChatResult(text=INV_REPORT)])
+    await asyncio.wait_for(runner(world).run(), timeout=30)
+    run = await store.get_run("mo:look:investigator:1")
+    assert run is not None and run.status == RunStatus.COMPLETED
+    assert run.context.get("max_turns") == 3
+    role_reqs = [
+        r
+        for r in provider.requests
+        if "Investigate any brief" in (r.system or "") and MARKER not in (r.system or "")
+    ]
+    loop_reqs = [r for r in role_reqs if r.tools]
+    assert len(loop_reqs) == 3, "the loop stopped at its budget"
+    assert "Turn budget: about 3" in str(loop_reqs[0].messages[0]["content"])
+    assert any("wrap up" in str(m.get("content")) for m in loop_reqs[-1].messages)

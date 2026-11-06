@@ -16,6 +16,29 @@ _STOP_MAP = {
 }
 
 
+def _mark_cache(payload: dict[str, Any]) -> None:
+    """Anthropic caches only up to explicit breakpoints: one after the system
+    prompt (static per run) and one on the newest message, so each turn reads
+    everything before it from cache. Requests with a session_id are the long
+    agent loops where this pays (cache reads bill at a tenth of input)."""
+    system = payload.get("system")
+    if isinstance(system, str):
+        payload["system"] = [
+            {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+        ]
+    messages = payload.get("messages") or []
+    if not messages:
+        return
+    last = messages[-1]
+    content = last.get("content")
+    if isinstance(content, str):
+        last["content"] = [
+            {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
+        ]
+    elif isinstance(content, list) and content and isinstance(content[-1], dict):
+        content[-1] = {**content[-1], "cache_control": {"type": "ephemeral"}}
+
+
 def translate_request(request: ChatRequest) -> dict[str, Any]:
     """Generic messages to the Anthropic Messages wire format."""
     messages: list[dict[str, Any]] = []
@@ -76,6 +99,8 @@ def translate_request(request: ChatRequest) -> dict[str, Any]:
     }
     if request.system:
         payload["system"] = request.system
+    if request.session_id:
+        _mark_cache(payload)
     if request.temperature is not None:
         payload["temperature"] = request.temperature
     if request.tools:
@@ -111,11 +136,14 @@ def translate_response(data: Any) -> ChatResult:
             )
     usage = data.get("usage", {})
     cached = usage.get("cache_read_input_tokens", 0) or 0
+    written = usage.get("cache_creation_input_tokens", 0) or 0
     return ChatResult(
         text="".join(text_parts),
         tool_calls=tool_calls,
         usage=Usage(
-            input_tokens=usage.get("input_tokens", 0),
+            # normalized: input INCLUDES cached tokens (OpenAI semantics);
+            # Anthropic reports cache reads and writes separately
+            input_tokens=(usage.get("input_tokens", 0) or 0) + cached + written,
             output_tokens=usage.get("output_tokens", 0),
             cached_tokens=int(cached),
         ),

@@ -433,6 +433,7 @@ class OrchestratorChat:
                 tools=specs,
                 max_tokens=min(self._entry.max_output, 2_048),
                 effort=self._effort,
+                session_id=self.chat_id,
             )
             result = await self._provider.complete(request)
             total_in += result.usage.input_tokens

@@ -12,9 +12,11 @@ normal use (ADR 0003: no hardcoded turn steering; the budget ledger enforces).
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 from rework.kernel.budget.ledger import Budget, guard
@@ -55,6 +57,84 @@ ToolLoopNode = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 # how long a role at the budget cap waits for the burn gate to put the mission
 # on hold before giving up (the gate is checked on the engine's poll interval)
 BUDGET_HOLD_GRACE_S = 30.0
+
+
+# -- transcript compaction ------------------------------------------------------
+# Every turn resends the whole transcript, so old tool output is paid for again
+# and again (found live: roles at 35-45k tokens per turn, 2.4M input tokens for
+# a one-line fix). Past COMPACT_AT characters, tool results older than the last
+# KEEP_RECENT are replaced by a one-line stub. It happens in one step, so the
+# prefix stays identical (prompt-cache friendly) until the next compaction.
+COMPACT_AT = 60_000
+KEEP_RECENT = 6
+STUB_MIN = 600
+
+
+def _size(messages: list[dict[str, Any]]) -> int:
+    return sum(len(str(m.get("content") or "")) for m in messages)
+
+
+def _compact(messages: list[dict[str, Any]]) -> int:
+    """Elide old tool results in place; returns how many were elided."""
+    if _size(messages) <= COMPACT_AT:
+        return 0
+    tool_idx = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    elided = 0
+    for i in tool_idx[:-KEEP_RECENT]:
+        body = str(messages[i].get("content") or "")
+        if len(body) < STUB_MIN or body.startswith("[elided"):
+            continue
+        first = body.strip().splitlines()[0][:160] if body.strip() else ""
+        messages[i] = {
+            **messages[i],
+            "content": f"[elided {len(body)} chars of {messages[i].get('name', 'tool')} output; "
+            f"first line: {first!r}. Re-run the tool if you need it again.]",
+        }
+        elided += 1
+    return elided
+
+
+# -- loop resume -------------------------------------------------------------------
+
+
+def _load_loop(
+    path: Path | None, initial: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], int] | None:
+    """A saved transcript for THIS run (same opening message), else None."""
+    if path is None or not path.is_file():
+        return None
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        messages = saved["messages"]
+        if initial and messages and messages[0].get("content") != initial[0].get("content"):
+            return None
+        # a transcript must not end on an assistant tool call without results
+        while (
+            messages and messages[-1].get("role") == "assistant" and messages[-1].get("tool_calls")
+        ):
+            messages.pop()
+        return messages, int(saved.get("turns") or 0)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _save_loop(path: Path | None, messages: list[dict[str, Any]], turns: int) -> None:
+    if path is None:
+        return
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"turns": turns, "messages": messages}, default=str))
+        tmp.replace(path)
+    except OSError:
+        log.warning("could not save loop transcript to %s", path)
+
+
+def _clear_loop(path: Path | None) -> None:
+    if path is not None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 async def _take_redirect(store: StateStore, run_id: str) -> str:
@@ -128,6 +208,7 @@ def make_toolloop_node(
     effort: str | None = None,
     bus: Any | None = None,
     on_start: Any | None = None,
+    resume_file: Path | None = None,
 ) -> ToolLoopNode:
     """`bus` (optional) turns on TRAJECTORY events: one per model turn and one
     per tool call, so the UI can show the agent loop the way Claude Code and
@@ -156,7 +237,12 @@ def make_toolloop_node(
                 model=model,
                 input_tokens=result_usage.input_tokens,
                 output_tokens=result_usage.output_tokens,
-                cost_usd=entry.estimate_cost(result_usage.input_tokens, result_usage.output_tokens),
+                cached_tokens=getattr(result_usage, "cached_tokens", 0) or 0,
+                cost_usd=entry.estimate_cost(
+                    result_usage.input_tokens,
+                    result_usage.output_tokens,
+                    getattr(result_usage, "cached_tokens", 0) or 0,
+                ),
             )
         )
 
@@ -170,8 +256,26 @@ def make_toolloop_node(
         turns = 0
         stop_note: str | None = None
         specs = executor.specs()
+        # the orchestrator may give this run a turn budget (cost control)
+        run_row = await store.get_run(run_id)
+        limit = int(((run_row.context if run_row else None) or {}).get("max_turns") or 0)
+        limit = min(limit, max_iterations) if limit > 0 else max_iterations
+        # RESUME (pause, budget gate, daemon restart): the loop is ONE graph
+        # node, so a re-entered node used to start over at turn 1 and pay for
+        # every earlier turn again. The transcript is saved after each turn.
+        saved = _load_loop(resume_file, messages)
+        if saved is not None:
+            messages, turns = saved
+            await emit("turn", {"turn": turns, "text": f"resumed at turn {turns}"})
+        elif limit < max_iterations and messages:
+            messages[-1] = {
+                **messages[-1],
+                "content": f"{messages[-1].get('content') or ''}\n\nTurn budget: about "
+                f"{limit} tool rounds. Plan for it and finish with your summary before it "
+                "runs out.",
+            }
 
-        for _ in range(max_iterations):
+        while turns < limit:
             # the orchestrator can steer a running role (ADR 0007 redirect):
             # the instruction arrives on the run row and is read once
             redirect = await _take_redirect(store, run_id)
@@ -182,6 +286,15 @@ def make_toolloop_node(
             if exceeded is not None and not await _wait_for_budget(store, mission_id, budget):
                 stop_note = f"stopped: {exceeded}"
                 break
+            if limit - turns == 2:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "[2 tool rounds left in your budget: wrap up and give "
+                        "your final summary now.]",
+                    }
+                )
+            _compact(messages)
             result = await provider.complete(
                 ChatRequest(
                     model=entry.model,
@@ -191,6 +304,7 @@ def make_toolloop_node(
                     temperature=temperature,
                     max_tokens=entry.max_output,
                     effort=effort,
+                    session_id=run_id,
                 )
             )
             await charge(result.usage, entry.model)
@@ -215,6 +329,7 @@ def make_toolloop_node(
                 }
             )
             if not result.tool_calls:
+                _clear_loop(resume_file)
                 return {"messages": messages, "loop_turns": turns, "final_text": result.text}
             for tc in result.tool_calls:
                 await emit(
@@ -240,8 +355,10 @@ def make_toolloop_node(
                 messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "name": tc.name, "content": out}
                 )
+            _save_loop(resume_file, messages, turns)
         if stop_note is None:
-            stop_note = f"stopped: iteration guard ({max_iterations})"
+            stop_note = f"stopped: turn budget ({limit}) reached"
+        _clear_loop(resume_file)
         return {"messages": messages, "loop_turns": turns, "final_text": stop_note}
 
     return node

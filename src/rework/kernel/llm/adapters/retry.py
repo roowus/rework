@@ -13,12 +13,27 @@ from rework.kernel.llm.types import ChatRequest, ChatResult
 
 log = logging.getLogger("rework.llm.retry")
 
-_TRANSIENT_MARKERS = ("502", "503", "504", "429", "timeout", "connect", "overloaded")
+_TRANSIENT_MARKERS = (
+    "500",  # found live: a Fireworks 500 killed an auditor ($0.51 wasted) unretried
+    "502",
+    "503",
+    "504",
+    "429",
+    "timeout",
+    "connect",
+    "overloaded",
+    "internal server error",
+)
 
 
 def _is_transient(exc: Exception) -> bool:
     name = type(exc).__name__.lower()
-    if "connectionerror" in name or "apitimeout" in name or "overloaded" in name:
+    if (
+        "connectionerror" in name
+        or "apitimeout" in name
+        or "overloaded" in name
+        or "internalservererror" in name
+    ):
         return True
     if "statuserror" in name:
         code = getattr(exc, "status_code", None)

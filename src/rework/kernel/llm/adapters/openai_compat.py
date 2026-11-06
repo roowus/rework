@@ -68,6 +68,10 @@ def translate_request(request: ChatRequest) -> dict[str, Any]:
     }
     if request.temperature is not None:
         payload["temperature"] = request.temperature
+    if request.session_id:
+        # OpenAI-standard field; Fireworks uses it for sticky replica routing,
+        # which is what makes prompt caching hit (docs: prompt-caching)
+        payload["user"] = request.session_id
     if request.tools:
         payload["tools"] = [
             {

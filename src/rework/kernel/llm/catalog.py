@@ -24,14 +24,28 @@ class ModelEntry(BaseModel):
     tier: int = 0  # higher = more capable; promotion moves up within a provider
     cost_in_per_mtok: float = 0.0
     cost_out_per_mtok: float = 0.0
+    # cached input price; None = half the input price (Fireworks' default)
+    cost_cached_per_mtok: float | None = None
     capabilities: set[str] = Field(default_factory=set)  # e.g. {"vision", "thinking"}
     context_window: int = 200_000
     max_output: int = 8_192
     base_url: str | None = None  # openai-compatible endpoints
     api_key_env: str = ""  # env var holding the key; empty = provider default
 
-    def estimate_cost(self, input_tokens: int, output_tokens: int) -> float:
-        return (input_tokens * self.cost_in_per_mtok + output_tokens * self.cost_out_per_mtok) / 1e6
+    def estimate_cost(self, input_tokens: int, output_tokens: int, cached_tokens: int = 0) -> float:
+        """`input_tokens` INCLUDES cached ones (adapters normalize to that);
+        the cached part bills at the cached rate."""
+        cached = max(0, min(cached_tokens, input_tokens))
+        cached_rate = (
+            self.cost_cached_per_mtok
+            if self.cost_cached_per_mtok is not None
+            else self.cost_in_per_mtok * 0.5
+        )
+        return (
+            (input_tokens - cached) * self.cost_in_per_mtok
+            + cached * cached_rate
+            + output_tokens * self.cost_out_per_mtok
+        ) / 1e6
 
     def has_credentials(self) -> bool:
         """Whether THIS process can call the model (its key is in the env).
