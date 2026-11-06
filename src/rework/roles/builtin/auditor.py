@@ -17,6 +17,7 @@ from langgraph.graph import END, START, StateGraph
 
 from rework.kernel.state.records import EventRecord, EventType
 from rework.library.tools import library_executor, with_library_menu
+from rework.nodes.escalate import EscalationAwareExecutor
 from rework.nodes.report_sections import (
     ASSEMBLY_AUDIT,
     mechanical_verdict,
@@ -120,7 +121,13 @@ class AuditorSpec(RoleSpec):
             catalog_id=catalog_id,
             executor=library_executor(
                 ctx,
-                ComplaintAwareExecutor(executor, ctx.store, ctx.mission.id, ctx.run.id, self.name),
+                ComplaintAwareExecutor(
+                    EscalationAwareExecutor(executor, ctx),
+                    ctx.store,
+                    ctx.mission.id,
+                    ctx.run.id,
+                    self.name,
+                ),
             ),
             system_prompt=with_library_menu(ctx, system_prompt),
             store=ctx.store,

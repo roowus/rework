@@ -15,6 +15,7 @@ from langgraph.graph import END, START, StateGraph
 
 from rework.kernel.state.records import EventRecord, EventType
 from rework.library.tools import library_executor, with_library_menu
+from rework.nodes.escalate import EscalationAwareExecutor
 from rework.nodes.repo_map import build_repo_map
 from rework.nodes.report_sections import resolve_sections
 from rework.nodes.report_writer import make_report_writer_node
@@ -106,7 +107,7 @@ class InvestigatorSpec(RoleSpec):
             executor=library_executor(
                 ctx,
                 ComplaintAwareExecutor(
-                    LocalExecutor(ctx.read_root),
+                    EscalationAwareExecutor(LocalExecutor(ctx.read_root), ctx),
                     ctx.store,
                     ctx.mission.id,
                     ctx.run.id,

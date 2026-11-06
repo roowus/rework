@@ -83,6 +83,11 @@ How you work:
   done looks like, and anything earlier roles found that it needs.
 - Read handoffs (`read_artifact`) before deciding what comes next.
 - Keep the owner informed with `message_owner` at meaningful moments only.
+- Roles may ask you questions (`ask_orchestrator`); answer with `answer_escalation`
+  when you can, or forward to the owner with `ask_owner(run_id=...)` when only they
+  can decide. Never leave a role waiting.
+- The owner may message you mid-mission; treat it as the latest word on intent.
+- Steer a role that is drifting with `redirect` instead of cancelling it.
 - Call `finish` when the mission's goal is met, or when it cannot be met (say why).
   Final gates (ship / open a PR) happen after you finish; you do not open them.
 - Respond with tool calls. Text without a tool call wastes a turn."""
@@ -167,6 +172,47 @@ TOOLS: list[ToolSpec] = [
             "type": "object",
             "properties": {"run_id": {"type": "string"}, "reason": {"type": "string"}},
             "required": ["run_id", "reason"],
+        },
+    ),
+    ToolSpec(
+        name="answer_escalation",
+        description="Answer a role that asked you something (see its question in wait/state).",
+        input_schema={
+            "type": "object",
+            "properties": {"run_id": {"type": "string"}, "answer": {"type": "string"}},
+            "required": ["run_id", "answer"],
+        },
+    ),
+    ToolSpec(
+        name="ask_owner",
+        description=(
+            "Ask the owner and wait for the answer. Use for decisions only they can make "
+            "(intent, scope, risk, access). Pass run_id when a role's question is being "
+            "forwarded: the role then receives the owner's answer directly."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "question": {"type": "string"},
+                "kind": {
+                    "type": "string",
+                    "enum": ["question", "choice", "permission", "task"],
+                    "description": "question = free text; choice = pick one of options; "
+                    "permission = allow/deny; task = the owner does something by hand.",
+                },
+                "options": {"type": "array", "items": {"type": "string"}},
+                "run_id": {"type": "string"},
+            },
+            "required": ["question"],
+        },
+    ),
+    ToolSpec(
+        name="redirect",
+        description="Steer a running role: the instruction reaches it at its next turn.",
+        input_schema={
+            "type": "object",
+            "properties": {"run_id": {"type": "string"}, "instruction": {"type": "string"}},
+            "required": ["run_id", "instruction"],
         },
     ),
     ToolSpec(
@@ -267,6 +313,8 @@ class MissionOrchestrator:
         self.effort = orch.get("effort") or None
         self.history: list[dict[str, Any]] = []
         self.seen: dict[str, str] = {}  # run id -> status already reported
+        self.questions_seen: set[str] = set()  # escalation ids already reported
+        self.owner_seq = 0  # last owner message delivered
         self.finished: tuple[str, str] | None = None
         self._provider: Any = None
 
@@ -310,6 +358,9 @@ class MissionOrchestrator:
             )
             return
         self.history = [m.body for m in await self.store.chat_messages(self.chat_id) if m.body]
+        self.owner_seq = max(
+            [int(m.get("owner_seq") or 0) for m in self.history if m.get("role") == "user"] + [0]
+        )
 
     async def _append(self, message: dict[str, Any], display: str = "") -> None:
         self.history.append(message)
@@ -381,6 +432,7 @@ class MissionOrchestrator:
                 self.finished = ("failed", f"orchestrator hit its {MAX_TURNS}-turn cap")
                 return
             turns += 1
+            await self._deliver_owner_messages()
             result = await self._think()
             if result is None:
                 return
@@ -392,8 +444,9 @@ class MissionOrchestrator:
                 await self._append(
                     {
                         "role": "user",
-                        "content": "Respond with tool calls only: spawn_role, wait, "
-                        "read_artifact, check_in, cancel_run, message_owner or finish.",
+                        "content": "Respond with tool calls only (spawn_role, wait, "
+                        "read_artifact, check_in, redirect, answer_escalation, ask_owner, "
+                        "cancel_run, message_owner or finish).",
                     }
                 )
                 continue
@@ -531,6 +584,14 @@ class MissionOrchestrator:
             return await self._cancel(str(args.get("run_id") or ""), str(args.get("reason") or ""))
         if name == "message_owner":
             return await self._message_owner(str(args.get("text") or ""))
+        if name == "answer_escalation":
+            return await self._answer(str(args.get("run_id") or ""), str(args.get("answer") or ""))
+        if name == "ask_owner":
+            return await self._ask_owner(call_id, args)
+        if name == "redirect":
+            return await self._redirect(
+                str(args.get("run_id") or ""), str(args.get("instruction") or "")
+            )
         if name == "finish":
             outcome = str(args.get("outcome") or "done")
             if outcome not in ("done", "failed"):
@@ -641,6 +702,29 @@ class MissionOrchestrator:
                 self.finished = None
                 return "the owner cancelled the mission"
             runs = await self.store.list_runs(self.mid)
+            if await self._pending_owner_messages():
+                return "the owner sent you a message (it is in the conversation now)"
+            asking = [r for r in runs if _open_question(r) and r.status not in TERMINAL]
+            fresh_q = [
+                r for r in asking if (r.escalation or {}).get("id") not in self.questions_seen
+            ]
+            if fresh_q:
+                lines = []
+                for r in fresh_q:
+                    esc = r.escalation or {}
+                    self.questions_seen.add(str(esc.get("id")))
+                    lines.append(
+                        f"{r.id} ({r.role}) asks [{esc.get('kind', 'question')}]: "
+                        f"{esc.get('question')}\nIt is blocked until you answer_escalation or "
+                        "ask_owner(run_id=...)."
+                    )
+                return "\n".join(lines)
+            others = [r for r in runs if r.status not in TERMINAL and not _open_question(r)]
+            if asking and not others:
+                return "still waiting on you: " + ", ".join(
+                    f"{r.id} asked {_short((r.escalation or {}).get('question') or '', 120)!r}"
+                    for r in asking
+                )
             halted = [r for r in runs if r.status == RunStatus.HALTED_ESCALATED]
             if halted:
                 reported = [r for r in halted if self.seen.get(r.id) != "halted"]
@@ -762,6 +846,101 @@ class MissionOrchestrator:
             )
         return "sent"
 
+    async def _answer(self, run_id: str, answer: str) -> str:
+        run = await self.store.get_run(run_id)
+        if run is None or run.mission_id != self.mid:
+            raise ToolError(f"no run {run_id!r} in this mission")
+        if not _open_question(run):
+            raise ToolError(f"{run_id} has no open question")
+        if not answer.strip():
+            raise ToolError("empty answer")
+        await self.store.update_run(run_id, escalation={**(run.escalation or {}), "answer": answer})
+        return f"answered {run_id}"
+
+    async def _ask_owner(self, call_id: str, args: dict[str, Any]) -> str:
+        from rework.kernel.state.records import GateKind
+        from rework.nodes.escalate import answer_text
+
+        question = str(args.get("question") or "").strip()
+        if not question:
+            raise ToolError("a question is required")
+        kind_name = str(args.get("kind") or "question")
+        try:
+            kind = GateKind(kind_name)
+        except ValueError as exc:
+            raise ToolError(f"unknown kind {kind_name!r}") from exc
+        options = [str(o) for o in (args.get("options") or []) if str(o).strip()]
+        if kind == GateKind.CHOICE and len(options) < 2:
+            raise ToolError("a choice needs at least two options")
+        run_id = str(args.get("run_id") or "") or None
+        if run_id is not None:
+            run = await self.store.get_run(run_id)
+            if run is None or run.mission_id != self.mid:
+                raise ToolError(f"no run {run_id!r} in this mission")
+        gate = next(
+            (
+                g
+                for g in await self.store.list_gates(self.mid)
+                if (g.spec or {}).get("_call") == call_id
+            ),
+            None,
+        )  # re-executed after a restart: reuse, never duplicate
+        if gate is None:
+            spec: dict[str, Any] = {"_call": call_id, "asked_by": "orchestrator"}
+            if options:
+                spec["options"] = options
+            gate = await self.r._gates.request(
+                self.mid, kind=kind, question=question, for_run=run_id, spec=spec
+            )
+        await self.store.update_mission(self.mid, status=MissionStatus.AWAITING_GATE)
+        while True:
+            row = await self.store.get_gate(gate.id)
+            if row is not None and row.status != GateStatus.OPEN:
+                break
+            mission = await self.store.get_mission(self.mid)
+            if mission is not None and mission.status == MissionStatus.CANCELLED:
+                return "the owner cancelled the mission"
+            await asyncio.sleep(self.r._poll)
+        await self.store.update_mission(self.mid, status=MissionStatus.RUNNING)
+        text = answer_text(row)
+        if run_id is not None:
+            run = await self.store.get_run(run_id)
+            if run is not None and _open_question(run):
+                await self.store.update_run(
+                    run_id, escalation={**(run.escalation or {}), "answer": f"owner: {text}"}
+                )
+                return f"owner: {text} (passed to {run_id})"
+        return f"owner: {text}"
+
+    async def _redirect(self, run_id: str, instruction: str) -> str:
+        run = await self.store.get_run(run_id)
+        if run is None or run.mission_id != self.mid:
+            raise ToolError(f"no run {run_id!r} in this mission")
+        if run.status in TERMINAL:
+            raise ToolError(f"{run_id} already {run.status.value}")
+        if not instruction.strip():
+            raise ToolError("empty instruction")
+        await self.store.update_run(run_id, redirect=instruction[:2000])
+        return f"{run_id} will see it at its next turn"
+
+    async def _owner_messages(self) -> list[Any]:
+        events = await self.store.events_since(self.owner_seq, mission_id=self.mid, limit=500)
+        return [e for e in events if e.type == EventType.OWNER_MESSAGE]
+
+    async def _pending_owner_messages(self) -> bool:
+        return bool(await self._owner_messages())
+
+    async def _deliver_owner_messages(self) -> None:
+        for ev in await self._owner_messages():
+            text = str((ev.payload or {}).get("text") or "")
+            seq = int(ev.seq or 0)
+            self.owner_seq = max(self.owner_seq, seq)
+            await self._append(
+                {"role": "user", "content": f"Message from the owner: {text}", "owner_seq": seq},
+                display=text,
+            )
+            log.info("owner message delivered", extra={"tool": "owner_message"})
+
     # -- recovery & state ------------------------------------------------------
 
     async def _recover_runs(self) -> None:
@@ -847,6 +1026,9 @@ class MissionOrchestrator:
                     line += f" :: {artifact_summary(r.artifact)}"
                 elif r.status == RunStatus.HALTED_ESCALATED:
                     line += f" :: escalated {_short(r.escalation or {}, 160)}"
+                elif _open_question(r):
+                    q = (r.escalation or {}).get("question") or ""
+                    line += f" :: ASKS YOU: {_short(q, 200)}"
                 lines.append(line)
         gates = await self.store.list_gates(self.mid)
         for g in gates:
@@ -856,6 +1038,12 @@ class MissionOrchestrator:
         if mission is not None and mission.status != MissionStatus.RUNNING:
             lines.append(f"- mission status: {mission.status.value}")
         return "\n".join(lines)
+
+
+def _open_question(run: Run) -> bool:
+    """A role's ask_orchestrator call that has not been answered yet."""
+    esc = run.escalation or {}
+    return bool(esc.get("id")) and esc.get("answer") is None and bool(esc.get("question"))
 
 
 def _args_line(args: dict[str, Any]) -> str:

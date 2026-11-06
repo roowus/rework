@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS gates (
     status TEXT NOT NULL,
     decision_note TEXT,
     decision TEXT,
+    spec TEXT,
     for_run TEXT,
     created_at REAL NOT NULL,
     decided_at REAL
@@ -224,6 +225,7 @@ class SqliteStore:
             status=GateStatus(row["status"]),
             decision_note=row["decision_note"],
             decision=_uj(row["decision"]) or None,
+            spec=_uj(row["spec"]) or None,
             for_run=row["for_run"],
             created_at=row["created_at"],
             decided_at=row["decided_at"],
@@ -434,8 +436,8 @@ class SqliteStore:
     async def create_gate(self, gate: Gate) -> Gate:
         await self._db.execute(
             "INSERT INTO gates (id, mission_id, kind, question, status, decision_note,"
-            " decision, for_run, created_at, decided_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " decision, spec, for_run, created_at, decided_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 gate.id,
                 gate.mission_id,
@@ -444,6 +446,7 @@ class SqliteStore:
                 gate.status.value,
                 gate.decision_note,
                 _j(gate.decision),
+                _j(gate.spec),
                 gate.for_run,
                 gate.created_at,
                 gate.decided_at,
@@ -917,5 +920,7 @@ async def open_sqlite(path: str) -> SqliteStore:
         await db.execute("ALTER TABLE gates ADD COLUMN for_run TEXT")
     if "decision" not in names:
         await db.execute("ALTER TABLE gates ADD COLUMN decision TEXT")
+    if "spec" not in names:
+        await db.execute("ALTER TABLE gates ADD COLUMN spec TEXT")
     await db.commit()
     return SqliteStore(db)

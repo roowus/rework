@@ -36,6 +36,7 @@ class GateManager:
         kind: GateKind,
         question: str,
         for_run: str | None = None,
+        spec: dict[str, Any] | None = None,
     ) -> Gate:
         """Create an OPEN gate row and publish GATE_OPENED. The caller then
         interrupts. `for_run` ties an escalation gate to the run it unblocks,
@@ -46,13 +47,19 @@ class GateManager:
             kind=kind,
             question=question,
             for_run=for_run,
+            spec=spec,
         )
         await self._store.create_gate(gate)
         await self._bus.publish(
             EventRecord(
                 mission_id=mission_id,
                 type=EventType.GATE_OPENED,
-                payload={"gate_id": gate.id, "kind": kind.value, "question": question},
+                payload={
+                    "gate_id": gate.id,
+                    "kind": kind.value,
+                    "question": question,
+                    **({"spec": spec} if spec else {}),
+                },
             )
         )
         return gate

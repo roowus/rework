@@ -299,3 +299,175 @@ async def test_owner_cancel_stops_the_orchestrator(world: dict[str, Any]) -> Non
     assert mission is not None and mission.status == MissionStatus.CANCELLED
     assert calls == 2, "no model calls after the cancel"
     assert not await store.list_gates("mo")
+
+
+# -- steering (M7 P2) ----------------------------------------------------------
+
+
+def asking_investigator(question: str) -> list[ChatResult]:
+    """An investigator that asks the orchestrator first, then works normally."""
+    ask = ChatResult(
+        tool_calls=[ToolCall(id="q1", name="ask_orchestrator", arguments={"question": question})],
+        usage=Usage(input_tokens=20, output_tokens=10),
+    )
+    return [ask, *_investigator_script()]
+
+
+def tool_results_seen(provider: ScriptedProvider, marker: str) -> list[str]:
+    out = []
+    for req in provider.requests:
+        if marker in (req.system or ""):
+            out += [
+                str(m.get("content")) for m in req.messages if m.get("role") in ("tool", "user")
+            ]
+    return out
+
+
+async def test_a_role_question_is_answered_by_the_orchestrator(world: dict[str, Any]) -> None:
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call("spawn_role", "a1", role="investigator", step="look", brief="look"),
+                call("wait", "a2"),
+            ),
+            turn(
+                call(
+                    "answer_escalation",
+                    "a3",
+                    run_id="mo:look:investigator:1",
+                    answer="only calc.py matters",
+                ),
+                call("wait", "a4"),
+            ),
+            turn(call("finish", "a5", outcome="failed", summary="investigation only")),
+        ],
+    )
+    provider.route("Investigate any brief", asking_investigator("which file matters?"))
+    await asyncio.wait_for(runner(world).run(), timeout=30)
+
+    msgs = await store.chat_messages(orchestrator_chat_id("mo"))
+    tool_out = [m.body.get("content", "") for m in msgs if m.role == "tool"]
+    assert any("asks [question]: which file matters?" in t for t in tool_out)
+    seen = tool_results_seen(provider, "Investigate any brief")
+    assert "orchestrator: only calc.py matters" in seen, "the role got the answer"
+    run = await store.get_run("mo:look:investigator:1")
+    assert run is not None and run.status == RunStatus.COMPLETED
+
+
+async def test_a_role_question_forwarded_to_the_owner_as_a_choice(world: dict[str, Any]) -> None:
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call("spawn_role", "b1", role="investigator", step="look", brief="look"),
+                call("wait", "b2"),
+            ),
+            turn(
+                call(
+                    "ask_owner",
+                    "b3",
+                    question="Old parser or new parser?",
+                    kind="choice",
+                    options=["old", "new"],
+                    run_id="mo:look:investigator:1",
+                ),
+                call("wait", "b4"),
+            ),
+            turn(call("finish", "b5", outcome="failed", summary="owner chose")),
+        ],
+    )
+    provider.route("Investigate any brief", asking_investigator("old or new parser?"))
+    task = asyncio.create_task(runner(world).run())
+    gate = None
+    for _ in range(300):
+        gates = await store.list_open_gates("mo")
+        if gates:
+            gate = gates[0]
+            break
+        await asyncio.sleep(0.05)
+    assert gate is not None and gate.kind.value == "choice"
+    assert (gate.spec or {}).get("options") == ["old", "new"]
+    assert gate.for_run == "mo:look:investigator:1"
+    mission = await store.get_mission("mo")
+    assert mission is not None and mission.status == MissionStatus.AWAITING_GATE
+    second = await open_sqlite(world["db"])
+    try:
+        await GateManager(second, InProcessEventBus(second)).decide(
+            gate.id, approved=True, decision={"choice": "new"}
+        )
+    finally:
+        await second.aclose()
+    await asyncio.wait_for(task, timeout=30)
+    seen = tool_results_seen(provider, "Investigate any brief")
+    assert any("owner: approved: new" in s for s in seen), "the role got the owner's choice"
+
+
+async def test_redirect_and_owner_message_reach_their_targets(world: dict[str, Any]) -> None:
+    """The orchestrator redirects a running role; the owner messages the
+    orchestrator mid-mission. Both arrive."""
+    store: SqliteStore = world["store"]
+    release = asyncio.Event()
+    inv = _investigator_script()
+
+    class Held(ScriptedProvider):
+        async def complete(self, request):  # type: ignore[no-untyped-def]
+            system = request.system or ""
+            if "Investigate any brief" in system and MARKER not in system:
+                self.requests.append(request)
+                if len(self.requests_for_role) == 0:
+                    self.requests_for_role.append(request)
+                    await release.wait()
+                else:
+                    self.requests_for_role.append(request)
+                return inv.pop(0)
+            return await super().complete(request)
+
+    provider = Held()
+    provider.requests_for_role = []  # type: ignore[attr-defined]
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call("spawn_role", "r1", role="investigator", step="look", brief="look"),
+                call("wait", "r2", minutes=10),
+            ),
+            # woken by the owner's message
+            turn(
+                call(
+                    "redirect", "r3", run_id="mo:look:investigator:1", instruction="check mul too"
+                ),
+                call("wait", "r4"),
+            ),
+            turn(call("finish", "r5", outcome="failed", summary="done")),
+        ],
+    )
+    world["provider"] = provider
+    task = asyncio.create_task(runner(world).run())
+    for _ in range(200):
+        if provider.requests_for_role:  # type: ignore[attr-defined]
+            break
+        await asyncio.sleep(0.05)
+    from rework.kernel.state.records import EventRecord, EventType
+
+    await store.append_event(
+        EventRecord(mission_id="mo", type=EventType.OWNER_MESSAGE, payload={"text": "add a test"})
+    )
+    for _ in range(200):
+        run = await store.get_run("mo:look:investigator:1")
+        if run is not None and run.redirect:
+            break
+        await asyncio.sleep(0.05)
+    release.set()
+    await asyncio.wait_for(task, timeout=30)
+
+    orch_reqs = [r for r in provider.requests if MARKER in (r.system or "")]
+    assert any(
+        "Message from the owner: add a test" in str(m.get("content")) for m in orch_reqs[1].messages
+    ), "the owner's message woke the orchestrator and is in its next turn"
+    role_msgs = [m for r in provider.requests_for_role for m in r.messages]  # type: ignore[attr-defined]
+    assert any("[Orchestrator redirect] check mul too" in str(m.get("content")) for m in role_msgs)

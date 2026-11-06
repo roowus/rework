@@ -89,6 +89,7 @@ _DDL = [
         status TEXT NOT NULL,
         decision_note TEXT,
         decision TEXT,
+        spec TEXT,
         for_run TEXT,
         created_at DOUBLE PRECISION NOT NULL,
         decided_at DOUBLE PRECISION
@@ -346,6 +347,7 @@ class PostgresStore:
             status=GateStatus(row["status"]),
             decision_note=row["decision_note"],
             decision=_uj(row["decision"]) or None,
+            spec=_uj(row["spec"]) or None,
             for_run=row["for_run"],
             created_at=row["created_at"],
             decided_at=row["decided_at"],
@@ -574,8 +576,8 @@ class PostgresStore:
     async def create_gate(self, gate: Gate) -> Gate:
         await self._conn.execute(
             "INSERT INTO gates (id, mission_id, kind, question, status, decision_note,"
-            " decision, for_run, created_at, decided_at)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            " decision, spec, for_run, created_at, decided_at)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 gate.id,
                 gate.mission_id,
@@ -584,6 +586,7 @@ class PostgresStore:
                 gate.status.value,
                 gate.decision_note,
                 _j(gate.decision),
+                _j(gate.spec),
                 gate.for_run,
                 gate.created_at,
                 gate.decided_at,
@@ -1108,6 +1111,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("missions", "chat_id", "ALTER TABLE missions ADD COLUMN chat_id TEXT"),
     ("gates", "for_run", "ALTER TABLE gates ADD COLUMN for_run TEXT"),
     ("gates", "decision", "ALTER TABLE gates ADD COLUMN decision TEXT"),
+    ("gates", "spec", "ALTER TABLE gates ADD COLUMN spec TEXT"),
 ]
 
 

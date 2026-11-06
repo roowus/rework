@@ -52,6 +52,11 @@ class GateKind(StrEnum):
     SPAWN = "spawn"
     OPEN_PR = "open_pr"
     GENERIC = "generic"
+    # asked by a mission orchestrator (ADR 0007); Gate.spec says how to answer
+    QUESTION = "question"  # free-text answer -> decision {"answer": str}
+    CHOICE = "choice"  # pick one of spec.options -> {"choice": str}
+    PERMISSION = "permission"  # allow / deny -> approved bool (+ optional note)
+    TASK = "task"  # the owner does something by hand -> {"done": bool, "note": str}
 
 
 class GateStatus(StrEnum):
@@ -75,6 +80,7 @@ class EventType(StrEnum):
     MISSION_FAILED = "mission_failed"
     CANCELLED = "cancelled"
     INFO = "info"
+    OWNER_MESSAGE = "owner_message"  # the owner talking to a running mission
 
 
 class Mission(BaseModel):
@@ -140,6 +146,9 @@ class Gate(BaseModel):
     # in between stranded the gate forever (found live: chaos test timed out
     # on a 3.13 CI runner).
     for_run: str | None = None
+    # how to answer (orchestrator gates): {"options": [...], "placeholder": str,
+    # "detail": str}; None for the classic approve/reject gates
+    spec: dict[str, Any] | None = None
     created_at: float = Field(default_factory=now)
     decided_at: float | None = None
 

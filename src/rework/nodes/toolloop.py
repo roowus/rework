@@ -57,6 +57,15 @@ ToolLoopNode = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
 BUDGET_HOLD_GRACE_S = 30.0
 
 
+async def _take_redirect(store: StateStore, run_id: str) -> str:
+    """Read-and-clear the run's pending redirect instruction."""
+    run = await store.get_run(run_id)
+    text = (run.redirect or "").strip() if run is not None else ""
+    if text:
+        await store.update_run(run_id, redirect="")
+    return text
+
+
 async def _current_budget(store: StateStore, mission_id: str, budget: Budget) -> Budget:
     """The role's cap, raised to the mission's CURRENT plan cap: the owner can
     extend a mission's budget at the burn gate after this role was built."""
@@ -163,6 +172,12 @@ def make_toolloop_node(
         specs = executor.specs()
 
         for _ in range(max_iterations):
+            # the orchestrator can steer a running role (ADR 0007 redirect):
+            # the instruction arrives on the run row and is read once
+            redirect = await _take_redirect(store, run_id)
+            if redirect:
+                messages.append({"role": "user", "content": f"[Orchestrator redirect] {redirect}"})
+                await emit("turn", {"turn": turns, "text": f"redirected: {redirect[:300]}"})
             exceeded = await _budget_exceeded(store, mission_id, budget)
             if exceeded is not None and not await _wait_for_budget(store, mission_id, budget):
                 stop_note = f"stopped: {exceeded}"

@@ -16,6 +16,7 @@ from langgraph.graph import END, START, StateGraph
 
 from rework.kernel.state.records import EventRecord, EventType
 from rework.library.tools import library_executor, with_library_menu
+from rework.nodes.escalate import EscalationAwareExecutor
 from rework.nodes.git_ops import (
     commit as git_commit,
 )
@@ -183,7 +184,7 @@ class CoderSpec(RoleSpec):
             executor=library_executor(
                 ctx,
                 ComplaintAwareExecutor(
-                    executor,
+                    EscalationAwareExecutor(executor, ctx),
                     ctx.store,
                     ctx.mission.id,
                     ctx.run.id,

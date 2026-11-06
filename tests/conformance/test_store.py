@@ -291,6 +291,27 @@ async def test_mission_carries_project_and_origin(store: StateStore) -> None:
     assert got.repo_path is None  # daemon resolves the path itself
 
 
+async def test_gate_spec_roundtrips(store: StateStore) -> None:
+    """Orchestrator gates carry how to answer them (options for a choice)."""
+    m = await store.create_mission(Mission(id=new_id("m"), objective="x"))
+    g = await store.create_gate(
+        Gate(
+            id=new_id("gate"),
+            mission_id=m.id,
+            kind=GateKind.CHOICE,
+            question="which parser?",
+            spec={"options": ["old", "new"], "detail": "new is faster"},
+        )
+    )
+    got = await store.get_gate(g.id)
+    assert got is not None and got.kind == GateKind.CHOICE
+    assert got.spec == {"options": ["old", "new"], "detail": "new is faster"}
+    plain = await store.create_gate(
+        Gate(id=new_id("gate"), mission_id=m.id, kind=GateKind.SHIP, question="ship?")
+    )
+    assert (await store.get_gate(plain.id)).spec is None  # type: ignore[union-attr]
+
+
 async def test_one_chat_owns_many_missions(store: StateStore) -> None:
     """Missions remember the chat that launched them, and a chat lists its
     missions (one conversation can launch several)."""
