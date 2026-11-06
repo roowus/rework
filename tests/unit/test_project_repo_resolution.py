@@ -1,0 +1,64 @@
+"""A mission inherits its project's repo (the chat usually names only the
+project), and project refs that are URLs become origins the daemon clones."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from rework.kernel.state.records import Project
+from rework.missions import create_mission
+
+URL = "https://github.com/roowus/rework"
+
+
+@pytest.fixture
+async def db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    path = str(tmp_path / "s.sqlite3")
+    monkeypatch.setenv("REWORK_DB", path)
+    return path
+
+
+async def _project(db: str, repos: list[dict[str, str]]) -> str:
+    from rework.kernel.state.sqlite import open_sqlite
+
+    store = await open_sqlite(db)
+    try:
+        p = await store.create_project(Project(name="rework", settings={"repos": repos}))
+        return p.id
+    finally:
+        await store.aclose()
+
+
+async def test_project_only_mission_uses_the_projects_single_repo(db: str) -> None:
+    pid = await _project(db, [{"name": "rework", "kind": "git", "url": URL}])
+    mission = await create_mission("fix the dashboard", plan="fix-pr", project_id=pid)
+    assert mission.repo_origin == URL, "a URL ref is an origin the daemon clones"
+    assert mission.repo_path is None
+
+
+async def test_named_ref_with_git_kind_is_an_origin_not_a_path(db: str) -> None:
+    pid = await _project(db, [{"name": "rework", "kind": "git", "url": URL}])
+    mission = await create_mission("x", plan="fix", project_id=pid, repo="rework")
+    assert mission.repo_origin == URL and mission.repo_path is None
+
+
+async def test_several_repos_and_no_name_is_ambiguous(db: str) -> None:
+    pid = await _project(
+        db,
+        [
+            {"name": "api", "kind": "git", "url": URL},
+            {"name": "web", "kind": "git", "url": URL + "-web"},
+        ],
+    )
+    with pytest.raises(ValueError, match="several repos"):
+        await create_mission("x", plan="fix", project_id=pid)
+
+
+async def test_project_without_repos_still_needs_one_for_fix(db: str) -> None:
+    pid = await _project(db, [])
+    with pytest.raises(ValueError, match="requires a repo"):
+        await create_mission("x", plan="fix", project_id=pid)
+    echo = await create_mission("x", plan="echo", project_id=pid)
+    assert echo.repo_origin is None and echo.repo_path is None

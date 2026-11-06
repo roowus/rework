@@ -140,7 +140,6 @@ async def resolve_repo(
 ) -> dict[str, Any]:
     """The three-way --repo resolution shared by CLI and TUI. Returns
     {repo_path, repo_origin} plus display notes for interactive callers."""
-    from rework.config import Config, open_store_from_config
 
     repo_path: str | None = None
     repo_origin: str | None = None
@@ -164,29 +163,49 @@ async def resolve_repo(
                 repo_path = await _asyncio.to_thread(prepare_repo, repo, mission_id)
                 notes.append(f"staged locally: {repo_path}")
             elif project_id:
-                store = await open_store_from_config(Config.from_env())
-                try:
-                    found = await store.get_project(project_id)
-                finally:
-                    await store.aclose()
-                ref = next(
-                    (
-                        r
-                        for r in ((found.settings if found else {}).get("repos") or [])
-                        if r.get("name") == repo
-                    ),
-                    None,
-                )
-                if ref is None:
-                    raise ValueError(f"repo {repo!r} not defined on project {project_id}")
-                if ref.get("kind") == "github":
-                    repo_origin = str(ref.get("url"))
-                else:
-                    repo_path = str(ref.get("url"))
+                origin, path = await _project_repo(project_id, repo)
+                repo_origin, repo_path = origin, path
                 notes.append(f"project ref {repo!r} resolved")
             else:
                 raise ValueError(f"repo not found: {repo}")
+    elif project_id:
+        # no repo named: a project with exactly one repo means that one (the
+        # chat usually leaves `repo` empty and lets the project decide)
+        origin, path = await _project_repo(project_id, None)
+        repo_origin, repo_path = origin, path
+        if origin or path:
+            notes.append("using the project's repo")
     return {"repo_path": repo_path, "repo_origin": repo_origin, "notes": notes}
+
+
+async def _project_repo(project_id: str, name: str | None) -> tuple[str | None, str | None]:
+    """(repo_origin, repo_path) for a project's repo ref. `name` None picks the
+    project's only repo, or nothing when it has none; several repos and no name
+    is ambiguous and raises. A URL becomes an origin the daemon clones; anything
+    else is a path the daemon can see (ADR 0005)."""
+    from rework.config import Config, open_store_from_config
+
+    store = await open_store_from_config(Config.from_env())
+    try:
+        found = await store.get_project(project_id)
+    finally:
+        await store.aclose()
+    refs = [r for r in ((found.settings if found else {}).get("repos") or []) if r]
+    if name is None:
+        if not refs:
+            return None, None
+        if len(refs) > 1:
+            names = ", ".join(str(r.get("name")) for r in refs)
+            raise ValueError(f"project {project_id} has several repos ({names}); name one")
+        ref = refs[0]
+    else:
+        ref = next((r for r in refs if r.get("name") == name), None)
+        if ref is None:
+            raise ValueError(f"repo {name!r} not defined on project {project_id}")
+    url = str(ref.get("url") or "")
+    if is_git_url(url) or ref.get("kind") == "github":
+        return url, None
+    return None, url
 
 
 async def create_mission(
