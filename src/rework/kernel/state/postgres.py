@@ -1115,9 +1115,19 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
 ]
 
 
+# psycopg auto-prepares a statement after 5 executions. A prepared `SELECT *`
+# breaks the moment ANY process adds a column ("cached plan must not change
+# result type"): found live, a client's migration crashed the daemon's runner
+# mid-mission. Our queries are cheap; robustness to schema change wins.
+PREPARE_THRESHOLD = None
+
+
 async def open_postgres(url: str) -> PostgresStore:
     conn = await psycopg.AsyncConnection.connect(
-        url, autocommit=False, row_factory=psycopg.rows.dict_row
+        url,
+        autocommit=False,
+        row_factory=psycopg.rows.dict_row,
+        prepare_threshold=PREPARE_THRESHOLD,
     )
     try:
         for ddl in _DDL:

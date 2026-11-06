@@ -7,6 +7,9 @@ swap freely behind the seam (docs/adr/0001).
 from __future__ import annotations
 
 import asyncio
+import os
+
+import pytest
 
 from rework.kernel.state.records import (
     BudgetState,
@@ -503,3 +506,30 @@ async def test_gate_typed_decision_roundtrip(store: StateStore) -> None:
     )
     done = await store.decide_gate(plain.id, approved=True)
     assert done is not None and done.decision is None
+
+
+async def test_a_schema_change_does_not_break_a_live_connection(
+    store: StateStore, tmp_path
+) -> None:  # type: ignore[no-untyped-def]
+    """Another process adds a column while this connection is live and has
+    run the same SELECT * many times (found live: a client's migration crashed
+    the daemon with 'cached plan must not change result type')."""
+    from rework.kernel.state.postgres import PostgresStore, open_postgres
+
+    if not isinstance(store, PostgresStore):
+        pytest.skip("prepared-statement caching is a Postgres concern")
+    m = await store.create_mission(Mission(id=new_id("m"), objective="x"))
+    await store.create_gate(
+        Gate(id=new_id("gate"), mission_id=m.id, kind=GateKind.SHIP, question="q")
+    )
+    for _ in range(8):  # past psycopg's auto-prepare threshold
+        await store.list_gates(m.id)
+    other = await open_postgres(os.environ["REWORK_TEST_POSTGRES"])
+    try:
+        await other._conn.execute("ALTER TABLE gates ADD COLUMN IF NOT EXISTS zz_probe TEXT")
+        await other._conn.commit()
+        assert len(await store.list_gates(m.id)) == 1
+    finally:
+        await other._conn.execute("ALTER TABLE gates DROP COLUMN IF EXISTS zz_probe")
+        await other._conn.commit()
+        await other.aclose()
