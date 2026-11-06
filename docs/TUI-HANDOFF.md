@@ -276,10 +276,10 @@ or `--answer-json '{...}'`.
 ### 3.6c Cancel and pause
 
 ```python
-data.cancel_mission(mission_id)   # stops it; stays cancelled
-data.pause_mission(mission_id)    # stops spending, keeps everything resumable
-data.resume_mission(mission_id)   # continues from the checkpoints
-data.set_mission_status(mission_id, "on_hold")   # generic
+data.cancel_mission(mission_id)  # stops it; stays cancelled
+data.pause_mission(mission_id)  # stops spending, keeps everything resumable
+data.resume_mission(mission_id)  # continues from the checkpoints
+data.set_mission_status(mission_id, "on_hold")  # generic
 ```
 
 These write the mission row; the daemon reads it, so they work from any machine

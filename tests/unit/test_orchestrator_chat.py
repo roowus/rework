@@ -152,9 +152,7 @@ async def test_orchestrator_looks_before_it_proposes(store) -> None:
             self.requests.append(request)
             if len(self.requests) == 1:
                 return ChatResult(
-                    tool_calls=[
-                        ToolCall(id="t1", name="list_missions", arguments={"limit": 5})
-                    ]
+                    tool_calls=[ToolCall(id="t1", name="list_missions", arguments={"limit": 5})]
                 )
             return ChatResult(
                 tool_calls=[
@@ -204,9 +202,7 @@ async def test_tool_loop_is_bounded(store) -> None:
 
         async def complete(self, request):
             self.calls += 1
-            return ChatResult(
-                tool_calls=[ToolCall(id="t", name="list_projects", arguments={})]
-            )
+            return ChatResult(tool_calls=[ToolCall(id="t", name="list_projects", arguments={})])
 
     provider = _Loop()
     chat = OrchestratorChat(
