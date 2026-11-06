@@ -19,7 +19,6 @@ Design notes:
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -447,19 +446,12 @@ class OrchestratorChat:
             call_msg: dict[str, Any] = {
                 "role": "assistant",
                 "content": result.text or "",
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments or {}),
-                        },
-                    }
-                    for tc in result.tool_calls
-                ],
+                "tool_calls": _neutral_calls(result.tool_calls),
             }
             self._history.append(call_msg)
+            # persisted too: a reloaded history with tool rows but no preceding
+            # assistant tool_calls is rejected by OpenAI-compatible providers
+            await self._record("assistant", call_msg, "")
             for tc in result.tool_calls:
                 if tc.name in {t.name for t in LOOK_TOOLS}:
                     if self._on_turn is not None:
@@ -494,17 +486,7 @@ class OrchestratorChat:
         # follow-ups keep context.
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": result.text or ""}
         if result.tool_calls:
-            assistant_msg["tool_calls"] = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.name,
-                        "arguments": json.dumps(tc.arguments or {}),
-                    },
-                }
-                for tc in result.tool_calls
-            ]
+            assistant_msg["tool_calls"] = _neutral_calls(result.tool_calls)
         self._history.append(assistant_msg)
 
         reply = (result.text or "").strip()
@@ -548,6 +530,14 @@ class OrchestratorChat:
             turn_cost_usd=cost,
             transcript=transcript,
         )
+
+
+def _neutral_calls(calls: list[Any]) -> list[dict[str, Any]]:
+    """Tool calls in rework's PROVIDER-NEUTRAL message shape ({id, name,
+    arguments}), the one every adapter translates (nodes/toolloop.py writes the
+    same). The OpenAI wire shape ({type, function: {...}}) crashed the adapters
+    with KeyError 'name' on the round after any lookup (found live)."""
+    return [{"id": tc.id, "name": tc.name, "arguments": dict(tc.arguments or {})} for tc in calls]
 
 
 YES_WORDS = {"y", "yes", "yeah", "yep", "ok", "okay", "sure", "go", "launch", "do it", "run it"}

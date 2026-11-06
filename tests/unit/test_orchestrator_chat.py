@@ -239,3 +239,57 @@ async def test_tools_are_off_without_a_store() -> None:
     names = {t.name for t in provider.requests[0].tools}
     assert "list_missions" not in names  # no toolbox, no look tools
     assert {"propose_mission", "ask"} <= names
+
+
+async def test_chat_history_survives_real_adapters(store) -> None:
+    """The history a chat builds (and reloads) must translate through BOTH real
+    adapters. Found live: tool calls were stored in OpenAI wire shape, every
+    adapter expects the provider-neutral one, and the round after any lookup
+    crashed with KeyError 'name'. Fake providers never translate, so only a
+    test that runs the adapters' own translate_request can catch this."""
+    from rework.kernel.llm.adapters.anthropic import translate_request as to_anthropic
+    from rework.kernel.llm.adapters.openai_compat import translate_request as to_openai
+    from rework.kernel.llm.catalog import ModelCatalog, ModelEntry
+    from rework.kernel.llm.types import ChatRequest, ChatResult, ToolCall
+    from rework.kernel.state.records import Chat
+    from rework.orchestrator.chat import OrchestratorChat
+
+    class _P:
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        async def complete(self, request):
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                return ChatResult(
+                    tool_calls=[ToolCall(id="t1", name="list_projects", arguments={})]
+                )
+            return ChatResult(
+                text="here",
+                tool_calls=[
+                    ToolCall(
+                        id="t2",
+                        name="propose_mission",
+                        arguments={"objective": "x", "plan": "echo"},
+                    )
+                ],
+            )
+
+    catalog = ModelCatalog([ModelEntry(id="flash", provider="fake", model="f")])
+    provider = _P()
+    row = await store.create_chat(Chat(title=""))
+    chat = OrchestratorChat(provider, catalog, "flash", store=store, chat_id=row.id)
+    await chat.send("hi")
+    for request in provider.requests:
+        to_openai(request)
+        to_anthropic(request)
+
+    # reopened: the persisted history must be valid for the adapters too
+    reopened = OrchestratorChat(provider, catalog, "flash", store=store, chat_id=row.id)
+    await reopened.load()
+    history = reopened._history
+    roles = [m["role"] for m in history]
+    assert roles.index("assistant") < roles.index("tool"), "tool rows need their call"
+    replay = ChatRequest(model="f", messages=[*history, {"role": "user", "content": "more"}])
+    to_openai(replay)
+    to_anthropic(replay)
