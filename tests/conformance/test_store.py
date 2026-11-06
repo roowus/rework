@@ -18,6 +18,7 @@ from rework.kernel.state.records import (
     EventType,
     Gate,
     GateKind,
+    GateStatus,
     Mission,
     MissionStatus,
     Project,
@@ -303,21 +304,44 @@ async def test_spend_history_buckets_and_groups(store: StateStore) -> None:
     base = float(int(_t.time() // day) * day) - 2 * day + day // 2
     proj = await store.create_project(Project(name="proj-a"))
     other = await store.create_project(Project(name="proj-b"))
-    m1 = await store.create_mission(
-        Mission(id=new_id("m"), objective="one", project_id=proj.id)
-    )
-    m2 = await store.create_mission(
-        Mission(id=new_id("m"), objective="two", project_id=other.id)
-    )
+    m1 = await store.create_mission(Mission(id=new_id("m"), objective="one", project_id=proj.id))
+    m2 = await store.create_mission(Mission(id=new_id("m"), objective="two", project_id=other.id))
     run1 = await store.create_run(Run(id="r1", mission_id=m1.id, role="coder", step="code"))
     run2 = await store.create_run(Run(id="r2", mission_id=m2.id, role="auditor", step="audit"))
 
-    await store.charge(Charge(mission_id=m1.id, run_id=run1.id, model="flash",
-                              input_tokens=10, output_tokens=1, cost_usd=0.10, ts=base))
-    await store.charge(Charge(mission_id=m1.id, run_id=run1.id, model="flash",
-                              input_tokens=10, output_tokens=1, cost_usd=0.10, ts=base + 60))
-    await store.charge(Charge(mission_id=m2.id, run_id=run2.id, model="pro",
-                              input_tokens=20, output_tokens=2, cost_usd=0.50, ts=base + day))
+    await store.charge(
+        Charge(
+            mission_id=m1.id,
+            run_id=run1.id,
+            model="flash",
+            input_tokens=10,
+            output_tokens=1,
+            cost_usd=0.10,
+            ts=base,
+        )
+    )
+    await store.charge(
+        Charge(
+            mission_id=m1.id,
+            run_id=run1.id,
+            model="flash",
+            input_tokens=10,
+            output_tokens=1,
+            cost_usd=0.10,
+            ts=base + 60,
+        )
+    )
+    await store.charge(
+        Charge(
+            mission_id=m2.id,
+            run_id=run2.id,
+            model="pro",
+            input_tokens=20,
+            output_tokens=2,
+            cost_usd=0.50,
+            ts=base + day,
+        )
+    )
 
     rows = await store.spend_history(bucket="day")
     assert [r["bucket_label"] for r in rows] == sorted(r["bucket_label"] for r in rows)
@@ -363,13 +387,23 @@ async def test_chat_roundtrip(store: StateStore) -> None:
     assert (await store.get_chat("nope")) is None
 
     first = await store.append_chat_message(
-        ChatMessage(chat_id=chat.id, role="user", body={"role": "user", "content": "hi"},
-                    display="hi", ts=100.0)
+        ChatMessage(
+            chat_id=chat.id,
+            role="user",
+            body={"role": "user", "content": "hi"},
+            display="hi",
+            ts=100.0,
+        )
     )
     assert first.id is not None
     second = await store.append_chat_message(
-        ChatMessage(chat_id=chat.id, role="assistant", body={"role": "assistant", "content": "yo"},
-                    display="yo", ts=101.0)
+        ChatMessage(
+            chat_id=chat.id,
+            role="assistant",
+            body={"role": "assistant", "content": "yo"},
+            display="yo",
+            ts=101.0,
+        )
     )
     assert second.id != first.id
 
@@ -403,3 +437,30 @@ async def test_chat_roundtrip(store: StateStore) -> None:
     await store.delete_chat(chat.id)
     assert await store.get_chat(chat.id) is None
     assert await store.chat_messages(chat.id) == []
+
+
+async def test_gate_typed_decision_roundtrip(store: StateStore) -> None:
+    """A gate can carry a typed answer, and it survives a reload.
+
+    `note` is human-facing; `decision` is what the paused role receives. Both
+    backends must persist the dict unchanged (JSON round-trip, no coercion)."""
+    m = await store.create_mission(Mission(id=new_id("m"), objective="typed"))
+    gate = await store.create_gate(
+        Gate(id=new_id("gate"), mission_id=m.id, kind=GateKind.GENERIC, question="q?")
+    )
+    typed = {"feedback": "don't touch the parser", "changes": ["a", "b"], "n": 3}
+    decided = await store.decide_gate(gate.id, approved=False, note="needs work", decision=typed)
+    assert decided is not None
+    assert decided.decision == typed
+    assert decided.decision_note == "needs work"
+    assert decided.status == GateStatus.REJECTED
+
+    reread = await store.get_gate(gate.id)
+    assert reread is not None and reread.decision == typed
+
+    # a plain decision leaves decision None (old behaviour intact)
+    plain = await store.create_gate(
+        Gate(id=new_id("gate"), mission_id=m.id, kind=GateKind.SHIP, question="ship?")
+    )
+    done = await store.decide_gate(plain.id, approved=True)
+    assert done is not None and done.decision is None

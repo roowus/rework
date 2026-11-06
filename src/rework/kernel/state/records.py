@@ -125,6 +125,13 @@ class Gate(BaseModel):
     question: str
     status: GateStatus = GateStatus.OPEN
     decision_note: str | None = None
+    # A TYPED ANSWER that reaches the role, not just a yes/no. The note above is
+    # for humans; this is what the graph receives as the result of its
+    # interrupt(). Shape is the gate kind's business — the engine passes it
+    # through untouched. Example: {"approved": false, "feedback": "don't touch
+    # the parser", "changes": [...]}. None = plain approve/reject (the role gets
+    # a bool, exactly as before).
+    decision: dict[str, Any] | None = None
     # the run this gate unblocks (escalations only; mission-level gates leave
     # it None). DURABLE on the row, not a follow-up event: recovery needs to
     # answer "which run does this decided gate belong to?" and the event that

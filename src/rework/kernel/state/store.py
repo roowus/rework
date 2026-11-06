@@ -95,8 +95,16 @@ class StateStore(Protocol):
     async def get_gate(self, gate_id: str) -> Gate | None: ...
 
     async def decide_gate(
-        self, gate_id: str, approved: bool, note: str | None = None
-    ) -> Gate | None: ...
+        self,
+        gate_id: str,
+        approved: bool,
+        note: str | None = None,
+        decision: dict[str, Any] | None = None,
+    ) -> Gate | None:
+        """Resolve an open gate. `note` is for humans; `decision` is the TYPED
+        answer handed to the paused role as its interrupt() result (None =
+        the role receives a plain bool, as before)."""
+        ...
 
     async def list_open_gates(self, mission_id: str | None = None) -> list[Gate]: ...
 

@@ -248,9 +248,19 @@ class TuiData:
                 count += 1
         return str(dest), count
 
-    async def decide_gate(self, gate_id: str, approved: bool) -> bool:
+    async def decide_gate(
+        self,
+        gate_id: str,
+        approved: bool,
+        *,
+        note: str | None = None,
+        decision: dict[str, Any] | None = None,
+    ) -> bool:
+        """Answer a gate. `note` is human-facing; `decision` is a TYPED answer
+        the paused role receives as its interrupt() result (e.g. free-text
+        feedback, or a choice among options the gate offered)."""
         store = await self.store()
-        gate = await store.decide_gate(gate_id, approved)
+        gate = await store.decide_gate(gate_id, approved, note, decision)
         return gate is not None and gate.status.value == ("approved" if approved else "rejected")
 
     # -- chats -------------------------------------------------------------
@@ -268,8 +278,14 @@ class TuiData:
             f"chat:{chat_id}", lambda: self._call(lambda s: s.get_chat(chat_id))
         )
 
-    async def new_chat(self, *, title: str = "", project_id: str | None = None,
-                       model_id: str | None = None, effort: str | None = None) -> Any:
+    async def new_chat(
+        self,
+        *,
+        title: str = "",
+        project_id: str | None = None,
+        model_id: str | None = None,
+        effort: str | None = None,
+    ) -> Any:
         from rework.kernel.state.records import Chat
 
         store = await self.store()

@@ -110,9 +110,7 @@ async def test_conversation_persists_and_reloads(store) -> None:
     catalog = ModelCatalog([ModelEntry(id="flash", provider="fake", model="f")])
     chat_row = await store.create_chat(Chat(title=""))
     provider = _P()
-    chat = OrchestratorChat(
-        provider, catalog, "flash", store=store, chat_id=chat_row.id
-    )
+    chat = OrchestratorChat(provider, catalog, "flash", store=store, chat_id=chat_row.id)
     await chat.send("audit the parser")
     await chat.send("it lives in github.com/x/y")
 
@@ -121,9 +119,7 @@ async def test_conversation_persists_and_reloads(store) -> None:
     assert stored[0].display == "audit the parser"
 
     # a NEW instance for the same chat sees the history and replays it to the model
-    reopened = OrchestratorChat(
-        provider, catalog, "flash", store=store, chat_id=chat_row.id
-    )
+    reopened = OrchestratorChat(provider, catalog, "flash", store=store, chat_id=chat_row.id)
     shown = await reopened.load()
     assert [who for who, _ in shown] == ["you", "orchestrator", "you", "orchestrator"]
     assert reopened.transcript[0] == ("you", "audit the parser")

@@ -11,6 +11,8 @@ down are honored (boot recovery reads open gates before the first astream).
 
 from __future__ import annotations
 
+from typing import Any
+
 from rework.kernel.events.bus import EventBus
 from rework.kernel.state.records import (
     EventRecord,
@@ -55,12 +57,21 @@ class GateManager:
         )
         return gate
 
-    async def decide(self, gate_id: str, approved: bool, note: str | None = None) -> Gate | None:
-        """Resolve an open gate; no-op (and no event) if already decided."""
+    async def decide(
+        self,
+        gate_id: str,
+        approved: bool,
+        note: str | None = None,
+        decision: dict[str, Any] | None = None,
+    ) -> Gate | None:
+        """Resolve an open gate; no-op (and no event) if already decided.
+
+        `decision` is the typed answer the paused role receives (see
+        Gate.decision); `note` stays human-facing."""
         before = await self._store.get_gate(gate_id)
         if before is None or before.status != GateStatus.OPEN:
             return before
-        gate = await self._store.decide_gate(gate_id, approved, note)
+        gate = await self._store.decide_gate(gate_id, approved, note, decision)
         if gate is not None and gate.status != GateStatus.OPEN:
             await self._bus.publish(
                 EventRecord(
@@ -70,6 +81,7 @@ class GateManager:
                         "gate_id": gate.id,
                         "approved": approved,
                         "note": note,
+                        "decision": decision,
                     },
                 )
             )

@@ -44,6 +44,7 @@ Design docs if you need depth: `docs/design.md`, `docs/adr/0001`–`0005`,
 ```python
 if len(sys.argv) == 1:
     from rework.tui import run_tui
+
     run_tui()
 ```
 
@@ -140,13 +141,22 @@ The tool-loop nodes publish `EventType.PROGRESS` events whose payload has a
 `trajectory` key. Three kinds:
 
 ```python
-{"trajectory": "turn", "turn": 3, "text": "…≤400 chars…",
- "tools": ["read_file", "run_command"], "tokens": 3800}
+{
+    "trajectory": "turn",
+    "turn": 3,
+    "text": "…≤400 chars…",
+    "tools": ["read_file", "run_command"],
+    "tokens": 3800,
+}
 
 {"trajectory": "tool_call", "name": "read_file", "arguments": "path=src/app.py"}
 
-{"trajectory": "tool_result", "name": "read_file",
- "result": "…≤400 chars…", "error": "…≤200 chars, empty when not an error…"}
+{
+    "trajectory": "tool_result",
+    "name": "read_file",
+    "result": "…≤400 chars…",
+    "error": "…≤200 chars, empty when not an error…",
+}
 ```
 
 These are already truncated server-side; do not expect full payloads. They are
@@ -180,10 +190,11 @@ from rework.config import load_catalog
 from rework.kernel.llm.adapters import build_provider
 
 catalog = load_catalog()
-entry   = catalog.resolve(model_id)
-chat    = OrchestratorChat(build_provider(entry), catalog, model_id,
-                           effort=None, context=my_context_note)
-result  = await chat.send("fix the flaky test in toyrepo", images=["/path/shot.png"])
+entry = catalog.resolve(model_id)
+chat = OrchestratorChat(
+    build_provider(entry), catalog, model_id, effort=None, context=my_context_note
+)
+result = await chat.send("fix the flaky test in toyrepo", images=["/path/shot.png"])
 # ChatResult: reply, proposal, asked, turn_tokens, turn_cost_usd, transcript[Turn]
 ```
 
@@ -205,10 +216,11 @@ Creating the mission afterwards:
 ```python
 await data.create_mission(
     objective=proposal.objective,
-    plan=proposal.plan or "fix",            # echo | fix | fix-pr
-    project_id=resolved_project_id,         # resolve the NAME the chat used
+    plan=proposal.plan or "fix",  # echo | fix | fix-pr
+    project_id=resolved_project_id,  # resolve the NAME the chat used
     repo=proposal.repo or None,
-    model=..., effort=...,
+    model=...,
+    effort=...,
 )
 ```
 

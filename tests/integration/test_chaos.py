@@ -486,3 +486,97 @@ async def _lock_held(store: SqliteStore, owner: str) -> bool:
 async def _lock_free(store: SqliteStore) -> bool:
     row = await store._fetch_one("SELECT owner FROM daemon_lock WHERE id = 1", ())
     return row is None
+
+
+async def test_typed_gate_answer_reaches_the_role(world: dict[str, Any]) -> None:
+    """A gate answered with FEEDBACK, not just yes/no.
+
+    The reported gap was that decide_gate saves a note but the engine resumes the
+    role with a boolean only. This drives the whole path: the role parks on
+    interrupt(), the owner answers with a dict, and the role's graph receives
+    that dict (including `approved`) instead of a bare True.
+    """
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import interrupt
+
+    from rework.roles.base import RoleSpec
+
+    seen: list[Any] = []
+
+    class EchoDecisionSpec(RoleSpec):
+        name = "echo_decision"
+        description = "records whatever its interrupt() returned"
+        goal = "record the decision"
+        default_model = "flash"
+
+        def build_graph(self, ctx):  # type: ignore[no-untyped-def]
+            async def ask(state: dict) -> dict:  # type: ignore[no-untyped-def]
+                value = interrupt({"kind": "question", "detail": "how should I change it?"})
+                seen.append(value)
+                return {"artifact": {"decision": value}}
+
+            graph = StateGraph(dict)  # type: ignore[arg-type]
+            graph.add_node("ask", ask)
+            graph.add_edge(START, "ask")
+            graph.add_edge("ask", END)
+            return graph.compile()
+
+    world["registry"].register(EchoDecisionSpec)
+    store: SqliteStore = world["store"]
+    mission = await store.create_mission(
+        Mission(
+            id=new_id("m"),
+            objective="answer me with feedback",
+            plan={"steps": [{"step": "do", "role": "echo_decision"}]},
+        )
+    )
+    task = asyncio.create_task(_runner(world, mission.id).run())
+    await _wait_for(lambda: _open_gate(store, mission.id), what="gate to open")
+
+    second: SqliteStore = await open_sqlite(world["db_path"])
+    try:
+        gates = GateManager(second, InProcessEventBus(second))
+        open_gates = await gates.open_gates(mission.id)
+        await gates.decide(
+            open_gates[0].id,
+            approved=False,
+            note="needs work",
+            decision={"feedback": "don't touch the parser", "changes": ["a", "b"]},
+        )
+    finally:
+        await second.aclose()
+
+    await asyncio.wait_for(task, timeout=60)
+    assert seen == [
+        {"feedback": "don't touch the parser", "changes": ["a", "b"], "approved": False}
+    ], seen
+    run = await store.get_run(f"{mission.id}:do:echo_decision:1")
+    assert run is not None and run.artifact is not None
+    assert run.artifact["decision"]["feedback"] == "don't touch the parser"
+
+
+async def test_plain_gate_still_resumes_with_a_bool(world: dict[str, Any]) -> None:
+    """Roles written before typed answers must keep receiving True/False."""
+    store: SqliteStore = world["store"]
+    mission = await store.create_mission(
+        Mission(
+            id=new_id("m"),
+            objective="plain approval",
+            plan={"steps": [{"step": "do", "role": "crashy"}]},
+        )
+    )
+    task = asyncio.create_task(_runner(world, mission.id).run())
+    await _wait_for(lambda: _open_gate(store, mission.id), what="gate to open")
+
+    second: SqliteStore = await open_sqlite(world["db_path"])
+    try:
+        gates = GateManager(second, InProcessEventBus(second))
+        open_gates = await gates.open_gates(mission.id)
+        await gates.decide(open_gates[0].id, approved=True)  # no typed decision
+    finally:
+        await second.aclose()
+
+    await asyncio.wait_for(task, timeout=60)
+    run = await store.get_run(f"{mission.id}:do:crashy:1")
+    assert run is not None and run.artifact is not None
+    assert run.artifact["approved"] is True  # bool(decision) is True

@@ -806,18 +806,40 @@ def approve(
     gate_id: str,
     note: str | None = None,
     reject: bool = typer.Option(False, help="reject instead of approve"),
+    answer: str | None = typer.Option(
+        None, help="typed answer handed to the paused role (free text feedback)"
+    ),
+    answer_json: str | None = typer.Option(None, help="typed answer as JSON, for structured gates"),
 ) -> None:
-    """Decide an open gate. Works from any machine sharing the database."""
+    """Decide an open gate. Works from any machine sharing the database.
+
+    `--answer` / `--answer-json` send a TYPED answer the paused role receives as
+    its interrupt() result, instead of a bare yes/no — that is how feedback like
+    "don't touch the parser" reaches the agent rather than stopping at a note."""
 
     async def go() -> tuple[bool, str]:
+        import json as _json
+
         from rework.config import Config, open_store_from_config
         from rework.kernel.events.bus import InProcessEventBus
         from rework.kernel.gates import GateManager
 
+        decision: dict[str, Any] | None = None
+        if answer_json is not None:
+            try:
+                parsed = _json.loads(answer_json)
+            except ValueError as exc:
+                raise typer.BadParameter(f"--answer-json is not valid JSON: {exc}") from exc
+            if not isinstance(parsed, dict):
+                raise typer.BadParameter("--answer-json must be a JSON object")
+            decision = parsed
+        elif answer is not None:
+            decision = {"feedback": answer}
+
         store = await open_store_from_config(Config.from_env())
         try:
             gates = GateManager(store, InProcessEventBus(store))
-            gate = await gates.decide(gate_id, approved=not reject, note=note)
+            gate = await gates.decide(gate_id, approved=not reject, note=note, decision=decision)
             if gate is None:
                 return False, "gate not found"
             return True, gate.status.value

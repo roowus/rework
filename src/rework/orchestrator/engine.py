@@ -647,6 +647,26 @@ class MissionRunner:
             EventRecord(mission_id=mission_id, type=event, payload={"runs": len(runs)})
         )
 
+    @staticmethod
+    def _resume_value(gate: Any) -> Any:
+        """What the paused role receives when this gate is resolved.
+
+        A gate may carry a TYPED answer (Gate.decision) — feedback text, a
+        choice among options, structured changes. When it does, that dict is the
+        role's interrupt() result, so the agent can act on what the owner
+        actually said instead of inferring it from a boolean. When it does not,
+        the role gets the plain bool it has always received, so every role
+        written before typed answers existed keeps working unchanged.
+
+        `approved` is always present in the dict form (mirrors the row status)
+        so existing "if decision:" checks on the role side keep working."""
+        if gate is None:
+            return False
+        approved = gate.status == GateStatus.APPROVED
+        if gate.decision:
+            return {**gate.decision, "approved": approved}
+        return approved
+
     async def _gate_decision(self, mission_id: str, gate_id: str) -> bool:
         """Read the decision from the gate ROW (the source of truth). The
         row-update and its event commit separately, so the event log can lag
@@ -681,9 +701,18 @@ class MissionRunner:
                             # decided while the engine was down: resume with
                             # the row's decision (a plain resume would re-fire
                             # the interrupt and open a duplicate gate)
-                            await self._supervisor.resume_with_decision(run, True)
+                            await self._supervisor.resume_with_decision(
+                                run, self._resume_value(gate)
+                            )
                             continue
                         if gate is not None and gate.status == GateStatus.REJECTED:
+                            if gate.decision:
+                                # rejected WITH feedback, decided while we were
+                                # down: deliver the answer instead of aborting
+                                await self._supervisor.resume_with_decision(
+                                    run, self._resume_value(gate)
+                                )
+                                continue
                             await self._store.update_run(run.id, status=RunStatus.ABORTED)
                             await self._bus.publish(
                                 EventRecord(
@@ -883,7 +912,14 @@ class MissionRunner:
             if fresh is None or fresh.status != RunStatus.HALTED_ESCALATED:
                 continue
             if gate_row.status == GateStatus.APPROVED:
-                await self._supervisor.resume_with_decision(fresh, True)
+                await self._supervisor.resume_with_decision(fresh, self._resume_value(gate_row))
+            elif gate_row.decision:
+                # REJECTED WITH FEEDBACK: the owner said no AND said why (or
+                # asked for changes). The role must SEE that to act on it —
+                # aborting the run here would throw the feedback away. It
+                # resumes with the typed answer, `approved` False, and gets one
+                # chance to correct course; the step still moves on afterwards.
+                await self._supervisor.resume_with_decision(fresh, self._resume_value(gate_row))
             else:
                 await self._store.update_run(fresh.id, status=RunStatus.ABORTED)
                 await self._bus.publish(

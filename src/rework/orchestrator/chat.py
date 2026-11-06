@@ -197,9 +197,7 @@ class OrchestratorChat:
         # stored roles are provider-neutral ("user"/"assistant"); the display
         # vocabulary used throughout the UI is "you"/"orchestrator"
         who = {"user": "you", "assistant": "orchestrator"}
-        self._display = [
-            (who.get(m.role, m.role), m.display) for m in messages if m.display
-        ]
+        self._display = [(who.get(m.role, m.role), m.display) for m in messages if m.display]
         return list(self._display)
 
     @property

@@ -87,6 +87,7 @@ _DDL = [
         question TEXT NOT NULL,
         status TEXT NOT NULL,
         decision_note TEXT,
+        decision TEXT,
         for_run TEXT,
         created_at DOUBLE PRECISION NOT NULL,
         decided_at DOUBLE PRECISION
@@ -337,6 +338,7 @@ class PostgresStore:
             question=row["question"],
             status=GateStatus(row["status"]),
             decision_note=row["decision_note"],
+            decision=_uj(row["decision"]) or None,
             for_run=row["for_run"],
             created_at=row["created_at"],
             decided_at=row["decided_at"],
@@ -557,8 +559,8 @@ class PostgresStore:
     async def create_gate(self, gate: Gate) -> Gate:
         await self._conn.execute(
             "INSERT INTO gates (id, mission_id, kind, question, status, decision_note,"
-            " for_run, created_at, decided_at)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            " decision, for_run, created_at, decided_at)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 gate.id,
                 gate.mission_id,
@@ -566,6 +568,7 @@ class PostgresStore:
                 gate.question,
                 gate.status.value,
                 gate.decision_note,
+                _j(gate.decision),
                 gate.for_run,
                 gate.created_at,
                 gate.decided_at,
@@ -581,14 +584,19 @@ class PostgresStore:
 
     @_serialized
     async def decide_gate(
-        self, gate_id: str, approved: bool, note: str | None = None
+        self,
+        gate_id: str,
+        approved: bool,
+        note: str | None = None,
+        decision: dict[str, Any] | None = None,
     ) -> Gate | None:
         await self._conn.execute(
-            "UPDATE gates SET status = %s, decision_note = %s, decided_at = %s"
-            " WHERE id = %s AND status = %s",
+            "UPDATE gates SET status = %s, decision_note = %s, decision = %s,"
+            " decided_at = %s WHERE id = %s AND status = %s",
             (
                 GateStatus.APPROVED.value if approved else GateStatus.REJECTED.value,
                 note,
+                _j(decision),
                 time.time(),
                 gate_id,
                 GateStatus.OPEN.value,
@@ -916,8 +924,13 @@ class PostgresStore:
             await cur.execute(
                 "INSERT INTO chat_messages (chat_id, role, body, display, ts)"
                 " VALUES (%s, %s, %s, %s, %s) RETURNING id",
-                (message.chat_id, message.role, _j(message.body) or "{}",
-                 message.display, message.ts),
+                (
+                    message.chat_id,
+                    message.role,
+                    _j(message.body) or "{}",
+                    message.display,
+                    message.ts,
+                ),
             )
             row = await cur.fetchone()
         await self._conn.execute(
@@ -1078,6 +1091,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("missions", "repo_origin", "ALTER TABLE missions ADD COLUMN repo_origin TEXT"),
     ("missions", "project_id", "ALTER TABLE missions ADD COLUMN project_id TEXT"),
     ("gates", "for_run", "ALTER TABLE gates ADD COLUMN for_run TEXT"),
+    ("gates", "decision", "ALTER TABLE gates ADD COLUMN decision TEXT"),
 ]
 
 

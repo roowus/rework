@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS gates (
     question TEXT NOT NULL,
     status TEXT NOT NULL,
     decision_note TEXT,
+    decision TEXT,
     for_run TEXT,
     created_at REAL NOT NULL,
     decided_at REAL
@@ -220,6 +221,7 @@ class SqliteStore:
             question=row["question"],
             status=GateStatus(row["status"]),
             decision_note=row["decision_note"],
+            decision=_uj(row["decision"]) or None,
             for_run=row["for_run"],
             created_at=row["created_at"],
             decided_at=row["decided_at"],
@@ -422,7 +424,8 @@ class SqliteStore:
     async def create_gate(self, gate: Gate) -> Gate:
         await self._db.execute(
             "INSERT INTO gates (id, mission_id, kind, question, status, decision_note,"
-            " for_run, created_at, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " decision, for_run, created_at, decided_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 gate.id,
                 gate.mission_id,
@@ -430,6 +433,7 @@ class SqliteStore:
                 gate.question,
                 gate.status.value,
                 gate.decision_note,
+                _j(gate.decision),
                 gate.for_run,
                 gate.created_at,
                 gate.decided_at,
@@ -443,14 +447,19 @@ class SqliteStore:
         return self._gate(row) if row else None
 
     async def decide_gate(
-        self, gate_id: str, approved: bool, note: str | None = None
+        self,
+        gate_id: str,
+        approved: bool,
+        note: str | None = None,
+        decision: dict[str, Any] | None = None,
     ) -> Gate | None:
         await self._db.execute(
-            "UPDATE gates SET status = ?, decision_note = ?, decided_at = ? WHERE id = ?"
-            " AND status = ?",
+            "UPDATE gates SET status = ?, decision_note = ?, decision = ?, decided_at = ?"
+            " WHERE id = ? AND status = ?",
             (
                 GateStatus.APPROVED.value if approved else GateStatus.REJECTED.value,
                 note,
+                _j(decision),
                 time.time(),
                 gate_id,
                 GateStatus.OPEN.value,
@@ -894,5 +903,7 @@ async def open_sqlite(path: str) -> SqliteStore:
     names = {row[1] for row in await cols.fetchall()}
     if "for_run" not in names:
         await db.execute("ALTER TABLE gates ADD COLUMN for_run TEXT")
+    if "decision" not in names:
+        await db.execute("ALTER TABLE gates ADD COLUMN decision TEXT")
     await db.commit()
     return SqliteStore(db)
