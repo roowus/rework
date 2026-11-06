@@ -95,13 +95,14 @@ async def test_no_bus_means_no_trajectory_noise(store) -> None:  # type: ignore[
     assert not [e for e in events if (e.payload or {}).get("trajectory")]
 
 
-def test_format_event_line_shapes() -> None:
+def test_event_step_shapes() -> None:
+    """The TUI's trajectory renderer turns each step kind into one readable line."""
     from rework.kernel.state.records import EventRecord
-    from rework.tui.app import format_event_line
+    from rework.tui.widgets.trajectory import event_step
 
     turn = EventRecord(
         mission_id="m",
-        run_id="r",
+        run_id="m:investigate:investigator:1",
         type=EventType.PROGRESS,
         payload={
             "trajectory": "turn",
@@ -111,8 +112,21 @@ def test_format_event_line_shapes() -> None:
             "tokens": 1200,
         },
     )
-    line = format_event_line(turn, "investigate")
-    assert "turn 3" in line and "reading" in line and "grep" in line and "1,200 tok" in line
+    step = event_step(turn)
+    assert step is not None
+    text = str(step.render())
+    assert "turn 3" in text and "reading" in text and "1.2k tok" in text
+    assert "investigator" in text
+
+    call = EventRecord(
+        mission_id="m",
+        run_id="m:code:coder:2",
+        type=EventType.PROGRESS,
+        payload={"trajectory": "tool_call", "name": "grep", "arguments": "pattern=x"},
+    )
+    step = event_step(call)
+    assert step is not None
+    assert "grep" in str(step.render()) and "coder #2" in str(step.render())
 
     err = EventRecord(
         mission_id="m",
@@ -120,4 +134,5 @@ def test_format_event_line_shapes() -> None:
         type=EventType.PROGRESS,
         payload={"trajectory": "tool_result", "name": "read", "error": "error: nope"},
     )
-    assert "error: nope" in format_event_line(err, "code")
+    step = event_step(err)
+    assert step is not None and "error: nope" in str(step.render())

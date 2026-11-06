@@ -86,56 +86,41 @@ with a continue/abort gate; approving doubles the cap and resumes, rejecting can
 Steps that FAIL get exactly one in-mission retry (the 429-storm lesson) before the
 plan moves on; synthesis counts only the latest attempt per step.
 
-### The TUI (owner ask, post-M5; OS-shell redesign 2026-11-05)
+### The TUI (rebuilt 2026-11-05, ADR 0006)
 
-Bare `rework` opens a Textual OS-style shell: a MENU BAR on top (rework
-wordmark, File / Edit / View / Help with working dropdowns), a TAB BAR under
-it, one full-width pane per section, and a hint row. Five tabs, `alt+1..5`:
+Bare `rework` opens a Textual app: a menu bar (wordmark, File / Edit / View /
+Mission / Help dropdowns, and a live status cluster: connection, open gates,
+spend today), a tab bar, one full-width view per tab, and a hint row. The
+visual language — tokens, status glyphs, components, interaction rules — is
+specified in `docs/tui/DESIGN.md`; every view is built from that kit.
 
-- **Work** — the CONVERSATION with the orchestrator. Missions are created by
-  talking, never by a form; the orchestrator proposes, you approve. The prompt
-  is a multi-line editor: enter sends, shift+enter adds a line, `/` completes
-  commands on tab, a pasted image path attaches the image, and a paste larger
-  than 20k chars becomes an attachment file instead of vanishing. Project /
-  model / effort are selection screens below the prompt.
-- **Dashboard** — projects as chips on top (the primary axis), missions
-  full-width below, then the selected mission's live trajectory (turns, tool
-  calls, tool results), its cost, and an approve/reject box when a gate waits.
-- **Gates** — every open gate across missions, with an unread badge on the tab
-  and a notification on arrival (REWORK_NOTIFY=toast|bell|both|none).
-- **Library** — search-first; hybrid when embeddings are configured.
-- **Cost** — the charges ledger, grouped by model (calls, input/output tokens,
-  USD) plus per-mission totals; `s` toggles all-missions vs the selected one.
+- **Work** — Claude-Code-style conversation with the orchestrator. Saved chats
+  on the left (persisted in the store, synced across devices); the transcript
+  shows your messages, the orchestrator's tool calls and results live, proposal
+  cards (Launch / Scrap — nothing runs until you confirm, or type "yes") and
+  live mission cards (status, last steps, inline gate answers, pause/cancel).
+  Project / model / effort knobs under the prompt. Opens with no chat selected.
+- **Dashboard** — overview (stats strip, projects, missions grouped needs-you →
+  running → paused → recent) and a mission drill-down: header + flow strip,
+  sessions (one per run) on the left, and Trajectory / Graph (LangGraph-style
+  node view, click a node to focus its run) / Output / Diff / Report / Gates.
+- **Gates** — inbox oldest-first with full decision context (mission, the run it
+  unblocks, the diff + audit verdict for ship gates, recent steps) and an answer
+  box; the typed answer reaches the paused role as `Gate.decision`.
+- **Library** — search-first (hybrid when embeddings are on), type/status
+  filters, reader with activate / retire, and New item.
+- **Cost** — range and metric chips, headline numbers, a one-year calendar
+  heatmap, a per-day column chart, and breakdowns by model / project / role /
+  mission (from `spend_history`).
 
-Gates are answered by CLICKING, first and always (owner: "dont make thigns
-work soley on keys we nede clicks, tui is for a reason"). Every open gate
-renders as a row with its own Approve / Reject buttons (dashboard and deep
-view), and the Gates tab has action buttons that apply to the selected row.
-Keyboard works as an accelerator (`alt+a` / `alt+x`; plain `a`/`x` collide
-with typing in any input and with the table's own row actions). Both paths
-act on the VISIBLE context only — never a stray database-wide approval.
-
-Resilience rule for a client that lives on a laptop talking to a daemon over
-the tailnet: a dropped connection must NEVER exit the app. TuiData retries
-once on a fresh connection and otherwise serves the last good result with an
-"offline" marker in the tab bar; poll loops catch their own errors; and
-ReworkApp._handle_exception turns anything that still escapes into a toast
-instead of Textual's default full-screen traceback + quit. (Found live: one
-timed-out poll painted a traceback over the whole dashboard.)
-
-Deep view tabs are Feed / Findings / Diff / Report. One navigation rule
-everywhere: enter = deeper, esc = back, alt+a/x = decide, f = fetch.
-Bare `rework` opens blank: nothing auto-opens, nothing auto-resumes.
-
-Visible ARTIFACTS land in ~/rework (results/<mission-id>/, reports/), so
-deliverables are never buried in a dot-directory; ~/.rework stays hidden
-and keeps only machinery (env, models.json, checkpoints). Overrides:
-REWORK_RESULTS_DIR / REWORK_REPORTS_DIR. The TUI is a CLIENT (own store
-connection from REWORK_DB), the scriptable command surface is unchanged
-underneath, and the quality bar is Claude-Code-grade: no blocking IO on
-the UI loop, one in-flight refresh guard, notify-not-crash on store
-hiccups, layout survives resizes. An in-app assistant model (back burner)
-would live here.
+Rules: mouse first with keys as accelerators (`alt+1..5`, `ctrl+n`, `alt+a/x`);
+one click acts; esc goes back, esc twice quits; ctrl+c copies (OSC 52 +
+pbcopy), never quits. One `Hub` polls the store and broadcasts snapshots;
+every poll is guarded, a dead connection shows `○ offline` with stale data,
+and `ReworkApp._handle_exception` turns surprises into toasts. Gate
+notifications are configurable (`REWORK_NOTIFY=toast,bell,os|none`, or File ›
+Settings). What the TUI still needs from the engine is tracked in
+`docs/tui/BACKEND-NEEDS.md`.
 
 ### The Library
 

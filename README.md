@@ -61,19 +61,23 @@ tailnet IP). Results return as a branch (open_pr gate) or via `rework fetch
 
 ## The TUI: just type `rework`
 
-With no arguments, `rework` opens a full-screen shell (mouse + keyboard):
+With no arguments, `rework` opens a full-screen app (mouse + keyboard):
 
-- **Work** — talk to the orchestrator; it proposes missions and you approve
-  them. Enter sends, shift+enter adds a line, `/` completes commands on tab,
-  and the prompt accepts pasted images and large pastes
-- **Dashboard** — projects across the top, missions below, the selected
-  mission's live agent trajectory and cost, and an approve/reject box
-- **Gates** — every open gate, with an unread badge and notifications
-- **Library** — search what missions learned
-- **Cost** — spend and token usage by model, and per mission
+- **Work** — talk to the orchestrator like Claude Code: it looks at your
+  projects and missions (tool calls shown live), proposes a mission, and nothing
+  runs until you press Launch. Saved chats sync across devices; launched
+  missions stay live in the conversation, gates included
+- **Dashboard** — every project and mission; open one for its live trajectory,
+  LangGraph-style graph, outputs, diff, report and gates; pause / resume / cancel
+- **Gates** — everything waiting on you, with the context to decide and an
+  answer box the agent receives
+- **Library** — search, read, activate / retire, add items
+- **Cost** — spend, tokens and calls over time (calendar heatmap) by model,
+  project, role and mission
 
-Gate keys are `alt+a` / `alt+x`; tabs are `alt+1..5`; `ctrl+p` is the command
-palette; escape twice quits.
+Tabs are `alt+1..5`, `ctrl+n` starts a chat, `alt+a` / `alt+x` answer a gate,
+`ctrl+c` copies, `f1` lists keys, escape twice quits. Design language:
+`docs/tui/DESIGN.md`.
 
 The TUI is a client like every other command: it reads `REWORK_DB`, so from
 your laptop it shows and controls the missions running on the daemon.

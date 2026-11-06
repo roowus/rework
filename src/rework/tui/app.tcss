@@ -1,0 +1,327 @@
+/* rework TUI — the whole visual language. Tokens come from theme.py. */
+
+Screen {
+    background: $bg;
+    color: $fg;
+    layers: base overlay;
+}
+
+/* ---------------------------------------------------------------- chrome */
+
+#menubar {
+    height: 1;
+    background: $bg;
+    color: $muted;
+}
+#wordmark { width: auto; padding: 0 2 0 1; }
+#wordmark:hover { background: $raised; }
+.menu-title { width: auto; color: $muted; }
+.menu-title:hover { background: $raised; color: $fg; }
+#menubar-spacer { width: 1fr; }
+#menubar-status { width: auto; }
+#menubar-status:hover { background: $raised; }
+
+#tabbar {
+    height: 2;
+    background: $bg;
+    border-bottom: solid $line;
+    padding: 0 0 0 1;
+}
+.tab {
+    width: auto;
+    height: 1;
+    color: $muted;
+    margin-right: 1;
+}
+.tab:hover { color: $fg; background: $raised; }
+.tab.-active { color: $fg; text-style: bold; background: $accent-dim; }
+#tabbar-spacer { width: 1fr; }
+#tabbar-note { width: auto; color: $faint; padding-right: 1; }
+
+#hintbar {
+    height: 1;
+    background: $bg;
+    color: $faint;
+    padding: 0 1;
+    border-top: none;
+}
+
+#views { height: 1fr; }
+
+/* dropdown menus */
+MenuScreen { background: transparent; align: left top; }
+#menu {
+    width: auto;
+    min-width: 30;
+    height: auto;
+    background: $overlay;
+    border: none;
+    padding: 0;
+}
+.menu-item { height: 1; width: 100%; padding: 0 2 0 1; layout: horizontal; }
+.menu-item:hover, .menu-item.-hover { background: $accent-dim; color: $fg; }
+.menu-key { dock: right; width: auto; padding-left: 3; }
+.menu-sep { height: 1; border-top: solid $line; margin: 0 1; }
+
+/* ---------------------------------------------------------------- kit */
+
+.btn {
+    width: auto;
+    height: 1;
+    background: $raised;
+    color: $fg;
+    margin-right: 1;
+}
+.btn:hover { background: $overlay; }
+.btn:focus { background: $overlay; text-style: bold; }
+.btn.primary { background: $accent-dim; color: $accent; text-style: bold; }
+.btn.primary:hover { background: $accent 30%; color: $fg; }
+.btn.danger { color: $danger; }
+.btn.danger:hover { background: $danger 20%; }
+.btn.ghost { background: transparent; color: $muted; }
+.btn.ghost:hover { background: $raised; color: $fg; }
+.btn.-disabled, .btn:disabled { color: $faint; background: transparent; }
+
+.chips { height: 1; width: auto; }
+.chips-label { width: auto; color: $faint; padding-right: 1; }
+.chip { width: auto; height: 1; background: transparent; color: $muted; margin-right: 1; }
+.chip:hover { background: $raised; color: $fg; }
+.chip.-selected { background: $accent-dim; color: $fg; }
+
+.rowlist { height: 1fr; background: transparent; scrollbar-size-vertical: 1; }
+.rowlist:focus { background-tint: transparent; }
+.rowlist-empty { color: $faint; padding: 1 2; }
+.row {
+    width: 100%;
+    height: auto;
+    padding: 0 1 0 1;
+    border-left: blank;
+    color: $fg;
+}
+.row:hover { background: $raised; }
+.row.-selected { background: $overlay; border-left: outer $accent; }
+.rowlist:focus .row.-selected { background: $accent-dim; }
+.row.-gap { margin-top: 1; }
+.row.-dim { color: $muted; }
+
+.label { color: $faint; text-style: bold; padding: 1 1 0 1; height: auto; }
+.empty { color: $faint; width: 100%; height: 1fr; content-align: center middle; text-align: center; }
+
+.breadcrumb { height: 1; width: 1fr; }
+.crumb { width: auto; color: $muted; }
+.crumb:hover { color: $fg; text-style: underline; }
+.crumb.-current { color: $fg; text-style: bold; }
+.crumb-sep { width: auto; }
+
+.stat { width: 1fr; height: auto; padding: 0 2 0 1; border-left: solid $line; }
+.stat:first-of-type { border-left: none; }
+
+/* ---------------------------------------------------------------- layout */
+
+.sidebar {
+    width: 34;
+    height: 1fr;
+    background: $surface;
+    border-right: solid $line;
+}
+.sidebar.-hidden { display: none; }
+.side-actions { height: auto; padding: 1 1 0 1; }
+#chat-list .row { margin-bottom: 1; }
+.main { width: 1fr; height: 1fr; }
+.pane-head {
+    height: auto;
+    padding: 0 1;
+    background: $bg;
+    border-bottom: solid $line;
+}
+.pane-head-title { height: auto; width: auto; }
+.toolbar { height: 1; width: auto; }
+.spacer { width: 1fr; }
+
+/* ---------------------------------------------------------------- trajectory */
+
+.trajectory { height: 1fr; padding: 0 2 1 2; background: $bg; scrollbar-size-vertical: 1; }
+.step { width: 100%; height: auto; }
+.step.-foldable:hover { background: $raised; }
+.step-user {
+    margin-top: 1;
+    padding: 0 1;
+    background: $raised;
+    border-left: outer $accent-dim;
+}
+.step-assistant { margin-top: 1; }
+.step-turn { margin-top: 1; }
+.step-phase { margin-top: 1; }
+.step-gate { margin-top: 1; }
+.step-meta { height: auto; }
+
+/* inline cards in the chat (proposal / mission) */
+.card {
+    height: auto;
+    margin: 1 0 0 0;
+    padding: 0 1;
+    background: $surface;
+    border-left: outer $line-strong;
+}
+.card.-accent { border-left: outer $accent; }
+.card.-warn { border-left: outer $warn; }
+.card.-ok { border-left: outer $ok; }
+.card.-danger { border-left: outer $danger; }
+.card-body { height: auto; padding: 0 0 0 0; }
+.card-actions { height: 1; margin-top: 1; }
+
+/* ---------------------------------------------------------------- composer */
+
+#composer {
+    height: auto;
+    max-height: 16;
+    padding: 0 2 0 2;
+    background: $bg;
+}
+#composer-box {
+    height: auto;
+    border: round $line-strong;
+    background: $bg;
+    padding: 0 1;
+}
+#composer-box:focus-within { border: round $accent 70%; }
+Prompt {
+    height: auto;
+    min-height: 1;
+    max-height: 12;
+    background: transparent;
+    border: none;
+    padding: 0;
+}
+Prompt:focus { border: none; background-tint: transparent; }
+Prompt > .text-area--placeholder { color: $faint; }
+#composer-attach { height: auto; color: $muted; }
+#composer-knobs { height: 1; width: 100%; margin: 0 0 1 0; }
+#composer-knobs .spacer { width: 1fr; }
+#send-hint { width: auto; }
+.knob { width: auto; height: 1; color: $muted; margin-right: 2; }
+.knob:hover { color: $fg; background: $raised; }
+
+/* ---------------------------------------------------------------- modals */
+
+.modal { background: $bg 70%; align: center middle; }
+.dialog {
+    width: 72;
+    max-width: 90%;
+    height: auto;
+    max-height: 85%;
+    background: $surface;
+    border: round $line-strong;
+    padding: 1 2;
+}
+.dialog-title { height: auto; margin-bottom: 1; }
+.dialog-hint { width: 1fr; color: $faint; height: 1; }
+.dialog-actions { height: 1; margin-top: 1; }
+.picker { height: 24; }
+.picker Input { margin-bottom: 1; background: $raised; border: none; }
+.picker .rowlist { height: 1fr; }
+.form-body { height: auto; max-height: 30; }
+.form-label { height: 1; margin-top: 1; }
+.form Input { background: $raised; border: none; }
+.form-area { height: 12; background: $raised; border: none; }
+.help { width: 76; }
+.help-body { height: auto; color: $muted; }
+
+/* toasts */
+Toast {
+    background: $overlay;
+    color: $fg;
+    border-left: outer $accent;
+    padding: 0 1;
+}
+Toast.-warning { border-left: outer $warn; }
+Toast.-error { border-left: outer $danger; }
+Toast .toast--title { text-style: bold; color: $fg; }
+
+Input { background: $raised; border: none; }
+Input:focus { background: $overlay; border: none; }
+Input > .input--placeholder { color: $faint; }
+
+Markdown { background: transparent; padding: 0; margin: 0; }
+MarkdownH1, MarkdownH2, MarkdownH3 { background: transparent; color: $fg; }
+
+/* ---------------------------------------------------------------- gates */
+
+.sidebar.wide { width: 46; }
+#gate-list .row { margin-bottom: 1; }
+#gate-pane { height: 1fr; }
+#gate-detail { height: 1fr; padding: 1 2; }
+#gate-question { height: auto; padding: 0 1; margin-bottom: 0; }
+.section { height: auto; padding: 0 1; }
+#gate-answer {
+    height: auto;
+    padding: 1 2;
+    border-top: solid $line;
+    background: $surface;
+}
+#gate-text { height: 4; background: $raised; border: none; margin-bottom: 1; }
+#gate-text:focus { background: $overlay; }
+.gate-actions { height: 1; }
+.gate-tip { width: auto; }
+
+/* ---------------------------------------------------------------- dashboard */
+
+#dash-head { height: 1; border-bottom: none; padding: 0 1; }
+#dash-head .breadcrumb { width: 1fr; }
+#dash-controls { width: auto; }
+#dash-pages { height: 1fr; }
+#dash-overview, #dash-mission { height: 1fr; }
+#dash-stats { height: auto; padding: 1 1; border-bottom: solid $line; }
+#dash-stats .stat.-warn { color: $warn; }
+.subbar { height: 1; padding: 0 1; margin: 1 0 1 0; }
+.subbar-note { width: auto; }
+#mission-list .row { margin-bottom: 1; }
+#mission-list .row.-header { margin-bottom: 0; margin-top: 1; color: $faint; }
+#mission-list .row.-header:hover { background: transparent; }
+#proj-list .row { margin-bottom: 0; }
+#run-list .row { margin-bottom: 1; }
+#m-header { height: auto; padding: 1 2 0 2; }
+#m-flow { height: auto; padding: 0 2 1 2; border-bottom: solid $line; }
+#m-pages { height: 1fr; }
+.doc { height: 1fr; padding: 0 2 1 2; }
+#m-gates-body { height: auto; }
+
+.graphview { height: 1fr; padding: 1 2; align-horizontal: left; }
+.gnode {
+    width: 64;
+    height: auto;
+    border: round $line-strong;
+    padding: 0 1;
+    background: $surface;
+}
+.gnode:hover { background: $raised; }
+.gnode.-s-running { border: round $accent; }
+.gnode.-s-completed, .gnode.-s-done, .gnode.-s-approved { border: round $ok 60%; }
+.gnode.-s-failed, .gnode.-s-rejected { border: round $danger; }
+.gnode.-s-halted_escalated, .gnode.-s-open { border: round $warn; }
+.gnode.-selected { background: $accent-dim; }
+.gedge { width: 64; height: 2; content-align: center top; text-align: center; color: $faint; }
+
+/* ---------------------------------------------------------------- library */
+
+.lib-head { height: auto; padding: 1 2; }
+.lib-search-row { height: 1; }
+#lib-search { width: 1fr; height: 1; margin-right: 2; }
+.lib-filters { height: 1; margin-top: 1; }
+#lib-list .row { margin-bottom: 1; }
+#lib-reader { height: 1fr; }
+#lib-meta { height: auto; padding: 1 2; border-bottom: solid $line; }
+#lib-body { padding: 1 2; }
+
+/* ---------------------------------------------------------------- cost */
+
+.cost-head { height: 1; padding: 0 1; border-bottom: none; }
+.cost-head .chips { width: auto; }
+#cost-body { height: 1fr; padding: 0 1 1 1; }
+#cost-stats { height: auto; padding: 1 0; border-bottom: solid $line; }
+.heatmap { height: auto; padding: 0 1; }
+.columns { height: auto; padding: 0 1; }
+.cost-grid { height: auto; margin-top: 1; }
+.cost-cell { width: 1fr; height: auto; padding-right: 2; }
+.cost-cell Static { padding: 0 1; }
+#c-foot { padding: 2 1 0 1; }

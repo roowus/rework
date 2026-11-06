@@ -375,6 +375,39 @@ class TuiData:
                 return out
             cursor = max(int(e.seq or 0) for e in batch)
 
+    async def run_spend(self, run_id: str) -> float:
+        """Exact cost of one run (sum of its charges)."""
+
+        async def _q() -> float:
+            store = await self.store()
+            return sum(float(c.cost_usd or 0) for c in await store.run_charges(run_id))
+
+        return await self._resilient(f"run_spend:{run_id}", _q)
+
+    async def mission_budget(self, mission_id: str) -> Any:
+        """BudgetState (spent_usd, input/output/cached tokens)."""
+        return await self._resilient(
+            f"budget:{mission_id}", lambda: self._call(lambda s: s.mission_spend(mission_id))
+        )
+
+    async def mission_report(self, mission_id: str) -> str:
+        """The same markdown `rework report --md` writes."""
+        from rework.cli import _render_md
+        from rework.nodes.run_stats import attach_run_stats
+
+        store = await self.store()
+        mission = await store.get_mission(mission_id)
+        if mission is None:
+            return f"no such mission: {mission_id}"
+        prepared: list[tuple[Any, dict[str, Any]]] = []
+        for run in await store.list_runs(mission_id):
+            artifact = dict(run.artifact or {})
+            if artifact and "run_stats" not in artifact:
+                artifact = await attach_run_stats(store, run.id, artifact)
+            prepared.append((run, artifact))
+        spend = await store.mission_spend(mission_id)
+        return _render_md(prepared, spend, mission)
+
     async def library_add(
         self,
         *,
