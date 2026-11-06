@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -653,3 +654,42 @@ async def test_owner_pause_holds_and_resume_finishes(world: dict[str, Any]) -> N
     await asyncio.wait_for(task, timeout=60)
     fresh = await store.get_mission(mission.id)
     assert fresh is not None and fresh.status == MissionStatus.DONE
+
+
+async def test_crashed_runner_marks_the_mission_failed(world: dict[str, Any]) -> None:
+    """A runner that dies with an unhandled exception must not leave its
+    mission on 'running' forever (found live: a client created a plan an older
+    daemon could not run; every UI showed it running)."""
+    from rework.kernel.state.records import Mission, MissionStatus
+
+    store = world["store"]
+    await store.create_mission(
+        Mission(id="m-broken", objective="x", status=MissionStatus.PENDING, plan={"steps": []})
+    )
+    daemon = Daemon(
+        store=store,
+        bus=world["bus"],
+        registry=world["registry"],
+        catalog=world["catalog"],
+        make_checkpointer=sqlite_checkpointer_factory(world["ck_path"]),
+        workroot=world["workroot"],
+        config=world["config"],
+    )
+    task = asyncio.create_task(daemon.run_forever())
+    try:
+
+        async def failed() -> bool:
+            m = await store.get_mission("m-broken")
+            return m is not None and m.status == MissionStatus.FAILED
+
+        for _ in range(100):
+            if await failed():
+                break
+            await asyncio.sleep(0.1)
+        mission = await store.get_mission("m-broken")
+        assert mission is not None and mission.status == MissionStatus.FAILED
+        assert "empty plan" in str((mission.result or {}).get("error"))
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task

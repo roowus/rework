@@ -183,6 +183,25 @@ class Daemon:
                 bg.add_done_callback(self._bg.discard)
 
     async def _log_runner_error(self, mission_id: str, exc: BaseException) -> None:
+        """A runner that died with an unhandled exception leaves nobody driving
+        its mission. Say so on the ROW, not only in the event log: found live,
+        a mission whose runner crashed sat on 'running' forever in every UI."""
+        log.error("runner for %s crashed: %s: %s", mission_id, type(exc).__name__, exc)
+        error = f"{type(exc).__name__}: {exc}"
+        try:
+            mission = await self._store.get_mission(mission_id)
+            if mission is not None and mission.status not in (
+                MissionStatus.DONE,
+                MissionStatus.FAILED,
+                MissionStatus.CANCELLED,
+            ):
+                await self._store.update_mission(
+                    mission_id,
+                    status=MissionStatus.FAILED,
+                    result={**(mission.result or {}), "error": error[:2000]},
+                )
+        except Exception:
+            log.exception("could not mark %s failed", mission_id)
         await self._bus.publish(
             EventRecord(
                 mission_id=mission_id,
