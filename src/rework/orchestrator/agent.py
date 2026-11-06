@@ -260,9 +260,14 @@ class MissionOrchestrator:
         self.finished: tuple[str, str] | None = None
         self._provider: Any = None
 
+    def _usable(self) -> list[Any]:
+        """Catalog entries this daemon can actually call (real ones first)."""
+        entries = self.r._catalog.all()
+        real = [e for e in entries if e.provider != "fake" and e.has_credentials()]
+        return real or [e for e in entries if e.has_credentials()] or entries
+
     def _strongest(self) -> Any:
-        entries = [e for e in self.r._catalog.all() if e.provider != "fake"]
-        entries = entries or self.r._catalog.all()
+        entries = self._usable()
         return max(entries, key=lambda e: (e.tier, -e.cost_in_per_mtok))
 
     # -- provider ------------------------------------------------------------
@@ -543,9 +548,12 @@ class MissionOrchestrator:
         model = str(args.get("model") or "").strip() or None
         if model:
             try:
-                self.r._catalog.resolve(model)
+                entry = self.r._catalog.resolve(model)
             except Exception as exc:
                 raise ToolError(f"unknown model {model!r}") from exc
+            if not entry.has_credentials():
+                usable = ", ".join(e.id for e in self._usable())
+                raise ToolError(f"model {model!r} has no API key here; usable: {usable}")
         else:
             model = (self.mission.plan or {}).get("model") or None
         context = await self._wire(role, runs)
@@ -775,8 +783,7 @@ class MissionOrchestrator:
         catalog = [
             f"- {e.id}: tier {e.tier}, ${e.cost_in_per_mtok}/${e.cost_out_per_mtok} per Mtok"
             + (f", {', '.join(sorted(e.capabilities))}" if e.capabilities else "")
-            for e in self.r._catalog.all()
-            if e.provider != "fake" or all(x.provider == "fake" for x in self.r._catalog.all())
+            for e in self._usable()
         ]
         spend = await self.store.mission_spend(self.mid)
         budget = plan.get("budget") or {}

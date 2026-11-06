@@ -179,3 +179,17 @@ async def test_fake_provider_scripts_and_records() -> None:
     second = await fake.complete(req)
     assert second.text == "done"
     assert len(fake.requests) == 2
+
+
+def test_has_credentials_mirrors_build_provider(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from rework.kernel.llm.catalog import ModelEntry
+
+    monkeypatch.delenv("X_TEST_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    compat = ModelEntry(id="c", provider="openai-compatible", model="m", api_key_env="X_TEST_KEY")
+    claude = ModelEntry(id="h", provider="anthropic", model="claude")
+    assert ModelEntry(id="f", provider="fake", model="f").has_credentials()
+    assert not compat.has_credentials() and not claude.has_credentials()
+    monkeypatch.setenv("X_TEST_KEY", "k")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    assert compat.has_credentials() and claude.has_credentials()

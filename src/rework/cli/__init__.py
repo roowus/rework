@@ -102,7 +102,7 @@ def default_orchestrator_model() -> str:
     from rework.config import load_catalog
 
     entries = load_catalog().all()
-    real = [e for e in entries if e.provider != "fake"] or entries
+    real = [e for e in entries if e.provider != "fake" and e.has_credentials()] or entries
     return max(real, key=lambda e: (e.tier, -e.cost_in_per_mtok)).id
 
 

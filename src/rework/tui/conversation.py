@@ -254,6 +254,7 @@ class Conversation:
 
 def default_model(catalog: Any) -> str:
     entries = catalog.all()
-    # the strongest tier is the orchestrator's natural default
-    best = max(entries, key=lambda e: (e.tier, -e.cost_in_per_mtok)) if entries else None
+    usable = [e for e in entries if e.provider != "fake" and e.has_credentials()] or entries
+    # the strongest callable tier is the orchestrator's natural default
+    best = max(usable, key=lambda e: (e.tier, -e.cost_in_per_mtok)) if usable else None
     return str(best.id) if best else "fake"

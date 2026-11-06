@@ -33,6 +33,19 @@ class ModelEntry(BaseModel):
     def estimate_cost(self, input_tokens: int, output_tokens: int) -> float:
         return (input_tokens * self.cost_in_per_mtok + output_tokens * self.cost_out_per_mtok) / 1e6
 
+    def has_credentials(self) -> bool:
+        """Whether THIS process can call the model (its key is in the env).
+        Mirrors build_provider's lookup. Found live: an orchestrator picked a
+        catalog model whose key existed only on another machine, and the
+        role died before its first call."""
+        import os
+
+        if self.provider == "fake":
+            return True
+        default = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
+        env = self.api_key_env or default.get(self.provider, "")
+        return bool(env and os.environ.get(env))
+
 
 @runtime_checkable
 class ModelProvider(Protocol):
