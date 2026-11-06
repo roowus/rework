@@ -343,7 +343,7 @@ async def create_mission(
 
 
 async def resolve_project(project_ref: str | None) -> str | None:
-    """project id -> validated id (raises when not found); None -> None."""
+    """project id OR name -> validated id (raises when not found); None -> None."""
     if not project_ref:
         return None
     from rework.config import Config, open_store_from_config
@@ -351,6 +351,9 @@ async def resolve_project(project_ref: str | None) -> str | None:
     store = await open_store_from_config(Config.from_env())
     try:
         found = await store.get_project(project_ref)
+        if found is None:
+            by_name = [p for p in await store.list_projects() if p.name == project_ref]
+            found = by_name[0] if len(by_name) == 1 else None
     finally:
         await store.aclose()
     if found is None:

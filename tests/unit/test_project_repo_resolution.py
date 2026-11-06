@@ -62,3 +62,13 @@ async def test_project_without_repos_still_needs_one_for_fix(db: str) -> None:
         await create_mission("x", plan="fix", project_id=pid)
     echo = await create_mission("x", plan="echo", project_id=pid)
     assert echo.repo_origin is None and echo.repo_path is None
+
+
+async def test_resolve_project_accepts_a_name(db: str) -> None:
+    from rework.missions import resolve_project
+
+    pid = await _project(db, [])
+    assert await resolve_project("rework") == pid
+    assert await resolve_project(pid) == pid
+    with pytest.raises(ValueError, match="project not found"):
+        await resolve_project("nope")
