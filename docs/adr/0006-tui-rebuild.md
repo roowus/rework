@@ -30,7 +30,7 @@ consistent design language.
    confirmed proposal into a mission; it is testable without widgets.
 5. **Store-only.** The TUI never decides what the daemon owns. Everything it
    reads or writes is a store row; features that need engine support are listed
-   in `docs/tui/BACKEND-NEEDS.md` rather than faked in the client.
+   in `docs/plans/m7-dogfood-loop.md` rather than faked in the client.
 6. **Custom list rows instead of DataTable.** `RowList` / `Row` give one-click
    activation, in-place updates without flicker, and section headers.
 

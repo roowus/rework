@@ -1,7 +1,7 @@
 """Work: talk to the orchestrator (Claude Code / pi style).
 
-Left: saved chats. Right: the conversation — your messages, the orchestrator's
-tool calls and replies, proposal cards (Launch / Scrap) and live mission cards —
+Left: saved chats. Right: the conversation: your messages, the orchestrator's
+tool calls and replies, proposal cards (Launch / Scrap) and live mission cards,
 then the composer with the project / model / effort knobs.
 
 Bare `rework` opens here with NO chat selected (owner requirement): typing
@@ -43,7 +43,7 @@ from rework.tui.widgets.trajectory import Step, Trajectory, assistant_step, user
 
 WELCOME = f"""[b]Talk to the orchestrator.[/b]
 
-[{MUTED}]Say what you want done — "fix the flaky test in polystats", "audit the
+[{MUTED}]Say what you want done, like "fix the flaky test in polystats", "audit the
 auth module". It looks at your projects and missions, proposes a mission, and
 nothing runs until you press Launch.[/]
 
@@ -329,7 +329,7 @@ class WorkView(View):
             engine = await convo.ensure_engine(self.snap, self._on_turn)
             if attachments and not engine.supports_images:
                 self.toast(
-                    f"{engine.model_label} can't read images — switch model or remove the "
+                    f"{engine.model_label} can't read images. Switch model or remove the "
                     "attachment",
                     severity="error",
                 )
@@ -432,7 +432,7 @@ class WorkView(View):
             if self.convo and self.convo.engine is not None:
                 self.convo.engine.proposal = None
             self.query_one("#chat-log", Trajectory).add(
-                Step(f"[{FAINT}]proposal scrapped — tell the orchestrator what to change[/]")
+                Step(f"[{FAINT}]proposal scrapped. Tell the orchestrator what to change[/]")
             )
 
     @work(group="send")

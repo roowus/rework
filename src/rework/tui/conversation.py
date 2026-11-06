@@ -121,11 +121,11 @@ def context_note(snap: Snapshot, project_id: str | None) -> str:
     """Facts the orchestrator should not have to ask about."""
     lines: list[str] = []
     if snap.projects:
-        lines.append("Projects (name — repos):")
+        lines.append("Projects (name: repos):")
         for p in snap.projects:
             repos = (p.settings or {}).get("repos") or []
             refs = ", ".join(f"{r.get('name')}={r.get('url') or r.get('kind')}" for r in repos if r)
-            lines.append(f"- {p.name} (id {p.id}) — {refs or 'no repos registered'}")
+            lines.append(f"- {p.name} (id {p.id}): {refs or 'no repos registered'}")
     else:
         lines.append("There are no projects yet; missions can be project-less.")
     if project_id:
@@ -237,7 +237,7 @@ class Conversation:
         from rework.missions import create_mission
 
         # forward-compatible: once missions carry their own orchestrator model
-        # (docs/tui/BACKEND-NEEDS.md §0) and a chat link (§1), pass them
+        # (ADR 0007) and a chat link (M7 P0), pass them
         if _accepts(create_mission, "orchestrator_model"):
             kwargs["orchestrator_model"] = self.chat.model_id
             kwargs["orchestrator_effort"] = self.chat.effort

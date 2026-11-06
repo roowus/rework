@@ -142,7 +142,7 @@ def event_step(ev: Any, *, show_role: bool = True) -> Step | None:
         ok = bool(p.get("approved"))
         mark = f"[{OK}]✓ approved[/]" if ok else f"[{DANGER}]✗ rejected[/]"
         note = p.get("note") or (p.get("decision") or {}).get("answer")
-        extra = f" [{MUTED}]— {esc(clip(str(note), 160))}[/]" if note else ""
+        extra = f" [{MUTED}]· {esc(clip(str(note), 160))}[/]" if note else ""
         return Step(f"{mark}{extra}", kind="gate")
     if kind == "mission_done":
         return Step(

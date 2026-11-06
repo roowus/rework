@@ -94,7 +94,7 @@ class MenuBar(Horizontal):
         spend = f"[{MUTED}]{esc(money(spend_today))} today[/]"
         status = self.query_one("#menubar-status", _Status)
         status.update(f"{conn}  {gate}  {spend} ")
-        status.tooltip = error or ("open gates — click to view" if gates else None)
+        status.tooltip = error or ("open gates: click to view" if gates else None)
 
 
 class _MenuEntry(Static):

@@ -53,7 +53,7 @@ class LibraryView(View):
         with Vertical(classes="pane-head lib-head"):
             with Horizontal(classes="lib-search-row"):
                 yield Input(
-                    placeholder="Search the library — skills, tools, reports, memories…",
+                    placeholder="Search the library: skills, tools, reports, memories…",
                     id="lib-search",
                 )
                 yield Btn("+ New item", "new", variant="primary")

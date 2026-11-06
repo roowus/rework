@@ -52,11 +52,20 @@ Everything else is written against these protocols:
 
 ### Orchestrator
 
-Supervisor graph nodes: `intake` → `plan` (LLM, validated) → `dispatch` (SpawnIntents →
-Run rows; never spawns tasks itself) → `monitor` (bounded wait, self-loop, store-reconciled)
-→ conditional edges to `checkin` (cheap LLM: continue/redirect/spawn/abort) · `escalate`
-(mechanical policies first, LLM-authored answers second) · `promote` (tier bump) · `gate`
-(interrupt) · `synthesis` (LLM → MissionResult) → `done`.
+**Today:** `MissionRunner._run_steps` is a mechanical runner over a canned plan
+(`missions.PLAN_FIX`: investigate, code, audit, revise on request-changes at most
+twice, one retry per failed step, then the ship or open_pr gate). Steps run one
+at a time. Escalations are handled by mechanical policy or become human gates,
+and synthesis is mechanical. The only LLM that talks to the owner is the
+pre-mission chat (`orchestrator/chat.py`), which proposes missions.
+
+**Target (ADR 0007, Proposed; M7):** each mission gets an LLM orchestrator, a
+tool-calling agent on the model chosen in the launching chat. It spawns roles
+(in parallel when useful), waits on store-derived events, reads handoffs,
+checks in on and redirects running roles, answers escalations or asks the
+owner, verifies mechanical claims itself, and finishes into the plan's fixed
+final gates. `fix` / `fix-pr` become playbooks it follows by default. Budget,
+run caps and final gates stay mechanical rails.
 
 The engine (`orchestrator/engine.py`) is the heart: MissionRunner streams the graph,
 materializes interrupts as gate rows, waits on store-derived wake conditions, resumes with
@@ -86,30 +95,30 @@ with a continue/abort gate; approving doubles the cap and resumes, rejecting can
 Steps that FAIL get exactly one in-mission retry (the 429-storm lesson) before the
 plan moves on; synthesis counts only the latest attempt per step.
 
-### The TUI (rebuilt 2026-11-05, ADR 0006)
+### The TUI (rebuilt 2026-11-06, ADR 0006)
 
 Bare `rework` opens a Textual app: a menu bar (wordmark, File / Edit / View /
 Mission / Help dropdowns, and a live status cluster: connection, open gates,
 spend today), a tab bar, one full-width view per tab, and a hint row. The
-visual language — tokens, status glyphs, components, interaction rules — is
+visual language (tokens, status glyphs, components, interaction rules) is
 specified in `docs/tui/DESIGN.md`; every view is built from that kit.
 
-- **Work** — Claude-Code-style conversation with the orchestrator. Saved chats
+- **Work**: Claude-Code-style conversation with the orchestrator. Saved chats
   on the left (persisted in the store, synced across devices); the transcript
   shows your messages, the orchestrator's tool calls and results live, proposal
-  cards (Launch / Scrap — nothing runs until you confirm, or type "yes") and
+  cards (Launch / Scrap; nothing runs until you confirm, or type "yes") and
   live mission cards (status, last steps, inline gate answers, pause/cancel).
   Project / model / effort knobs under the prompt. Opens with no chat selected.
-- **Dashboard** — overview (stats strip, projects, missions grouped needs-you →
+- **Dashboard**: overview (stats strip, projects, missions grouped needs-you →
   running → paused → recent) and a mission drill-down: header + flow strip,
   sessions (one per run) on the left, and Trajectory / Graph (LangGraph-style
   node view, click a node to focus its run) / Output / Diff / Report / Gates.
-- **Gates** — inbox oldest-first with full decision context (mission, the run it
+- **Gates**: inbox oldest-first with full decision context (mission, the run it
   unblocks, the diff + audit verdict for ship gates, recent steps) and an answer
   box; the typed answer reaches the paused role as `Gate.decision`.
-- **Library** — search-first (hybrid when embeddings are on), type/status
+- **Library**: search-first (hybrid when embeddings are on), type/status
   filters, reader with activate / retire, and New item.
-- **Cost** — range and metric chips, headline numbers, a one-year calendar
+- **Cost**: range and metric chips, headline numbers, a one-year calendar
   heatmap, a per-day column chart, and breakdowns by model / project / role /
   mission (from `spend_history`).
 
@@ -120,7 +129,7 @@ every poll is guarded, a dead connection shows `○ offline` with stale data,
 and `ReworkApp._handle_exception` turns surprises into toasts. Gate
 notifications are configurable (`REWORK_NOTIFY=toast,bell,os|none`, or File ›
 Settings). What the TUI still needs from the engine is tracked in
-`docs/tui/BACKEND-NEEDS.md`.
+`docs/plans/m7-dogfood-loop.md`.
 
 ### The Library
 
@@ -160,7 +169,8 @@ execution per role behind the `ToolExecutor` protocol.
 | M5 | Library v1 (git store, curation, MCP server, role integration) | ✅ done MVP (`251c1fc`..`cbe9fd3`: item model + git store + index on both backends, CLI add/ls/show/search/activate/retire, curation tiers (tools human-gated), roles carry search/read/contribute + spawn menu, MCP server mounted by Claude Code. Flywheel live-verified: mission m-4b9de000d56c contributed two skills (git-provenance stamped mission+role), read the seeded one, audit approved the contribution as a deliverable. Open for later: pgvector hybrid ranking (M6), library repo mirror sync across devices (back burner), per-project memory namespaces |
 | M5.5 | Complaints clustering → GitHub issues (table + tool landed early in M3, ADR 0004) | ✅ done (`fc5adbc`: Jaccard clustering within kind, one gh issue per loud cluster, members → issue_open with URL, gh failure non-destructive; `rework complaints-triage`) |
 | M6 | Semantic search + external ingest pipeline + eval-in-CI | ✅ done MVP (`70a07d3`+`7e942e0`: embeddings via REWORK_EMBEDDINGS_URL/KEY/MODEL, vectors as JSON on the item row (native pgvector deferred until scale; dev container lacks the extension), HybridSearch 60/40 keyword+cosine behind the same search() wired into roles/MCP/serve, ensure_indexed backfill; eval-in-CI = toyrepo task through the real engine on a scripted provider in the normal pytest pass (zero cost) with the broken-coder regression pinned; external ingest MVP = allowlist hosts + per-item owner approval, activate refuses un-gated external items) |
-| M7+ | Container sandboxing, dashboard, real event transport, more roles | stubbed |
+| M7 | Dogfood loop: LLM mission orchestrator (ADR 0007), steering from the chat, verification, three real rework changes shipped as PRs from the TUI | in progress (plan: `docs/plans/m7-dogfood-loop.md`) |
+| M8+ | Container sandboxing, real event transport, more roles, catalog in the Library | stubbed |
 
 ## Backlog (back burner: ideas parked for the owner to flesh out later)
 

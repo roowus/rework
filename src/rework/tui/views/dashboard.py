@@ -604,7 +604,7 @@ class DashboardView(View):
                     + diff_markup(str(art.get("diff") or ""))
                 )
             else:
-                body = f"[{FAINT}]No diff yet — the coder hands one off when it finishes.[/]"
+                body = f"[{FAINT}]No diff yet. The coder hands one off when it finishes.[/]"
             self.query_one("#m-diff-body", Static).update(body)
         elif tab == "report":
             if self.report_loaded_for != f"{self.mission_id}:{len(self.runs)}":

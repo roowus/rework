@@ -325,7 +325,7 @@ class ReworkApp(App[None]):
         from rework import __version__
 
         self.notify(
-            f"rework {__version__} — talk to the orchestrator; it runs the roles.",
+            f"rework {__version__}. Talk to the orchestrator; it runs the roles.",
             title="About",
             timeout=5,
         )

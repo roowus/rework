@@ -3,7 +3,7 @@
 Each node is a step (or a gate / the end); its border carries the status
 colour, the active node is accent. Clicking a node selects that step's run.
 Inside a node, when the role published its own graph topology (ROLE_SPAWNED
-payload["graph"], docs/tui/BACKEND-NEEDS.md §6) the role's inner nodes are
+payload["graph"], M7 P3) the role's inner nodes are
 drawn as a strip with the current one highlighted."""
 
 from __future__ import annotations

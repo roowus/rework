@@ -1,9 +1,9 @@
 """Gates: where agents need you. The most time-sensitive surface.
 
-Left: the inbox (open gates, oldest first — the one blocking longest on top) or
-the decided history. Right: the selected gate with everything needed to decide
-— the question, its mission, the run it unblocks, the diff for ship gates, the
-agent's recent steps — and an answer box. Approve / Reject are buttons first,
+Left: the inbox (open gates, oldest first, so the one blocking longest is on top) or
+the decided history. Right: the selected gate with everything needed to decide:
+the question, its mission, the run it unblocks, the diff for ship gates, the
+agent's recent steps, and an answer box. Approve / Reject are buttons first,
 alt+a / alt+x second; a typed answer rides along to the paused role."""
 
 from __future__ import annotations
@@ -114,7 +114,7 @@ class GatesView(View):
                             "",
                             id="gate-text",
                             compact=True,
-                            placeholder="Optional answer or feedback — the agent receives it",
+                            placeholder="Optional answer or feedback (the agent receives it)",
                         )
                         with Horizontal(classes="gate-actions"):
                             yield Btn("Approve  alt+a", "approve", variant="primary")
@@ -282,7 +282,7 @@ class GatesView(View):
                 f"{esc(model)} · {esc(run.status.value)}[/]" + (f"\n{esc_line}" if esc_line else "")
             )
         elif gate.kind.value in ("ship", "open_pr"):
-            run_box.update(f"[{MUTED}]the whole mission — approving ships the result[/]")
+            run_box.update(f"[{MUTED}]the whole mission: approving ships the result[/]")
         else:
             run_box.update(f"[{FAINT}]{esc(gate.for_run or 'mission-level gate')}[/]")
 

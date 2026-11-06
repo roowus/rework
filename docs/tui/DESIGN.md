@@ -1,4 +1,4 @@
-# rework TUI — design language
+# rework TUI: design language
 
 The TUI is the owner's cockpit for rework. It should feel like a well-made
 desktop app that happens to live in a terminal: quiet, dense, fast, and

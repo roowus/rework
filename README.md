@@ -63,16 +63,16 @@ tailnet IP). Results return as a branch (open_pr gate) or via `rework fetch
 
 With no arguments, `rework` opens a full-screen app (mouse + keyboard):
 
-- **Work** — talk to the orchestrator like Claude Code: it looks at your
+- **Work**: talk to the orchestrator like Claude Code: it looks at your
   projects and missions (tool calls shown live), proposes a mission, and nothing
   runs until you press Launch. Saved chats sync across devices; launched
   missions stay live in the conversation, gates included
-- **Dashboard** — every project and mission; open one for its live trajectory,
+- **Dashboard**: every project and mission; open one for its live trajectory,
   LangGraph-style graph, outputs, diff, report and gates; pause / resume / cancel
-- **Gates** — everything waiting on you, with the context to decide and an
+- **Gates**: everything waiting on you, with the context to decide and an
   answer box the agent receives
-- **Library** — search, read, activate / retire, add items
-- **Cost** — spend, tokens and calls over time (calendar heatmap) by model,
+- **Library**: search, read, activate / retire, add items
+- **Cost**: spend, tokens and calls over time (calendar heatmap) by model,
   project, role and mission
 
 Tabs are `alt+1..5`, `ctrl+n` starts a chat, `alt+a` / `alt+x` answer a gate,
