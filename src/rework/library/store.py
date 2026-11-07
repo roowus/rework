@@ -388,7 +388,7 @@ async def open_library_store(db: str) -> LibraryStore:
         from psycopg.rows import dict_row
 
         conn = await psycopg.AsyncConnection.connect(
-            db, autocommit=False, row_factory=dict_row, prepare_threshold=None
+            db, autocommit=False, row_factory=dict_row, prepare_threshold=None, connect_timeout=10
         )
         for ddl in _DDL:
             await conn.execute(ddl)

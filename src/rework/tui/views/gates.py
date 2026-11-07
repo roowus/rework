@@ -67,8 +67,10 @@ class GatesView(View):
     LABEL = "Gates"
 
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("alt+a", "decide(True)", "approve", show=False),
-        Binding("alt+x", "decide(False)", "reject", show=False),
+        # alt+a / alt+x in meta-mode terminals (priority so a focused answer box
+        # can't eat them); the macOS å / ≈ spellings are handled by the App
+        Binding("alt+a", "decide(True)", "approve", show=False, priority=True),
+        Binding("alt+x", "decide(False)", "reject", show=False, priority=True),
     ]
 
     def __init__(self) -> None:

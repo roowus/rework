@@ -1124,6 +1124,7 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
 # result type"): found live, a client's migration crashed the daemon's runner
 # mid-mission. Our queries are cheap; robustness to schema change wins.
 PREPARE_THRESHOLD = None
+CONNECT_TIMEOUT_S = 10
 
 
 async def open_postgres(url: str) -> PostgresStore:
@@ -1132,6 +1133,9 @@ async def open_postgres(url: str) -> PostgresStore:
         autocommit=False,
         row_factory=psycopg.rows.dict_row,
         prepare_threshold=PREPARE_THRESHOLD,
+        # an unreachable host otherwise waits for the OS TCP timeout (~75s on
+        # macOS) per attempt; found live as a frozen TUI while rewvis was down
+        connect_timeout=CONNECT_TIMEOUT_S,
     )
     try:
         for ddl in _DDL:

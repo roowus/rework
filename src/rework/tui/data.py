@@ -4,6 +4,7 @@ local sqlite or the deployment Postgres over the tailnet)."""
 
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,11 @@ def library_root() -> Path:
     return Path(
         os.environ.get("REWORK_LIBRARY_DIR", str(DEFAULT_STATE_DIR / "library"))
     ).expanduser()
+
+
+# A read that has not answered in this long is treated as a dead connection
+# (found live: an unreachable host made the first query hang for minutes).
+QUERY_TIMEOUT_S = 15.0
 
 
 def _is_connection_error(exc: BaseException) -> bool:
@@ -111,13 +117,13 @@ class TuiData:
         right failure mode for a dashboard, and the last good result keeps the
         table populated instead of blanking it."""
         try:
-            result = await _maybe_await(call())
+            result = await asyncio.wait_for(_maybe_await(call()), QUERY_TIMEOUT_S)
         except Exception as first:
             if not _is_connection_error(first):
                 raise
             await self.drop_store()
             try:
-                result = await _maybe_await(call())
+                result = await asyncio.wait_for(_maybe_await(call()), QUERY_TIMEOUT_S)
             except Exception:
                 self._reconnecting_hint = f"{type(first).__name__}: {first}"[:160]
                 if key in self._last_good:

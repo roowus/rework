@@ -90,9 +90,22 @@ class MenuBar(Horizontal):
 
     target = ""  # which database this TUI talks to ("local", "rewvis", a host)
 
-    def set_status(self, *, online: bool, gates: int, spend_today: float, error: str = "") -> None:
+    def set_status(
+        self,
+        *,
+        online: bool,
+        gates: int,
+        spend_today: float,
+        error: str = "",
+        connecting: bool = False,
+    ) -> None:
         where = f" {esc(self.target)}" if self.target else " live"
-        conn = f"[{OK}]●[/][{MUTED}]{where}[/]" if online else f"[{WARN}]○ offline{where}[/]"
+        if connecting:
+            conn = f"[{FAINT}]◌ connecting{where}…[/]"
+        elif online:
+            conn = f"[{OK}]●[/][{MUTED}]{where}[/]"
+        else:
+            conn = f"[{WARN}]○ offline{where}[/]"
         gate = f"[{WARN}]◆ {gates}[/]" if gates else f"[{FAINT}]◆ 0[/]"
         spend = f"[{MUTED}]{esc(money(spend_today))} today[/]"
         status = self.query_one("#menubar-status", _Status)

@@ -23,6 +23,18 @@ same branch after the turn budget, audit on the strong model, revise, audit
 again, both audits approve with zero open findings, ship gate (rejected by me so
 nothing was pushed). The investigator report cited exact file:line evidence.
 
+## 2026-11-07, owner: "the TUI can't be clicked, no keyboard input"
+
+Not the rework agent: its dogfood PR was never opened, so none of its code was
+in the owner's checkout. Both causes were mine, and both were invisible to the
+Pilot test suite.
+
+| # | finding | cause | status |
+|---|---|---|---|
+| 25 | No test could see either bug | Pilot simulates keys by NAME and never simulated a hanging database | fixed: `tests/tui/test_real_terminal.py` runs the TUI in a real pty (pyte reads the screen) against a socket that accepts and never answers; fails on the old code with "typing reaches the prompt" |
+| 24 | alt+1..5 (tabs) and alt+a/x (gates) never worked in a real macOS terminal | Option+digit arrives as ¡ ™ £ ¢ ∞ (Textual maps ESC+digit to those too) and Option+a/x type å / ≈; Textual drops printable-character bindings while a text input has focus | fixed: the App intercepts those keys in on_event before the focused input; meta-mode alt+N bindings kept |
+| 23 | Whole TUI frozen (no keys, no clicks) while rewvis was unreachable | the hub refresh was awaited on the App's message queue; Postgres had no connect timeout (OS TCP timeout ~75s per try) and reads were unbounded | fixed: refresh runs in a worker; `connect_timeout=10`; reads bounded at 15s and treated as a dead connection; status shows "connecting" until the first load |
+
 ## 2026-11-06, dogfood #2 m-d454350350af (orchestrator Output tab, local, fix-pr)
 
 | # | finding | cause | status |

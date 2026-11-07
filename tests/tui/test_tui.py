@@ -129,6 +129,39 @@ async def test_tabs_by_key_and_by_click(ids: dict[str, str]) -> None:
         assert not app.swallowed
 
 
+async def test_alt_keys_as_a_real_macos_terminal_sends_them(ids: dict[str, str], env: Path) -> None:
+    """Found live: alt+N worked under Pilot but never in a real terminal,
+    because Textual turns Option+digit into the macOS character (¡ ™ £ ¢ ∞)
+    and Option+a / Option+x type å / ≈. Every shortcut answers to both."""
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        for key, tab in [
+            ("trade_mark_sign", "dashboard"),
+            ("pound_sign", "gates"),
+            ("cent_sign", "library"),
+            ("infinity", "cost"),
+            ("inverted_exclamation_mark", "work"),
+        ]:
+            await pilot.press(key)
+            await pilot.pause()
+            assert app.active_tab == tab, key
+        assert app.query_one("#prompt").text == "", "none of them typed a character"
+        await pilot.press("pound_sign")
+        await _settle(pilot)
+        app.query_one("#gate-list", RowList).activate(ids["gate"], via_mouse=True)
+        await _settle(pilot)
+        app.query_one("#gate-text").focus()  # typing an answer must not eat the key
+        await pilot.press("å")
+        await _settle(pilot, 0.8)
+    store = await _store(env)
+    try:
+        gate = await store.get_gate(ids["gate"])
+        assert gate is not None and gate.status.value == "approved"
+    finally:
+        await store.aclose()
+
+
 async def test_escape_twice_quits_once_does_not(ids: dict[str, str]) -> None:
     app = _app()
     async with app.run_test(size=SIZE) as pilot:
@@ -193,6 +226,51 @@ def test_target_label_names_the_database(monkeypatch: pytest.MonkeyPatch) -> Non
     assert target_label() == "db.example.com"
     monkeypatch.setenv("REWORK_TARGET_NAME", "staging")
     assert target_label() == "staging"
+
+
+async def test_a_hanging_database_never_freezes_input(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Found live: with rewvis unreachable the first refresh hung for minutes,
+    and because it ran on the App's message queue NO key or click was handled.
+    Here the database hangs FOREVER: input must still be handled at once."""
+    import asyncio as _asyncio
+
+    from rework.tui import data as data_mod
+
+    monkeypatch.setattr(data_mod, "QUERY_TIMEOUT_S", 3600.0)
+
+    async def hang(self, fn):  # type: ignore[no-untyped-def]
+        await _asyncio.sleep(3600)
+
+    monkeypatch.setattr(data_mod.TuiData, "_call", hang)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause(0.3)  # the first refresh is now hanging
+        await _asyncio.wait_for(pilot.press("alt+2"), timeout=3)
+        assert app.active_tab == "dashboard", "keys work while the database hangs"
+        await _asyncio.wait_for(pilot.press("alt+1", "h", "i"), timeout=3)
+        assert app.query_one("#prompt").text == "hi", "typing works too"
+        assert app.is_running
+
+
+async def test_a_slow_database_ends_up_offline(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A read that does not answer within QUERY_TIMEOUT_S counts as a dead
+    connection: the status bar says offline instead of waiting forever."""
+    import asyncio as _asyncio
+
+    from rework.tui import data as data_mod
+
+    monkeypatch.setattr(data_mod, "QUERY_TIMEOUT_S", 0.3)
+
+    async def hang(self, fn):  # type: ignore[no-untyped-def]
+        await _asyncio.sleep(3600)
+
+    monkeypatch.setattr(data_mod.TuiData, "_call", hang)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause(1.5)
+        assert "offline" in str(app.query_one("#menubar-status").render())
 
 
 async def test_a_dead_database_never_exits_the_app(ids: dict[str, str]) -> None:

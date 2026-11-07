@@ -12,6 +12,7 @@ import sys
 import time
 from typing import Any, ClassVar
 
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.screen import ModalScreen
@@ -27,6 +28,21 @@ from rework.tui.widgets.modals import Field, Form, Help
 log = logging.getLogger("rework.tui")
 
 TABS = ["work", "dashboard", "gates", "library", "cost"]
+
+# Found live: alt+N worked under Pilot and NEVER in a real macOS terminal.
+# Option+digit reaches Textual as a character (¡ ™ £ ¢ ∞; Textual even maps
+# ESC+digit to those), and while a text input has focus Textual deliberately
+# drops bindings for printable characters so typing works. The Work prompt is
+# focused nearly always, so these are intercepted in on_event instead.
+OPTION_KEYS = {
+    "inverted_exclamation_mark": "work",
+    "trade_mark_sign": "dashboard",
+    "pound_sign": "gates",
+    "cent_sign": "library",
+    "infinity": "cost",
+}
+# Option+a / Option+x type å / ≈ on macOS; they approve / reject on the Gates tab
+GATE_KEYS = {"å": True, "almost_equal_to": False}
 
 
 def _menus() -> dict[str, list[MenuItem]]:
@@ -85,6 +101,8 @@ class ReworkApp(App[None]):
     ESCAPE_TO_MINIMIZE = False
 
     BINDINGS: ClassVar[list[BindingType]] = [
+        # meta-mode terminals send real alt+N; the macOS spellings (¡ ™ £ ¢ ∞)
+        # are handled in on_event, see OPTION_KEYS
         Binding("alt+1", "tab('work')", show=False, priority=True),
         Binding("alt+2", "tab('dashboard')", show=False, priority=True),
         Binding("alt+3", "tab('gates')", show=False, priority=True),
@@ -148,10 +166,10 @@ class ReworkApp(App[None]):
         asyncio.get_running_loop().set_exception_handler(asyncio_exception_handler)
         self.hub.subscribe(self._on_snapshot)
         self.query_one(TabBar).set_active("work")
-        self.query_one(MenuBar).set_status(online=True, gates=0, spend_today=0.0)
+        self.query_one(MenuBar).set_status(online=True, gates=0, spend_today=0.0, connecting=True)
         self._paint_hints()
-        self.call_later(self._tick)
-        self.set_interval(self.poll_seconds, self._tick)
+        self._kick()
+        self.set_interval(self.poll_seconds, self._kick)
 
     def get_theme_variable_defaults(self) -> dict[str, str]:
         # the stylesheet references $bg/$fg/… before any theme switch happens
@@ -167,7 +185,26 @@ class ReworkApp(App[None]):
     def current(self) -> View:
         return self.view(self.active_tab)
 
+    async def on_event(self, event: events.Event) -> None:
+        if isinstance(event, events.Key) and not event.is_forwarded:
+            tab = OPTION_KEYS.get(event.key)
+            if tab is not None:
+                self.action_tab(tab)
+                return
+            if event.key in GATE_KEYS and self.active_tab == "gates":
+                self.view("gates").action_decide(GATE_KEYS[event.key])
+                return
+        await super().on_event(event)
+
     # -- heartbeat -----------------------------------------------------------
+
+    def _kick(self) -> None:
+        """Start a refresh in a WORKER. Found live: the refresh used to be
+        awaited on the App's own message queue, so a slow or unreachable
+        database froze every key and click until it returned (rewvis offline =
+        a dead TUI). Single-flight is the Hub's job; exclusive=False keeps a
+        hung refresh from being cancelled mid-query by the next tick."""
+        self.run_worker(self._tick(), group="hub", exclusive=False)
 
     async def _tick(self) -> None:
         try:
@@ -269,8 +306,8 @@ class ReworkApp(App[None]):
     def on_tab_bar_changed(self, event: TabBar.Changed) -> None:
         self.action_tab(event.name)
 
-    async def action_refresh(self) -> None:
-        await self._tick()
+    def action_refresh(self) -> None:
+        self._kick()
 
     def action_go_back(self) -> None:
         if isinstance(self.screen, ModalScreen):
