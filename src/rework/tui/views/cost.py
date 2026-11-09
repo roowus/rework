@@ -18,7 +18,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Static
 
 from rework.tui.hub import Snapshot, midnight
-from rework.tui.theme import FAINT, MUTED, clip, money, tokens
+from rework.tui.theme import FAINT, MUTED, clip, duration, money, tokens
 from rework.tui.views.base import View
 from rework.tui.widgets.base import ChipGroup, Label, Stat
 from rework.tui.widgets.charts import Columns, Heatmap, table
@@ -47,6 +47,32 @@ def short_model(name: str) -> str:
     return name.rsplit("/", 1)[-1] if name else "unattributed"
 
 
+def active_seconds_of(runs: list[Any]) -> float:
+    """Summed active time from the `run_stats` blob on each run's artifact.
+
+    `active_seconds` (first to last model call) wins whenever the key is
+    present: 0.0 is a real value for an ordinary single-call run, so a falsy
+    fallback would swap in wall time and inflate the headline. `elapsed_seconds`
+    only stands in when the key is missing, and a run without usable stats
+    contributes nothing."""
+    total = 0.0
+    for run in runs:
+        artifact = getattr(run, "artifact", None)
+        stats = artifact.get("run_stats") if isinstance(artifact, dict) else None
+        if not isinstance(stats, dict):
+            continue
+        value = stats.get("active_seconds")
+        if value is None:
+            value = stats.get("elapsed_seconds")
+        if value is None:
+            continue
+        try:
+            total += max(0.0, float(value))
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
 class CostView(View):
     TAB = "cost"
     LABEL = "Cost"
@@ -60,6 +86,7 @@ class CostView(View):
         self.year: list[dict[str, Any]] = []
         self.by: dict[str, list[dict[str, Any]]] = {}
         self.missions: list[tuple[str, float, str]] = []
+        self.active_seconds = 0.0
 
     def compose(self) -> ComposeResult:
         with Horizontal(classes="pane-head cost-head"):
@@ -76,6 +103,7 @@ class CostView(View):
                 yield Stat("model calls", id="c-calls")
                 yield Stat("per active day", id="c-avg")
                 yield Stat("today", id="c-today")
+                yield Stat("active time", id="c-active")
             yield Label("Activity")
             yield Heatmap(id="c-heat")
             yield Label("Over the range", id="c-range-label")
@@ -149,8 +177,11 @@ class CostView(View):
         cutoff = range_since or 0.0
         candidates = [m for m in self.snap.missions if m.updated_at >= cutoff][:30]
         rows = []
+        active = 0.0
         for mission in candidates:
             budget = await self.hub.guard(partial(data.mission_budget, mission.id), None)
+            runs = await self.hub.guard(partial(data.mission_runs, mission.id), [])
+            active += active_seconds_of(runs)
             if budget is None:
                 continue
             rows.append(
@@ -165,6 +196,7 @@ class CostView(View):
                 )
             )
         self._mission_rows = rows
+        self.active_seconds = active
         self._paint()
 
     # -- paint ----------------------------------------------------------------
@@ -186,6 +218,7 @@ class CostView(View):
         avg = sum(metric_of(r, metric) for r in days) / active_days
         self.query_one("#c-avg", Stat).set(fmt(avg), metric)
         self.query_one("#c-today", Stat).set(money(self.snap.spend_today))
+        self.query_one("#c-active", Stat).set(duration(self.active_seconds), span)
 
         values: dict[dt.date, float] = {}
         for r in self.year:
