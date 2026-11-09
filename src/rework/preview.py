@@ -266,9 +266,7 @@ def spawn_daemon(n: int, worktree: Path, env: dict[str, str]) -> subprocess.Pope
     return proc
 
 
-def wait_ready(
-    daemon_url: str, proc: subprocess.Popen[bytes], timeout_s: float = 60.0
-) -> bool:
+def wait_ready(daemon_url: str, proc: subprocess.Popen[bytes], timeout_s: float = 60.0) -> bool:
     """Wait for any HTTP answer from the daemon (even 404 counts as up). Give up
     early if the process died."""
     deadline = time.monotonic() + timeout_s
