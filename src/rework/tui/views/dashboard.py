@@ -481,6 +481,11 @@ class DashboardView(View):
                 self.run_cost[run.id] = await self.hub.guard(
                     partial(data.run_spend, run.id), self.run_cost.get(run.id, 0.0)
                 )
+        orch_id = self._orchestrator_id()
+        if orch_id:  # the orchestrator has no Run row; its charges carry the pseudo id
+            self.run_cost[orch_id] = await self.hub.guard(
+                partial(data.run_spend, orch_id), self.run_cost.get(orch_id, 0.0)
+            )
         self.mission_gates = await self.hub.guard(
             lambda: data.gates(mission_id), self.mission_gates
         )
