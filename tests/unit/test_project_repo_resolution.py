@@ -72,3 +72,47 @@ async def test_resolve_project_accepts_a_name(db: str) -> None:
     assert await resolve_project(pid) == pid
     with pytest.raises(ValueError, match="project not found"):
         await resolve_project("nope")
+
+
+async def test_a_mission_on_a_project_repo_is_labeled_automatically(db: str) -> None:
+    """Owner: use project labels correctly. A mission created with only the
+    repo URL (old CLI habit) still lands in the project owning that repo."""
+    pid = await _project(db, [{"name": "rework", "kind": "git", "url": URL}])
+    for spelling in (URL, URL + ".git", URL + "/", "git@github.com:roowus/rework.git"):
+        mission = await create_mission("x", plan="fix", repo=spelling)
+        assert mission.project_id == pid, spelling
+    other = await create_mission("y", plan="fix", repo="https://github.com/someone/else")
+    assert other.project_id is None
+
+
+def test_project_assign_relabels_missions(db: str) -> None:
+    import asyncio
+
+    from typer.testing import CliRunner
+
+    from rework.cli import app
+    from rework.kernel.state.records import Mission
+    from rework.kernel.state.sqlite import open_sqlite
+
+    async def setup() -> str:
+        pid = await _project(db, [])
+        store = await open_sqlite(db)
+        try:
+            await store.create_mission(Mission(id="m-old1", objective="old"))
+        finally:
+            await store.aclose()
+        return pid
+
+    pid = asyncio.run(setup())
+    result = CliRunner().invoke(app, ["project", "assign", "rework", "m-old1"])
+    assert result.exit_code == 0, result.output
+
+    async def check() -> str | None:
+        store = await open_sqlite(db)
+        try:
+            m = await store.get_mission("m-old1")
+            return m.project_id if m else None
+        finally:
+            await store.aclose()
+
+    assert asyncio.run(check()) == pid

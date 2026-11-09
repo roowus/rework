@@ -110,6 +110,38 @@ project_app = typer.Typer(no_args_is_help=True, add_completion=False, help="Proj
 app.add_typer(project_app, name="project")
 
 
+@project_app.command("assign")
+def project_assign(
+    project: str = typer.Argument(..., help="Project name or id."),
+    missions: list[str] = typer.Argument(..., help="Mission ids to label."),  # noqa: B008
+) -> None:
+    """Label existing missions with a project (fixes missions created without one)."""
+
+    async def go() -> list[str]:
+        from rework.config import Config, open_store_from_config
+        from rework.missions import resolve_project
+
+        project_id = await resolve_project(project)
+        assert project_id is not None
+        store = await open_store_from_config(Config.from_env())
+        try:
+            done = []
+            for mid in missions:
+                if await store.update_mission(mid, project_id=project_id) is None:
+                    typer.echo(f"no mission {mid}", err=True)
+                else:
+                    done.append(mid)
+            return done
+        finally:
+            await store.aclose()
+
+    try:
+        labeled = asyncio.run(go())
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(f"{project}: {len(labeled)} mission(s) labeled")
+
+
 @project_app.command("create")
 def project_create(
     name: str,

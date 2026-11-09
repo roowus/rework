@@ -394,6 +394,7 @@ class PostgresStore:
         plan: dict[str, Any] | None = None,
         result: dict[str, Any] | None = None,
         repo_path: str | None = None,
+        project_id: str | None = None,
     ) -> Mission | None:
         sets: list[str] = []
         params: list[Any] = []
@@ -409,6 +410,9 @@ class PostgresStore:
         if repo_path is not None:
             sets.append("repo_path = %s")
             params.append(repo_path)
+        if project_id is not None:
+            sets.append("project_id = %s")
+            params.append(project_id)
         if sets:
             sets.append("updated_at = %s")
             params.append(time.time())

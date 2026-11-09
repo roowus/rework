@@ -222,6 +222,37 @@ async def resolve_repo(
     return {"repo_path": repo_path, "repo_origin": repo_origin, "notes": notes}
 
 
+def _norm_repo(url: str) -> str:
+    url = url.strip().rstrip("/").lower()
+    url = url.removesuffix(".git")
+    if url.startswith("git@github.com:"):
+        url = "https://github.com/" + url.split(":", 1)[1]
+    return url
+
+
+async def project_for_repo(repo: str) -> str | None:
+    """The single project whose repo refs include this URL, else None."""
+    if not repo:
+        return None
+    from rework.config import Config, open_store_from_config
+
+    want = _norm_repo(repo)
+    store = await open_store_from_config(Config.from_env())
+    try:
+        projects = await store.list_projects()
+    finally:
+        await store.aclose()
+    owners = [
+        p.id
+        for p in projects
+        if any(
+            _norm_repo(str(r.get("url") or "")) == want
+            for r in (p.settings or {}).get("repos") or []
+        )
+    ]
+    return owners[0] if len(owners) == 1 else None
+
+
 async def _project_repo(project_id: str, name: str | None) -> tuple[str | None, str | None]:
     """(repo_origin, repo_path) for a project's repo ref. `name` None picks the
     project's only repo, or nothing when it has none; several repos and no name
@@ -281,6 +312,11 @@ async def create_mission(
     resolved = await resolve_repo(
         repo=repo, repo_dir=repo_dir, project_id=project_id, mission_id=mission_id
     )
+    if project_id is None and (resolved["repo_origin"] or repo):
+        # owner: "use project labels correctly". A mission on a repo that a
+        # project already owns belongs to that project even when the caller
+        # (an old CLI habit, a chat proposal without a project) did not say so.
+        project_id = await project_for_repo(resolved["repo_origin"] or repo or "")
     if plan not in PLANS:
         raise ValueError(f"unknown plan {plan!r}; plans: {', '.join(PLANS)}")
     if plan in ("fix", "fix-pr") and not resolved["repo_path"] and not resolved["repo_origin"]:

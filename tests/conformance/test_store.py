@@ -315,6 +315,13 @@ async def test_gate_spec_roundtrips(store: StateStore) -> None:
     assert (await store.get_gate(plain.id)).spec is None  # type: ignore[union-attr]
 
 
+async def test_mission_can_be_relabeled_with_a_project(store: StateStore) -> None:
+    p = await store.create_project(Project(name="toyrepo"))
+    m = await store.create_mission(Mission(id=new_id("m"), objective="x"))
+    updated = await store.update_mission(m.id, project_id=p.id)
+    assert updated is not None and updated.project_id == p.id
+
+
 async def test_mission_title_roundtrips(store: StateStore) -> None:
     m = await store.create_mission(
         Mission(id=new_id("m"), objective="make the menus have borders", title="Dropdown border")
