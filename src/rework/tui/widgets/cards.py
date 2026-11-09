@@ -110,6 +110,7 @@ class MissionCard(Vertical):
         yield Static("", classes="card-body mc-pr")
         with Horizontal(classes="card-actions mc-actions"):
             yield Btn("Open", "open")
+            yield Btn("Preview", "preview", classes="mc-previewbtn")
             yield Btn("Approve", "approve", variant="primary", classes="mc-gatebtn")
             yield Btn("Reject", "reject", variant="danger", classes="mc-gatebtn")
             yield Btn("Answer…", "answer", variant="ghost", classes="mc-gatebtn")
@@ -187,6 +188,8 @@ class MissionCard(Vertical):
         pr.display = bool(pr_url)
         if pr_url:
             pr.update(f"PR: {esc(pr_url)}")
+        for btn in self.query(".mc-previewbtn").results(Btn):
+            btn.display = bool(pr_url)
         yes_no = self.gate is not None and self.gate.kind.value in (
             "ship",
             "open_pr",

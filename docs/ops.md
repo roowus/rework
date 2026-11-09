@@ -87,3 +87,34 @@ ssh ubuntu@100.107.125.118 "docker exec rework-dev-pg psql -U postgres -d rework
 Tests never touch `rework_state`. Postgres tests use the dedicated
 `rework_test` database:
 `REWORK_TEST_POSTGRES=postgresql://postgres:rework@100.107.125.118:5433/rework_test`.
+
+## Preview a PR
+
+`rework preview <n>` runs pull request <n>'s build as a fully isolated second
+instance, without touching the real one:
+
+- fetches `refs/pull/<n>/head` from origin into `~/.rework/previews/<n>/repo`
+  (a git worktree on branch `rework/preview-pr-<n>`) and runs `uv sync` there;
+- copies the state DB with sqlite's backup API into the preview dir (if
+  `REWORK_DB` points at Postgres, the preview starts on a fresh SQLite
+  database instead and says so);
+- picks a free port and starts the preview's own daemon in the background
+  (logs: `~/.rework/previews/<n>/daemon.log`);
+- opens the preview build's TUI in the same terminal, labelled
+  `PREVIEW #<n>`.
+
+Quitting that TUI stops the preview daemon and removes the preview. Flags:
+
+- `--keep` — leave the preview running after the TUI exits; the command prints
+  how to re-attach and how to remove it.
+- `--allow-missions` — let the preview dispatch role runs. By default a
+  preview runs no missions (safe no-execute posture).
+- `rework preview --list` — show known previews (port, pid, liveness).
+- `rework preview --rm <n>` — stop and delete a preview (worktree, branch,
+  state copy, descriptor).
+
+Previews live under `~/.rework/previews/<n>/` (override the root with
+`REWORK_PREVIEW_DIR`); a descriptor `~/.rework/previews/<n>.json` records the
+port, pid and paths. In the TUI, mission cards with an open PR get a
+**Preview** button that runs the same command and returns to the main TUI
+when done.

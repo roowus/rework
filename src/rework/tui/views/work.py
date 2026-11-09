@@ -572,6 +572,8 @@ class WorkView(View):
         elif verb == "answer" and event.gate_id:
             self.rw.action_tab("gates")
             self.rw.view("gates").select_gate(event.gate_id)
+        elif verb == "preview":
+            self.run_worker(actions.preview(self.rw, mid), group="preview")
         elif verb in ("pause", "resume", "cancel"):
             self.run_worker(actions.control(self.rw, mid, verb), group="control")
 

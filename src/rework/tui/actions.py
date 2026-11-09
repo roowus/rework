@@ -5,6 +5,8 @@ button in the Dashboard can never disagree. All writes go through TuiData
 
 from __future__ import annotations
 
+import re
+import subprocess
 from typing import TYPE_CHECKING, Any
 
 from rework.tui.theme import clip
@@ -93,5 +95,48 @@ async def decide(
         await app.hub.refresh()
         return False
     app.notify("Approved" if approved else "Rejected", timeout=2)
+    await app.hub.refresh()
+    return True
+
+
+async def preview(app: ReworkApp, mission_id: str) -> bool:
+    """Run the mission's PR as a preview (ADR 0008): suspend this TUI, hand the
+    terminal to `rework preview <n>`, come back when it exits."""
+    try:
+        mission = await app.hub.data.get_mission(mission_id)
+    except Exception as exc:
+        app.notify(f"Could not load {mission_id}: {exc}", severity="error", timeout=6)
+        return False
+    if mission is None:
+        app.notify(f"No mission {mission_id}", severity="error")
+        return False
+    pr_url = (getattr(mission, "result", None) or {}).get("pr_url")
+    if not pr_url:
+        app.notify("This mission has no pull request yet", severity="warning", timeout=4)
+        return False
+    match = re.search(r"/pull/(\d+)", str(pr_url))
+    if match is None:
+        app.notify(f"cannot parse PR number from {pr_url}", severity="error", timeout=6)
+        return False
+    # the repo must come from the MISSION, never from this process's cwd (which
+    # is what --repo-dir defaults to): fetching the wrong repo is worse than
+    # refusing (ADR 0008, section 1)
+    repo_path = getattr(mission, "repo_path", None)
+    if not repo_path:
+        app.notify(
+            f"No repo recorded on {mission_id}; cannot preview PR {match.group(1)}",
+            severity="error",
+            timeout=8,
+        )
+        return False
+    cmd = ["rework", "preview", match.group(1), "--repo-dir", str(repo_path)]
+    try:
+        app.notify(f"Starting preview of PR {match.group(1)}…", timeout=3)
+        with app.suspend():
+            # blocking on purpose: suspend() handed the terminal to the child
+            subprocess.run(cmd)  # noqa: ASYNC221
+    except Exception as exc:
+        app.notify(str(exc), severity="error", timeout=8)
+        return False
     await app.hub.refresh()
     return True
