@@ -109,3 +109,19 @@ reloaded its conversation, called `check_in` on the coder and carried on.
 
 What worked: skipped the investigator as too small, recovered from the dead
 coder by respawning on `flash`, audited, finished with an accurate summary.
+
+## 2026-11-09, mission m-7d6377d16624 (local, PR previews: the first large mission)
+
+| # | finding | cause | status |
+|---|---|---|---|
+| 1 | Missions on rewvis under "No project" | `create_mission` never attached a project; no relabel command | fixed: missions on a project's repo are labeled automatically; `rework project assign`; prod relabeled |
+| 2 | Orchestrator re-picked kimi-k3 after two provider failures | a prompt rule alone did not hold | fixed: `spawn_role` refuses a model with 2 provider-error failures in the mission |
+| 3 | An owner message never reached the orchestrator after a restart | `events_since(0, limit=N)` returns the OLDEST N events; owner messages, `check_in` and failure reasons went blind past a few thousand events | fixed: one incremental event cache with a seq cursor |
+| 4 | Owner approved "up to $5" and the burn gate asked again at $2 | a permission gate does not move `plan.budget.max_usd` | fixed: `request_budget` tool raises the cap on approval |
+| 5 | A coder's `uv run pytest` froze the mission | on timeout `run_command` killed only `/bin/sh`; orphans kept the pipe open and `communicate()` blocked forever | fixed: own session, process-group TERM then KILL, bounded read; verified live (420s timeout fired, coder continued) |
+| 6 | Four silent stalls looked like hangs | clamshell sleep: timers stop while the Mac sleeps (an earlier "model call hung" diagnosis was this) | mitigated: `rework-local serve` runs under `caffeinate -i`; ops.md says to check `pmset -g log` first |
+| 7 | A daemon restart left its roles' child processes running | children are not reaped when the daemon dies | open (minor): reap a role's process group on resume |
+
+What worked: the orchestrator asked for budget before running out with an
+honest status, cancelled a coder and switched to `flash` on the owner's word,
+and gave its coders tight briefs after two of them explored instead of editing.
