@@ -107,6 +107,7 @@ class MissionCard(Vertical):
         yield Static(f"[{MUTED}]mission {esc(self.mission_id)}[/]", classes="card-body mc-head")
         yield Static("", classes="card-body mc-tail")
         yield Static("", classes="card-body mc-gate")
+        yield Static("", classes="card-body mc-pr")
         with Horizontal(classes="card-actions mc-actions"):
             yield Btn("Open", "open")
             yield Btn("Approve", "approve", variant="primary", classes="mc-gatebtn")
@@ -181,6 +182,11 @@ class MissionCard(Vertical):
         gate.display = self.gate is not None
         if self.gate is not None:
             gate.update(f"[{WARN}]◆ needs you[/]  {esc(self.gate.question)}")
+        pr = self.query_one(".mc-pr", Static)
+        pr_url = (getattr(m, "result", None) or {}).get("pr_url")
+        pr.display = bool(pr_url)
+        if pr_url:
+            pr.update(f"PR: {esc(pr_url)}")
         yes_no = self.gate is not None and self.gate.kind.value in (
             "ship",
             "open_pr",
