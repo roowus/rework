@@ -743,3 +743,27 @@ async def test_long_missions_still_see_their_newest_events(world: dict[str, Any]
         EventRecord(mission_id="mo", type=EventType.OWNER_MESSAGE, payload={"text": "and hurry"})
     )
     assert [e.payload["text"] for e in await orch._owner_messages()] == ["use flash", "and hurry"]
+
+
+async def test_request_budget_raises_the_real_cap(world: dict[str, Any]) -> None:
+    """Found live: the owner approved 'up to $5' on a permission gate and the
+    engine's cap stayed $2. request_budget's approval moves the cap itself."""
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+    provider.route(
+        MARKER,
+        [
+            turn(call("request_budget", "b1", max_usd=5, reason="one more coder")),
+            turn(call("finish", "b2", outcome="failed", summary="checked budget")),
+        ],
+    )
+    task = asyncio.create_task(runner(world).run())
+    gate = await approve_next_gate(world)
+    assert gate.kind.value == "permission" and "$2.00 to $5.00" in gate.question
+    await asyncio.wait_for(task, timeout=30)
+    mission = await store.get_mission("mo")
+    assert mission is not None and (mission.plan or {})["budget"]["max_usd"] == 5.0
+    msgs = await store.chat_messages(orchestrator_chat_id("mo"))
+    assert any(
+        "budget raised to $5.00" in m.body.get("content", "") for m in msgs if m.role == "tool"
+    )

@@ -97,6 +97,8 @@ How you work:
   can decide. Never leave a role waiting.
 - The owner may message you mid-mission; treat it as the latest word on intent.
 - Steer a role that is drifting with `redirect` instead of cancelling it.
+- Money: when the mission will need more than its budget, call request_budget
+  (approval raises the cap); never ask about money with ask_owner.
 - Cost: give every role a turn budget (`max_turns`) sized to the work, prefer quick
   investigations, and keep briefs tight. But money is the owner's call: never skip
   a needed revision or audit to save budget. The budget gate asks the owner before
@@ -230,6 +232,21 @@ TOOLS: list[ToolSpec] = [
                 "run_id": {"type": "string"},
             },
             "required": ["question"],
+        },
+    ),
+    ToolSpec(
+        name="request_budget",
+        description=(
+            "Ask the owner to raise this mission's budget cap before it runs out. On "
+            "approval the cap is raised (use this, never ask_owner, for money)."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "max_usd": {"type": "number", "description": "The new cap you need."},
+                "reason": {"type": "string", "description": "What is left and why."},
+            },
+            "required": ["max_usd", "reason"],
         },
     ),
     ToolSpec(
@@ -645,6 +662,8 @@ class MissionOrchestrator:
             return await self._answer(str(args.get("run_id") or ""), str(args.get("answer") or ""))
         if name == "ask_owner":
             return await self._ask_owner(call_id, args)
+        if name == "request_budget":
+            return await self._request_budget(call_id, args)
         if name == "redirect":
             return await self._redirect(
                 str(args.get("run_id") or ""), str(args.get("instruction") or "")
@@ -1023,6 +1042,61 @@ class MissionOrchestrator:
                 )
                 return f"owner: {text} (passed to {run_id})"
         return f"owner: {text}"
+
+    async def _request_budget(self, call_id: str, args: dict[str, Any]) -> str:
+        """One question about money, and the answer moves the real cap. Found
+        live: a permission gate approved 'up to $5' while the engine's burn gate
+        kept the old $2 cap and would have asked the owner again."""
+        from rework.kernel.state.records import GateKind
+
+        try:
+            wanted = float(args.get("max_usd") or 0)
+        except (TypeError, ValueError) as exc:
+            raise ToolError("max_usd must be a number") from exc
+        mission = await self.store.get_mission(self.mid) or self.mission
+        plan = dict(mission.plan or {})
+        budget = dict(plan.get("budget") or {})
+        cap = float(budget.get("max_usd") or 0)
+        if wanted <= cap:
+            raise ToolError(f"the cap is already ${cap:.2f}")
+        spend = await self.store.mission_spend(self.mid)
+        question = (
+            f"Raise this mission's budget from ${cap:.2f} to ${wanted:.2f}? "
+            f"(${spend.spent_usd:.2f} spent) {str(args.get('reason') or '').strip()}"
+        )
+        gate = next(
+            (
+                g
+                for g in await self.store.list_gates(self.mid)
+                if (g.spec or {}).get("_call") == call_id
+            ),
+            None,
+        )
+        if gate is None:
+            gate = await self.r._gates.request(
+                self.mid,
+                kind=GateKind.PERMISSION,
+                question=question,
+                spec={"_call": call_id, "asked_by": "orchestrator", "budget_to": wanted},
+            )
+        await self.store.update_mission(self.mid, status=MissionStatus.AWAITING_GATE)
+        while True:
+            row = await self.store.get_gate(gate.id)
+            if row is not None and row.status != GateStatus.OPEN:
+                break
+            await asyncio.sleep(self.r._poll)
+        await self.store.update_mission(self.mid, status=MissionStatus.RUNNING)
+        if row.status != GateStatus.APPROVED:
+            return (
+                f"owner declined the budget raise (cap stays ${cap:.2f}): {row.decision_note or ''}"
+            )
+        budget["max_usd"] = wanted
+        plan["budget"] = budget
+        await self.store.update_mission(self.mid, plan=plan)
+        if isinstance(self.r._plan, dict):  # the burn gate reads this copy
+            self.r._plan["budget"] = budget
+        await self._note(f"budget raised to ${wanted:.2f} by the owner")
+        return f"budget raised to ${wanted:.2f}"
 
     async def _redirect(self, run_id: str, instruction: str) -> str:
         run = await self.store.get_run(run_id)
