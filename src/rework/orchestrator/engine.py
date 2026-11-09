@@ -768,7 +768,9 @@ class MissionRunner:
             return None
         branch = str(coder_run.artifact.get("branch") or "")
         worktree = Path(str(coder_run.artifact.get("worktree") or mission.repo_path or "."))
-        title = f"rework: {mission.objective}"
+        # a PR title is one line (found live: PR #2 carried the whole objective)
+        name = mission.title or mission.objective.strip().splitlines()[0]
+        title = f"rework: {name if len(name) <= 72 else name[:71].rstrip() + '…'}"
         body = self._pr_body(mission, coder_run.artifact, results.get("audit"))
         await push_branch(worktree, branch)
         url = await pr_create(worktree, head=branch, title=title, body=body)

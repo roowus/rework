@@ -424,8 +424,11 @@ class MissionOrchestrator:
                 display=self.mission.objective,
             )
         else:
-            await self._finish_interrupted_turn()
-        await self._loop()
+            self.finished = self._recorded_finish()
+            if self.finished is None:
+                await self._finish_interrupted_turn()
+        if self.finished is None:
+            await self._loop()
         if self.finished is None:
             return  # cancelled by the owner or the burn gate
         outcome, summary = self.finished
@@ -576,6 +579,21 @@ class MissionOrchestrator:
             )
             if self.finished is not None:
                 return
+
+    def _recorded_finish(self) -> tuple[str, str] | None:
+        """A `finish` already executed before a restart (its tool result is in
+        the history). Found live: a daemon restart while the mission waited at
+        its final gate re-entered the loop and spent a model call re-deciding
+        what it had already decided."""
+        answered = {
+            m.get("tool_call_id"): m.get("content") for m in self.history if m.get("role") == "tool"
+        }
+        for message in reversed(self.history):
+            for call in message.get("tool_calls") or []:
+                if call.get("name") == "finish" and answered.get(call.get("id")) == "finished":
+                    args = call.get("arguments") or {}
+                    return (str(args.get("outcome") or "done"), str(args.get("summary") or ""))
+        return None
 
     async def _finish_interrupted_turn(self) -> None:
         """A crash between recording an assistant turn and its tool results

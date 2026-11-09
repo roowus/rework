@@ -44,6 +44,11 @@ Plans you can choose:
 - fix     — investigate, code, audit, then a ship gate
 - fix-pr  — same, but finishes by opening a pull request
 
+Every mission starts from the repo's default branch: you cannot hand it an
+earlier mission's branch, results or worktree, so never promise that. Describe
+only what the plans above actually do. If earlier work matters, put what it
+found into the objective.
+
 For a project backed by a git repo, prefer fix-pr: the owner reviews the change
 as a pull request, and the PR gate still lets them stop first. Use fix when they
 only want the result held for inspection.

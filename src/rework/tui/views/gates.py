@@ -232,7 +232,7 @@ class GatesView(View):
             else status_text(gate.status.value)
         )
         self.query_one("#gate-head", Static).update(
-            f"[b]{esc(kind.capitalize())}[/b]  {state}  [{FAINT}]{esc(gate.id)}[/]"
+            f"[b]{esc(kind[:1].upper() + kind[1:])}[/b]  {state}  [{FAINT}]{esc(gate.id)}[/]"
         )
         spec = getattr(gate, "spec", None) or {}
         extra = ""
@@ -292,8 +292,16 @@ class GatesView(View):
                 f"[b]{esc(role_of(run.id))}[/b]  [{FAINT}]step {esc(run.step)} · "
                 f"{esc(model)} · {esc(run.status.value)}[/]" + (f"\n{esc_line}" if esc_line else "")
             )
-        elif gate.kind.value in ("ship", "open_pr"):
-            run_box.update(f"[{MUTED}]the whole mission: approving ships the result[/]")
+        elif gate.kind.value == "open_pr":
+            run_box.update(
+                f"[{MUTED}]the whole mission: approving pushes the branch and opens a pull "
+                "request (you still merge)[/]"
+            )
+        elif gate.kind.value == "ship":
+            run_box.update(
+                f"[{MUTED}]the whole mission: approving ships the result (git projects: the "
+                "branch is pushed)[/]"
+            )
         else:
             run_box.update(f"[{FAINT}]{esc(gate.for_run or 'mission-level gate')}[/]")
 

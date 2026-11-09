@@ -23,6 +23,17 @@ same branch after the turn budget, audit on the strong model, revise, audit
 again, both audits approve with zero open findings, ship gate (rejected by me so
 nothing was pushed). The investigator report cited exact file:line evidence.
 
+## 2026-11-09, driving the real TUI myself (pty + pyte, scripts/tui_driver.py)
+
+| # | finding | cause | status |
+|---|---|---|---|
+| 31 | PR #2's title was the whole objective paragraph | `_create_pr` used `rework: {objective}` | fixed: mission title, else the objective's first line clipped to 72 |
+| 30 | Status bar cut "$0.029 today" to "$0.029 tod" | width:auto not re-measured when the text grew | fixed: refresh(layout=True) after update |
+| 29 | Gate header said "Open a pr?"; a PR gate said "approving ships the result" | str.capitalize lowercases the rest; one shared ship/open_pr line | fixed |
+| 28 | (worked) Gates tab: clicked "Open the PR" on dogfood #2, mission finished, PR #2 opened and is mergeable | | |
+| 27 | Chat orchestrator promised to "point this mission at" a cancelled mission's branch | no such mechanism; the prompt never said missions start from the default branch | fixed: prompt states what plans can and cannot do |
+| 26 | After a daemon restart at the final gate, the orchestrator thought again (wasted call, duplicate owner message) | the executed `finish` was not recovered from the history | fixed: a recorded finish goes straight to the gate (test) |
+
 ## 2026-11-07, owner: "the TUI can't be clicked, no keyboard input"
 
 Not the rework agent: its dogfood PR was never opened, so none of its code was

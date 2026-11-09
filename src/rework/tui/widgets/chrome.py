@@ -110,6 +110,9 @@ class MenuBar(Horizontal):
         spend = f"[{MUTED}]{esc(money(spend_today))} today[/]"
         status = self.query_one("#menubar-status", _Status)
         status.update(f"{conn}  {gate}  {spend} ")
+        # width:auto must be re-measured when the text grows (found driving the
+        # real TUI: "$0.029 today" rendered as "$0.029 tod")
+        status.refresh(layout=True)
         status.tooltip = error or ("open gates: click to view" if gates else None)
 
 
