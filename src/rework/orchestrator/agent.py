@@ -66,8 +66,8 @@ PLAYBOOKS: dict[str, str] = {
         "Same shape and same revise-until-clean loop as fix: investigate (optional for "
         "small changes), code, audit, revise while the audit requests changes or has "
         "medium-or-higher findings (ask_owner after three rounds). After you finish, "
-        "the owner decides whether to open a pull request from the last coder's "
-        "branch; agents never merge."
+        "the ENGINE pushes the last coder's branch and opens the pull request when the "
+        "owner approves the gate; agents never merge."
     ),
 }
 
@@ -102,6 +102,9 @@ How you work:
   the cap is passed.
 - Call `finish` when the mission's goal is met, or when it cannot be met (say why).
   Final gates (ship / open a PR) happen after you finish; you do not open them.
+  The engine pushes the last coder's branch and opens the PR itself on approval:
+  never spawn a role to push, commit, or open PRs (each coder run also creates a
+  new branch, so a "push" coder only adds noise).
 - Respond with tool calls. Text without a tool call wastes a turn."""
 
 TOOLS: list[ToolSpec] = [
