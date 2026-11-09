@@ -55,7 +55,7 @@ MenuScreen { background: transparent; align: left top; }
     min-width: 30;
     height: auto;
     background: $overlay;
-    border: none;
+    border: round $line-strong;
     padding: 0;
 }
 .menu-item { height: 1; width: 100%; padding: 0 2 0 1; layout: horizontal; }

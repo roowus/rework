@@ -202,6 +202,47 @@ async def test_menu_bar_dropdown_runs_an_action(ids: dict[str, str]) -> None:
         assert app.active_tab == "cost"
 
 
+async def test_the_open_menu_box_is_outlined(ids: dict[str, str]) -> None:
+    """The dropdown is a box, not a floating list of words: all four edges are
+    drawn, and Textual adds the border to the box model (min-width is content,
+    so the box is 2 cells wider than the 30-cell content minimum)."""
+    from textual.geometry import Region
+
+    from rework.tui.widgets.chrome import MenuScreen
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        view_title = next(t for t in app.query(".menu-title") if "View" in str(t.render()))
+        await pilot.click(view_title)
+        await pilot.pause()
+        assert isinstance(app.screen, MenuScreen)
+        menu = app.screen.query_one("#menu")
+        edges = menu.styles.border
+        assert [(e[0] if e else None) for e in (edges.top, edges.right, edges.bottom, edges.left)] == [
+            "round",
+            "round",
+            "round",
+            "round",
+        ], "the dropdown has an outline on every edge"
+        outer = menu.outer_size
+        lines = [strip.text for strip in menu.render_lines(Region(0, 0, outer.width, outer.height))]
+        assert "\u256d" in lines[0] and "\u256e" in lines[0], f"top edge: {lines[0]!r}"
+        assert "\u2570" in lines[-1] and "\u256f" in lines[-1], f"bottom edge: {lines[-1]!r}"
+        assert lines[1].startswith("\u2502") and lines[1].endswith("\u2502"), f"side edges: {lines[1]!r}"
+        # the border is drawn around the content, not over it: Textual's default
+        # border-box sizing keeps the 30-cell minimum as the OUTER width, and the
+        # auto height grows by the 2 border rows
+        assert outer.width == 30, f"the box keeps its 30-cell footprint: {outer}"
+        assert outer.height == len(menu.children) + 2
+        assert menu.size == (outer.width - 2, outer.height - 2), "content is inset by the border"
+        # and the menu still works from the bordered box
+        entry = next(e for e in app.screen.query(".menu-item") if "Cost" in str(e.render()))
+        await pilot.click(entry)
+        await _settle(pilot, 0.3)
+        assert app.active_tab == "cost"
+
+
 async def test_status_bar_counts_open_gates(ids: dict[str, str]) -> None:
     app = _app()
     async with app.run_test(size=SIZE) as pilot:
