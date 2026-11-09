@@ -27,6 +27,11 @@ nothing was pushed). The investigator report cited exact file:line evidence.
 
 | # | finding | cause | status |
 |---|---|---|---|
+| 38 | (worked) Dropdown border shipped as PR #3 from a TUI-only session: chat, Launch, steer, Option+a on the PR gate. $0.36 total (first attempt at the same task: $3.03) | | |
+| 37 | Mission card tail shows node-enter events ("→ investigator prepare") | card reuses the trajectory renderer | open (after PR for m-4f41a4395872, which edits cards.py) |
+| 36 | Orchestrator respawned a provider-failed auditor on the same struggling model | prompt said nothing about provider failures | fixed: prompt says switch models after provider errors |
+| 35 | tui.log: 2,400+ identical warnings from a TUI pointed at an unreachable rewvis | the hub retried and logged every 2s poll | fixed: offline backoff (2..30s), transition logs only |
+| 34 | Dashboard orchestrator session showed no cost | the poll fetching its spend had never been applied (a scripted edit missed its anchor) | fixed; audited the other edits from that period |
 | 33 | (worked) Owner steer mid-mission: a chat message woke the orchestrator, which read the budget-stopped coder's handoff note and spawned a continuation with "owner steer (final word on scope)". It over-read "no probe scripts" as "no new tests" (ambiguous ask) | | judgment, not a bug |
 | 32 | After a click in the chat transcript, typed keys vanished | focus moved to the scroll view | fixed: printable keys anywhere in the Work tab go to the prompt |
 | 31 | PR #2's title was the whole objective paragraph | `_create_pr` used `rework: {objective}` | fixed: mission title, else the objective's first line clipped to 72 |

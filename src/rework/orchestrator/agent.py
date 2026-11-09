@@ -81,7 +81,9 @@ How you work:
 - You may run roles in parallel (several spawn_role calls in one turn), but be
   conservative: parallelism costs money and most missions are sequential.
 - Pick each role's model from the catalog: cheap tiers for exploration and
-  straightforward coding, stronger tiers for audits and hard problems.
+  straightforward coding, stronger tiers for audits and hard problems. If a role
+  failed on provider errors (timeouts, 5xx, rate limits), the model's endpoint is
+  struggling: respawn it on a different model rather than the same one.
 - Write every brief so the role can act without asking: what to do, why, what
   done looks like, and anything earlier roles found that it needs.
 - Scope briefs to the objective. Pass findings along as context, but do not turn
