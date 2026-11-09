@@ -254,3 +254,25 @@ def test_report_transcript_keeps_the_evidence() -> None:
     assert len(shrunk) <= 20_100
     assert "find the menu border" in shrunk, "the start survives"
     assert shrunk.rstrip().endswith("border: none;"), "the end survives"
+
+
+async def test_run_command_timeout_kills_the_whole_process_tree(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Found live: a timed-out `uv run pytest` left orphans holding the pipe
+    and the role hung forever. A grandchild that ignores the shell's death must
+    not keep the tool call from returning."""
+    import time
+
+    from rework.nodes.tools import LocalExecutor
+
+    ex = LocalExecutor(tmp_path)
+    start = time.monotonic()
+    out = await ex.execute(
+        "run_command",
+        {
+            "command": "python3 -c "
+            + repr("import subprocess,time; subprocess.Popen(['sleep','60']); time.sleep(60)"),
+            "timeout_seconds": 1,
+        },
+    )
+    assert "timeout after 1s" in out
+    assert time.monotonic() - start < 10, "returned instead of waiting on orphans"

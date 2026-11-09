@@ -199,20 +199,24 @@ class LocalExecutor:
                 if refusal is not None:
                     return refusal
                 timeout = float(args.get("timeout_seconds", 120))
+                # own session/process group: on timeout the WHOLE tree dies.
+                # Found live: terminate() killed only /bin/sh; the orphaned
+                # `uv run pytest` kept the pipe open and communicate() blocked
+                # forever, hanging the role and its mission with no log.
                 proc = await asyncio.create_subprocess_shell(
                     command,
                     cwd=str(self._workdir),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
+                    start_new_session=True,
                 )
                 try:
                     out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
                 except TimeoutError:
-                    proc.terminate()
-                    rest, _ = await proc.communicate()
+                    rest = await _kill_tree(proc)
                     return (
-                        f"(timeout after {timeout:.0f}s) partial output:\n"
-                        f"{rest.decode(errors='replace')[:4000]}"
+                        f"(timeout after {timeout:.0f}s; the command and its children were "
+                        f"killed) partial output:\n{rest.decode(errors='replace')[:4000]}"
                     )
                 text = out.decode(errors="replace")
                 if len(text) > 8000:
@@ -233,6 +237,25 @@ class LocalExecutor:
         if allowed is None:
             return list(all_specs)
         return [s for s in all_specs if s.name in allowed]
+
+
+async def _kill_tree(proc: Any) -> bytes:
+    """TERM, then KILL, the command's whole process group; read what is left
+    without ever waiting forever."""
+    import os
+    import signal
+
+    for sig, grace in ((signal.SIGTERM, 3.0), (signal.SIGKILL, 2.0)):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            rest, _ = await asyncio.wait_for(proc.communicate(), timeout=grace)
+            return rest or b""
+        except TimeoutError:
+            continue
+    return b""
 
 
 class ComplaintAwareExecutor:
