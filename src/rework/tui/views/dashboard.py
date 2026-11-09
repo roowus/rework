@@ -618,15 +618,18 @@ class DashboardView(View):
                 mission_nodes(mission, self.runs, self.mission_gates, meta, inner), self.run_id
             )
         elif tab == "output":
-            runs = [r for r in self.runs if self.run_id in (None, r.id)]
-            parts = []
-            for run in runs:
-                parts.append(
-                    f"{glyph(run.status)} [b]{esc(role_of(run.id))}[/b]  "
-                    f"[{FAINT}]{esc(run.step)} · {esc(self._run_sub(run))}[/]\n"
-                    + artifact_markup(run.role, run.artifact)
-                )
-            body = "\n\n".join(parts) or f"[{FAINT}]no sessions yet[/]"
+            if self.run_id is not None and self.run_id == self._orchestrator_id():
+                body = self._orchestrator_output(mission)
+            else:
+                runs = [r for r in self.runs if self.run_id in (None, r.id)]
+                parts = []
+                for run in runs:
+                    parts.append(
+                        f"{glyph(run.status)} [b]{esc(role_of(run.id))}[/b]  "
+                        f"[{FAINT}]{esc(run.step)} · {esc(self._run_sub(run))}[/]\n"
+                        + artifact_markup(run.role, run.artifact)
+                    )
+                body = "\n\n".join(parts) or f"[{FAINT}]no sessions yet[/]"
             self.query_one("#m-output-body", Static).update(body)
         elif tab == "diff":
             coder = [
@@ -653,6 +656,30 @@ class DashboardView(View):
         follow = self.query_one("#m-follow", Static)
         live = status_value(mission.status) in actions.ACTIVE
         follow.update(f"[{ACCENT}]● live[/]" if live else "")
+
+    def _orchestrator_output(self, mission: Any) -> str:
+        """The orchestrator's own Output: its notes to the owner (INFO events
+        carrying to_owner, written by message_owner/finish), then the mission's
+        final summary, oldest first. It is a synthetic run with no artifact."""
+        parts: list[str] = []
+        notes = [
+            str((ev.payload or {}).get("note") or "")
+            for ev in self.events
+            if ev.run_id == self.run_id
+            and str(getattr(ev.type, "value", ev.type)) == "info"
+            and (ev.payload or {}).get("to_owner")
+        ]
+        notes = [n for n in notes if n]
+        if notes:
+            parts.append(
+                f"[b]orchestrator[/b]  [{FAINT}]notes to you · {len(notes)}[/]\n"
+                + "\n".join(f"[{MUTED}]·[/] {esc(n)}" for n in notes)
+            )
+        result = mission.result if isinstance(mission.result, dict) else {}
+        summary = result.get("summary")
+        if summary:
+            parts.append(f"[b]mission summary[/b]\n{esc(str(summary))}")
+        return "\n\n".join(parts) or f"[{FAINT}]nothing from the orchestrator yet[/]"
 
     def _inner_graphs(self) -> dict[str, tuple[list[str], str]]:
         """Role graph topology + current node, when roles publish them."""

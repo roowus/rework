@@ -859,3 +859,82 @@ async def test_chat_messages_go_to_the_running_mission(ids: dict[str, str], env:
         assert owner and owner[-1].payload["text"] == "add a test"
     finally:
         await store.aclose()
+
+
+async def test_dashboard_orchestrator_output_shows_owner_notes_and_summary(
+    ids: dict[str, str], env: Path
+) -> None:
+    """The orchestrator session's Output tab shows its notes to the owner
+    (INFO events with to_owner), oldest first, then the mission summary."""
+    from textual.widgets import Static
+
+    from rework.kernel.state.records import EventRecord, EventType
+    from rework.tui.widgets.base import ChipGroup
+
+    mid = ids["running"]
+    orch = f"{mid}:orchestrate:orchestrator:1"
+    note1 = "FIRST NOTE TO OWNER"
+    note2 = "SECOND NOTE TO OWNER"
+    hidden = "INTERNAL NOTE NOT FOR OWNER"
+    summary = "FINAL SUMMARY TEXT"
+
+    store = await _store(env)
+    try:
+        await store.update_mission(
+            mid,
+            plan={
+                "kind": "fix",
+                "steps": [
+                    {"step": "investigate", "role": "investigator"},
+                    {"step": "code", "role": "coder"},
+                    {"step": "audit", "role": "auditor"},
+                ],
+                "gates": ["ship"],
+                "orchestrator": {"model": "pro"},
+            },
+            result={"summary": summary},
+        )
+        base = 1_000_000.0
+        for i, payload in enumerate(
+            [
+                {"note": note1, "to_owner": True},
+                {"note": hidden},
+                {"note": note2, "to_owner": True},
+            ]
+        ):
+            await store.append_event(
+                EventRecord(
+                    mission_id=mid,
+                    run_id=orch,
+                    type=EventType.INFO,
+                    payload=payload,
+                    ts=base + i,
+                )
+            )
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.open_mission(mid)
+        await _settle(pilot, 1.0)
+        dash = app.view("dashboard")
+        runs = app.query_one("#run-list", RowList)
+        assert orch in runs.keys, f"orchestrator session missing from {runs.keys}"
+        runs.activate(orch, via_mouse=True)
+        await _settle(pilot, 0.8)
+        assert dash.run_id == orch
+        tabs = app.query_one("#m-tabs", ChipGroup)
+        chip = next(c for c in tabs.query(".chip") if c.value == "output")
+        await pilot.click(chip)
+        await _settle(pilot, 0.8)
+        assert dash.mtab == "output"
+        body = str(app.query_one("#m-output-body", Static).render())
+
+    assert note1 in body and note2 in body, body
+    assert hidden not in body, body
+    assert body.index(note1) < body.index(note2), body
+    assert summary in body, body
+    assert body.index(note2) < body.index(summary), body
+    assert not app.swallowed
