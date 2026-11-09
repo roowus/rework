@@ -12,7 +12,7 @@ The owner wants, before merging a rework pull request, to run *that PR's* rework
 and try it, the way a web project gets a Tilt environment and a per-PR subdomain.
 Today the loop ends at the open_pr gate: the daemon pushes the coder's branch and
 `gh pr create` opens the PR (`src/rework/orchestrator/engine.py:739` `_create_pr`,
-`src/rework/nodes/gh.py:22-35` `pr_create`); the human reviews and merges, and
+`src/rework/nodes/gh.py:15` `pr_create`); the human reviews and merges, and
 the merged code is only exercised by the next real mission against the real
 database. There is no way to drive a PR's TUI, daemon and migrations by hand
 before they land on the owner's live state.
@@ -48,12 +48,14 @@ Running a second instance is non-trivial for four concrete reasons:
    `engine.py:183`), so two processes on one DB would collide on paths.
 3. **Every piece of instance state defaults to a fixed global path** under
    `~/.rework`: state DB (`config.py:17` `DEFAULT_STATE_DIR`, `:37`), checkpoints
-   DB (`Config.from_env`, derived from the DB dir), library git root
+   DB (`Config.from_env`; derived from the DB dir on the sqlite branch,
+   `config.py:71-73`, while on Postgres checkpoints share the main DB,
+   `config.py:62-66`), library git root
    (`cli/__init__.py:1202-1208` `_library_root()`, `REWORK_LIBRARY_DIR`), log dir
    (`logs.py:54` `log_dir()`, `REWORK_LOG_DIR`), model catalog
    (`config.py:105-109` `REWORK_MODELS`, default `~/.rework/models.json`), TUI
    settings (`tui/settings.py:22`, `~/.rework/tui.json` / `REWORK_TUI_SETTINGS`),
-   and the visible results/reports dirs (`config.py:23-32` `DEFAULT_USER_DIR =
+   and the visible results/reports dirs (`config.py:21` `DEFAULT_USER_DIR =
    ~/rework`, `REWORK_RESULTS_DIR` / `REWORK_REPORTS_DIR`). There is no XDG
    usage; none of these paths is derived from an instance identity. Two instances
    that do not override them share or collide.
@@ -120,9 +122,15 @@ routes verbs (`open`, `approve`, `reject`, `answer`, `pause`, `resume`, `cancel`
 to `tui/actions.py`. So: new `Btn("Preview", "preview")` in the card, new
 `"preview"` branch in `on_mission_card_act`, and a new `actions.preview(app,
 mission_id)` that parses the PR number out of `mission.result["pr_url"]` and
-shells the same `rework preview <n>` code path. A `rework pr-123`-style shortcut
-is rejected: it invents a second, number-only namespace next to mission ids and
-gives no way to say *which repo*; the card is where the PR URL already lives.
+shells the same `rework preview <n>` code path. The action must resolve the
+repo from the *mission*, never from the process cwd that `--repo-dir`
+defaults to: `OWNER/NAME` parsed out of the `pr_url` for `--repo`, and
+`mission.repo_path` (`kernel/state/records.py:89`; repo identity lives on
+the mission, not the card) for `--repo-dir`. If neither is resolvable the
+verb must refuse with a clear message rather than fetch the wrong repo. A
+`rework pr-123`-style shortcut is rejected: it invents a second, number-only
+namespace next to mission ids and gives no way to say *which repo*; the card is
+where the PR URL already lives.
 (Whichever surface wins, both must call one implementation, per ADR 0006's
 "actions are shared".)
 
