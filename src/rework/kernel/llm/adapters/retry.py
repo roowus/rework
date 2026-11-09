@@ -27,6 +27,8 @@ _TRANSIENT_MARKERS = (
 
 
 def _is_transient(exc: Exception) -> bool:
+    if isinstance(exc, TimeoutError):  # LoggedProvider's hard deadline
+        return True
     name = type(exc).__name__.lower()
     if (
         "connectionerror" in name

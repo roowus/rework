@@ -6,13 +6,20 @@ tags come from the caller's log context; prompts are never logged."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import time
 from typing import Any
 
 from rework.kernel.llm.types import ChatRequest, ChatResult
 
 log = logging.getLogger("rework.llm")
+
+
+def hard_timeout_s() -> float:
+    """Upper bound for one model call, whatever the client thinks."""
+    return float(os.environ.get("REWORK_MODEL_TIMEOUT_S", "300"))
 
 
 class LoggedProvider:
@@ -26,7 +33,12 @@ class LoggedProvider:
     async def complete(self, request: ChatRequest) -> ChatResult:
         start = time.perf_counter()
         try:
-            result: ChatResult = await self._inner.complete(request)
+            # HARD deadline (found live: a Fireworks call stayed in flight 15+
+            # minutes despite the client's 180s timeout, which does not bound a
+            # request whose server keeps the connection alive)
+            result: ChatResult = await asyncio.wait_for(
+                self._inner.complete(request), timeout=hard_timeout_s()
+            )
         except Exception as exc:
             log.warning(
                 "model call failed: %s: %s",

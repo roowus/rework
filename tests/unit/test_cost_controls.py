@@ -108,3 +108,26 @@ def test_turn_budget_defaults_and_bounds() -> None:
     assert _turn_budget("coder", {}) == 40
     assert _turn_budget("auditor", {"max_turns": 500}) == 64
     assert _turn_budget("auditor", {"max_turns": 1}) == 3
+
+
+async def test_a_hung_model_call_hits_the_hard_deadline(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Found live: a provider call stayed in flight 15+ minutes despite the
+    client's own timeout. Every call has a hard deadline, and the timeout is a
+    transient error the retry wrapper retries."""
+    import asyncio
+
+    import pytest
+
+    from rework.kernel.llm.adapters.logged import LoggedProvider
+    from rework.kernel.llm.adapters.retry import _is_transient
+    from rework.kernel.llm.types import ChatRequest
+
+    monkeypatch.setenv("REWORK_MODEL_TIMEOUT_S", "0.2")
+
+    class Hung:
+        async def complete(self, request):  # type: ignore[no-untyped-def]
+            await asyncio.sleep(3600)
+
+    with pytest.raises(TimeoutError) as caught:
+        await LoggedProvider(Hung()).complete(ChatRequest(model="m"))
+    assert _is_transient(caught.value)
