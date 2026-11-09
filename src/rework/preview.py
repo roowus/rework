@@ -70,14 +70,66 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def is_alive(pid: int | None) -> bool:
+def _ps_command(pid: int) -> str | None:
+    """The full command line of pid via ps(1) (macOS and Linux both accept
+    `-p <pid> -o command=`), or None when ps cannot tell us."""
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
+def is_alive(pid: int | None, marker: str | None = None) -> bool:
+    """True only for a live process that is recognisably ours: `os.kill(pid, 0)`
+    also succeeds for an unrelated process after pid reuse, so the command line
+    must mention `rework` (or the preview worktree). Never signal a pid this
+    says False for."""
     if not pid:
         return False
     try:
         os.kill(int(pid), 0)
     except (OSError, ValueError):
         return False
-    return True
+    command = _ps_command(int(pid))
+    if command is None:
+        return False
+    markers = ["rework"]
+    if marker:
+        markers.append(str(marker))
+    return any(m in command for m in markers)
+
+
+def stop_group(pid: int | str | None) -> None:
+    """SIGTERM then SIGKILL the whole process group of a backgrounded preview
+    daemon. The descriptor records the `uv run` wrapper's pid (uv does not
+    exec), so killing the pid alone leaves the real daemon running; spawn_daemon
+    used start_new_session, so that pid is the group leader."""
+    try:
+        pgid = int(pid)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return
+    if not is_alive(pgid):
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except OSError:
+            try:
+                os.kill(pgid, sig)
+            except OSError:
+                return
+        for _ in range(50):  # up to ~5s for the group to go away
+            if not is_alive(pgid):
+                return
+            time.sleep(0.1)
 
 
 def _sqlite_backup(src: Path, dst: Path) -> None:
@@ -108,16 +160,30 @@ def copy_state_db(src: Path, dst: Path) -> None:
         conn.close()
 
 
+def fresh_sqlite(path: Path) -> None:
+    """Deliberately create an empty SQLite database at path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sqlite3.connect(str(path)).close()
+
+
 def prepare_state(n: int, src_db: Path) -> tuple[Path, str | None]:
     """The preview's state DB. Postgres cannot be copied this way, so a preview
-    of a Postgres-backed instance starts on a fresh SQLite file instead."""
+    of a Postgres-backed instance starts on a fresh SQLite file instead; a
+    missing sqlite source does too, out loud (`sqlite3.connect` would silently
+    create an empty file anyway). The notice is printed and returned."""
     pdir = preview_dir(n)
     pdir.mkdir(parents=True, exist_ok=True)
     state_db = pdir / "state.sqlite3"
     if is_postgres(str(src_db)):
-        return state_db, "REWORK_DB is Postgres; starting preview on a fresh SQLite database"
-    copy_state_db(src_db, state_db)
-    return state_db, None
+        notice = "REWORK_DB is Postgres; starting preview on a fresh SQLite database"
+    elif not src_db.exists():
+        fresh_sqlite(state_db)
+        notice = f"source DB {src_db} not found; starting preview on a fresh SQLite database"
+    else:
+        copy_state_db(src_db, state_db)
+        return state_db, None
+    print(notice)
+    return state_db, notice
 
 
 def prepare_checkpoints(n: int) -> Path | None:
@@ -139,34 +205,57 @@ def source_state_db() -> Path:
     return Path(os.environ.get("REWORK_DB", "~/.rework/state.sqlite3")).expanduser()
 
 
+def registered_worktrees(repo_dir: Path) -> list[tuple[str, str]]:
+    """(path, branch) for every worktree git has registered, from
+    `git worktree list --porcelain`."""
+    out = subprocess.run(
+        ["git", "-C", str(repo_dir), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    entries: list[tuple[str, str]] = []
+    path, branch = "", ""
+    for line in [*out.splitlines(), ""]:
+        if line.startswith("worktree "):
+            path, branch = line[len("worktree ") :], ""
+        elif line.startswith("branch "):
+            branch = line[len("branch ") :].removeprefix("refs/heads/")
+        elif not line.strip() and path:
+            entries.append((path, branch))
+            path, branch = "", ""
+    return entries
+
+
 def fetch_worktree(n: int, repo_dir: Path) -> Path:
     """Fetch refs/pull/<n>/head into origin/pr/<n> and check it out as a
-    worktree on branch rework/preview-pr-<n>."""
+    worktree on branch rework/preview-pr-<n>.
+
+    Re-runnable: when the branch is already checked out at the conventional
+    path the worktree is reset onto the freshly fetched ref instead of failing
+    with "already used by worktree", and a registration at a stale path is
+    removed first."""
     worktree = preview_dir(n) / "repo"
     worktree.parent.mkdir(parents=True, exist_ok=True)
+    branch = f"rework/preview-pr-{n}"
+    ref = f"origin/pr/{n}"
     subprocess.run(
-        [
-            "git",
-            "-C",
-            str(repo_dir),
-            "fetch",
-            "origin",
-            f"+refs/pull/{n}/head:refs/remotes/origin/pr/{n}",
-        ],
+        ["git", "-C", str(repo_dir), "fetch", "origin", f"+refs/pull/{n}/head:refs/remotes/{ref}"],
         check=True,
     )
+    for path, registered in registered_worktrees(repo_dir):
+        if registered != branch:
+            continue
+        if Path(path) == worktree:
+            subprocess.run(["git", "-C", str(worktree), "reset", "--hard", ref], check=True)
+            return worktree
+        subprocess.run(
+            ["git", "-C", str(repo_dir), "worktree", "remove", "--force", path],
+            capture_output=True,
+        )
+        subprocess.run(["git", "-C", str(repo_dir), "worktree", "prune"], capture_output=True)
     subprocess.run(
-        [
-            "git",
-            "-C",
-            str(repo_dir),
-            "worktree",
-            "add",
-            "-B",
-            f"rework/preview-pr-{n}",
-            str(worktree),
-            f"origin/pr/{n}",
-        ],
+        ["git", "-C", str(repo_dir), "worktree", "add", "-B", branch, str(worktree), ref],
         check=True,
     )
     return worktree
@@ -267,19 +356,24 @@ def spawn_daemon(n: int, worktree: Path, env: dict[str, str]) -> subprocess.Pope
 
 
 def wait_ready(daemon_url: str, proc: subprocess.Popen[bytes], timeout_s: float = 60.0) -> bool:
-    """Wait for any HTTP answer from the daemon (even 404 counts as up). Give up
-    early if the process died."""
+    """Wait until the daemon answers GET /healthz with 200 and an ok body (the
+    route in rework/orchestrator/workspace.py). Any other answer -- a stranger's
+    service on the port, a 404, a refused connection -- is not our daemon, so
+    keep polling; give up early once the process died."""
     deadline = time.monotonic() + timeout_s
+    url = daemon_url.rstrip("/") + "/healthz"
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             return False
         try:
-            urllib.request.urlopen(daemon_url + "/healthz", timeout=2.0).close()
-            return True
+            with urllib.request.urlopen(url, timeout=2.0) as resp:
+                if resp.status == 200 and "ok" in resp.read(2048).decode("utf-8", "replace"):
+                    return True
         except urllib.error.HTTPError:
-            return True
+            pass
         except Exception:
-            time.sleep(0.5)
+            pass
+        time.sleep(0.5)
     return False
 
 
@@ -320,6 +414,14 @@ def run_preview_tui(n: int, worktree: Path, env: dict[str, str]) -> int:
     ).returncode
 
 
+def keep_notice(n: int, daemon_url: str) -> None:
+    """How to get back into a preview that was left running."""
+    print(f"preview #{n} kept: {descriptor_path(n)}")
+    print(f"  daemon: {daemon_url}")
+    print(f"  attach: REWORK_PREVIEW={n} rework tui")
+    print(f"  remove: rework preview --rm {n}")
+
+
 def create_preview(
     n: int,
     repo_dir: Path,
@@ -329,13 +431,19 @@ def create_preview(
 ) -> int:
     """Build, start, drive and (unless kept) tear down preview #n."""
     repo_dir = Path(repo_dir).expanduser()
-    worktree = fetch_worktree(n, repo_dir)
-    subprocess.run(["uv", "sync", "--project", str(worktree)], check=True)
+    worktree_created = False
+    try:
+        worktree = fetch_worktree(n, repo_dir)
+        worktree_created = True
+        subprocess.run(["uv", "sync", "--project", str(worktree)], check=True)
 
-    state_db, notice = prepare_state(n, source_state_db())
-    if notice:
-        print(notice)
-    checkpoints_db = prepare_checkpoints(n)
+        state_db, _ = prepare_state(n, source_state_db())
+        checkpoints_db = prepare_checkpoints(n)
+    except BaseException:
+        # a setup failure must not leak a registered worktree
+        if worktree_created and not keep:
+            remove_preview(n, repo_dir)
+        raise
 
     port = port or free_port()
     daemon_url = f"http://127.0.0.1:{port}"
@@ -367,23 +475,37 @@ def create_preview(
     descriptor["pid"] = proc.pid
     write_descriptor(n, descriptor)
 
+    log_path = preview_dir(n) / "daemon.log"
     if not wait_ready(daemon_url, proc):
-        log_path = preview_dir(n) / "daemon.log"
         print(f"preview daemon for PR {n} did not come up; last log lines:")
         print(tail_log(log_path))
         stop_daemon(proc)
+        if not keep:
+            remove_preview(n, repo_dir)
         raise RuntimeError(f"preview daemon for PR {n} failed to start (see {log_path})")
 
     try:
-        run_preview_tui(n, worktree, env)
-    finally:
+        rc = run_preview_tui(n, worktree, env)
+    except BaseException:
+        stop_daemon(proc)
+        if not keep:
+            remove_preview(n, repo_dir)
+        raise
+    if rc != 0:
+        # the TUI is a client: a failed one says nothing about the daemon, so
+        # report where its log is before any teardown removes it
+        print(f"preview #{n}: TUI exited with status {rc}; daemon log: {log_path}")
         if keep:
-            print(f"preview #{n} kept: {descriptor_path(n)}")
-            print(f"  daemon: {daemon_url}")
-            print(f"  remove: rework preview --rm {n}")
+            keep_notice(n, daemon_url)
         else:
             stop_daemon(proc)
-            remove_preview(n)
+            remove_preview(n, repo_dir)
+        return rc
+    if keep:
+        keep_notice(n, daemon_url)
+    else:
+        stop_daemon(proc)
+        remove_preview(n, repo_dir)
     return 0
 
 
@@ -405,26 +527,42 @@ def list_previews() -> list[dict[str, Any]]:
     return rows
 
 
-def remove_preview(n: int) -> None:
-    """Stop the preview's daemon and delete everything it owns."""
+def resolve_repo_dir(desc: dict[str, Any], repo_dir: Path | None) -> Path | None:
+    """Which repo holds the preview's worktree registration: an explicit
+    --repo-dir, the descriptor, or the git repo we are standing in."""
+    if repo_dir is not None:
+        return Path(repo_dir).expanduser()
+    if desc.get("repo_dir"):
+        return Path(str(desc["repo_dir"])).expanduser()
+    top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    if top.returncode == 0 and top.stdout.strip():
+        return Path(top.stdout.strip())
+    return None
+
+
+def remove_preview(n: int, repo_dir: Path | None = None) -> None:
+    """Stop the preview's daemon and delete everything it owns.
+
+    Works with a missing or corrupt descriptor too: the worktree at the
+    conventional path is unregistered from the resolved repo (never just
+    rmtree'd out from under git), and when no repo can be resolved the exact
+    manual commands are printed instead of wedging the registration."""
     desc = load_descriptor(n) or {}
-    pid = desc.get("pid")
-    if is_alive(pid):
-        try:
-            os.kill(int(pid), signal.SIGTERM)
-        except OSError:
-            pass
-    repo_dir = desc.get("repo_dir")
+    stop_group(desc.get("pid"))
+    branch = str(desc.get("branch") or f"rework/preview-pr-{n}")
     worktree = desc.get("worktree")
-    branch = desc.get("branch") or f"rework/preview-pr-{n}"
-    if repo_dir:
-        if worktree:
-            subprocess.run(
-                ["git", "-C", str(repo_dir), "worktree", "remove", "--force", str(worktree)],
-                capture_output=True,
-            )
+    path = Path(str(worktree)) if worktree else preview_dir(n) / "repo"
+    resolved = resolve_repo_dir(desc, repo_dir)
+    if resolved is None:
+        print(f"preview #{n}: no repo to unregister its worktree from; run manually:")
+        print("  git worktree prune")
+        print(f"  git branch -D {branch}")
+    else:
         subprocess.run(
-            ["git", "-C", str(repo_dir), "branch", "-D", str(branch)], capture_output=True
+            ["git", "-C", str(resolved), "worktree", "remove", "--force", str(path)],
+            capture_output=True,
         )
+        subprocess.run(["git", "-C", str(resolved), "worktree", "prune"], capture_output=True)
+        subprocess.run(["git", "-C", str(resolved), "branch", "-D", branch], capture_output=True)
     shutil.rmtree(preview_dir(n), ignore_errors=True)
     descriptor_path(n).unlink(missing_ok=True)

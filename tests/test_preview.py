@@ -9,6 +9,9 @@ import os
 import socket
 import sqlite3
 import subprocess
+import threading
+import types
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -199,3 +202,204 @@ def test_cli_preview_list_on_an_empty_root() -> None:
     result = runner.invoke(app, ["preview", "--list"])
     assert result.exit_code == 0, result.output
     assert "no previews" in result.output
+
+
+def test_tui_command_is_registered() -> None:
+    result = runner.invoke(app, ["tui", "--help"])
+    assert result.exit_code == 0, result.output
+    assert "No such command" not in result.output
+
+
+def test_fetch_worktree_is_re_runnable(pr_repo: tuple[Path, str]) -> None:
+    work, sha = pr_repo
+    first = preview_mod.fetch_worktree(7, work)
+    second = preview_mod.fetch_worktree(7, work)  # must not fail on the registration
+    assert first == second
+    assert _git("rev-parse", "HEAD", cwd=second) == sha
+
+    # a new commit on the PR head is picked up by the second call
+    (work / "README.md").write_text("# rework\n\nmore\n")
+    _git("add", "-A", cwd=work)
+    _git("commit", "-m", "more", cwd=work)
+    new_sha = _git("rev-parse", "HEAD", cwd=work)
+    _git("push", "origin", "main", cwd=work)
+    _git("update-ref", "refs/pull/7/head", new_sha, cwd=work.parent / "origin.git")
+    preview_mod.fetch_worktree(7, work)
+    assert _git("rev-parse", "HEAD", cwd=second) == new_sha
+
+
+def test_remove_preview_without_a_descriptor(pr_repo: tuple[Path, str]) -> None:
+    work, _ = pr_repo
+    worktree = preview_mod.fetch_worktree(7, work)
+    preview_mod.descriptor_path(7).unlink(missing_ok=True)
+
+    preview_mod.remove_preview(7, work)
+
+    assert not preview_mod.preview_dir(7).exists()
+    assert str(worktree) not in _git("worktree", "list", cwd=work)
+
+
+def test_remove_preview_leaves_an_unrelated_process_alone(pr_repo: tuple[Path, str]) -> None:
+    work, _ = pr_repo
+    worktree = preview_mod.fetch_worktree(7, work)
+    victim = subprocess.Popen(["sleep", "30"])
+    preview_mod.write_descriptor(
+        7,
+        {
+            "pr": 7,
+            "branch": "rework/preview-pr-7",
+            "worktree": str(worktree),
+            "pid": victim.pid,
+            "port": 9998,
+            "daemon_url": "http://127.0.0.1:9998",
+            "repo_dir": str(work),
+        },
+    )
+    try:
+        preview_mod.remove_preview(7)
+        assert victim.poll() is None  # not ours: the ps identity check refuses it
+    finally:
+        victim.kill()
+        victim.wait()
+
+
+def test_create_preview_tears_down_a_half_built_preview(
+    pr_repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    work, _ = pr_repo
+    real_run = subprocess.run
+
+    def fake_run(cmd, **kwargs):  # let git through, stub uv
+        if cmd[:2] == ["uv", "sync"]:
+            return subprocess.CompletedProcess(cmd, 0)
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(
+        preview_mod,
+        "subprocess",
+        types.SimpleNamespace(run=fake_run, TimeoutExpired=subprocess.TimeoutExpired),
+    )
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("state prep failed")
+
+    monkeypatch.setattr(preview_mod, "prepare_state", boom)
+    with pytest.raises(RuntimeError, match="state prep failed"):
+        preview_mod.create_preview(7, work)
+
+    assert not preview_mod.preview_dir(7).exists()
+    assert str(preview_mod.preview_dir(7) / "repo") not in _git("worktree", "list", cwd=work)
+
+
+class _FakeProc:
+    def poll(self) -> int | None:
+        return None
+
+
+def _http_server(status: int, body: bytes) -> ThreadingHTTPServer:
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: object) -> None:
+            pass
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd
+
+
+def test_wait_ready_rejects_a_stranger_service() -> None:
+    httpd = _http_server(404, b"nope")
+    url = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        assert preview_mod.wait_ready(url, _FakeProc(), timeout_s=1.0) is False
+    finally:
+        httpd.shutdown()
+
+
+def test_wait_ready_accepts_the_daemon_healthz() -> None:
+    httpd = _http_server(200, b'{"ok": true}')
+    url = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        assert preview_mod.wait_ready(url, _FakeProc(), timeout_s=5.0) is True
+    finally:
+        httpd.shutdown()
+
+
+def test_prepare_state_with_a_missing_source_db_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("REWORK_DB", str(tmp_path / "nope.sqlite3"))
+    state_db, notice = preview_mod.prepare_state(7, preview_mod.source_state_db())
+    out = capsys.readouterr().out
+    assert notice is not None and "fresh" in notice
+    assert "fresh" in out
+    assert state_db.exists()
+    conn = sqlite3.connect(state_db)
+    try:
+        assert conn.execute("SELECT count(*) FROM sqlite_master").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+class _FakeDaemon:
+    pid = 0
+
+    def poll(self) -> int | None:
+        return None
+
+
+@pytest.fixture
+def fake_build(pr_repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A create_preview that really fetches, but fakes uv/the daemon/the TUI."""
+    work, _ = pr_repo
+    real_run = subprocess.run
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] == ["uv", "sync"]:
+            return subprocess.CompletedProcess(cmd, 0)
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(
+        preview_mod,
+        "subprocess",
+        types.SimpleNamespace(run=fake_run, TimeoutExpired=subprocess.TimeoutExpired),
+    )
+    monkeypatch.setattr(preview_mod, "spawn_daemon", lambda *a, **k: _FakeDaemon())
+    monkeypatch.setattr(preview_mod, "wait_ready", lambda *a, **k: True)
+    monkeypatch.setattr(preview_mod, "stop_daemon", lambda proc: None)
+    return work
+
+
+def test_create_preview_reports_a_failed_tui_and_cleans_up(
+    fake_build: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch_run = preview_mod.run_preview_tui
+    preview_mod.run_preview_tui = lambda n, worktree, env: 3
+    try:
+        assert preview_mod.create_preview(7, fake_build) == 3
+    finally:
+        preview_mod.run_preview_tui = monkeypatch_run
+    out = capsys.readouterr().out
+    assert "daemon.log" in out and "status 3" in out
+    assert not preview_mod.preview_dir(7).exists()
+
+
+def test_create_preview_keeps_a_failed_tui_when_asked(
+    fake_build: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch_run = preview_mod.run_preview_tui
+    preview_mod.run_preview_tui = lambda n, worktree, env: 3
+    try:
+        assert preview_mod.create_preview(7, fake_build, keep=True) == 3
+    finally:
+        preview_mod.run_preview_tui = monkeypatch_run
+    out = capsys.readouterr().out
+    assert "daemon.log" in out
+    assert "REWORK_PREVIEW=7 rework tui" in out  # how to attach again
+    assert preview_mod.descriptor_path(7).exists()
+    preview_mod.remove_preview(7, fake_build)

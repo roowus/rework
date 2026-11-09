@@ -96,14 +96,17 @@ instance, without touching the real one:
 - fetches `refs/pull/<n>/head` from origin into `~/.rework/previews/<n>/repo`
   (a git worktree on branch `rework/preview-pr-<n>`) and runs `uv sync` there;
 - copies the state DB with sqlite's backup API into the preview dir (if
-  `REWORK_DB` points at Postgres, the preview starts on a fresh SQLite
-  database instead and says so);
+  `REWORK_DB` points at Postgres, or at a sqlite file that does not exist, the
+  preview starts on a fresh SQLite database instead and says so);
 - picks a free port and starts the preview's own daemon in the background
   (logs: `~/.rework/previews/<n>/daemon.log`);
 - opens the preview build's TUI in the same terminal, labelled
   `PREVIEW #<n>`.
 
-Quitting that TUI stops the preview daemon and removes the preview. Flags:
+Quitting that TUI stops the preview daemon and removes the preview. If the TUI
+itself exits nonzero the command reports the exit status and the daemon log
+path, and (with `--keep`) leaves the preview running instead of tearing it
+down. Flags:
 
 - `--keep` — leave the preview running after the TUI exits; the command prints
   how to re-attach and how to remove it.
@@ -111,7 +114,13 @@ Quitting that TUI stops the preview daemon and removes the preview. Flags:
   preview runs no missions (safe no-execute posture).
 - `rework preview --list` — show known previews (port, pid, liveness).
 - `rework preview --rm <n>` — stop and delete a preview (worktree, branch,
-  state copy, descriptor).
+  state copy, descriptor). It works even when the descriptor is missing: the
+  worktree is unregistered from `--repo-dir` (or the repo you are in) and
+  pruned, and without a resolvable repo it prints the manual `git worktree
+  prune` / `git branch -D` commands.
+
+`rework tui` opens the dashboard in its own terminal (the same TUI bare
+`rework` starts), which is what the preview command runs inside the worktree.
 
 Previews live under `~/.rework/previews/<n>/` (override the root with
 `REWORK_PREVIEW_DIR`); a descriptor `~/.rework/previews/<n>.json` records the

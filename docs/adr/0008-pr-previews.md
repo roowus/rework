@@ -386,8 +386,16 @@ dead mission worktrees are.
    Preview button that suspends the main TUI (Textual `App.suspend`), runs
    `rework preview <n>`, and returns to the main TUI afterwards.
 3. **`rework preview --list` / `rework preview --rm <n>`** list and remove
-   previews (descriptor files `~/.rework/previews/<n>.json`).
-4. **No-execute default.** A preview daemon does not dispatch role runs unless
+   previews (descriptor files `~/.rework/previews/<n>.json`). `--rm` kills the
+   daemon's whole process group (the descriptor records the `uv run` wrapper),
+   and unregisters the worktree from `--repo-dir`/the current repo even when the
+   descriptor is gone. The preview TUI is launched with `rework tui` (new
+   command; the same TUI bare `rework` starts), and a nonzero TUI exit is
+   reported with the daemon log path rather than being ignored.
+4. **Daemon readiness is `/healthz` 200 with an ok body** (not "any HTTP
+   answer"), and a missing sqlite `REWORK_DB` yields a fresh preview DB with a
+   printed notice instead of a silently created empty file.
+5. **No-execute default.** A preview daemon does not dispatch role runs unless
    `--allow-missions` was passed (which sets
    `REWORK_PREVIEW_ALLOW_MISSIONS=1` in the preview daemon env). The guard
    lives in the daemon's dispatch path.

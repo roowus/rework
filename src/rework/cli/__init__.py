@@ -968,6 +968,14 @@ def attach(mission_id: str, follow: bool = True) -> None:
 
 
 @app.command()
+def tui() -> None:
+    """Open the TUI dashboard (the same one bare `rework` starts)."""
+    from rework.tui import run_tui
+
+    run_tui()
+
+
+@app.command()
 def preview(
     pr: int | None = typer.Argument(None, help="Pull request number."),
     repo_dir: Path | None = typer.Option(None, "--repo-dir", help="Fetch into."),  # noqa: B008
@@ -1001,7 +1009,7 @@ def preview(
             )
         return
     if rm is not None:
-        preview_mod.remove_preview(rm)
+        preview_mod.remove_preview(rm, repo_dir)
         typer.echo(f"removed preview #{rm}")
         return
     if pr is None:
