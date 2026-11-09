@@ -507,6 +507,22 @@ async def test_reopening_a_chat_replays_its_trajectory(ids: dict[str, str]) -> N
         assert cards[0].tail, "the mission card streams the live trajectory"
 
 
+async def test_typing_after_clicking_the_transcript_reaches_the_prompt(ids: dict[str, str]) -> None:
+    """Found driving the real TUI: a click in the chat log moved focus to the
+    transcript, and the next keystrokes vanished."""
+    from rework.tui.widgets.prompt import Prompt
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.query_one("#chat-list", RowList).activate(ids["chat"], via_mouse=True)
+        await _settle(pilot, 0.8)
+        app.query_one("#chat-log").focus()
+        await pilot.press("o", "k")
+        assert app.query_one("#prompt", Prompt).text == "ok"
+        assert app.focused is app.query_one("#prompt", Prompt)
+
+
 async def test_prompt_newline_keys_and_image_paste(ids: dict[str, str], tmp_path: Path) -> None:
     from textual import events
 

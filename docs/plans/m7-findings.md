@@ -27,6 +27,8 @@ nothing was pushed). The investigator report cited exact file:line evidence.
 
 | # | finding | cause | status |
 |---|---|---|---|
+| 33 | (worked) Owner steer mid-mission: a chat message woke the orchestrator, which read the budget-stopped coder's handoff note and spawned a continuation with "owner steer (final word on scope)". It over-read "no probe scripts" as "no new tests" (ambiguous ask) | | judgment, not a bug |
+| 32 | After a click in the chat transcript, typed keys vanished | focus moved to the scroll view | fixed: printable keys anywhere in the Work tab go to the prompt |
 | 31 | PR #2's title was the whole objective paragraph | `_create_pr` used `rework: {objective}` | fixed: mission title, else the objective's first line clipped to 72 |
 | 30 | Status bar cut "$0.029 today" to "$0.029 tod" | width:auto not re-measured when the text grew | fixed: refresh(layout=True) after update |
 | 29 | Gate header said "Open a pr?"; a PR gate said "approving ships the result" | str.capitalize lowercases the rest; one shared ship/open_pr line | fixed |

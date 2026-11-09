@@ -16,7 +16,7 @@ from typing import Any
 from textual import events, work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Static
+from textual.widgets import Input, Static, TextArea
 
 from rework.tui import actions
 from rework.tui.conversation import Conversation, Item, args_text, default_model
@@ -711,6 +711,19 @@ class WorkView(View):
                 self.toast(f"Could not save: {exc}", severity="error")
             self._paint_head()
         self.focus_prompt()
+
+    def on_key(self, event: events.Key) -> None:
+        """Typing goes to the prompt wherever focus is in this tab. Found
+        driving the TUI: after a click in the transcript (to select text, or a
+        mis-click) keystrokes went to the scroll view and vanished."""
+        prompt = self.query_one("#prompt", Prompt)
+        if self.screen.focused is prompt or not event.is_printable or not event.character:
+            return
+        if isinstance(self.screen.focused, Input | TextArea):
+            return  # another text box (a dialog field) keeps its keys
+        event.stop()
+        prompt.focus()
+        prompt.insert(event.character)
 
     def back(self) -> bool:
         prompt = self.query_one("#prompt", Prompt)
