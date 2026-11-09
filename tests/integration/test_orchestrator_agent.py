@@ -651,3 +651,47 @@ async def test_restart_after_finish_goes_straight_to_the_gate(world: dict[str, A
     mission = await store.get_mission("mo")
     assert mission is not None and mission.status == MissionStatus.DONE
     assert (mission.result or {}).get("summary") == "all good"
+
+
+async def test_spawn_refuses_a_model_whose_provider_keeps_failing(world: dict[str, Any]) -> None:
+    """Found live: after two kimi-k3 runs died on timeouts/500s the orchestrator
+    picked kimi-k3 again. Two provider failures on a model: spawn refuses it."""
+    from rework.kernel.state.records import EventRecord, EventType, Run
+
+    store: SqliteStore = world["store"]
+    for i in (1, 2):
+        rid = f"mo:code:coder:{i}"
+        await store.create_run(
+            Run(
+                id=rid,
+                mission_id="mo",
+                role="coder",
+                step="code",
+                attempt=i,
+                status=RunStatus.FAILED,
+                model_ref={"id": "pro"},
+            )
+        )
+        await store.append_event(
+            EventRecord(
+                mission_id="mo",
+                run_id=rid,
+                type=EventType.INFO,
+                payload={"error": "InternalServerError: Error code: 500"},
+            )
+        )
+    provider: ScriptedProvider = world["provider"]
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call("spawn_role", "x1", role="investigator", step="look", brief="b", model="pro")
+            ),
+            turn(call("finish", "x2", outcome="failed", summary="stopped")),
+        ],
+    )
+    await asyncio.wait_for(runner(world).run(), timeout=30)
+    msgs = await store.chat_messages(orchestrator_chat_id("mo"))
+    out = [m.body.get("content", "") for m in msgs if m.role == "tool"]
+    assert any("already failed 2 runs" in t and "choose another" in t for t in out)
+    assert not [r for r in await store.list_runs("mo") if r.step == "look"]

@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 MARKER = "You are the MISSION ORCHESTRATOR"
 MAX_TURNS = 80  # runaway protection only; the budget is the real rail
 MAX_IDLE_NUDGES = 3
+PROVIDER_FAILURE_LIMIT = 2  # failed runs on one model before spawn_role refuses it
 
 PLAYBOOKS: dict[str, str] = {
     "echo": (
@@ -687,6 +688,15 @@ class MissionOrchestrator:
             if not entry.has_credentials():
                 usable = ", ".join(e.id for e in self._usable())
                 raise ToolError(f"model {model!r} has no API key here; usable: {usable}")
+            failures = await self._provider_failures(model, runs)
+            if failures >= PROVIDER_FAILURE_LIMIT:
+                # mechanical rail (found live: a prompt rule alone did not stop
+                # the orchestrator re-picking a model whose endpoint kept failing)
+                others = ", ".join(e.id for e in self._usable() if e.id != model)
+                raise ToolError(
+                    f"model {model!r} already failed {failures} runs in this mission on "
+                    f"provider errors (timeouts/5xx/rate limits); choose another: {others}"
+                )
         else:
             model = (self.mission.plan or {}).get("model") or None
         context = await self._wire(role, runs)
@@ -735,6 +745,23 @@ class MissionOrchestrator:
         assert self.r._supervisor is not None
         await self.r._supervisor.ensure_started(created)
         return f"spawned {created.id} ({role}, model {model or 'role default'})"
+
+    async def _provider_failures(self, model: str, runs: list[Run]) -> int:
+        """Failed runs on `model` whose error looks like the provider's fault."""
+        failed = [
+            r
+            for r in runs
+            if r.status == RunStatus.FAILED and (r.model_ref or {}).get("id") == model
+        ]
+        if not failed:
+            return 0
+        events = await self.store.events_since(0, mission_id=self.mid, limit=9000)
+        errors: dict[str, str] = {}
+        for ev in events:
+            if ev.run_id and (ev.payload or {}).get("error"):
+                errors[ev.run_id] = str(ev.payload["error"]).lower()
+        markers = ("timeout", "timed out", "500", "502", "503", "504", "429", "connection")
+        return sum(1 for r in failed if any(m in errors.get(r.id, "") for m in markers))
 
     async def _wire(self, role: str, runs: list[Run]) -> dict[str, Any]:
         context: dict[str, Any] = {}
