@@ -338,3 +338,11 @@ async def library_index(request: pytest.FixtureRequest) -> AsyncIterator[object]
         store = SqliteLibraryStore(conn)
         yield store
         await store.aclose()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_command_registry(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """run_command records process groups under REWORK_RUN_DIR; never ~/.rework."""
+    monkeypatch.setenv("REWORK_RUN_DIR", str(tmp_path_factory.mktemp("run")))

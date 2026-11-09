@@ -143,6 +143,7 @@ class LocalExecutor:
     def __init__(self, workdir: Path, extra_specs: list[ToolSpec] | None = None) -> None:
         self._workdir = workdir.resolve()
         self._extra = extra_specs or []
+        reap_orphaned_commands()
 
     def _jail(self, path_str: str) -> Path:
         candidate = (self._workdir / path_str).resolve()
@@ -210,14 +211,17 @@ class LocalExecutor:
                     stderr=asyncio.subprocess.STDOUT,
                     start_new_session=True,
                 )
+                mark = _register_command(proc.pid, command)
                 try:
                     out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
                 except TimeoutError:
                     rest = await _kill_tree(proc)
+                    mark.unlink(missing_ok=True)
                     return (
                         f"(timeout after {timeout:.0f}s; the command and its children were "
                         f"killed) partial output:\n{rest.decode(errors='replace')[:4000]}"
                     )
+                mark.unlink(missing_ok=True)
                 text = out.decode(errors="replace")
                 if len(text) > 8000:
                     text = (
@@ -237,6 +241,87 @@ class LocalExecutor:
         if allowed is None:
             return list(all_specs)
         return [s for s in all_specs if s.name in allowed]
+
+
+def _command_registry() -> Path:
+    import os
+
+    from rework.config import DEFAULT_STATE_DIR
+
+    root = Path(os.environ.get("REWORK_RUN_DIR", str(DEFAULT_STATE_DIR / "run"))) / "commands"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _register_command(pgid: int, command: str) -> Path:
+    """Record a running command's process group and the daemon that owns it,
+    so a later daemon can reap it if this one dies mid-command."""
+    import json
+    import os
+
+    mark = _command_registry() / f"{pgid}.json"
+    mark.write_text(json.dumps({"pgid": pgid, "owner": os.getpid(), "command": command}))
+    return mark
+
+
+_reaped = False
+
+
+def reap_orphaned_commands(force: bool = False) -> list[int]:
+    """Kill command trees left by a daemon that died mid-command (found live: a
+    restart left two `uv run pytest` trees running). Only groups whose owner
+    daemon is gone, and only if the group still runs that exact shell command,
+    so a reused pid is never killed. Runs once per process."""
+    import json
+    import os
+    import signal
+    import subprocess
+
+    global _reaped
+    if _reaped and not force:
+        return []
+    _reaped = True
+    killed: list[int] = []
+    try:
+        marks = list(_command_registry().glob("*.json"))
+    except OSError:
+        return killed
+    for mark in marks:
+        try:
+            info = json.loads(mark.read_text())
+            pgid, owner, command = int(info["pgid"]), int(info["owner"]), str(info["command"])
+        except (OSError, ValueError, KeyError):
+            mark.unlink(missing_ok=True)
+            continue
+        if owner == os.getpid() or _alive(owner):
+            continue  # its daemon (or this one) is still running it
+        try:
+            rows = subprocess.run(
+                ["ps", "-ax", "-o", "pgid=,command="], capture_output=True, text=True, timeout=10
+            ).stdout.splitlines()
+        except (OSError, subprocess.SubprocessError):
+            return killed
+        leader = f"-c {command}"
+        if any(r.split(None, 1)[0] == str(pgid) and leader in r for r in rows if r.strip()):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+                killed.append(pgid)
+            except (ProcessLookupError, PermissionError):
+                pass
+        mark.unlink(missing_ok=True)
+    return killed
+
+
+def _alive(pid: int) -> bool:
+    import os
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 async def _kill_tree(proc: Any) -> bytes:

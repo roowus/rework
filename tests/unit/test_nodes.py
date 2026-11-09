@@ -276,3 +276,56 @@ async def test_run_command_timeout_kills_the_whole_process_tree(tmp_path) -> Non
     )
     assert "timeout after 1s" in out
     assert time.monotonic() - start < 10, "returned instead of waiting on orphans"
+
+
+def test_a_dead_daemons_command_tree_is_reaped(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Found live: a daemon restart left two `uv run pytest` trees running.
+    A later daemon kills groups whose owner is gone, only if the group still
+    runs that exact command, and leaves a live owner's commands alone."""
+    import json
+    import os
+    import subprocess
+    import time
+
+    from rework.nodes.tools import _command_registry, reap_orphaned_commands
+
+    command = "sleep 61; true"
+    orphan = subprocess.Popen(["/bin/sh", "-c", command], start_new_session=True)
+    dead_owner = subprocess.Popen(["true"])
+    dead_owner.wait()
+    reg = _command_registry()
+    (reg / f"{orphan.pid}.json").write_text(
+        json.dumps({"pgid": orphan.pid, "owner": dead_owner.pid, "command": command})
+    )
+    # a stale mark whose pgid now runs something else: never killed
+    bystander = subprocess.Popen(["/bin/sh", "-c", "sleep 62; true"], start_new_session=True)
+    (reg / f"{bystander.pid}.json").write_text(
+        json.dumps({"pgid": bystander.pid, "owner": dead_owner.pid, "command": "pytest -x"})
+    )
+    # a live owner's command: left alone
+    live = subprocess.Popen(["/bin/sh", "-c", "sleep 63; true"], start_new_session=True)
+    (reg / f"{live.pid}.json").write_text(
+        json.dumps({"pgid": live.pid, "owner": os.getppid(), "command": "sleep 63; true"})
+    )
+    try:
+        killed = reap_orphaned_commands(force=True)
+        assert killed == [orphan.pid]
+        deadline = time.monotonic() + 5
+        while orphan.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert orphan.poll() is not None
+        assert bystander.poll() is None and live.poll() is None
+        assert not (reg / f"{orphan.pid}.json").exists()
+        assert (reg / f"{live.pid}.json").exists()
+    finally:
+        for p in (orphan, bystander, live):
+            if p.poll() is None:
+                p.kill()
+
+
+async def test_run_command_clears_its_registry_mark(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    from rework.nodes.tools import LocalExecutor, _command_registry
+
+    out = await LocalExecutor(tmp_path).execute("run_command", {"command": "echo hi"})
+    assert "hi" in out
+    assert list(_command_registry().glob("*.json")) == []
