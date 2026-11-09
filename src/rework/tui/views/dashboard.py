@@ -243,12 +243,21 @@ class DashboardView(View):
         done_week = sum(
             1 for m in snap.missions if status_value(m.status) == "done" and m.updated_at > week_ago
         )
+        if not snap.loaded:
+            # owner screenshot: zeros everywhere looked like real data while the
+            # first refresh was still pending (or the database was unreachable)
+            note = "offline" if not snap.online else "connecting…"
+            for sid in ("st-running", "st-gates", "st-paused", "st-done", "st-today", "st-week"):
+                self.query_one(f"#{sid}", Stat).set("—", note)
+            return
         self.query_one("#st-running", Stat).set(str(counts.get("running", 0)))
         self.query_one("#st-gates", Stat).set(str(len(snap.gates)))
         self.query_one("#st-paused", Stat).set(str(counts.get("on_hold", 0)))
         self.query_one("#st-done", Stat).set(str(done_week))
         self.query_one("#st-today", Stat).set(money(snap.spend_today))
-        self.query_one("#st-week", Stat).set(money(self.spend_week))
+        self.query_one("#st-week", Stat).set(
+            money(self.spend_week) if self._enriched_at else "—", "" if self._enriched_at else "…"
+        )
         self.query_one("#st-gates").set_class(bool(snap.gates), "-warn")
 
         # projects

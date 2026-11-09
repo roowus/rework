@@ -254,6 +254,32 @@ async def test_a_hanging_database_never_freezes_input(
         assert app.is_running
 
 
+async def test_stats_say_not_loaded_instead_of_zero(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Owner screenshot: the Dashboard showed 0 / $0 everywhere while its first
+    refresh had not landed, which reads as real data."""
+    import asyncio as _asyncio
+
+    from rework.tui import data as data_mod
+    from rework.tui.widgets.base import Stat
+
+    monkeypatch.setattr(data_mod, "QUERY_TIMEOUT_S", 3600.0)
+
+    async def hang(self, fn):  # type: ignore[no-untyped-def]
+        await _asyncio.sleep(3600)
+
+    monkeypatch.setattr(data_mod.TuiData, "_call", hang)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause(0.3)
+        await _asyncio.wait_for(pilot.press("alt+2"), timeout=3)
+        await pilot.pause(0.3)
+        app.view("dashboard").on_snapshot(app.hub.snapshot)
+        running = app.query_one("#st-running", Stat)
+        assert running._value == "—" and running._sub == "connecting…"
+
+
 async def test_a_slow_database_ends_up_offline(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A read that does not answer within QUERY_TIMEOUT_S counts as a dead
     connection: the status bar says offline instead of waiting forever."""
