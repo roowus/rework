@@ -695,3 +695,51 @@ async def test_spawn_refuses_a_model_whose_provider_keeps_failing(world: dict[st
     out = [m.body.get("content", "") for m in msgs if m.role == "tool"]
     assert any("already failed 2 runs" in t and "choose another" in t for t in out)
     assert not [r for r in await store.list_runs("mo") if r.step == "look"]
+
+
+async def test_long_missions_still_see_their_newest_events(world: dict[str, Any]) -> None:
+    """Found live on a 9000-event mission: events_since(0, limit=N) returns the
+    OLDEST N events, so an owner message and a role's latest steps were
+    invisible to the orchestrator. Its event reads page forward."""
+    from rework.kernel.state.records import EventRecord, EventType, Run
+    from rework.orchestrator.agent import MissionOrchestrator
+
+    store: SqliteStore = world["store"]
+    await store.create_run(
+        Run(
+            id="mo:code:coder:1",
+            mission_id="mo",
+            role="coder",
+            step="code",
+            status=RunStatus.RUNNING,
+        )
+    )
+    for i in range(1200):
+        await store.append_event(
+            EventRecord(
+                mission_id="mo",
+                run_id="mo:code:coder:1",
+                type=EventType.PROGRESS,
+                payload={"note": f"filler {i}"},
+            )
+        )
+    await store.append_event(
+        EventRecord(
+            mission_id="mo",
+            run_id="mo:code:coder:1",
+            type=EventType.PROGRESS,
+            payload={"trajectory": "turn", "turn": 99, "text": "the newest step"},
+        )
+    )
+    await store.append_event(
+        EventRecord(mission_id="mo", type=EventType.OWNER_MESSAGE, payload={"text": "use flash"})
+    )
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    owner = await orch._owner_messages()
+    assert [e.payload["text"] for e in owner] == ["use flash"]
+    assert "the newest step" in await orch._check_in("mo:code:coder:1", 5)
+    # incremental: a second read fetches only what is new
+    await store.append_event(
+        EventRecord(mission_id="mo", type=EventType.OWNER_MESSAGE, payload={"text": "and hurry"})
+    )
+    assert [e.payload["text"] for e in await orch._owner_messages()] == ["use flash", "and hurry"]

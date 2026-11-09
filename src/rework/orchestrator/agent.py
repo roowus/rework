@@ -341,6 +341,11 @@ class MissionOrchestrator:
         self.seen: dict[str, str] = {}  # run id -> status already reported
         self.questions_seen: set[str] = set()  # escalation ids already reported
         self.owner_seq = 0  # last owner message delivered
+        # every event of the mission, read forward with a seq cursor (found
+        # live: events_since(0, limit=N) returns the OLDEST N events, so on a
+        # 9000-event mission owner messages and check-ins were invisible)
+        self._events: list[Any] = []
+        self._event_cursor = 0
         self.finished: tuple[str, str] | None = None
         self._provider: Any = None
 
@@ -746,6 +751,19 @@ class MissionOrchestrator:
         await self.r._supervisor.ensure_started(created)
         return f"spawned {created.id} ({role}, model {model or 'role default'})"
 
+    async def _all_events(self) -> list[Any]:
+        """All mission events, oldest first; only new ones are fetched."""
+        while True:
+            batch = await self.store.events_since(
+                self._event_cursor, mission_id=self.mid, limit=500
+            )
+            if not batch:
+                return self._events
+            self._events.extend(batch)
+            self._event_cursor = max(int(e.seq or 0) for e in batch)
+            if len(batch) < 500:
+                return self._events
+
     async def _provider_failures(self, model: str, runs: list[Run]) -> int:
         """Failed runs on `model` whose error looks like the provider's fault."""
         failed = [
@@ -755,7 +773,7 @@ class MissionOrchestrator:
         ]
         if not failed:
             return 0
-        events = await self.store.events_since(0, mission_id=self.mid, limit=9000)
+        events = await self._all_events()
         errors: dict[str, str] = {}
         for ev in events:
             if ev.run_id and (ev.payload or {}).get("error"):
@@ -856,7 +874,7 @@ class MissionOrchestrator:
         if run.status == RunStatus.COMPLETED:
             return f"{run.id} ({run.role}) completed: {artifact_summary(run.artifact)}"
         reason = ""
-        events = await self.store.events_since(0, mission_id=self.mid, limit=2000)
+        events = await self._all_events()
         for ev in reversed(events):
             if ev.run_id == run.id and (ev.payload or {}).get("error"):
                 reason = str(ev.payload["error"])[:300]
@@ -886,11 +904,7 @@ class MissionOrchestrator:
         run = await self.store.get_run(run_id)
         if run is None or run.mission_id != self.mid:
             raise ToolError(f"no run {run_id!r} in this mission")
-        events = [
-            e
-            for e in await self.store.events_since(0, mission_id=self.mid, limit=5000)
-            if e.run_id == run_id
-        ]
+        events = [e for e in await self._all_events() if e.run_id == run_id]
         lines = []
         for ev in events[-max(1, min(last, 40)) :]:
             p = ev.payload or {}
@@ -1022,8 +1036,11 @@ class MissionOrchestrator:
         return f"{run_id} will see it at its next turn"
 
     async def _owner_messages(self) -> list[Any]:
-        events = await self.store.events_since(self.owner_seq, mission_id=self.mid, limit=500)
-        return [e for e in events if e.type == EventType.OWNER_MESSAGE]
+        return [
+            e
+            for e in await self._all_events()
+            if e.type == EventType.OWNER_MESSAGE and int(e.seq or 0) > self.owner_seq
+        ]
 
     async def _pending_owner_messages(self) -> bool:
         return bool(await self._owner_messages())
