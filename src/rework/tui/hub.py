@@ -63,6 +63,10 @@ class Hub:
         self.snapshot = Snapshot()
         self._listeners: list[Callable[[Snapshot], None]] = []
         self._busy = False
+        # offline backoff (found live: an unreachable host was retried and
+        # logged twice every 2s, 2,400+ warnings in tui.log)
+        self._failures = 0
+        self._next_try = 0.0
         self._on_offline: Callable[[str], None] | None = None
 
     def subscribe(self, fn: Callable[[Snapshot], None]) -> None:
@@ -75,7 +79,7 @@ class Hub:
     async def refresh(self) -> Snapshot:
         """One poll. Single-flight: an overlapping call returns the current
         snapshot instead of stacking queries on a slow link."""
-        if self._busy:
+        if self._busy or time.monotonic() < self._next_try:
             return self.snapshot
         self._busy = True
         try:
@@ -96,8 +100,15 @@ class Hub:
                 snap.online = not self.data._reconnecting_hint
                 snap.error = self.data._reconnecting_hint
                 snap.loaded = True
+                if self._failures:
+                    log.info("back online after %d failed refreshes", self._failures)
+                self._failures = 0
+                self._next_try = 0.0
             except Exception as exc:  # stale data with an offline marker
-                log.warning("hub refresh failed: %s", exc)
+                self._failures += 1
+                if self._failures == 1:  # log the transition, not every poll
+                    log.warning("offline: %s", exc)
+                self._next_try = time.monotonic() + min(30.0, 2.0**self._failures)
                 snap.online = False
                 snap.error = f"{type(exc).__name__}: {exc}"[:200]
             snap.at = time.time()
@@ -134,8 +145,8 @@ class Hub:
         try:
             return await call()
         except Exception as exc:
-            log.warning("query failed: %s", exc)
             if self.snapshot.online:
+                log.warning("query failed: %s", exc)
                 self.snapshot.online = False
                 self.snapshot.error = f"{type(exc).__name__}: {exc}"[:200]
                 self._broadcast()

@@ -96,3 +96,30 @@ def test_reader_filters_and_formats(log_env: Path) -> None:
     assert [r["msg"] for r in logs.read_logs(grep="OFFLINE")] == ["offline: timeout"]
     line = logs.format_record(rows[1])
     assert "error" in line and "mission=m-2" in line
+
+
+async def test_hub_backs_off_and_logs_only_transitions(caplog) -> None:  # type: ignore[no-untyped-def]
+    """Found live: an unreachable database was retried and logged every 2s."""
+    from rework.tui.hub import Hub
+
+    class Down:
+        _reconnecting_hint = ""
+        calls = 0
+
+        async def missions(self, limit: int = 60):  # type: ignore[no-untyped-def]
+            Down.calls += 1
+            raise OSError("connection timeout expired")
+
+        async def aclose(self) -> None:
+            pass
+
+    hub = Hub(Down())  # type: ignore[arg-type]
+    caplog.set_level(logging.INFO, logger="rework.tui")
+    for _ in range(5):
+        await hub.refresh()
+    assert Down.calls == 1, "backed off: no retry within the backoff window"
+    assert sum("offline" in r.message for r in caplog.records) == 1
+    hub._next_try = 0  # backoff elapsed
+    await hub.refresh()
+    assert Down.calls == 2
+    assert sum("offline" in r.message for r in caplog.records) == 1, "no repeat warning"
