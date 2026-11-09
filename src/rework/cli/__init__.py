@@ -118,7 +118,7 @@ def project_create(
     # typer needs list for repeatable options (tuple[str, ...] chokes on the
     # Ellipsis); ruff B008 flags any list-annotated default, so noqa is the
     # only clean escape (matches the existing ASYNC240 noqa above)
-    repo: list[str] | None = typer.Option(
+    repo: list[str] | None = typer.Option(  # noqa: B008
         None,
         help="Repo reference NAME=URL, repeatable. A URL marks it github-kind;"
         " a local path marks it path-kind (the daemon must see that path).",
@@ -970,7 +970,7 @@ def attach(mission_id: str, follow: bool = True) -> None:
 @app.command()
 def preview(
     pr: int | None = typer.Argument(None, help="Pull request number."),
-    repo_dir: Path | None = typer.Option(None, "--repo-dir", help="Fetch the PR into."),
+    repo_dir: Path | None = typer.Option(None, "--repo-dir", help="Fetch into."),  # noqa: B008
     port: int | None = typer.Option(None, "--port", help="Fixed port (default: a free one)."),
     keep: bool = typer.Option(
         False, "--keep", help="Leave the preview running when the TUI exits."
@@ -1270,7 +1270,7 @@ def library_add(
     type_: str = typer.Option("skill", "--type", help="skill | tool | report | memory"),
     name: str = typer.Option(..., help="Item name (searchable)."),
     description: str = typer.Option("", help="One-line description (searchable)."),
-    tag: list[str] = typer.Option([], "--tag", help="Repeatable."),
+    tag: list[str] = typer.Option([], "--tag", help="Repeatable."),  # noqa: B008
     project: str | None = typer.Option(None, help="Provenance: project id."),
     mission: str | None = typer.Option(None, help="Provenance: mission id."),
 ) -> None:
@@ -1349,7 +1349,7 @@ def library_add_external(
         ..., help="Where this came from (host must be allowlisted to activate)."
     ),
     description: str = typer.Option(""),
-    tag: list[str] = typer.Option([], "--tag", help="Repeatable."),
+    tag: list[str] = typer.Option([], "--tag", help="Repeatable."),  # noqa: B008
 ) -> None:
     """Stage an EXTERNAL item (from the web). Always lands proposed; needs an
     allowlisted host + explicit owner approval to ever go active."""
