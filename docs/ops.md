@@ -17,6 +17,13 @@ daemon clones `github.com/roowus/rework`, runs the roles in
 `~/.rework/work/`, and stops at the final gate (open_pr for fix-pr). Approving
 it pushes the branch and opens the PR with your local `gh` login.
 
+A sleeping Mac pauses every local mission: nothing fails, it just stops
+until the lid opens (seen 2026-11-09: four stalls that looked like hangs
+were clamshell sleep; check `pmset -g log | grep -E "Sleep|Wake"` before
+debugging a silent mission). `scripts/rework-local serve` runs under
+`caffeinate -i`, which stops idle sleep but not a lid close on battery, so
+run long missions on rewvis when you step away.
+
 Any CLI command works the same way: `scripts/rework-local ls`,
 `scripts/rework-local gates`, `scripts/rework-local new --plan fix-pr --project
 rework "..."`.

@@ -15,4 +15,10 @@ export REWORK_CHECKPOINTS_DB="$state/local-checkpoints.sqlite3"
 export REWORK_HTTP_HOST=127.0.0.1
 export REWORK_HTTP_PORT="${REWORK_LOCAL_PORT:-8941}"
 export REWORK_DAEMON_URL="http://127.0.0.1:${REWORK_HTTP_PORT}"
+# a sleeping Mac freezes every mission (asyncio timers stop with the clock);
+# keep it awake while the daemon serves. caffeinate cannot stop a lid-close
+# sleep on battery: use rewvis for long missions away from the desk.
+if [[ "${1:-}" == "serve" ]] && command -v caffeinate >/dev/null 2>&1; then
+  exec caffeinate -i uv run --project "$here" rework "$@"
+fi
 exec uv run --project "$here" rework "$@"
