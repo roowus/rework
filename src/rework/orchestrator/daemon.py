@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -28,6 +29,14 @@ log = logging.getLogger("rework.daemon")
 
 class DaemonLocked(Exception):
     pass
+
+
+def preview_dispatch_allowed() -> bool:
+    """A preview daemon (ADR 0008) does not dispatch role runs unless its owner
+    opted in with --allow-missions (REWORK_PREVIEW_ALLOW_MISSIONS=1)."""
+    if not os.environ.get("REWORK_PREVIEW"):
+        return True
+    return bool(os.environ.get("REWORK_PREVIEW_ALLOW_MISSIONS"))
 
 
 def sqlite_checkpointer_factory(checkpoints_db: str) -> CheckpointerFactory:
@@ -149,6 +158,12 @@ class Daemon:
             await self._spawn_runner(mission.id)
 
     async def _spawn_runner(self, mission_id: str) -> None:
+        if not preview_dispatch_allowed():
+            log.info(
+                "preview mode: mission dispatch disabled "
+                "(set REWORK_PREVIEW_ALLOW_MISSIONS=1 or use --allow-missions)"
+            )
+            return
         if mission_id in self._runners and not self._runners[mission_id].done():
             return
 

@@ -1000,6 +1000,74 @@ def attach(mission_id: str, follow: bool = True) -> None:
 
 
 @app.command()
+def tui() -> None:
+    """Open the TUI dashboard (the same one bare `rework` starts)."""
+    from rework.tui import run_tui
+
+    run_tui()
+
+
+@app.command()
+def preview(
+    pr: int | None = typer.Argument(None, help="Pull request number."),
+    repo_dir: Path | None = typer.Option(None, "--repo-dir", help="Fetch into."),  # noqa: B008
+    port: int | None = typer.Option(None, "--port", help="Fixed port (default: a free one)."),
+    keep: bool = typer.Option(
+        False, "--keep", help="Leave the preview running when the TUI exits."
+    ),
+    allow_missions: bool = typer.Option(
+        False, "--allow-missions", help="Let the preview daemon dispatch role runs."
+    ),
+    list_: bool = typer.Option(False, "--list", help="List known previews."),
+    rm: int | None = typer.Option(None, "--rm", help="Stop and delete preview <n>."),
+) -> None:
+    """Run pull request <n>'s build as a fully isolated second instance
+    (ADR 0008): its own worktree, venv, state copy, dirs and port."""
+    import subprocess as _subprocess
+
+    from rework import preview as preview_mod
+
+    if list_:
+        rows = preview_mod.list_previews()
+        if not rows:
+            typer.echo("no previews")
+            return
+        typer.echo("pr  branch                    port   pid    alive  created")
+        for row in rows:
+            typer.echo(
+                f"{row.get('pr')!s:<3} {row.get('branch', '')!s:<24} "
+                f"{row.get('port', '')!s:<6} {row.get('pid', '')!s:<6} "
+                f"{'yes' if row.get('alive') else 'no':<6} {row.get('created_at', '')}"
+            )
+        return
+    if rm is not None:
+        preview_mod.remove_preview(rm, repo_dir)
+        typer.echo(f"removed preview #{rm}")
+        return
+    if pr is None:
+        typer.secho("give a pull request number (or --list / --rm)", fg=typer.colors.RED)
+        raise typer.Exit(2)
+    if repo_dir is None:
+        top = _subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True
+        )
+        if top.returncode != 0:
+            typer.secho("not inside a git repo; pass --repo-dir", fg=typer.colors.RED)
+            raise typer.Exit(2)
+        repo_dir = Path(top.stdout.strip())
+    try:
+        preview_mod.create_preview(pr, repo_dir, keep, allow_missions, port)
+    except _subprocess.CalledProcessError as exc:
+        typer.secho(f"command failed: {exc.cmd}", fg=typer.colors.RED)
+        raise typer.Exit(2) from exc
+    except (OSError, RuntimeError) as exc:
+        # create_preview tears the preview down before re-raising: report the
+        # cause on one line instead of a traceback
+        typer.secho(f"preview failed: {exc}", fg=typer.colors.RED)
+        raise typer.Exit(2) from exc
+
+
+@app.command()
 def serve() -> None:
     """Run the headless daemon (one per database; leader-locked)."""
     from pathlib import Path

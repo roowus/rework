@@ -94,3 +94,65 @@ ssh ubuntu@100.107.125.118 "docker exec rework-dev-pg psql -U postgres -d rework
 Tests never touch `rework_state`. Postgres tests use the dedicated
 `rework_test` database:
 `REWORK_TEST_POSTGRES=postgresql://postgres:rework@100.107.125.118:5433/rework_test`.
+
+## Preview a PR
+
+`rework preview <n>` runs pull request <n>'s build as a fully isolated second
+instance, without touching the real one:
+
+- fetches `refs/pull/<n>/head` from origin into `~/.rework/previews/<n>/repo`
+  (a git worktree on branch `rework/preview-pr-<n>`) and runs `uv sync` there;
+- copies the state DB with sqlite's backup API into the preview dir (if
+  `REWORK_DB` points at Postgres, or at a sqlite file that does not exist, the
+  preview starts on a fresh SQLite database instead and says so);
+- picks a free port and starts the preview's own daemon in the background
+  (logs: `~/.rework/previews/<n>/daemon.log`);
+- opens the preview build's TUI in the same terminal, labelled
+  `PREVIEW #<n>`.
+
+Quitting that TUI stops the preview daemon and removes the preview. If the TUI
+itself exits nonzero the preview is kept either way -- the daemon is stopped,
+but the dir, worktree, descriptor and daemon log stay so the failure can be
+read, and the command prints the log path and `rework preview --rm <n>`.
+Flags:
+
+- `--keep` — leave the preview running after the TUI exits; the command prints
+  how to remove it and a ready-to-paste attach command that carries the whole
+  preview env (`REWORK_DB`, `REWORK_HTTP_PORT`, `REWORK_DAEMON_URL`, the
+  preview's library/log/results/reports dirs, `REWORK_TARGET_NAME='PREVIEW
+  #<n>'`) and runs `uv run --project ~/.rework/previews/<n>/repo rework`.
+  Set `REWORK_PREVIEW=<n>` alone and nothing would read it: only the preview
+  daemon's dispatch guard consults that variable, so the TUI would open the
+  real instance's DB and port.
+- `--allow-missions` — let the preview dispatch role runs. By default the
+  missions in the copied state DB are frozen first (any pending/running/
+  awaiting_gate/on_hold row is set to `cancelled`, and the count is printed), so
+  the preview daemon has nothing to recover or dispatch — the guard inside the
+  previewed build cannot protect us, since an older PR does not have it. Pass
+  `--allow-missions` to skip the freeze and keep the copy as-is.
+- `rework preview --list` — show known previews (port, pid, liveness).
+- `rework preview --rm <n>` — stop and delete a preview (worktree, branch,
+  state copy, descriptor). It works even when the descriptor is missing: the
+  worktree is unregistered from `--repo-dir` (or the repo you are in) and
+  pruned, and without a resolvable repo it prints the manual `git worktree
+  prune` / `git branch -D` commands. When git cleanup fails (a locked worktree,
+  a branch still checked out) the preview dir and descriptor are still deleted
+  and the command prints the failing stderr plus the exact manual recovery
+  commands.
+
+A preview whose worktree directory was deleted by hand (or by an interrupted
+`--rm`) does not wedge the next `rework preview <n>`: the stale registration is
+dropped before the worktree is re-added. If the daemon cannot be spawned (no
+`uv` on `PATH`) or never becomes ready, the command tears the half-built
+preview down and exits 2 with a one-line message.
+
+The preview command runs the preview build's TUI as bare `rework` inside the
+worktree, not `rework tui`: the previewed PR may predate the `tui` command,
+while every build's CLI opens the TUI when given no arguments. `rework tui` is
+still there for the instance you are in.
+
+Previews live under `~/.rework/previews/<n>/` (override the root with
+`REWORK_PREVIEW_DIR`); a descriptor `~/.rework/previews/<n>.json` records the
+port, pid and paths. In the TUI, mission cards with an open PR get a
+**Preview** button that runs the same command and returns to the main TUI
+when done.
