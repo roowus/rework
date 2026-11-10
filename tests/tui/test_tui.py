@@ -1267,6 +1267,157 @@ async def test_menu_preview_a_pr_opens_modal_with_no_mission_focused(
         assert form.query_one("#f-pr").value == ""
 
 
+async def _add_mission(
+    store: Any,
+    mid: str,
+    *,
+    created_at: float,
+    project_id: str | None = None,
+    repo_path: str | None = None,
+) -> None:
+    """One extra mission, seeded through the real store (newest = biggest ts)."""
+    from rework.kernel.state.records import Mission, MissionStatus
+
+    await store.create_mission(
+        Mission(
+            id=mid,
+            objective=f"seeded mission {mid}",
+            project_id=project_id,
+            repo_path=repo_path,
+            status=MissionStatus.DONE,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+    )
+
+
+async def _prefill_with_work_project(ids: dict[str, str], pilot: Any, app: ReworkApp) -> str:
+    """Open the modal with the Work tab's project selected (the seed's chat)."""
+    app.query_one("#chat-list", RowList).activate(ids["chat"], via_mouse=True)
+    await _settle(pilot, 1.0)
+    assert app.view("work").project_id == ids["project"]
+    form = await _open_preview_modal(pilot, app)
+    return str(form.query_one("#f-repo").value)
+
+
+async def test_preview_prefill_takes_the_newest_mission_in_the_project(
+    ids: dict[str, str], env: Path, tmp_path: Path
+) -> None:
+    """Newest wins, not oldest: two missions of the selected project, both with
+    a repo path, and the prefill must be the newer one's."""
+    import time as _time
+
+    older = tmp_path / "older-repo"
+    newer = tmp_path / "newer-repo"
+    now = _time.time()
+    store = await _store(env)
+    try:
+        await _add_mission(
+            store,
+            "m-preview000a",
+            created_at=now - 7200,
+            project_id=ids["project"],
+            repo_path=str(older),
+        )
+        await _add_mission(
+            store,
+            "m-preview000b",
+            created_at=now - 60,
+            project_id=ids["project"],
+            repo_path=str(newer),
+        )
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        assert await _prefill_with_work_project(ids, pilot, app) == str(newer)
+
+
+async def test_preview_prefill_prefers_the_selected_project_over_a_newer_mission(
+    ids: dict[str, str], env: Path, tmp_path: Path
+) -> None:
+    """Project-scoped: a NEWER mission outside the selected project must not
+    override an older one inside it."""
+    import time as _time
+
+    inside = tmp_path / "inside-repo"
+    outside = tmp_path / "outside-repo"
+    now = _time.time()
+    store = await _store(env)
+    try:
+        await _add_mission(
+            store,
+            "m-preview000c",
+            created_at=now - 7200,
+            project_id=ids["project"],
+            repo_path=str(inside),
+        )
+        await _add_mission(store, "m-preview000d", created_at=now - 60, repo_path=str(outside))
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        assert await _prefill_with_work_project(ids, pilot, app) == str(inside)
+
+
+async def test_preview_prefill_falls_back_to_the_newest_mission_overall(
+    ids: dict[str, str], env: Path, tmp_path: Path
+) -> None:
+    """The selected project has NO repo_path-bearing mission: the newest mission
+    overall supplies the path (the seed's project missions have none)."""
+    import time as _time
+
+    older = tmp_path / "global-older-repo"
+    newer = tmp_path / "global-newer-repo"
+    now = _time.time()
+    store = await _store(env)
+    try:
+        await _add_mission(store, "m-preview000e", created_at=now - 7200, repo_path=str(older))
+        await _add_mission(store, "m-preview000f", created_at=now - 60, repo_path=str(newer))
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        assert await _prefill_with_work_project(ids, pilot, app) == str(newer)
+
+
+async def test_preview_prefill_ignores_a_newer_mission_without_a_repo_path(
+    ids: dict[str, str], env: Path, tmp_path: Path
+) -> None:
+    """A newer mission with repo_path=None must not shadow an older one that has
+    a path -- neither inside the project nor in the overall fallback."""
+    import time as _time
+
+    has_path = tmp_path / "has-path-repo"
+    now = _time.time()
+    store = await _store(env)
+    try:
+        await _add_mission(
+            store,
+            "m-preview000g",
+            created_at=now - 7200,
+            project_id=ids["project"],
+            repo_path=str(has_path),
+        )
+        # newer, same project, but no path: must be skipped, not returned
+        await _add_mission(store, "m-preview000h", created_at=now - 60, project_id=ids["project"])
+        # newest mission of all, project-less and pathless: also skipped
+        await _add_mission(store, "m-preview000i", created_at=now - 30)
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        assert await _prefill_with_work_project(ids, pilot, app) == str(has_path)
+
+
 async def test_preview_pr_refuses_non_digit_number(
     ids: dict[str, str], env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
