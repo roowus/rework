@@ -122,6 +122,20 @@ coder by respawning on `flash`, audited, finished with an accurate summary.
 | 6 | Four silent stalls looked like hangs | clamshell sleep: timers stop while the Mac sleeps (an earlier "model call hung" diagnosis was this) | mitigated: `rework-local serve` runs under `caffeinate -i`; ops.md says to check `pmset -g log` first |
 | 7 | A daemon restart left its roles' child processes running | children are not reaped when the daemon dies | fixed: commands are registered; a new daemon reaps trees whose owner died |
 
+| 8 | Squash-merge put the whole brief on main as the commit title (#5) | the coder's commit subject was the brief | fixed: subject is the mission title (72 chars), brief in the body |
+| 9 | A budget gate waited 4.5 hours unseen | nothing told the owner | fixed: `REWORK_NOTIFY_CMD` on every gate; `rework-local serve` defaults to a macOS banner |
+| 10 | A bare repo and a clone (gitlink) were committed; two audits missed them | handoff `git add -A`; the auditor's diff was cut at 60k | fixed: handoff unstages nested repos; auditor gets the full file list first |
+| 11 | `rework preview` opened no TUI, and later resumed a real mission from the copied DB | the previewed build has no `tui` command; the copy's in-flight missions were recovered | fixed in #7 after the owner's end-to-end runs (bare `rework`; freeze the copy's missions) |
+| 12 | The 80-turn cap failed the mission one step before its PR | runaway cap ended missions outright | fixed: the cap opens a gate ("allow 40 more?") |
+| 13 | kimi-k3 timed out on every orchestrator call though it answers in 0.8s | the orchestrator never compacted (335k chars per turn, cold cache) | fixed: roles' compaction rule (205k -> 50k chars) |
+| 14 | After its own model failed the mission failed, flash healthy | the model switch covered roles only | fixed: the orchestrator switches its own model, fails only when all have failed |
+
+Outcome: PR #7 merged after 5 audit rounds and 3 owner end-to-end runs;
+$7.07 total. The Preview button was verified in a real pty (suspend, preview
+TUI with PREVIEW #7, return, clean teardown). Lesson: run the feature the way
+the owner will before the PR gate; the last two blockers were invisible to
+audits and unit tests.
+
 What worked: the orchestrator asked for budget before running out with an
 honest status, cancelled a coder and switched to `flash` on the owner's word,
 and gave its coders tight briefs after two of them explored instead of editing.
