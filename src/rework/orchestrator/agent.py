@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 
 MARKER = "You are the MISSION ORCHESTRATOR"
 MAX_TURNS = 80  # runaway protection only; the budget is the real rail
+TURN_EXTENSION = 40  # per owner approval at the cap
 MAX_IDLE_NUDGES = 3
 PROVIDER_FAILURE_LIMIT = 2  # failed runs on one model before spawn_role refuses it
 
@@ -478,10 +479,14 @@ class MissionOrchestrator:
             if signal == "cancelled":
                 await self.r._synthesize(self.mid, None)
                 return
-            if turns >= MAX_TURNS:
-                await self._note(f"turn cap ({MAX_TURNS}) reached; finishing as failed")
-                self.finished = ("failed", f"orchestrator hit its {MAX_TURNS}-turn cap")
-                return
+            if turns >= await self._turn_cap():
+                # ask, don't fail: found live, the cap killed a large mission one
+                # step before its PR, with every role's work committed
+                if not await self._ask_more_turns(turns):
+                    await self._note(f"turn cap reached at {turns}; owner declined more")
+                    self.finished = ("failed", f"orchestrator hit its turn cap ({turns} turns)")
+                    return
+                continue
             turns += 1
             await self._deliver_owner_messages()
             result = await self._think()
@@ -1042,6 +1047,47 @@ class MissionOrchestrator:
                 )
                 return f"owner: {text} (passed to {run_id})"
         return f"owner: {text}"
+
+    async def _turn_cap(self) -> int:
+        """MAX_TURNS plus TURN_EXTENSION per approved extension (gate rows, so
+        the allowance survives a restart)."""
+        granted = sum(
+            1
+            for g in await self.store.list_gates(self.mid)
+            if (g.spec or {}).get("turn_cap") and g.status == GateStatus.APPROVED
+        )
+        return MAX_TURNS + TURN_EXTENSION * granted
+
+    async def _ask_more_turns(self, turns: int) -> bool:
+        from rework.kernel.state.records import GateKind
+
+        gate = next(
+            (
+                g
+                for g in await self.store.list_gates(self.mid)
+                if (g.spec or {}).get("turn_cap") and g.status == GateStatus.OPEN
+            ),
+            None,
+        )
+        if gate is None:
+            spend = await self.store.mission_spend(self.mid)
+            gate = await self.r._gates.request(
+                self.mid,
+                kind=GateKind.PERMISSION,
+                question=(
+                    f"The orchestrator has taken {turns} turns (its runaway cap; "
+                    f"${spend.spent_usd:.2f} spent). Allow {TURN_EXTENSION} more?"
+                ),
+                spec={"turn_cap": True, "asked_by": "engine"},
+            )
+        await self.store.update_mission(self.mid, status=MissionStatus.AWAITING_GATE)
+        while True:
+            row = await self.store.get_gate(gate.id)
+            if row is not None and row.status != GateStatus.OPEN:
+                break
+            await asyncio.sleep(self.r._poll)
+        await self.store.update_mission(self.mid, status=MissionStatus.RUNNING)
+        return row.status == GateStatus.APPROVED
 
     async def _request_budget(self, call_id: str, args: dict[str, Any]) -> str:
         """One question about money, and the answer moves the real cap. Found

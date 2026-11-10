@@ -767,3 +767,49 @@ async def test_request_budget_raises_the_real_cap(world: dict[str, Any]) -> None
     assert any(
         "budget raised to $5.00" in m.body.get("content", "") for m in msgs if m.role == "tool"
     )
+
+
+async def _decide_next_gate(world: dict[str, Any], approved: bool) -> Any:
+    store = world["store"]
+    for _ in range(300):
+        gates = await store.list_open_gates(world["mission"].id)
+        if gates:
+            second = await open_sqlite(world["db"])
+            try:
+                await GateManager(second, InProcessEventBus(second)).decide(
+                    gates[0].id, approved=approved
+                )
+            finally:
+                await second.aclose()
+            return gates[0]
+        await asyncio.sleep(0.1)
+    raise AssertionError("no gate opened")
+
+
+@pytest.mark.parametrize("approved", [True, False])
+async def test_the_turn_cap_asks_the_owner_instead_of_failing(
+    world: dict[str, Any], monkeypatch: pytest.MonkeyPatch, approved: bool
+) -> None:
+    """Found live: the 80-turn cap failed a large mission one step before its
+    PR. At the cap the owner is asked; approval grants more turns."""
+    from rework.orchestrator import agent
+
+    monkeypatch.setattr(agent, "MAX_TURNS", 2)
+    provider: ScriptedProvider = world["provider"]
+    provider.route(
+        MARKER,
+        [
+            turn(call("message_owner", "t1", text="one")),
+            turn(call("message_owner", "t2", text="two")),
+            turn(call("finish", "t3", outcome="failed", summary="finished after the extension")),
+        ],
+    )
+    task = asyncio.create_task(runner(world).run())
+    gate = await _decide_next_gate(world, approved)
+    assert gate.kind.value == "permission" and "Allow 40 more" in gate.question
+    await asyncio.wait_for(task, timeout=30)
+    msgs = await world["store"].chat_messages(orchestrator_chat_id("mo"))
+    finished = any(
+        tc.get("name") == "finish" for m in msgs for tc in (m.body.get("tool_calls") or [])
+    )
+    assert finished is approved
