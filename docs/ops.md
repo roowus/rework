@@ -65,6 +65,45 @@ On rewvis the daemon's console lines also go to journald
 
 `REWORK_LOG_LEVEL=DEBUG` adds detail. Prompts and keys are never logged.
 
+## Get notified when rework needs you
+
+A budget gate once sat open for 4.5 hours because nobody was looking at the
+TUI. `REWORK_NOTIFY_CMD` is the fix: the daemon runs that shell command every
+time a gate opens, i.e. whenever rework needs your attention or a decision.
+
+The command gets the gate in its environment:
+
+| variable | meaning |
+| --- | --- |
+| `REWORK_GATE_ID` | the gate's id (`rework gates`, `rework approve <id>`) |
+| `REWORK_GATE_KIND` | the kind of gate that opened (e.g. `open_pr`, `question`) |
+| `REWORK_GATE_QUESTION` | the question being asked, truncated to 500 chars |
+| `REWORK_MISSION_ID` | the mission the gate belongs to |
+
+It is fire-and-forget: the daemon waits at most 30 seconds and never blocks a
+mission on it. A nonzero exit or a failure is only logged (see
+[Logs](#logs)) -- the gate stays open either way, and so does the mission.
+
+`scripts/rework-local serve` sets the variable for you when it is unset (and
+`osascript` is available): a macOS banner with the gate question. That is the
+whole default:
+
+```bash
+export REWORK_NOTIFY_CMD='osascript -e "display notification (system attribute \"REWORK_GATE_QUESTION\") with title \"rework needs you\""'
+```
+
+Away from the Mac (rewvis, phone), push to your phone with ntfy.sh instead.
+The topic is the only secret, so pick a long random one:
+
+```bash
+export REWORK_NOTIFY_CMD='curl -s -d "$REWORK_GATE_QUESTION" \
+  -H "Title: rework: $REWORK_GATE_KIND gate" \
+  -H "Tags: robot" ntfy.sh/rewvis-rework-<long-random-topic>'
+```
+
+Set it yourself to use anything else (a webhook, a script); on rewvis put it
+in `~/.rework/rework.env`.
+
 ## rewvis (the deployment)
 
 The daemon runs as `rework.service` (systemd, User=ubuntu) on rewvis
