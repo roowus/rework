@@ -17,6 +17,7 @@ from typing import Any
 from textual import work
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.widgets import ContentSwitcher, Markdown, Static
 
 from rework.tui import actions
@@ -500,9 +501,16 @@ class DashboardView(View):
         )
         if self.mission_id != mission_id:
             return
-        self._paint_mission_static()
-        self._paint_runs()
-        self._paint_detail_tabs()
+        # the app can close while this worker awaits. Teardown removes children
+        # first, so the view is still attached while '#m-header' (composed
+        # statically, so only ever missing then) is gone; painting raised
+        # NoMatches and failed tests under load (m7 findings #19: 2 of 8 runs)
+        try:
+            self._paint_mission_static()
+            self._paint_runs()
+            self._paint_detail_tabs()
+        except NoMatches:
+            return
 
     def _paint_mission_static(self) -> None:
         mission = self.snap.mission(self.mission_id)
