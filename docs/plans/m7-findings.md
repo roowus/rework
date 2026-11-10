@@ -133,6 +133,12 @@ coder by respawning on `flash`, audited, finished with an accurate summary.
 | 17 | PR #9 failed CI on ruff format | coder prompt said "run the test suite"; audits re-ran tests only; CLAUDE.md listed no formatter | fixed: roles run what `.github/workflows` runs |
 | 18 | A finished mission card lost its cost after #9 | the new finished path skipped the spend fetch | fixed (found by checking #9 in the real TUI after merge) |
 | 19 | test_dashboard_graph_and_tabs_render flaky (about 1 in 5 tests/tui runs) | the poll worker painted after app teardown began; children go first, so NoMatches | fixed: 0 of 16 runs after |
+| 20 | The chat agent copied an operator skill ("label the mission with its project") into an objective | Library guidance about creating missions was forwarded, not applied | fixed: chat prompt |
+| 21 | A network drop failed a mission (every model shares one provider) | the model fallback had nothing left | fixed: when every model fails transiently, wait (about 7.5 min) and start over |
+| 22 | kimi-k3 "stalls" were long answers: 8192-token replies took 114-132s, slower ones crossed 180s, and retries regenerated them | a flat client timeout | fixed: every OpenAI-compatible call streams with a 90s idle timeout (measured: chunk gaps under 1s, cached tokens kept) |
+| 23 | Replies cut at max_tokens were accepted as final (two 8192-token investigator reports) | the adapter reported every text reply as end_turn | fixed: `max_tokens` stop reason; the loop asks for the rest |
+| 24 | The halfway progress check | measured on m-58d05d4101c7: fired at turn 20 of 40 with nothing edited; the coder then produced +257 lines | working |
+| 25 | "ctrl+s save" on the Preview a PR form | the form hint was fixed text | fixed (found running #11 end to end) |
 
 Outcome: PR #7 merged after 5 audit rounds and 3 owner end-to-end runs;
 $7.07 total. The Preview button was verified in a real pty (suspend, preview
