@@ -25,5 +25,5 @@ uv.lock~
 pytest_fixture*
 
 # test residue from the preview/local-dogfood fixtures
-work/
-origin.git/
+/work/
+/origin.git/

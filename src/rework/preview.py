@@ -168,11 +168,39 @@ def fresh_sqlite(path: Path) -> None:
     sqlite3.connect(str(path)).close()
 
 
-def prepare_state(n: int, src_db: Path) -> tuple[Path, str | None]:
+def freeze_missions(state_db: Path) -> int:
+    """Cancel the missions the copy inherited, and return how many changed.
+
+    Runs on the COPY, never on the source. The guard inside the previewed build
+    cannot protect the real instance -- an older PR has no REWORK_PREVIEW
+    support at all -- so the copy is disarmed before its daemon starts: no
+    pending/running/awaiting_gate/on_hold mission survives to be recovered or
+    dispatched (the status values are MissionStatus in
+    rework/kernel/state/records.py). A DB without a missions table (or without a
+    status column) freezes nothing instead of raising."""
+    conn = sqlite3.connect(str(state_db))
+    try:
+        try:
+            cur = conn.execute(
+                "UPDATE missions SET status = 'cancelled'"
+                " WHERE status IN ('pending', 'running', 'awaiting_gate', 'on_hold')"
+            )
+            conn.commit()
+        except sqlite3.OperationalError:
+            return 0  # no missions table in this schema version
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def prepare_state(n: int, src_db: Path, allow_missions: bool = False) -> tuple[Path, str | None]:
     """The preview's state DB. Postgres cannot be copied this way, so a preview
     of a Postgres-backed instance starts on a fresh SQLite file instead; a
     missing sqlite source does too, out loud (`sqlite3.connect` would silently
-    create an empty file anyway). The notice is printed and returned."""
+    create an empty file anyway). The notice is printed and returned.
+
+    Unless `allow_missions`, the missions in the copy are frozen (see
+    freeze_missions) before the preview daemon can recover or dispatch them."""
     pdir = preview_dir(n)
     pdir.mkdir(parents=True, exist_ok=True)
     state_db = pdir / "state.sqlite3"
@@ -183,6 +211,13 @@ def prepare_state(n: int, src_db: Path) -> tuple[Path, str | None]:
         notice = f"source DB {src_db} not found; starting preview on a fresh SQLite database"
     else:
         copy_state_db(src_db, state_db)
+        if allow_missions:
+            print("preview: missions allowed (--allow-missions); copied state DB left as-is")
+        else:
+            frozen = freeze_missions(state_db)
+            print(
+                f"preview: froze {frozen} mission(s) in the copied state DB (status -> cancelled)"
+            )
         return state_db, None
     print(notice)
     return state_db, notice
@@ -505,7 +540,7 @@ def create_preview(
         worktree_created = True
         subprocess.run(["uv", "sync", "--project", str(worktree)], check=True)
 
-        state_db, _ = prepare_state(n, source_state_db())
+        state_db, _ = prepare_state(n, source_state_db(), allow_missions)
         checkpoints_db = prepare_checkpoints(n)
 
         port = port or free_port()

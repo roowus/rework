@@ -136,6 +136,92 @@ def test_prepare_state_copies_a_sqlite_db(tmp_path: Path, monkeypatch: pytest.Mo
         copy.close()
 
 
+def _mission_db(path: Path, rows: list[tuple[str, str]]) -> None:
+    """A source-shaped state DB with a real missions table and the given rows."""
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE missions (id TEXT PRIMARY KEY, objective TEXT NOT NULL, status TEXT NOT NULL,"
+        " created_at REAL NOT NULL, updated_at REAL NOT NULL)"
+    )
+    conn.executemany(
+        "INSERT INTO missions VALUES (?, 'obj', ?, 0.0, 0.0)",
+        [(mid, status) for mid, status in rows],
+    )
+    conn.commit()
+    conn.close()
+
+
+def _statuses(path: Path) -> dict[str, str]:
+    conn = sqlite3.connect(path)
+    try:
+        return dict(conn.execute("SELECT id, status FROM missions").fetchall())
+    finally:
+        conn.close()
+
+
+def test_prepare_state_freezes_the_copied_missions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The copied DB must not hand the preview daemon anything to recover or
+    dispatch: the source's own guard lives in the *previewed* build, which may
+    predate it. Only the copy is touched."""
+    src = tmp_path / "state.sqlite3"
+    _mission_db(
+        src,
+        [
+            ("m-running", "running"),
+            ("m-pending", "pending"),
+            ("m-gate", "awaiting_gate"),
+            ("m-hold", "on_hold"),
+            ("m-done", "done"),
+            ("m-cancelled", "cancelled"),
+        ],
+    )
+    before = src.read_bytes()
+    monkeypatch.setenv("REWORK_DB", str(src))
+
+    state_db, notice = preview_mod.prepare_state(7, preview_mod.source_state_db())
+
+    out = capsys.readouterr().out
+    assert notice is None
+    assert "froze 4 mission(s)" in out and "cancelled" in out
+    assert _statuses(state_db) == {
+        "m-running": "cancelled",
+        "m-pending": "cancelled",
+        "m-gate": "cancelled",
+        "m-hold": "cancelled",
+        "m-done": "done",
+        "m-cancelled": "cancelled",
+    }
+    assert src.read_bytes() == before  # the source DB is never written
+    assert _statuses(src)["m-running"] == "running"
+
+
+def test_prepare_state_keeps_missions_when_allowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    src = tmp_path / "state.sqlite3"
+    _mission_db(src, [("m-running", "running"), ("m-pending", "pending")])
+    monkeypatch.setenv("REWORK_DB", str(src))
+
+    state_db, notice = preview_mod.prepare_state(
+        7, preview_mod.source_state_db(), allow_missions=True
+    )
+
+    out = capsys.readouterr().out
+    assert notice is None
+    assert "froze" not in out
+    assert "allow-missions" in out
+    assert _statuses(state_db) == {"m-running": "running", "m-pending": "pending"}
+
+
+def test_freeze_missions_without_a_missions_table(tmp_path: Path) -> None:
+    """A fresh/Postgres-fallback DB has no missions table: 0 frozen, no crash."""
+    db = tmp_path / "empty.sqlite3"
+    preview_mod.fresh_sqlite(db)
+    assert preview_mod.freeze_missions(db) == 0
+
+
 def test_list_and_remove_preview(pr_repo: tuple[Path, str]) -> None:
     work, sha = pr_repo
     worktree = preview_mod.fetch_worktree(7, work)
@@ -420,6 +506,34 @@ def test_create_preview_keeps_a_failed_tui_when_asked(
     preview_mod.remove_preview(7, fake_build)
 
 
+def test_create_preview_keeps_the_preview_when_the_tui_raises(
+    fake_build: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A TUI that *raises* (not just exits nonzero) is the same failure: the
+    daemon is stopped, the preview is kept, and --rm is printed."""
+    stopped: list[object] = []
+    monkeypatch.setattr(preview_mod, "stop_daemon", stopped.append)
+
+    def boom(n: int, worktree: Path, env: dict[str, str]) -> int:
+        raise RuntimeError("no tty")
+
+    monkeypatch.setattr(preview_mod, "run_preview_tui", boom)
+
+    with pytest.raises(RuntimeError, match="no tty"):
+        preview_mod.create_preview(7, fake_build)
+
+    out = capsys.readouterr().out
+    assert "TUI failed" in out and "daemon.log" in out
+    assert "rework preview --rm 7" in out
+    assert stopped
+    assert preview_mod.preview_dir(7).exists()
+    assert preview_mod.descriptor_path(7).exists()
+    assert str(preview_mod.preview_dir(7) / "repo") in _git("worktree", "list", cwd=fake_build)
+    preview_mod.remove_preview(7, fake_build)
+
+
 def test_fetch_worktree_recovers_a_deleted_conventional_worktree(
     pr_repo: tuple[Path, str],
 ) -> None:
@@ -472,6 +586,25 @@ def test_cli_preview_reports_a_spawn_failure_cleanly(
     assert "preview failed" in result.output and "uv" in result.output
     assert "Traceback" not in result.output
     assert not preview_mod.preview_dir(7).exists()
+
+
+def test_run_preview_tui_uses_bare_rework(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A previewed PR may predate the `tui` command, but every build's CLI opens
+    the TUI when given no arguments -- so the preview launches bare `rework`."""
+    seen: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        seen.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(preview_mod.subprocess, "run", fake_run)
+    worktree = tmp_path / "repo"
+    env = {"REWORK_TARGET_NAME": "PREVIEW #7"}
+
+    assert preview_mod.run_preview_tui(7, worktree, env) == 0
+
+    assert seen == [["uv", "run", "--project", str(worktree), "rework"]]
+    assert "tui" not in seen[0]
 
 
 def test_attach_command_carries_the_preview_env() -> None:

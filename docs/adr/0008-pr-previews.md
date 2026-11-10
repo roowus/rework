@@ -401,7 +401,12 @@ dead mission worktrees are.
 4. **Daemon readiness is `/healthz` 200 with an ok body** (not "any HTTP
    answer"), and a missing sqlite `REWORK_DB` yields a fresh preview DB with a
    printed notice instead of a silently created empty file.
-5. **No-execute default.** A preview daemon does not dispatch role runs unless
-   `--allow-missions` was passed (which sets
-   `REWORK_PREVIEW_ALLOW_MISSIONS=1` in the preview daemon env). The guard
-   lives in the daemon's dispatch path.
+5. **No-execute default, in two layers.** (a) Unless `--allow-missions` was
+   passed, `prepare_state` freezes the missions in the *copied* state DB right
+   after the sqlite backup: `status='cancelled'` for every row whose status is
+   `pending`, `running`, `awaiting_gate` or `on_hold`, with the count printed.
+   This layer does not depend on the previewed build — an older PR has no
+   `REWORK_PREVIEW` support at all, so its daemon would otherwise recover and
+   dispatch the real instance's missions. (b) The daemon's dispatch path still
+   refuses role runs unless `REWORK_PREVIEW_ALLOW_MISSIONS=1` (set by
+   `--allow-missions`). The source DB is never written.

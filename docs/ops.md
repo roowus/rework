@@ -117,8 +117,12 @@ Flags:
   Set `REWORK_PREVIEW=<n>` alone and nothing would read it: only the preview
   daemon's dispatch guard consults that variable, so the TUI would open the
   real instance's DB and port.
-- `--allow-missions` — let the preview dispatch role runs. By default a
-  preview runs no missions (safe no-execute posture).
+- `--allow-missions` — let the preview dispatch role runs. By default the
+  missions in the copied state DB are frozen first (any pending/running/
+  awaiting_gate/on_hold row is set to `cancelled`, and the count is printed), so
+  the preview daemon has nothing to recover or dispatch — the guard inside the
+  previewed build cannot protect us, since an older PR does not have it. Pass
+  `--allow-missions` to skip the freeze and keep the copy as-is.
 - `rework preview --list` — show known previews (port, pid, liveness).
 - `rework preview --rm <n>` — stop and delete a preview (worktree, branch,
   state copy, descriptor). It works even when the descriptor is missing: the
