@@ -183,12 +183,12 @@ async def test_finished_mission_tail_rebuilds_from_the_newest_events() -> None:
     app = CardApp(card)
     async with app.run_test() as pilot:
         card.update_from(_status(MissionStatus.DONE), [])
-        early = [_call(i, f"early_tool_{i}") for i in range(1, 7)]
+        early = [_call(i, f"early_tool_{i}") for i in range(1, 5)]
         card.add_events(early)
         await pilot.pause()
         assert "early_tool_1" in _tail_text(card)
 
-        late = [_call(i, f"late_tool_{i}") for i in range(7, 13)]
+        late = [_call(i, f"late_tool_{i}") for i in range(5, 13)]
         card.rebuild_tail(early + late)
         await pilot.pause()
         tail = _tail_text(card)
