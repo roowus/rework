@@ -115,8 +115,25 @@ def translate_response(data: Any) -> ChatResult:
             output_tokens=usage.get("completion_tokens", 0),
             cached_tokens=int(cached),
         ),
-        stop_reason="tool_calls" if tool_calls else "end_turn",
+        # found live: every reply without tool calls was reported as end_turn,
+        # so a report cut off at max_tokens counted as finished
+        stop_reason=(
+            "tool_calls"
+            if tool_calls
+            else "max_tokens"
+            if choice.get("finish_reason") == "length"
+            else "end_turn"
+        ),
     )
+
+
+def client_timeout_s(max_tokens: int | None) -> float:
+    """Long enough for the answer asked for at a slow-but-healthy 35 tokens/s,
+    never under 180s. Found live: kimi-k3 answers of 8192 tokens took 114-132s
+    at 60-70 tok/s; slightly slower ones crossed a flat 180s, and re-sending
+    the same request regenerated the same long answer into the same timeout
+    (what looked like a provider 'stall' on 6% of calls)."""
+    return max(180.0, 60.0 + float(max_tokens or 0) / 35.0)
 
 
 class OpenAICompatProvider:
@@ -136,7 +153,9 @@ class OpenAICompatProvider:
 
     async def complete(self, request: ChatRequest) -> ChatResult:
         payload = translate_request(request)
-        response = await self._client.chat.completions.create(**payload)
+        response = await self._client.chat.completions.create(
+            **payload, timeout=client_timeout_s(request.max_tokens)
+        )
         return translate_response(response.model_dump())
 
 

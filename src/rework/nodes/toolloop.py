@@ -68,6 +68,7 @@ BUDGET_HOLD_GRACE_S = 30.0
 # Tuned on dogfood #2: at 60k/6 a coder re-read dashboard.py ~7 times because
 # its earlier reads had been elided; with prompt caching (~85% hits) keeping
 # context is cheap and re-reading is not.
+MAX_CUT_OFFS = 2  # continuations asked for when a reply hits max_tokens
 PROGRESS_CHECK_MIN = 10  # turn budgets this small get no halfway nudge
 COMPACT_AT = 160_000
 KEEP_RECENT = 12
@@ -309,7 +310,11 @@ def make_toolloop_node(
                 "runs out.",
             }
 
+        cut_offs = 0
+        first_cut = len(messages)
         while turns < limit:
+            if not cut_offs:
+                first_cut = len(messages)
             # the orchestrator can steer a running role (ADR 0007 redirect):
             # the instruction arrives on the run row and is read once
             redirect = await _take_redirect(store, run_id)
@@ -380,8 +385,31 @@ def make_toolloop_node(
                 }
             )
             if not result.tool_calls:
+                if result.stop_reason == "max_tokens" and cut_offs < MAX_CUT_OFFS:
+                    # found live: 8192-token investigator reports were cut at
+                    # the limit and accepted as final
+                    cut_offs += 1
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": "[Your reply hit the output limit and was cut off. "
+                            "Continue exactly where it stopped, and keep the rest short.]",
+                        }
+                    )
+                    await emit("turn", {"turn": turns, "text": "reply cut off; continuing"})
+                    continue
+                if cut_offs:
+                    # the final answer is everything after the first cut-off
+                    parts = [
+                        str(m.get("content") or "")
+                        for m in messages[first_cut:]
+                        if m.get("role") == "assistant"
+                    ]
+                    final = "".join(parts)
+                else:
+                    final = result.text
                 _clear_loop(resume_file)
-                return {"messages": messages, "loop_turns": turns, "final_text": result.text}
+                return {"messages": messages, "loop_turns": turns, "final_text": final}
             for tc in result.tool_calls:
                 await emit(
                     "tool_call",

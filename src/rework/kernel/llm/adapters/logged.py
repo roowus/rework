@@ -17,9 +17,17 @@ from rework.kernel.llm.types import ChatRequest, ChatResult
 log = logging.getLogger("rework.llm")
 
 
-def hard_timeout_s() -> float:
-    """Upper bound for one model call, whatever the client thinks."""
-    return float(os.environ.get("REWORK_MODEL_TIMEOUT_S", "300"))
+def hard_timeout_s(max_tokens: int | None = None) -> float:
+    """Upper bound for one model call, whatever the client thinks.
+    REWORK_MODEL_TIMEOUT_S, when set, is the operator's override; otherwise
+    300s or the client's own timeout plus a margin for long answers, so the
+    deadline never cuts a call the client would allow."""
+    from rework.kernel.llm.adapters.openai_compat import client_timeout_s
+
+    override = os.environ.get("REWORK_MODEL_TIMEOUT_S")
+    if override:
+        return float(override)
+    return max(300.0, client_timeout_s(max_tokens) + 30.0)
 
 
 class LoggedProvider:
@@ -37,7 +45,7 @@ class LoggedProvider:
             # minutes despite the client's 180s timeout, which does not bound a
             # request whose server keeps the connection alive)
             result: ChatResult = await asyncio.wait_for(
-                self._inner.complete(request), timeout=hard_timeout_s()
+                self._inner.complete(request), timeout=hard_timeout_s(request.max_tokens)
             )
         except Exception as exc:
             log.warning(

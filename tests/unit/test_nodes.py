@@ -437,3 +437,40 @@ async def test_has_changes_sees_edits_and_new_commits(tmp_path: Path) -> None:
     assert await has_changes(tmp_path, base)
     git("commit", "-qam", "edit")
     assert await has_changes(tmp_path, base)  # committed: clean tree, new HEAD
+
+
+async def test_a_reply_cut_at_the_output_limit_is_continued(tmp_path: Path, workdir: Path) -> None:
+    """Found live: 8192-token reports stopped at the limit and were accepted
+    as final. A max_tokens stop asks for the rest; the final text is stitched."""
+    store = await _store(tmp_path)
+    fake = FakeProvider(
+        [
+            ChatResult(text="## Report\npart one, ", usage=Usage(), stop_reason="max_tokens"),
+            ChatResult(text="part two.", usage=Usage(), stop_reason="end_turn"),
+        ]
+    )
+    node = make_toolloop_node(
+        fake, _catalog(), "fake", LocalExecutor(workdir), "s", store, "m4", "m4:look:x:1", Budget()
+    )
+    result = await node({"messages": [{"role": "user", "content": "report"}]})
+    assert result["final_text"] == "## Report\npart one, part two."
+    assert len(fake.requests) == 2
+    assert "cut off" in str(fake.requests[1].messages[-1]["content"])
+
+
+def test_openai_compat_reports_truncation_and_scales_its_timeout() -> None:
+    from rework.kernel.llm.adapters.logged import hard_timeout_s
+    from rework.kernel.llm.adapters.openai_compat import client_timeout_s, translate_response
+
+    cut = translate_response(
+        {"choices": [{"message": {"content": "half"}, "finish_reason": "length"}], "usage": {}}
+    )
+    done = translate_response(
+        {"choices": [{"message": {"content": "all"}, "finish_reason": "stop"}], "usage": {}}
+    )
+    assert cut.stop_reason == "max_tokens" and done.stop_reason == "end_turn"
+    assert client_timeout_s(None) == 180.0
+    assert client_timeout_s(4096) == 180.0
+    assert 290 < client_timeout_s(8192) < 300  # kimi-k3's 8192 at 35 tok/s
+    assert hard_timeout_s(8192) > client_timeout_s(8192)
+    assert hard_timeout_s(16384) > client_timeout_s(16384)
