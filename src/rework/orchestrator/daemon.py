@@ -154,6 +154,9 @@ class Daemon:
 
     async def _pickup_pending(self) -> None:
         for mission in await self._store.list_missions(status=MissionStatus.PENDING, limit=10):
+            runner = self._runners.get(mission.id)
+            if runner is not None and not runner.done():
+                continue  # queued behind the concurrency limit; logged once
             log.info("picking up pending mission %s", mission.id)
             await self._spawn_runner(mission.id)
 

@@ -693,3 +693,40 @@ async def test_crashed_runner_marks_the_mission_failed(world: dict[str, Any]) ->
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await task
+
+
+async def test_a_queued_pending_mission_is_logged_once(
+    world: dict[str, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    """Found live: with concurrency 1 a second mission waits, and the daemon
+    logged 'picking up pending mission' on every poll (275 lines in 4 min)."""
+    import logging
+
+    from rework.kernel.state.records import Mission
+
+    store: SqliteStore = world["store"]
+    await store.create_mission(Mission(id="mq", objective="queued", repo_path=str(world["tmp"])))
+    d = Daemon(
+        store=store,
+        bus=world["bus"],
+        registry=world["registry"],
+        catalog=world["catalog"],
+        make_checkpointer=sqlite_checkpointer_factory(world["ck_path"]),
+        workroot=world["workroot"],
+        config=world["config"],
+    )
+    spawned: list[str] = []
+
+    async def fake_spawn(mid: str) -> None:
+        spawned.append(mid)
+        d._runners[mid] = asyncio.create_task(asyncio.sleep(60))  # queued on the semaphore
+
+    d._spawn_runner = fake_spawn  # type: ignore[method-assign]
+    with caplog.at_level(logging.INFO, logger="rework.daemon"):
+        for _ in range(5):
+            await d._pickup_pending()
+    try:
+        assert spawned == ["mq"]
+        assert sum("picking up pending mission mq" in r.message for r in caplog.records) == 1
+    finally:
+        d._runners["mq"].cancel()
