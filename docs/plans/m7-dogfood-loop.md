@@ -98,7 +98,8 @@ checked with `gh run list`, and deployed to rewvis when the daemon changed.
       missions clone rework from GitHub and open real PRs. Runbook in
       `docs/ops.md` and `scripts/rework-local`. Merged PRs built this way:
       #2, #3, #4, #5, #7.
-- [ ] Then deploy to rewvis and run the same loop there.
+- [x] Then deploy to rewvis and run the same loop there (2026-11-09: the
+      REWORK_NOTIFY_CMD docs, m-ded57b5d8004, TUI on rewvis to merged PR #8).
 - [x] Run three real rework changes end to end from the TUI: bugs found along
       the way, TUI work, workflow features. Done: the dropdown border (#3), the
       Cost tab active time (#5), PR previews (#7, the first large mission:

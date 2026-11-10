@@ -82,7 +82,7 @@ The command gets the gate in its environment:
 
 It is fire-and-forget: the daemon waits at most 30 seconds and never blocks a
 mission on it. A nonzero exit or a failure is only logged (see
-[Logs](#logs)) -- the gate stays open either way, and so does the mission.
+[Logs](#logs)); the gate stays open either way, and so does the mission.
 
 `scripts/rework-local serve` sets the variable for you when it is unset (and
 `osascript` is available): a macOS banner with the gate question. That is the
