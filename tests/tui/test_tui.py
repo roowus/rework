@@ -738,6 +738,92 @@ async def test_cost_tab_renders_history(ids: dict[str, str]) -> None:
         assert not app.swallowed
 
 
+async def test_cost_tab_active_time_sums_run_stats(ids: dict[str, str], env: Path) -> None:
+    """The "active time" headline sums run_stats over the range's missions.
+
+    Fallback semantics: a run whose artifact has no `active_seconds` contributes
+    its `elapsed_seconds`; `active_seconds == 0.0` is the normal value for a
+    single-call run, so it must stay 0 instead of falling back to wall time."""
+    import time as _time
+
+    from rework.kernel.state.records import Mission, MissionStatus, Run, RunStatus
+    from rework.tui.widgets.base import ChipGroup, Stat
+
+    now = _time.time()
+    store = await _store(env)
+    try:
+        await store.create_mission(
+            Mission(
+                id="m-active00000a",
+                objective="sum the active time of this mission's runs",
+                status=MissionStatus.DONE,
+                created_at=now - 600,
+            )
+        )
+        artifacts: dict[str, Any] = {
+            # 152s active; wall time (9_999s) must lose
+            "a": {"run_stats": {"active_seconds": 152.0, "elapsed_seconds": 9999.0}},
+            # no active_seconds key at all -> elapsed stands in
+            "b": {"run_stats": {"elapsed_seconds": 100.0}},
+            # one model call: active_seconds 0.0 is real, elapsed must not leak in
+            "c": {"run_stats": {"active_seconds": 0.0, "elapsed_seconds": 5000.0}},
+            "d": {"run_stats": {}},
+            "e": None,
+        }
+        for key, artifact in artifacts.items():
+            await store.create_run(
+                Run(
+                    id=f"m-active00000a:code:coder:{key}",
+                    mission_id="m-active00000a",
+                    role="coder",
+                    step="code",
+                    status=RunStatus.COMPLETED,
+                    artifact=artifact,
+                    created_at=now - 600,
+                )
+            )
+        # outside the 30d range: only the "All" chip may count its 60s
+        await store.create_mission(
+            Mission(
+                id="m-activeold00b",
+                objective="an old mission with a minute of active time",
+                status=MissionStatus.DONE,
+                created_at=now - 40 * 86400,
+                updated_at=now - 40 * 86400,
+            )
+        )
+        await store.create_run(
+            Run(
+                id="m-activeold00b:code:coder:1",
+                mission_id="m-activeold00b",
+                role="coder",
+                step="code",
+                status=RunStatus.COMPLETED,
+                artifact={"run_stats": {"active_seconds": 60.0}},
+                created_at=now - 40 * 86400,
+            )
+        )
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+5")
+        await _settle(pilot, 1.2)
+        active = app.query_one("#c-active", Stat)
+        assert active._label == "active time"
+        assert active._value == "4m 12s", active._value
+        rendered = str(active.render())
+        assert "4m 12s" in rendered and "active time" in rendered
+        # the stat follows the range selector: "All" adds the 40-day-old run
+        chips = app.query_one("#cost-range", ChipGroup)
+        await pilot.click(next(c for c in chips.query(".chip") if c.value == "0"))
+        await _settle(pilot, 1.2)
+        assert app.query_one("#c-active", Stat)._value == "5m 12s"
+        assert not app.swallowed
+
+
 async def test_resize_survives(ids: dict[str, str]) -> None:
     app = _app()
     async with app.run_test(size=SIZE) as pilot:
