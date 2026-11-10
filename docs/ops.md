@@ -104,15 +104,16 @@ instance, without touching the real one:
   `PREVIEW #<n>`.
 
 Quitting that TUI stops the preview daemon and removes the preview. If the TUI
-itself exits nonzero the command reports the exit status and the daemon log
-path, and (with `--keep`) leaves the preview running instead of tearing it
-down. Flags:
+itself exits nonzero the preview is kept either way -- the daemon is stopped,
+but the dir, worktree, descriptor and daemon log stay so the failure can be
+read, and the command prints the log path and `rework preview --rm <n>`.
+Flags:
 
 - `--keep` — leave the preview running after the TUI exits; the command prints
   how to remove it and a ready-to-paste attach command that carries the whole
   preview env (`REWORK_DB`, `REWORK_HTTP_PORT`, `REWORK_DAEMON_URL`, the
   preview's library/log/results/reports dirs, `REWORK_TARGET_NAME='PREVIEW
-  #<n>'`) and runs `uv run --project ~/.rework/previews/<n>/repo rework tui`.
+  #<n>'`) and runs `uv run --project ~/.rework/previews/<n>/repo rework`.
   Set `REWORK_PREVIEW=<n>` alone and nothing would read it: only the preview
   daemon's dispatch guard consults that variable, so the TUI would open the
   real instance's DB and port.
@@ -134,8 +135,10 @@ dropped before the worktree is re-added. If the daemon cannot be spawned (no
 `uv` on `PATH`) or never becomes ready, the command tears the half-built
 preview down and exits 2 with a one-line message.
 
-`rework tui` opens the dashboard in its own terminal (the same TUI bare
-`rework` starts), which is what the preview command runs inside the worktree.
+The preview command runs the preview build's TUI as bare `rework` inside the
+worktree, not `rework tui`: the previewed PR may predate the `tui` command,
+while every build's CLI opens the TUI when given no arguments. `rework tui` is
+still there for the instance you are in.
 
 Previews live under `~/.rework/previews/<n>/` (override the root with
 `REWORK_PREVIEW_DIR`); a descriptor `~/.rework/previews/<n>.json` records the

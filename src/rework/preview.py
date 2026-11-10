@@ -439,8 +439,10 @@ def run_preview_tui(n: int, worktree: Path, env: dict[str, str]) -> int:
     """The preview build's TUI in this terminal, labelled PREVIEW #<n>."""
     env2 = dict(env)
     env2["REWORK_TARGET_NAME"] = f"PREVIEW #{n}"
+    # bare `rework`: the previewed PR's build may predate the `tui` command,
+    # while every build's cli main opens the TUI when given no arguments
     return subprocess.run(
-        ["uv", "run", "--project", str(worktree), "rework", "tui"],
+        ["uv", "run", "--project", str(worktree), "rework"],
         env=env2,
         cwd=str(worktree),
     ).returncode
@@ -448,7 +450,7 @@ def run_preview_tui(n: int, worktree: Path, env: dict[str, str]) -> int:
 
 def attach_command(n: int, desc: dict[str, Any]) -> str:
     """The one-line shell command that opens the preview's TUI *against the
-    preview*. `REWORK_PREVIEW=<n> rework tui` would not do it: only the daemon's
+    preview*. `REWORK_PREVIEW=<n> rework` would not do it: only the daemon's
     dispatch guard reads that variable, so the TUI would attach to the real
     instance's DB and port. The descriptor holds every value the client needs,
     so spell them out."""
@@ -475,7 +477,7 @@ def attach_command(n: int, desc: dict[str, Any]) -> str:
     assigns = " ".join(f"{key}={shlex.quote(str(value))}" for key, value in env.items())
     # two shell lines, one command: the trailing backslash keeps the whole
     # thing copy-pasteable while staying readable
-    return f"{assigns} \\\n  uv run --project {shlex.quote(str(worktree))} rework tui"
+    return f"{assigns} \\\n  uv run --project {shlex.quote(str(worktree))} rework"
 
 
 def keep_notice(n: int, desc: dict[str, Any]) -> None:
@@ -496,6 +498,7 @@ def create_preview(
     """Build, start, drive and (unless kept) tear down preview #n."""
     repo_dir = Path(repo_dir).expanduser()
     worktree_created = False
+    tui_started = False
     proc: subprocess.Popen[bytes] | None = None
     try:
         worktree = fetch_worktree(n, repo_dir)
@@ -541,25 +544,29 @@ def create_preview(
             print(tail_log(log_path))
             raise RuntimeError(f"preview daemon for PR {n} failed to start (see {log_path})")
 
+        tui_started = True
         rc = run_preview_tui(n, worktree, env)
     except BaseException:
         # ANY failure after the worktree exists -- uv missing so spawn_daemon
-        # raises FileNotFoundError, a daemon that never becomes ready, a TUI
-        # that cannot launch -- must not leak a registered worktree, a live
-        # daemon or a descriptor
+        # raises FileNotFoundError, a daemon that never becomes ready -- must
+        # not leak a registered worktree, a live daemon or a descriptor
         stop_daemon(proc)
-        if worktree_created and not keep:
+        if worktree_created and tui_started:
+            # the TUI *is* what was being previewed and it died: keep the whole
+            # preview (worktree, descriptor, state copy, daemon log) to debug,
+            # whatever --keep says, and say how to get back in or drop it
+            print(f"preview #{n}: TUI failed; daemon log: {log_path}")
+            keep_notice(n, descriptor)
+        elif worktree_created and not keep:
             remove_preview(n, repo_dir)
         raise
     if rc != 0:
-        # the TUI is a client: a failed one says nothing about the daemon, so
-        # report where its log is before any teardown removes it
+        # a nonzero TUI says nothing about the daemon, but its log is the only
+        # clue: stop the daemon (it is ours, and the TUI was its only client)
+        # and keep the preview so the log outlives the failure
         print(f"preview #{n}: TUI exited with status {rc}; daemon log: {log_path}")
-        if keep:
-            keep_notice(n, descriptor)
-        else:
-            stop_daemon(proc)
-            remove_preview(n, repo_dir)
+        stop_daemon(proc)
+        keep_notice(n, descriptor)
         return rc
     if keep:
         keep_notice(n, descriptor)

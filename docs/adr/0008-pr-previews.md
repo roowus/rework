@@ -357,12 +357,11 @@ dead mission worktrees are.
   `tui/views/work.py` + `tui/actions.py`. There is nothing yet that makes the
   owner clean up, so preview directories will accumulate until `--rm` is
   habitual.
-- **Explicitly not implemented by this ADR.** Nothing above exists today: there
-  is no `preview` subcommand, no `~/.rework/previews/`, no descriptor, no
-  `REWORK_PREVIEW*` variable, and no Preview button. This document is the design
-  to build against; a follow-up mission implements it, and this ADR's status
-  moves to Accepted (with the landed commit range, in the style of ADR 0005)
-  when it does.
+- **Implemented.** The `preview` subcommand, the descriptor under
+  `~/.rework/previews/`, the `REWORK_PREVIEW*` variables and the TUI Preview
+  button all exist, as amended below; `docs/ops.md` documents the operator
+  surface ("Preview a PR"). Sections 1–6 describe the original two-terminal
+  design, so read them with the Amendments.
 - **Follow-up work:** decide the create-time default for the library clone
   (clone vs. read-only mount of the real one); decide whether `--refresh-db`
   should be automatic when the PR touches migrations; add a
@@ -378,8 +377,9 @@ dead mission worktrees are.
    fresh SQLite DB with a printed notice), picks a free port, starts the
    preview's own daemon in the background (logs in the preview dir), then runs
    the preview build's TUI in the same terminal with the preview env and
-   `REWORK_TARGET_NAME='PREVIEW #<n>'`. When that TUI exits, the preview daemon
-   is stopped and the preview removed unless `--keep` was passed. This
+   `REWORK_TARGET_NAME='PREVIEW #<n>'`. When that TUI exits cleanly, the preview
+   daemon is stopped and the preview removed unless `--keep` was passed; a
+   nonzero exit stops the daemon but keeps the preview for debugging. This
    supersedes the two-terminal `--serve` / `REWORK_PREVIEW=<n> rework` flow in
    §3–§4.
 2. **TUI Preview button.** Mission cards whose mission has a `pr_url` get a
@@ -389,14 +389,15 @@ dead mission worktrees are.
    previews (descriptor files `~/.rework/previews/<n>.json`). `--rm` kills the
    daemon's whole process group (the descriptor records the `uv run` wrapper),
    and unregisters the worktree from `--repo-dir`/the current repo even when the
-   descriptor is gone. The preview TUI is launched with `rework tui` (new
-   command; the same TUI bare `rework` starts), and a nonzero TUI exit is
-   reported with the daemon log path rather than being ignored. The client
+   descriptor is gone. The preview TUI is launched with bare `rework` (the
+   `tui` command exists too, but a previewed PR may predate it), and a nonzero
+   TUI exit stops the daemon yet keeps the preview dir and descriptor, so the
+   daemon log it points at still exists. The client
    switch in §2 is **not** implemented: `REWORK_PREVIEW=<n>` is only the
    daemon's dispatch guard, so the re-attach command the preview prints sets
    the full env from the descriptor (`REWORK_DB`, `REWORK_HTTP_PORT`,
    `REWORK_DAEMON_URL`, the per-preview dirs, `REWORK_TARGET_NAME`) and runs
-   `uv run --project <worktree> rework tui`.
+   `uv run --project <worktree> rework`.
 4. **Daemon readiness is `/healthz` 200 with an ok body** (not "any HTTP
    answer"), and a missing sqlite `REWORK_DB` yields a fresh preview DB with a
    printed notice instead of a silently created empty file.

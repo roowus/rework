@@ -376,32 +376,46 @@ def fake_build(pr_repo: tuple[Path, str], monkeypatch: pytest.MonkeyPatch) -> Pa
     return work
 
 
-def test_create_preview_reports_a_failed_tui_and_cleans_up(
-    fake_build: Path, capsys: pytest.CaptureFixture[str]
+def test_create_preview_keeps_the_dir_when_the_tui_fails(
+    fake_build: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch_run = preview_mod.run_preview_tui
-    preview_mod.run_preview_tui = lambda n, worktree, env: 3
-    try:
-        assert preview_mod.create_preview(7, fake_build) == 3
-    finally:
-        preview_mod.run_preview_tui = monkeypatch_run
+    """A failed TUI is the thing being previewed: its daemon log is the only
+    clue, so the preview (dir, worktree, descriptor) survives even without
+    --keep -- only the daemon is stopped, and the output says how to drop it."""
+    stopped: list[object] = []
+    monkeypatch.setattr(preview_mod, "stop_daemon", stopped.append)
+    monkeypatch.setattr(preview_mod, "run_preview_tui", lambda n, worktree, env: 3)
+
+    assert preview_mod.create_preview(7, fake_build) == 3
+
     out = capsys.readouterr().out
     assert "daemon.log" in out and "status 3" in out
-    assert not preview_mod.preview_dir(7).exists()
+    assert "rework preview --rm 7" in out
+    assert stopped  # the daemon was still stopped
+    assert preview_mod.preview_dir(7).exists()
+    assert preview_mod.descriptor_path(7).exists()
+    assert str(preview_mod.preview_dir(7) / "repo") in _git("worktree", "list", cwd=fake_build)
+    preview_mod.remove_preview(7, fake_build)
 
 
 def test_create_preview_keeps_a_failed_tui_when_asked(
-    fake_build: Path, capsys: pytest.CaptureFixture[str]
+    fake_build: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch_run = preview_mod.run_preview_tui
-    preview_mod.run_preview_tui = lambda n, worktree, env: 3
-    try:
-        assert preview_mod.create_preview(7, fake_build, keep=True) == 3
-    finally:
-        preview_mod.run_preview_tui = monkeypatch_run
+    stopped: list[object] = []
+    monkeypatch.setattr(preview_mod, "stop_daemon", stopped.append)
+    monkeypatch.setattr(preview_mod, "run_preview_tui", lambda n, worktree, env: 3)
+
+    assert preview_mod.create_preview(7, fake_build, keep=True) == 3
+
     out = capsys.readouterr().out
-    assert "daemon.log" in out
-    assert "uv run --project" in out and "rework tui" in out  # how to attach again
+    assert "daemon.log" in out and "status 3" in out
+    assert "uv run --project" in out and "rework" in out  # how to attach again
+    assert "rework preview --rm 7" in out
+    assert stopped
     assert preview_mod.descriptor_path(7).exists()
     preview_mod.remove_preview(7, fake_build)
 
@@ -478,7 +492,7 @@ def test_attach_command_carries_the_preview_env() -> None:
     assert "REWORK_DAEMON_URL=http://127.0.0.1:9997" in cmd
     assert "REWORK_TARGET_NAME='PREVIEW #7'" in cmd
     assert "REWORK_PREVIEW=7" in cmd
-    assert cmd.endswith("uv run --project /tmp/prev/7/repo rework tui")
+    assert cmd.endswith("uv run --project /tmp/prev/7/repo rework")
 
 
 def test_keep_notice_prints_the_working_attach_command(
@@ -487,7 +501,7 @@ def test_keep_notice_prints_the_working_attach_command(
     preview_mod.keep_notice(7, {"daemon_url": "http://127.0.0.1:9997", "port": 9997})
     out = capsys.readouterr().out
     assert "attach: " in out
-    assert "REWORK_PREVIEW=7 rework tui" not in out
+    assert "REWORK_PREVIEW=7 rework" not in out
     assert "uv run --project" in out
     assert out.count("attach:") == 1  # one line, not a wall of text
 

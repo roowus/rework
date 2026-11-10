@@ -23,3 +23,7 @@ uv.lock~
 .idea/
 .vscode/
 pytest_fixture*
+
+# test residue from the preview/local-dogfood fixtures
+work/
+origin.git/
