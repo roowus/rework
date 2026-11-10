@@ -1028,6 +1028,11 @@ def preview(
     except _subprocess.CalledProcessError as exc:
         typer.secho(f"command failed: {exc.cmd}", fg=typer.colors.RED)
         raise typer.Exit(2) from exc
+    except (OSError, RuntimeError) as exc:
+        # create_preview tears the preview down before re-raising: report the
+        # cause on one line instead of a traceback
+        typer.secho(f"preview failed: {exc}", fg=typer.colors.RED)
+        raise typer.Exit(2) from exc
 
 
 @app.command()

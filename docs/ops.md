@@ -109,7 +109,13 @@ path, and (with `--keep`) leaves the preview running instead of tearing it
 down. Flags:
 
 - `--keep` — leave the preview running after the TUI exits; the command prints
-  how to re-attach and how to remove it.
+  how to remove it and a ready-to-paste attach command that carries the whole
+  preview env (`REWORK_DB`, `REWORK_HTTP_PORT`, `REWORK_DAEMON_URL`, the
+  preview's library/log/results/reports dirs, `REWORK_TARGET_NAME='PREVIEW
+  #<n>'`) and runs `uv run --project ~/.rework/previews/<n>/repo rework tui`.
+  Set `REWORK_PREVIEW=<n>` alone and nothing would read it: only the preview
+  daemon's dispatch guard consults that variable, so the TUI would open the
+  real instance's DB and port.
 - `--allow-missions` — let the preview dispatch role runs. By default a
   preview runs no missions (safe no-execute posture).
 - `rework preview --list` — show known previews (port, pid, liveness).
@@ -117,7 +123,16 @@ down. Flags:
   state copy, descriptor). It works even when the descriptor is missing: the
   worktree is unregistered from `--repo-dir` (or the repo you are in) and
   pruned, and without a resolvable repo it prints the manual `git worktree
-  prune` / `git branch -D` commands.
+  prune` / `git branch -D` commands. When git cleanup fails (a locked worktree,
+  a branch still checked out) the preview dir and descriptor are still deleted
+  and the command prints the failing stderr plus the exact manual recovery
+  commands.
+
+A preview whose worktree directory was deleted by hand (or by an interrupted
+`--rm`) does not wedge the next `rework preview <n>`: the stale registration is
+dropped before the worktree is re-added. If the daemon cannot be spawned (no
+`uv` on `PATH`) or never becomes ready, the command tears the half-built
+preview down and exits 2 with a one-line message.
 
 `rework tui` opens the dashboard in its own terminal (the same TUI bare
 `rework` starts), which is what the preview command runs inside the worktree.

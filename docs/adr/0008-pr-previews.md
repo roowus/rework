@@ -391,7 +391,12 @@ dead mission worktrees are.
    and unregisters the worktree from `--repo-dir`/the current repo even when the
    descriptor is gone. The preview TUI is launched with `rework tui` (new
    command; the same TUI bare `rework` starts), and a nonzero TUI exit is
-   reported with the daemon log path rather than being ignored.
+   reported with the daemon log path rather than being ignored. The client
+   switch in §2 is **not** implemented: `REWORK_PREVIEW=<n>` is only the
+   daemon's dispatch guard, so the re-attach command the preview prints sets
+   the full env from the descriptor (`REWORK_DB`, `REWORK_HTTP_PORT`,
+   `REWORK_DAEMON_URL`, the per-preview dirs, `REWORK_TARGET_NAME`) and runs
+   `uv run --project <worktree> rework tui`.
 4. **Daemon readiness is `/healthz` 200 with an ok body** (not "any HTTP
    answer"), and a missing sqlite `REWORK_DB` yields a fresh preview DB with a
    printed notice instead of a silently created empty file.

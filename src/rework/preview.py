@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -26,6 +27,7 @@ import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 DESCRIPTOR_KEYS = (
     "pr",
@@ -227,6 +229,30 @@ def registered_worktrees(repo_dir: Path) -> list[tuple[str, str]]:
     return entries
 
 
+def _is_registered(repo_dir: Path, path: Path) -> bool:
+    """Is `path` still a registered worktree of repo_dir? Paths are resolved
+    first: git reports /private/tmp where the caller said /tmp."""
+    try:
+        target = path.resolve()
+        return any(Path(p).resolve() == target for p, _ in registered_worktrees(repo_dir))
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _branch_exists(repo_dir: Path, branch: str) -> bool:
+    out = subprocess.run(
+        ["git", "-C", str(repo_dir), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        capture_output=True,
+        text=True,
+    )
+    return out.returncode == 0
+
+
+def _first_line(proc: subprocess.CompletedProcess[str]) -> str:
+    detail = (proc.stderr or proc.stdout).strip().splitlines()
+    return detail[0] if detail else f"rc {proc.returncode}"
+
+
 def fetch_worktree(n: int, repo_dir: Path) -> Path:
     """Fetch refs/pull/<n>/head into origin/pr/<n> and check it out as a
     worktree on branch rework/preview-pr-<n>.
@@ -246,14 +272,20 @@ def fetch_worktree(n: int, repo_dir: Path) -> Path:
     for path, registered in registered_worktrees(repo_dir):
         if registered != branch:
             continue
-        if Path(path) == worktree:
+        if Path(path) == worktree and worktree.exists():
             subprocess.run(["git", "-C", str(worktree), "reset", "--hard", ref], check=True)
             return worktree
-        subprocess.run(
+        # Stale registration: either a different path, or the conventional path
+        # whose directory was deleted (rm -rf, crash, an interrupted --rm). Git
+        # cannot chdir into a missing worktree, so unregister it first -- and
+        # prune when the removal cannot do it -- before re-adding.
+        removed = subprocess.run(
             ["git", "-C", str(repo_dir), "worktree", "remove", "--force", path],
             capture_output=True,
+            text=True,
         )
-        subprocess.run(["git", "-C", str(repo_dir), "worktree", "prune"], capture_output=True)
+        if removed.returncode != 0:
+            subprocess.run(["git", "-C", str(repo_dir), "worktree", "prune"], capture_output=True)
     subprocess.run(
         ["git", "-C", str(repo_dir), "worktree", "add", "-B", branch, str(worktree), ref],
         check=True,
@@ -414,11 +446,42 @@ def run_preview_tui(n: int, worktree: Path, env: dict[str, str]) -> int:
     ).returncode
 
 
-def keep_notice(n: int, daemon_url: str) -> None:
+def attach_command(n: int, desc: dict[str, Any]) -> str:
+    """The one-line shell command that opens the preview's TUI *against the
+    preview*. `REWORK_PREVIEW=<n> rework tui` would not do it: only the daemon's
+    dispatch guard reads that variable, so the TUI would attach to the real
+    instance's DB and port. The descriptor holds every value the client needs,
+    so spell them out."""
+    worktree = Path(str(desc.get("worktree") or preview_dir(n) / "repo"))
+    state_db = Path(str(desc.get("state_db") or preview_dir(n) / "state.sqlite3"))
+    daemon_url = str(desc.get("daemon_url") or "")
+    port = desc.get("port") or (urlsplit(daemon_url).port if daemon_url else None)
+    if not daemon_url and port:
+        daemon_url = f"http://127.0.0.1:{port}"
+    pdir = preview_dir(n)
+    env = {
+        "REWORK_DB": str(state_db),
+        "REWORK_HTTP_PORT": str(port),
+        "REWORK_DAEMON_URL": daemon_url,
+        "REWORK_LIBRARY_DIR": str(pdir / "library"),
+        "REWORK_LOG_DIR": str(pdir / "logs"),
+        "REWORK_RESULTS_DIR": str(pdir / "results"),
+        "REWORK_REPORTS_DIR": str(pdir / "reports"),
+        "REWORK_TUI_SETTINGS": str(pdir / "tui.json"),
+        "REWORK_PREVIEW": str(n),
+        "REWORK_TARGET_NAME": f"PREVIEW #{n}",
+    }
+    assigns = " ".join(f"{key}={shlex.quote(str(value))}" for key, value in env.items() if value)
+    # two shell lines, one command: the trailing backslash keeps the whole
+    # thing copy-pasteable while staying readable
+    return f"{assigns} \\\n  uv run --project {shlex.quote(str(worktree))} rework tui"
+
+
+def keep_notice(n: int, desc: dict[str, Any]) -> None:
     """How to get back into a preview that was left running."""
     print(f"preview #{n} kept: {descriptor_path(n)}")
-    print(f"  daemon: {daemon_url}")
-    print(f"  attach: REWORK_PREVIEW={n} rework tui")
+    print(f"  daemon: {desc.get('daemon_url')}")
+    print(f"  attach: {attach_command(n, desc)}")
     print(f"  remove: rework preview --rm {n}")
 
 
@@ -432,6 +495,7 @@ def create_preview(
     """Build, start, drive and (unless kept) tear down preview #n."""
     repo_dir = Path(repo_dir).expanduser()
     worktree_created = False
+    proc: subprocess.Popen[bytes] | None = None
     try:
         worktree = fetch_worktree(n, repo_dir)
         worktree_created = True
@@ -439,56 +503,51 @@ def create_preview(
 
         state_db, _ = prepare_state(n, source_state_db())
         checkpoints_db = prepare_checkpoints(n)
-    except BaseException:
-        # a setup failure must not leak a registered worktree
-        if worktree_created and not keep:
-            remove_preview(n, repo_dir)
-        raise
 
-    port = port or free_port()
-    daemon_url = f"http://127.0.0.1:{port}"
-    descriptor = {
-        "pr": n,
-        "head_sha": head_sha(worktree),
-        "branch": f"rework/preview-pr-{n}",
-        "worktree": str(worktree),
-        "state_db": str(state_db),
-        "host": "127.0.0.1",
-        "port": port,
-        "pid": None,
-        "daemon_url": daemon_url,
-        "created_at": datetime.now(UTC).isoformat(),
-        "repo_dir": str(repo_dir),
-    }
-    write_descriptor(n, descriptor)
+        port = port or free_port()
+        daemon_url = f"http://127.0.0.1:{port}"
+        descriptor = {
+            "pr": n,
+            "head_sha": head_sha(worktree),
+            "branch": f"rework/preview-pr-{n}",
+            "worktree": str(worktree),
+            "state_db": str(state_db),
+            "host": "127.0.0.1",
+            "port": port,
+            "pid": None,
+            "daemon_url": daemon_url,
+            "created_at": datetime.now(UTC).isoformat(),
+            "repo_dir": str(repo_dir),
+        }
+        write_descriptor(n, descriptor)
 
-    env = preview_env(
-        n,
-        worktree,
-        state_db,
-        port,
-        allow_missions=allow_missions,
-        checkpoints_db=checkpoints_db,
-    )
-    print(f"starting preview daemon on {daemon_url} (logs: {preview_dir(n) / 'daemon.log'})")
-    proc = spawn_daemon(n, worktree, env)
-    descriptor["pid"] = proc.pid
-    write_descriptor(n, descriptor)
+        env = preview_env(
+            n,
+            worktree,
+            state_db,
+            port,
+            allow_missions=allow_missions,
+            checkpoints_db=checkpoints_db,
+        )
+        print(f"starting preview daemon on {daemon_url} (logs: {preview_dir(n) / 'daemon.log'})")
+        proc = spawn_daemon(n, worktree, env)
+        descriptor["pid"] = proc.pid
+        write_descriptor(n, descriptor)
 
-    log_path = preview_dir(n) / "daemon.log"
-    if not wait_ready(daemon_url, proc):
-        print(f"preview daemon for PR {n} did not come up; last log lines:")
-        print(tail_log(log_path))
-        stop_daemon(proc)
-        if not keep:
-            remove_preview(n, repo_dir)
-        raise RuntimeError(f"preview daemon for PR {n} failed to start (see {log_path})")
+        log_path = preview_dir(n) / "daemon.log"
+        if not wait_ready(daemon_url, proc):
+            print(f"preview daemon for PR {n} did not come up; last log lines:")
+            print(tail_log(log_path))
+            raise RuntimeError(f"preview daemon for PR {n} failed to start (see {log_path})")
 
-    try:
         rc = run_preview_tui(n, worktree, env)
     except BaseException:
+        # ANY failure after the worktree exists -- uv missing so spawn_daemon
+        # raises FileNotFoundError, a daemon that never becomes ready, a TUI
+        # that cannot launch -- must not leak a registered worktree, a live
+        # daemon or a descriptor
         stop_daemon(proc)
-        if not keep:
+        if worktree_created and not keep:
             remove_preview(n, repo_dir)
         raise
     if rc != 0:
@@ -496,13 +555,13 @@ def create_preview(
         # report where its log is before any teardown removes it
         print(f"preview #{n}: TUI exited with status {rc}; daemon log: {log_path}")
         if keep:
-            keep_notice(n, daemon_url)
+            keep_notice(n, descriptor)
         else:
             stop_daemon(proc)
             remove_preview(n, repo_dir)
         return rc
     if keep:
-        keep_notice(n, daemon_url)
+        keep_notice(n, descriptor)
     else:
         stop_daemon(proc)
         remove_preview(n, repo_dir)
@@ -558,11 +617,25 @@ def remove_preview(n: int, repo_dir: Path | None = None) -> None:
         print("  git worktree prune")
         print(f"  git branch -D {branch}")
     else:
-        subprocess.run(
+        removed = subprocess.run(
             ["git", "-C", str(resolved), "worktree", "remove", "--force", str(path)],
             capture_output=True,
+            text=True,
         )
         subprocess.run(["git", "-C", str(resolved), "worktree", "prune"], capture_output=True)
-        subprocess.run(["git", "-C", str(resolved), "branch", "-D", branch], capture_output=True)
+        deleted = subprocess.run(
+            ["git", "-C", str(resolved), "branch", "-D", branch], capture_output=True, text=True
+        )
+        # rmtree below deletes the preview dir regardless, so a failed removal
+        # (a locked worktree, a branch still checked out) would silently leave a
+        # dangling registration: say what failed and how to finish it by hand.
+        if _is_registered(resolved, path) or _branch_exists(resolved, branch):
+            print(f"preview #{n}: git cleanup incomplete (preview dir and descriptor are gone):")
+            for proc, cmd in ((removed, "worktree remove"), (deleted, "branch -D")):
+                if proc.returncode != 0:
+                    print(f"  {cmd}: {_first_line(proc)}")
+            print("  finish by hand:")
+            print(f"    git -C {resolved} worktree remove -f -f {path}  # -f -f if it is locked")
+            print(f"    git -C {resolved} branch -D {branch}")
     shutil.rmtree(preview_dir(n), ignore_errors=True)
     descriptor_path(n).unlink(missing_ok=True)

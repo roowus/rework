@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -400,6 +401,115 @@ def test_create_preview_keeps_a_failed_tui_when_asked(
         preview_mod.run_preview_tui = monkeypatch_run
     out = capsys.readouterr().out
     assert "daemon.log" in out
-    assert "REWORK_PREVIEW=7 rework tui" in out  # how to attach again
+    assert "uv run --project" in out and "rework tui" in out  # how to attach again
     assert preview_mod.descriptor_path(7).exists()
     preview_mod.remove_preview(7, fake_build)
+
+
+def test_fetch_worktree_recovers_a_deleted_conventional_worktree(
+    pr_repo: tuple[Path, str],
+) -> None:
+    """A registered worktree whose directory vanished (crash, manual rm, an
+    interrupted --rm) must not wedge the next fetch: git cannot chdir into it,
+    so the registration is dropped before the worktree is re-added."""
+    work, sha = pr_repo
+    worktree = preview_mod.fetch_worktree(7, work)
+    shutil.rmtree(worktree)
+
+    again = preview_mod.fetch_worktree(7, work)
+
+    assert again == worktree
+    assert worktree.is_dir()
+    assert _git("rev-parse", "HEAD", cwd=worktree) == sha
+    assert _git("rev-parse", "--abbrev-ref", "HEAD", cwd=worktree) == "rework/preview-pr-7"
+
+
+def test_create_preview_tears_down_when_the_daemon_cannot_spawn(
+    fake_build: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`uv` missing from PATH makes spawn_daemon raise: the half-built preview
+    (worktree registration, descriptor, dirs) must not leak."""
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise FileNotFoundError("uv")
+
+    monkeypatch.setattr(preview_mod, "spawn_daemon", boom)
+
+    with pytest.raises(FileNotFoundError):
+        preview_mod.create_preview(7, fake_build)
+
+    assert not preview_mod.preview_dir(7).exists()
+    assert not preview_mod.descriptor_path(7).exists()
+    assert str(preview_mod.preview_dir(7) / "repo") not in _git("worktree", "list", cwd=fake_build)
+    assert _git("branch", "--list", "rework/preview-pr-7", cwd=fake_build) == ""
+
+
+def test_cli_preview_reports_a_spawn_failure_cleanly(
+    fake_build: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*args: object, **kwargs: object) -> None:
+        raise FileNotFoundError("uv")
+
+    monkeypatch.setattr(preview_mod, "spawn_daemon", boom)
+
+    result = runner.invoke(app, ["preview", "7", "--repo-dir", str(fake_build)])
+
+    assert result.exit_code == 2, result.output
+    assert "preview failed" in result.output and "uv" in result.output
+    assert "Traceback" not in result.output
+    assert not preview_mod.preview_dir(7).exists()
+
+
+def test_attach_command_carries_the_preview_env() -> None:
+    """The printed attach command must reach the preview, not the real instance:
+    REWORK_PREVIEW alone is only the daemon's dispatch guard, so every client
+    setting is spelled out from the descriptor."""
+    desc = {
+        "pr": 7,
+        "worktree": "/tmp/prev/7/repo",
+        "state_db": "/tmp/prev/7/state.sqlite3",
+        "port": 9997,
+        "daemon_url": "http://127.0.0.1:9997",
+    }
+    cmd = preview_mod.attach_command(7, desc)
+
+    assert "REWORK_DB=/tmp/prev/7/state.sqlite3" in cmd
+    assert "REWORK_HTTP_PORT=9997" in cmd
+    assert "REWORK_DAEMON_URL=http://127.0.0.1:9997" in cmd
+    assert "REWORK_TARGET_NAME='PREVIEW #7'" in cmd
+    assert "REWORK_PREVIEW=7" in cmd
+    assert cmd.endswith("uv run --project /tmp/prev/7/repo rework tui")
+
+
+def test_keep_notice_prints_the_working_attach_command(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    preview_mod.keep_notice(7, {"daemon_url": "http://127.0.0.1:9997", "port": 9997})
+    out = capsys.readouterr().out
+    assert "attach: " in out
+    assert "REWORK_PREVIEW=7 rework tui" not in out
+    assert "uv run --project" in out
+    assert out.count("attach:") == 1  # one line, not a wall of text
+
+
+def test_remove_preview_warns_when_git_cleanup_fails(
+    pr_repo: tuple[Path, str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A locked worktree cannot be removed with --force, and its branch is still
+    checked out: the preview dir is still deleted, but the dangling registration
+    is reported with the manual recovery commands."""
+    work, _ = pr_repo
+    worktree = preview_mod.fetch_worktree(7, work)
+    preview_mod.write_descriptor(
+        7, {"pr": 7, "branch": "rework/preview-pr-7", "worktree": str(worktree), "pid": None}
+    )
+    _git("worktree", "lock", str(worktree), cwd=work)
+
+    preview_mod.remove_preview(7, work)
+
+    out = capsys.readouterr().out
+    assert "git cleanup incomplete" in out
+    assert "cannot remove a locked working tree" in out
+    assert "worktree remove -f -f" in out and "branch -D rework/preview-pr-7" in out
+    assert not preview_mod.preview_dir(7).exists()
+    assert not preview_mod.descriptor_path(7).exists()
