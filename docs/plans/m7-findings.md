@@ -121,7 +121,6 @@ coder by respawning on `flash`, audited, finished with an accurate summary.
 | 5 | A coder's `uv run pytest` froze the mission | on timeout `run_command` killed only `/bin/sh`; orphans kept the pipe open and `communicate()` blocked forever | fixed: own session, process-group TERM then KILL, bounded read; verified live (420s timeout fired, coder continued) |
 | 6 | Four silent stalls looked like hangs | clamshell sleep: timers stop while the Mac sleeps (an earlier "model call hung" diagnosis was this) | mitigated: `rework-local serve` runs under `caffeinate -i`; ops.md says to check `pmset -g log` first |
 | 7 | A daemon restart left its roles' child processes running | children are not reaped when the daemon dies | fixed: commands are registered; a new daemon reaps trees whose owner died |
-
 | 8 | Squash-merge put the whole brief on main as the commit title (#5) | the coder's commit subject was the brief | fixed: subject is the mission title (72 chars), brief in the body |
 | 9 | A budget gate waited 4.5 hours unseen | nothing told the owner | fixed: `REWORK_NOTIFY_CMD` on every gate; `rework-local serve` defaults to a macOS banner |
 | 10 | A bare repo and a clone (gitlink) were committed; two audits missed them | handoff `git add -A`; the auditor's diff was cut at 60k | fixed: handoff unstages nested repos; auditor gets the full file list first |
