@@ -104,7 +104,7 @@ def is_git_repo(repo_dir: str | Path) -> bool:
     """`rework preview --repo-dir` fetches into a real git repo; anything else
     blows up deep inside the CLI, so refuse up front with something readable."""
     try:
-        top = subprocess.run(  # noqa: ASYNC221
+        top = subprocess.run(
             ["git", "-C", str(repo_dir), "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
@@ -120,9 +120,7 @@ async def run_preview(app: ReworkApp, pr_number: str, repo_dir: str) -> bool:
     the mission card's Preview button and the Mission menu both come here."""
     repo_dir = str(repo_dir or "").strip()
     if not repo_dir:
-        app.notify(
-            "Give the path of a local git repo to preview", severity="error", timeout=6
-        )
+        app.notify("Give the path of a local git repo to preview", severity="error", timeout=6)
         return False
     if not is_git_repo(repo_dir):
         app.notify(f"Not a git repo: {repo_dir}", severity="error", timeout=8)

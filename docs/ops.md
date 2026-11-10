@@ -194,4 +194,7 @@ Previews live under `~/.rework/previews/<n>/` (override the root with
 `REWORK_PREVIEW_DIR`); a descriptor `~/.rework/previews/<n>.json` records the
 port, pid and paths. In the TUI, mission cards with an open PR get a
 **Preview** button that runs the same command and returns to the main TUI
-when done.
+when done. The same command is reachable with no mission focused via **Mission
+> Preview a PR...**, which asks for the PR number and a local repo path
+(prefilled from the newest mission of the Work tab's project, if any) and
+refuses non-numeric PRs, missing paths and non-git directories.

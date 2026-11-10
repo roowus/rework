@@ -1346,6 +1346,7 @@ async def test_preview_a_pr_end_to_end_through_the_menu(
     off-screen; that part stays unverified, see the handoff note)."""
     import os
     import stat
+
     from textual.drivers.headless_driver import HeadlessDriver
 
     repo = _git_dir(tmp_path)

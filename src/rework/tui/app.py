@@ -14,8 +14,8 @@ from typing import Any, ClassVar
 
 from textual import events
 from textual.app import App, ComposeResult
-from textual.notifications import SeverityLevel
 from textual.binding import Binding, BindingType
+from textual.notifications import SeverityLevel
 from textual.screen import ModalScreen
 from textual.widgets import ContentSwitcher
 
@@ -434,9 +434,7 @@ class ReworkApp(App[None]):
             if not pr.isdigit():
                 self.notify("PR number must be digits only", severity="error", timeout=4)
                 return
-            self.run_worker(
-                actions.run_preview(self, pr, values.get("repo", "")), group="preview"
-            )
+            self.run_worker(actions.run_preview(self, pr, values.get("repo", "")), group="preview")
 
         self.push_screen(
             Form(
