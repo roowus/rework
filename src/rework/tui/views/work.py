@@ -670,15 +670,24 @@ class WorkView(View):
             except Exception as exc:
                 self.toast(f"Model catalog unreadable: {exc}", severity="error")
                 return
-            options = [
-                Option(
-                    e.id,
-                    e.id,
-                    f"{e.model} · tier {e.tier} · ${e.cost_in_per_mtok}/${e.cost_out_per_mtok}"
-                    + (" · vision" if "vision" in e.capabilities else ""),
+            options = []
+            for e in entries:
+                ready = e.has_credentials()
+                options.append(
+                    Option(
+                        e.id,
+                        e.id,
+                        f"{e.model} · tier {e.tier} · ${e.cost_in_per_mtok}/"
+                        f"${e.cost_out_per_mtok}"
+                        + (" · vision" if "vision" in e.capabilities else "")
+                        + ("" if ready else " · no key"),
+                        # dimmed, not hidden: the owner can still pick it and go
+                        # add the key (the orchestrator rejects it with a clear
+                        # error if it really has no key by then)
+                        classes="" if ready else "-dim",
+                    )
                 )
-                for e in entries
-            ]
+            options.sort(key=lambda o: bool(o.classes))  # keyed models first
             current = self.model_id or self._default_model()
         else:
             options = [Option(v, label) for v, label in EFFORTS]
