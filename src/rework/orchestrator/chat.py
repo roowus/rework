@@ -49,6 +49,13 @@ earlier mission's branch, results or worktree, so never promise that. Describe
 only what the plans above actually do. If earlier work matters, put what it
 found into the objective.
 
+Library guidance about creating missions (which project, plan or model to use,
+how to label them) is for you: apply it through propose_mission's fields, do
+not copy it into the objective. The roles cannot act on it (found live: "Also
+label the mission with its project." in an objective sent the orchestrator off
+asking the owner what it meant). Only lessons about doing the work itself
+belong in the objective.
+
 For a project backed by a git repo, prefer fix-pr: the owner reviews the change
 as a pull request, and the PR gate still lets them stop first. Use fix when they
 only want the result held for inspection.
