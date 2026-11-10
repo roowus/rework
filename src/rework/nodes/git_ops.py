@@ -122,6 +122,41 @@ async def stage_all(worktree: Path) -> str:
     return out
 
 
+async def unstage_nested_repos(worktree: Path) -> list[str]:
+    """Unstage newly added git repositories inside the worktree: gitlinks
+    (a nested clone, mode 160000) and bare-repo layouts (HEAD + objects/ +
+    refs/). Found live: a coder's manual experiment left `origin.git/` and a
+    clone `work/` in its worktree and the handoff's `git add -A` committed both.
+    Returns the excluded paths; the files stay on disk, out of the commit."""
+    code, out = await _run(worktree, "diff", "--cached", "--raw", "--diff-filter=A", "-z")
+    if code != 0 or not out:
+        return []
+    fields = out.split("\0")
+    excluded: set[str] = set()
+    added: list[str] = []
+    for meta, path in zip(fields[0::2], fields[1::2], strict=False):
+        if not path:
+            continue
+        if meta.split(" ")[1:2] == ["160000"]:
+            excluded.add(path)
+        else:
+            added.append(path)
+    for path in added:
+        for parent in Path(path).parents:
+            if str(parent) == ".":
+                break
+            d = worktree / parent
+            if (d / "HEAD").is_file() and (d / "objects").is_dir() and (d / "refs").is_dir():
+                excluded.add(str(parent))
+                break
+    roots = sorted(p for p in excluded if not any(p.startswith(o + "/") for o in excluded))
+    for path in roots:
+        # --cached -f: index only (files stay on disk); -f because a newly
+        # staged gitlink is otherwise refused
+        await _run(worktree, "rm", "-r", "-q", "-f", "--cached", "--", path)
+    return roots
+
+
 async def commit(
     worktree: Path,
     message: str,

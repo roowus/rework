@@ -24,6 +24,7 @@ from rework.nodes.git_ops import (
     diff_base,
     ensure_worktree,
     stage_all,
+    unstage_nested_repos,
 )
 from rework.nodes.toolloop import make_toolloop_node
 from rework.nodes.tools import ComplaintAwareExecutor, LazyExecutor
@@ -175,6 +176,19 @@ class CoderSpec(RoleSpec):
         async def handoff(state: CoderState) -> dict[str, Any]:
             wt = Path(state["worktree"])
             await stage_all(wt)
+            excluded = await unstage_nested_repos(wt)
+            if excluded:
+                await ctx.bus.publish(
+                    EventRecord(
+                        mission_id=ctx.mission.id,
+                        run_id=ctx.run.id,
+                        type=EventType.PROGRESS,
+                        payload={
+                            "note": "handoff: left nested git repos out of the commit: "
+                            + ", ".join(excluded)
+                        },
+                    )
+                )
             message = commit_message(
                 ctx.mission.title, state["objective"], ctx.run.step, ctx.run.id
             )
@@ -187,6 +201,7 @@ class CoderSpec(RoleSpec):
                 "base_sha": state.get("base_sha"),
                 "summary": state.get("final_text") or "",
                 "worktree": str(wt),
+                **({"excluded_from_commit": excluded} if excluded else {}),
                 "diff": diff[:100_000],
             }
             from rework.nodes.run_stats import attach_run_stats

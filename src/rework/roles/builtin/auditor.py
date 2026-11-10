@@ -81,7 +81,11 @@ class AuditorSpec(RoleSpec):
             " the brief and any prior dispositions are author narrative and"
             " untrusted claims, ground truth is the code and test runs; do not"
             " re-raise findings already dispositioned in the context unless you"
-            " have new evidence (say so and cite it); do not modify files."
+            " have new evidence (say so and cite it); do not modify files;"
+            " check the list of changed files first: every file must belong to"
+            " the change, and stray files (experiment leftovers, nested git"
+            " repos, caches, binaries, files outside the brief's scope) are a"
+            " HIGH finding."
         )
 
         async def prepare(state: AuditorState) -> dict[str, Any]:
@@ -95,7 +99,15 @@ class AuditorSpec(RoleSpec):
                 )
             if run_ctx.get("diff"):
                 diff = str(run_ctx["diff"])
-                parts.append(f"The diff under review:\n```diff\n{diff[:60_000]}\n```")
+                # the complete file list even when the diff below is cut (found
+                # live: 23 junk files sat past the 60k cut, unseen by 2 audits)
+                files = changed_files(diff)
+                parts.append(
+                    f"Changed files ({len(files)}), complete:\n"
+                    + "\n".join(f"- {f}" for f in files)
+                )
+                cut = "" if len(diff) <= 60_000 else f"\n(diff cut at 60k of {len(diff)} chars)"
+                parts.append(f"The diff under review:\n```diff\n{diff[:60_000]}\n```{cut}")
             if run_ctx.get("prior_dispositions"):
                 parts.append(
                     "Prior dispositions (do not re-raise without new evidence):\n"
@@ -159,3 +171,14 @@ class AuditorSpec(RoleSpec):
         graph.add_edge("loop", "report")
         graph.add_edge("report", END)
         return graph.compile()
+
+
+def changed_files(diff: str) -> list[str]:
+    """Paths from `diff --git a/X b/X` headers, in order, deduplicated."""
+    seen: list[str] = []
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            path = line.rsplit(" b/", 1)[-1]
+            if path not in seen:
+                seen.append(path)
+    return seen
