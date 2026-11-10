@@ -474,3 +474,52 @@ def test_openai_compat_reports_truncation_and_scales_its_timeout() -> None:
     assert 290 < client_timeout_s(8192) < 300  # kimi-k3's 8192 at 35 tok/s
     assert hard_timeout_s(8192) > client_timeout_s(8192)
     assert hard_timeout_s(16384) > client_timeout_s(16384)
+
+
+async def test_a_streamed_completion_is_assembled() -> None:
+    """Streaming with an idle timeout replaced the flat one; the chunks must
+    rebuild exactly what the non-streamed response carried."""
+    from types import SimpleNamespace as NS
+
+    from rework.kernel.llm.adapters.openai_compat import assemble_stream, translate_response
+
+    def chunk(content=None, calls=None, finish=None, usage=None):  # type: ignore[no-untyped-def]
+        choices = (
+            [] if usage else [NS(delta=NS(content=content, tool_calls=calls), finish_reason=finish)]
+        )
+        return NS(choices=choices, usage=usage)
+
+    def call(index, id=None, name=None, args=None):  # type: ignore[no-untyped-def]
+        return NS(index=index, id=id, function=NS(name=name, arguments=args))
+
+    class Usage:
+        def model_dump(self) -> dict[str, object]:
+            return {
+                "prompt_tokens": 100,
+                "completion_tokens": 7,
+                "prompt_tokens_details": {"cached_tokens": 90},
+            }
+
+    async def stream():  # type: ignore[no-untyped-def]
+        for c in [
+            chunk(content="Let me "),
+            chunk(content="look."),
+            chunk(calls=[call(0, id="c1", name="read_file", args='{"pa')]),
+            chunk(calls=[call(0, args='th": "a.py"}')]),
+            chunk(calls=[call(1, id="c2", name="list_dir", args="{}")], finish="tool_calls"),
+            chunk(usage=Usage()),
+        ]:
+            yield c
+
+    result = translate_response(await assemble_stream(stream()))
+    assert result.text == "Let me look."
+    assert [(t.id, t.name, t.arguments) for t in result.tool_calls] == [
+        ("c1", "read_file", {"path": "a.py"}),
+        ("c2", "list_dir", {}),
+    ]
+    assert result.stop_reason == "tool_calls"
+    assert (result.usage.input_tokens, result.usage.output_tokens, result.usage.cached_tokens) == (
+        100,
+        7,
+        90,
+    )

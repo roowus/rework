@@ -136,11 +136,54 @@ def client_timeout_s(max_tokens: int | None) -> float:
     return max(180.0, 60.0 + float(max_tokens or 0) / 35.0)
 
 
+IDLE_TIMEOUT_S = 90.0  # no bytes for this long = a dead request
+
+
+async def assemble_stream(stream: Any) -> dict[str, Any]:
+    """Chat-completion chunks back into the non-streamed response shape."""
+    text: list[str] = []
+    calls: dict[int, dict[str, str]] = {}
+    finish: str | None = None
+    usage: Any = None
+    async for chunk in stream:
+        if getattr(chunk, "usage", None):
+            usage = chunk.usage
+        for choice in chunk.choices or []:
+            delta = choice.delta
+            if delta.content:
+                text.append(delta.content)
+            for tc in delta.tool_calls or []:
+                slot = calls.setdefault(tc.index, {"id": "", "name": "", "arguments": ""})
+                if tc.id:
+                    slot["id"] = tc.id
+                fn = tc.function
+                if fn is not None and fn.name and not slot["name"]:
+                    slot["name"] = fn.name
+                if fn is not None and fn.arguments:
+                    slot["arguments"] += fn.arguments
+            if choice.finish_reason:
+                finish = choice.finish_reason
+    tool_calls = [
+        {"id": c["id"], "function": {"name": c["name"], "arguments": c["arguments"]}}
+        for _, c in sorted(calls.items())
+    ]
+    return {
+        "choices": [
+            {
+                "message": {"content": "".join(text), "tool_calls": tool_calls},
+                "finish_reason": finish,
+            }
+        ],
+        "usage": usage.model_dump() if usage is not None else {},
+    }
+
+
 class OpenAICompatProvider:
-    """Works with any /chat/completions endpoint via base_url. Client timeout
-    180s: a silently-dropped upstream must surface as APITimeoutError (which
-    RetryingProvider treats as transient), not hang for the SDK default of
-    10 minutes. SDK-level retries stay off; RetryingProvider owns retries."""
+    """Works with any /chat/completions endpoint via base_url. Streams every
+    call with an idle timeout (see complete): a silently-dropped upstream
+    surfaces as APITimeoutError (RetryingProvider treats it as transient)
+    within IDLE_TIMEOUT_S. SDK-level retries stay off; RetryingProvider owns
+    retries."""
 
     name = "openai-compatible"
 
@@ -152,11 +195,20 @@ class OpenAICompatProvider:
             self.name = name
 
     async def complete(self, request: ChatRequest) -> ChatResult:
+        """Streamed, with an IDLE timeout: a long answer keeps sending tokens
+        (reasoning included; measured on Fireworks: chunk gaps under 1s), a
+        dead request goes silent. A flat timeout could not tell them apart:
+        180s cut real 8192-token answers, a longer one let a stalled call
+        hang for minutes. The hard deadline (LoggedProvider) bounds the total."""
+        from openai import Timeout
+
         payload = translate_request(request)
-        response = await self._client.chat.completions.create(
-            **payload, timeout=client_timeout_s(request.max_tokens)
+        payload["stream"] = True
+        payload["stream_options"] = {"include_usage": True}
+        stream = await self._client.chat.completions.create(
+            **payload, timeout=Timeout(IDLE_TIMEOUT_S, connect=30.0)
         )
-        return translate_response(response.model_dump())
+        return translate_response(await assemble_stream(stream))
 
 
 class OpenAIProvider(OpenAICompatProvider):
