@@ -21,6 +21,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
+from rework.kernel.llm.adapters.retry import _is_transient
 from rework.kernel.llm.types import ChatRequest, ToolSpec
 from rework.kernel.state.records import (
     Charge,
@@ -46,6 +47,8 @@ MARKER = "You are the MISSION ORCHESTRATOR"
 MAX_TURNS = 80  # runaway protection only; the budget is the real rail
 TURN_EXTENSION = 40  # per owner approval at the cap
 PREFERRED_FAILURE_LIMIT = 3  # failed turns in a row before leaving the chosen model
+# waits when EVERY model fails transiently (an outage), about 7.5 minutes in all
+OUTAGE_WAITS_S = (15.0, 30.0, 60.0, 120.0, 240.0)
 MAX_IDLE_NUDGES = 3
 PROVIDER_FAILURE_LIMIT = 2  # failed runs on one model before spawn_role refuses it
 
@@ -536,6 +539,7 @@ class MissionOrchestrator:
         system = await self._system_prompt()
         entry = self.entry
         tried: set[str] = set()
+        outage = list(OUTAGE_WAITS_S)
         while True:
             request = ChatRequest(
                 model=entry.model,
@@ -575,6 +579,20 @@ class MissionOrchestrator:
                     ),
                     None,
                 )
+                if fallback is None and outage and _is_transient(exc):
+                    # every model failed on a transient error: the network or
+                    # the provider is down, not the mission. Found live: a
+                    # connection drop failed a mission mid-way (all catalog
+                    # models share one provider). Wait, then start over.
+                    pause = outage.pop(0)
+                    await self._note(
+                        f"every model failed ({type(exc).__name__}); provider or network "
+                        f"down? retrying in {pause:.0f}s"
+                    )
+                    await asyncio.sleep(pause)
+                    tried.clear()
+                    entry = self.entry
+                    continue
                 if fallback is None:
                     self.finished = ("failed", f"orchestrator model call failed: {exc}"[:300])
                     return None

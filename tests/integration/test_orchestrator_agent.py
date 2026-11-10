@@ -943,3 +943,52 @@ async def test_timeouts_are_not_retried_when_the_caller_switches_models() -> Non
     with pytest.raises(TimeoutError):
         await with_retries(Stall(), backoff_s=0).complete(None)  # type: ignore[arg-type]
     assert calls == 4
+
+
+async def test_an_outage_waits_instead_of_failing_the_mission(
+    world: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Found live: a network drop made every model (all on one provider) fail
+    with a connection error, and the mission failed. A transient failure of
+    every model now waits and retries from the owner's model."""
+    from rework.orchestrator import agent
+
+    monkeypatch.setattr(agent, "OUTAGE_WAITS_S", (0.01, 0.01, 0.01))
+    scripted: ScriptedProvider = world["provider"]
+    scripted.route(
+        MARKER, [turn(call("finish", "f", outcome="failed", summary="after the outage"))]
+    )
+
+    class Outage:
+        def __init__(self) -> None:
+            self.models: list[str] = []
+
+        async def complete(self, request: Any) -> Any:
+            self.models.append(request.model)
+            if len(self.models) <= 6:  # two full rounds of the 3-model catalog
+                raise ConnectionError("Connection error.")
+            return await scripted.complete(request)
+
+    outage = Outage()
+    world["provider"] = outage
+    await asyncio.wait_for(runner(world).run(), timeout=30)
+    assert outage.models[6] == "fake-pro", "after the wait it starts from the chosen model"
+    msgs = await world["store"].chat_messages(orchestrator_chat_id("mo"))
+    assert any(tc.get("name") == "finish" for m in msgs for tc in (m.body.get("tool_calls") or []))
+
+
+async def test_a_long_outage_still_fails(
+    world: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rework.orchestrator import agent
+
+    monkeypatch.setattr(agent, "OUTAGE_WAITS_S", (0.01,))
+
+    class Down:
+        async def complete(self, request: Any) -> Any:
+            raise ConnectionError("Connection error.")
+
+    world["provider"] = Down()
+    await asyncio.wait_for(runner(world).run(), timeout=30)
+    mission = await world["store"].get_mission("mo")
+    assert mission is not None and (mission.result or {}).get("outcome") == "failed"
