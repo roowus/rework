@@ -18,6 +18,11 @@ export REWORK_DAEMON_URL="http://127.0.0.1:${REWORK_HTTP_PORT}"
 # a sleeping Mac freezes every mission (asyncio timers stop with the clock);
 # keep it awake while the daemon serves. caffeinate cannot stop a lid-close
 # sleep on battery: use rewvis for long missions away from the desk.
+# a macOS banner when a gate opens (a budget gate once sat 4.5 hours unseen);
+# set REWORK_NOTIFY_CMD yourself for something else, e.g. an ntfy push
+if [[ "${1:-}" == "serve" && -z "${REWORK_NOTIFY_CMD:-}" ]] && command -v osascript >/dev/null 2>&1; then
+  export REWORK_NOTIFY_CMD='osascript -e "display notification (system attribute \"REWORK_GATE_QUESTION\") with title \"rework needs you\""'
+fi
 if [[ "${1:-}" == "serve" ]] && command -v caffeinate >/dev/null 2>&1; then
   exec caffeinate -i uv run --project "$here" rework "$@"
 fi

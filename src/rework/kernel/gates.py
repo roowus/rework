@@ -11,6 +11,9 @@ down are honored (boot recovery reads open gates before the first astream).
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import os
 from typing import Any
 
 from rework.kernel.events.bus import EventBus
@@ -23,6 +26,57 @@ from rework.kernel.state.records import (
     new_id,
 )
 from rework.kernel.state.store import StateStore
+
+log = logging.getLogger("rework.gates")
+
+
+_notify_tasks: set[asyncio.Task[None]] = set()
+
+
+def notify_owner(gate: Gate) -> asyncio.Task[None] | None:
+    """Run REWORK_NOTIFY_CMD when a gate opens, fire-and-forget. Found live: a
+    budget gate waited 4.5 hours because nobody was looking at the TUI. The
+    command gets REWORK_GATE_ID / _KIND / _QUESTION and REWORK_MISSION_ID in its
+    environment, e.g. a macOS banner:
+
+        REWORK_NOTIFY_CMD='osascript -e "display notification (system attribute
+        \"REWORK_GATE_QUESTION\") with title \"rework needs you\""'
+
+    or a phone push: curl -d "$REWORK_GATE_QUESTION" ntfy.sh/<topic>. A slow or
+    broken notifier never blocks or fails the mission (30s cap, errors logged)."""
+    command = os.environ.get("REWORK_NOTIFY_CMD", "").strip()
+    if not command:
+        return None
+    env = {
+        **os.environ,
+        "REWORK_GATE_ID": gate.id,
+        "REWORK_GATE_KIND": gate.kind.value,
+        "REWORK_GATE_QUESTION": gate.question[:500],
+        "REWORK_MISSION_ID": gate.mission_id,
+    }
+
+    async def run() -> None:
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                env=env,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=30)
+            if proc.returncode:
+                log.warning("notify command exited %s: %s", proc.returncode, err.decode()[:200])
+        except Exception as exc:  # never let a notifier hurt a mission
+            log.warning("notify command failed: %s", exc)
+
+    try:
+        task = asyncio.get_running_loop().create_task(run())
+    except RuntimeError:
+        return None
+    _notify_tasks.add(task)
+    task.add_done_callback(_notify_tasks.discard)
+    return task
 
 
 class GateManager:
@@ -62,6 +116,7 @@ class GateManager:
                 },
             )
         )
+        notify_owner(gate)
         return gate
 
     async def decide(
