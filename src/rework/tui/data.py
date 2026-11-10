@@ -391,9 +391,7 @@ class TuiData:
         return await self._resilient(
             f"events_newest:{mission_id}:{limit}",
             lambda: self._call(
-                lambda s: s.events_since(
-                    0, mission_id=mission_id, limit=limit, newest_first=True
-                )
+                lambda s: s.events_since(0, mission_id=mission_id, limit=limit, newest_first=True)
             ),
         )
 
