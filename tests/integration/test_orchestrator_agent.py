@@ -867,3 +867,79 @@ async def test_the_orchestrator_switches_its_own_model_when_it_fails(
     assert picky.models[:2] == ["fake-pro", "fake-flash"]
     msgs = await world["store"].chat_messages(orchestrator_chat_id("mo"))
     assert any(tc.get("name") == "finish" for m in msgs for tc in (m.body.get("tool_calls") or []))
+
+
+async def test_a_stalled_turn_uses_the_fallback_then_returns_to_the_chosen_model(
+    world: dict[str, Any],
+) -> None:
+    """kimi-k3 stalls on ~6% of calls; one stall must not cost the owner their
+    chosen model, but three in a row switch for good."""
+    scripted: ScriptedProvider = world["provider"]
+    scripted.route(
+        MARKER,
+        [
+            turn(call("message_owner", "a", text="answered by flash")),
+            turn(call("message_owner", "b", text="back on pro")),
+            turn(call("finish", "c", outcome="failed", summary="done")),
+        ],
+    )
+
+    class FlakyPro:
+        def __init__(self) -> None:
+            self.models: list[str] = []
+
+        async def complete(self, request: Any) -> Any:
+            self.models.append(request.model)
+            if request.model == "fake-pro" and self.models.count("fake-pro") == 1:
+                raise TimeoutError("stalled")
+            return await scripted.complete(request)
+
+    flaky = FlakyPro()
+    world["provider"] = flaky
+    await asyncio.wait_for(runner(world).run(), timeout=30)
+    assert flaky.models == ["fake-pro", "fake-flash", "fake-pro", "fake-pro"]
+
+
+async def test_three_failed_turns_switch_the_orchestrator_for_good(world: dict[str, Any]) -> None:
+    scripted: ScriptedProvider = world["provider"]
+    scripted.route(
+        MARKER,
+        [turn(call("message_owner", f"m{i}", text=str(i))) for i in range(3)]
+        + [turn(call("finish", "f", outcome="failed", summary="done"))],
+    )
+
+    class DeadPro:
+        def __init__(self) -> None:
+            self.models: list[str] = []
+
+        async def complete(self, request: Any) -> Any:
+            self.models.append(request.model)
+            if request.model == "fake-pro":
+                raise TimeoutError("down")
+            return await scripted.complete(request)
+
+    dead = DeadPro()
+    world["provider"] = dead
+    await asyncio.wait_for(runner(world).run(), timeout=30)
+    assert dead.models == ["fake-pro", "fake-flash"] * 3 + ["fake-flash"]
+
+
+async def test_timeouts_are_not_retried_when_the_caller_switches_models() -> None:
+    from rework.kernel.llm.adapters.retry import with_retries
+
+    calls = 0
+
+    class Stall:
+        name = "stall"
+
+        async def complete(self, request: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            raise TimeoutError("stalled")
+
+    with pytest.raises(TimeoutError):
+        await with_retries(Stall(), backoff_s=0, retry_timeouts=False).complete(None)  # type: ignore[arg-type]
+    assert calls == 1
+    with pytest.raises(TimeoutError):
+        await with_retries(Stall(), backoff_s=0).complete(None)  # type: ignore[arg-type]
+    assert calls == 4

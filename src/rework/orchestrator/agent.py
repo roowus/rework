@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 MARKER = "You are the MISSION ORCHESTRATOR"
 MAX_TURNS = 80  # runaway protection only; the budget is the real rail
 TURN_EXTENSION = 40  # per owner approval at the cap
+PREFERRED_FAILURE_LIMIT = 3  # failed turns in a row before leaving the chosen model
 MAX_IDLE_NUDGES = 3
 PROVIDER_FAILURE_LIMIT = 2  # failed runs on one model before spawn_role refuses it
 
@@ -358,7 +359,7 @@ class MissionOrchestrator:
         self.history: list[dict[str, Any]] = []
         self.seen: dict[str, str] = {}  # run id -> status already reported
         self.questions_seen: set[str] = set()  # escalation ids already reported
-        self._failed_models: set[str] = set()  # orchestrator models that failed a call
+        self._preferred_failures = 0  # consecutive turns the chosen model failed
         self.owner_seq = 0  # last owner message delivered
         # every event of the mission, read forward with a seq cursor (found
         # live: events_since(0, limit=N) returns the OLDEST N events, so on a
@@ -366,7 +367,7 @@ class MissionOrchestrator:
         self._events: list[Any] = []
         self._event_cursor = 0
         self.finished: tuple[str, str] | None = None
-        self._provider: Any = None
+        self._providers: dict[str, Any] = {}
 
     def _usable(self) -> list[Any]:
         """Catalog entries this daemon can actually call (real ones first)."""
@@ -380,16 +381,18 @@ class MissionOrchestrator:
 
     # -- provider ------------------------------------------------------------
 
-    def provider(self) -> Any:
-        if self._provider is None:
-            if self.r._provider is not None:
-                self._provider = self.r._provider  # tests inject a scripted one
-            else:
-                from rework.kernel.llm.adapters import build_provider
-                from rework.kernel.llm.adapters.retry import with_retries
+    def provider(self, entry: Any = None) -> Any:
+        """One provider per catalog entry. Timeouts are NOT retried on the same
+        model: _think answers that turn with the next model instead."""
+        entry = entry or self.entry
+        if self.r._provider is not None:
+            return self.r._provider  # tests inject a scripted one
+        if entry.id not in self._providers:
+            from rework.kernel.llm.adapters import build_provider
+            from rework.kernel.llm.adapters.retry import with_retries
 
-                self._provider = with_retries(build_provider(self.entry))
-        return self._provider
+            self._providers[entry.id] = with_retries(build_provider(entry), retry_timeouts=False)
+        return self._providers[entry.id]
 
     # -- persistence -------------------------------------------------------
 
@@ -530,59 +533,76 @@ class MissionOrchestrator:
         state = f"CURRENT STATE (rebuilt from the database for this turn):\n{await self._state()}"
         self._compact_history()
         messages = [*self.history, {"role": "user", "content": state}]
-        request = ChatRequest(
-            model=self.entry.model,
-            system=await self._system_prompt(),
-            messages=messages,
-            tools=TOOLS,
-            max_tokens=min(int(self.entry.max_output or 4096), 4096),
-            effort=self.effort,
-            session_id=self.run_id,
-        )
-        try:
-            result = await self.provider().complete(request)
-        except Exception as exc:
-            log.exception("orchestrator model call failed")
-            await self.bus.publish(
-                EventRecord(
-                    mission_id=self.mid,
-                    run_id=self.run_id,
-                    type=EventType.INFO,
-                    payload={"error": f"orchestrator model call failed: {exc}"[:400]},
-                )
+        system = await self._system_prompt()
+        entry = self.entry
+        tried: set[str] = set()
+        while True:
+            request = ChatRequest(
+                model=entry.model,
+                system=system,
+                messages=messages,
+                tools=TOOLS,
+                max_tokens=min(int(entry.max_output or 4096), 4096),
+                effort=self.effort,
+                session_id=self.run_id,
             )
-            # switch the orchestrator's OWN model before giving up. Found live:
-            # kimi-k3 timed out 3x on a big context and the mission (work done,
-            # one step from its PR) was failed while flash was healthy
-            self._failed_models.add(self.entry.id)
-            fallback = next(
-                (
-                    e
-                    for e in sorted(self._usable(), key=lambda e: (-e.tier, e.cost_in_per_mtok))
-                    if e.id not in self._failed_models
-                ),
-                None,
-            )
-            if fallback is not None:
-                await self._note(
-                    f"orchestrator model {self.entry.id} failed ({type(exc).__name__}); "
-                    f"switching to {fallback.id}"
+            try:
+                result = await self.provider(entry).complete(request)
+                break
+            except Exception as exc:
+                log.exception("orchestrator model call failed")
+                await self.bus.publish(
+                    EventRecord(
+                        mission_id=self.mid,
+                        run_id=self.run_id,
+                        type=EventType.INFO,
+                        payload={"error": f"orchestrator model call failed: {exc}"[:400]},
+                    )
                 )
-                self.entry = fallback
-                self._provider = None
-                return await self._think()
-            self.finished = ("failed", f"orchestrator model call failed: {exc}"[:300])
-            return None
+                # never fail the mission while another model can answer. Found
+                # live: kimi-k3 stalls on ~6% of calls and a stalled request
+                # stalls again when re-sent; the mission (work done, one step
+                # from its PR) was failed while flash was healthy
+                tried.add(entry.id)
+                preferred = entry.id == self.entry.id
+                if preferred:
+                    self._preferred_failures += 1
+                fallback = next(
+                    (
+                        e
+                        for e in sorted(self._usable(), key=lambda e: (-e.tier, e.cost_in_per_mtok))
+                        if e.id not in tried
+                    ),
+                    None,
+                )
+                if fallback is None:
+                    self.finished = ("failed", f"orchestrator model call failed: {exc}"[:300])
+                    return None
+                if preferred and self._preferred_failures >= PREFERRED_FAILURE_LIMIT:
+                    await self._note(
+                        f"orchestrator model {entry.id} failed {self._preferred_failures} "
+                        f"turns in a row; switching to {fallback.id} for the rest"
+                    )
+                    self.entry = fallback
+                    self._preferred_failures = 0
+                else:
+                    await self._note(
+                        f"orchestrator model {entry.id} failed ({type(exc).__name__}); "
+                        f"{fallback.id} answers this turn"
+                    )
+                entry = fallback
+        if entry.id == self.entry.id:
+            self._preferred_failures = 0
         usage = result.usage
         await self.store.charge(
             Charge(
                 mission_id=self.mid,
                 run_id=self.run_id,
-                model=self.entry.model,
+                model=entry.model,
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
                 cached_tokens=usage.cached_tokens,
-                cost_usd=self.entry.estimate_cost(
+                cost_usd=entry.estimate_cost(
                     usage.input_tokens, usage.output_tokens, usage.cached_tokens
                 ),
             )

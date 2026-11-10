@@ -26,6 +26,12 @@ _TRANSIENT_MARKERS = (
 )
 
 
+def is_timeout(exc: Exception) -> bool:
+    """A request that got no answer in time (client timeout or hard deadline)."""
+    name = type(exc).__name__.lower()
+    return isinstance(exc, TimeoutError) or "timeout" in name
+
+
 def _is_transient(exc: Exception) -> bool:
     if isinstance(exc, TimeoutError):  # LoggedProvider's hard deadline
         return True
@@ -52,8 +58,18 @@ class RetryingProvider:
 
     name = "retrying"
 
-    def __init__(self, inner: Any, attempts: int = 3, backoff_s: float = 2.0) -> None:
+    def __init__(
+        self,
+        inner: Any,
+        attempts: int = 3,
+        backoff_s: float = 2.0,
+        retry_timeouts: bool = True,
+    ) -> None:
         self._inner = inner
+        # False: a timeout is raised at once so the caller can switch models
+        # (found live: a stalled kimi-k3 request stalls again when re-sent,
+        # and three 180s attempts cost the orchestrator 9 minutes)
+        self._retry_timeouts = retry_timeouts
         self._attempts = attempts
         self._rate_attempts = attempts * 3  # 429: 9 shots when base is 3
         self._backoff = backoff_s
@@ -77,6 +93,8 @@ class RetryingProvider:
             except Exception as exc:
                 if not _is_transient(exc):
                     raise
+                if not self._retry_timeouts and is_timeout(exc):
+                    raise
                 last = exc
                 if self._is_rate_limit(exc):
                     limit = self._rate_attempts  # extend the pool for 429s
@@ -94,5 +112,9 @@ class RetryingProvider:
         raise last
 
 
-def with_retries(provider: Any, attempts: int = 3, backoff_s: float = 2.0) -> Any:
-    return RetryingProvider(provider, attempts=attempts, backoff_s=backoff_s)
+def with_retries(
+    provider: Any, attempts: int = 3, backoff_s: float = 2.0, retry_timeouts: bool = True
+) -> Any:
+    return RetryingProvider(
+        provider, attempts=attempts, backoff_s=backoff_s, retry_timeouts=retry_timeouts
+    )
