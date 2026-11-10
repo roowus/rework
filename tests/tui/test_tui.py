@@ -1205,3 +1205,162 @@ async def test_a_finished_card_shows_its_cost(ids: dict[str, str], env: Path) ->
         card = app.query_one(MissionCard)
         assert card.tail_filled
         assert card.spend > 0, "a finished card must still show what it cost"
+
+
+# -- preview a PR (Mission menu) ---------------------------------------------
+
+
+def _git_dir(tmp_path: Path) -> Path:
+    """A minimal real git repo (only rev-parse --show-toplevel has to work)."""
+    import subprocess
+
+    repo = tmp_path / "preview-repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
+    return repo
+
+
+async def _open_preview_modal(pilot: Any, app: ReworkApp) -> Any:
+    from rework.tui.widgets.modals import Form
+
+    title = next(t for t in app.query(".menu-title") if "Mission" in str(t.render()))
+    await pilot.click(title)
+    await pilot.pause()
+    entry = next(e for e in app.screen.query(".menu-item") if "Preview a PR" in str(e.render()))
+    await pilot.click(entry)
+    await _settle(pilot)
+    form = app.screen
+    assert isinstance(form, Form)
+    return form
+
+
+def _fake_subprocess(monkeypatch: pytest.MonkeyPatch, calls: list[list[str]]) -> None:
+    """Nothing real is launched: both the git check and the preview are stubbed."""
+    from types import SimpleNamespace
+
+    from rework.tui import actions as actions_mod
+
+    def fake_run(cmd: Any, *a: Any, **kw: Any) -> Any:
+        calls.append([str(c) for c in cmd])
+        return SimpleNamespace(returncode=0, stdout="/repo\n", stderr="")
+
+    monkeypatch.setattr(actions_mod, "subprocess", SimpleNamespace(run=fake_run))
+
+
+async def test_menu_preview_a_pr_opens_modal_with_no_mission_focused(
+    ids: dict[str, str], env: Path, tmp_path: Path
+) -> None:
+    """The whole point: no mission focused (action_mission would refuse here)."""
+    repo = _git_dir(tmp_path)
+    store = await _store(env)
+    try:
+        await store.update_mission(ids["running"], repo_path=str(repo))
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        assert app.view("work").convo is None  # nothing opened, no target mission
+        form = await _open_preview_modal(pilot, app)
+        assert form.query_one("#f-repo").value == str(repo)
+        assert form.query_one("#f-pr").value == ""
+
+
+async def test_preview_pr_refuses_non_digit_number(
+    ids: dict[str, str], env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _git_dir(tmp_path)
+    calls: list[list[str]] = []
+    _fake_subprocess(monkeypatch, calls)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        form = await _open_preview_modal(pilot, app)
+        form.query_one("#f-pr").value = "abc"
+        form.query_one("#f-repo").value = str(repo)
+        await pilot.click(_btn(app, form, "submit"))
+        await _settle(pilot)
+    assert any("digits" in text for _, text in app.notifications_sent)
+    assert calls == [], calls
+
+
+async def test_preview_pr_refuses_empty_repo_path(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    _fake_subprocess(monkeypatch, calls)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        form = await _open_preview_modal(pilot, app)
+        form.query_one("#f-pr").value = "128"
+        form.query_one("#f-repo").value = "   "
+        await pilot.click(_btn(app, form, "submit"))
+        await _settle(pilot, 1.0)
+    assert any("local git repo" in text for _, text in app.notifications_sent)
+    assert calls == [], calls
+
+
+async def test_preview_pr_refuses_a_path_that_is_not_a_git_repo(
+    ids: dict[str, str], env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from rework.tui import actions as actions_mod
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        actions_mod,
+        "subprocess",
+        SimpleNamespace(
+            run=lambda cmd, *a, **kw: (
+                calls.append([str(c) for c in cmd])
+                or SimpleNamespace(returncode=128, stdout="", stderr="not a repo")
+            )
+        ),
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        form = await _open_preview_modal(pilot, app)
+        form.query_one("#f-pr").value = "128"
+        form.query_one("#f-repo").value = str(tmp_path / "not-a-repo")
+        await pilot.click(_btn(app, form, "submit"))
+        await _settle(pilot, 1.0)
+    assert any("Not a git repo" in text for _, text in app.notifications_sent)
+    assert all(cmd[:2] != ["rework", "preview"] for cmd in calls), calls
+
+
+async def test_preview_pr_runs_the_shared_preview_flow(
+    ids: dict[str, str], env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A valid submission goes through actions.run_preview: suspend + subprocess."""
+    from contextlib import nullcontext
+
+    from rework.tui import actions as actions_mod
+
+    repo = _git_dir(tmp_path)
+    calls: list[list[str]] = []
+    _fake_subprocess(monkeypatch, calls)
+    suspended: list[bool] = []
+
+    def fake_suspend(self: Any) -> Any:
+        suspended.append(True)
+        return nullcontext()
+
+    monkeypatch.setattr(ReworkApp, "suspend", fake_suspend)
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        form = await _open_preview_modal(pilot, app)
+        form.query_one("#f-pr").value = "128"
+        form.query_one("#f-repo").value = str(repo)
+        await pilot.click(_btn(app, form, "submit"))
+        await _settle(pilot, 1.0)
+        await app.workers.wait_for_complete()
+
+    assert ["rework", "preview", "128", "--repo-dir", str(repo)] in calls, calls
+    assert suspended == [True]
+    assert actions_mod.is_git_repo(str(repo)) is True

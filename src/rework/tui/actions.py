@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from rework.tui.theme import clip
@@ -99,9 +100,49 @@ async def decide(
     return True
 
 
+def is_git_repo(repo_dir: str | Path) -> bool:
+    """`rework preview --repo-dir` fetches into a real git repo; anything else
+    blows up deep inside the CLI, so refuse up front with something readable."""
+    try:
+        top = subprocess.run(  # noqa: ASYNC221
+            ["git", "-C", str(repo_dir), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    return top.returncode == 0
+
+
+async def run_preview(app: ReworkApp, pr_number: str, repo_dir: str) -> bool:
+    """Suspend this TUI, hand the terminal to `rework preview <n> --repo-dir`,
+    come back when it exits. The ONE place a preview is launched from the TUI:
+    the mission card's Preview button and the Mission menu both come here."""
+    repo_dir = str(repo_dir or "").strip()
+    if not repo_dir:
+        app.notify(
+            "Give the path of a local git repo to preview", severity="error", timeout=6
+        )
+        return False
+    if not is_git_repo(repo_dir):
+        app.notify(f"Not a git repo: {repo_dir}", severity="error", timeout=8)
+        return False
+    cmd = ["rework", "preview", str(pr_number), "--repo-dir", repo_dir]
+    try:
+        app.notify(f"Starting preview of PR {pr_number}…", timeout=3)
+        with app.suspend():
+            # blocking on purpose: suspend() handed the terminal to the child
+            subprocess.run(cmd)  # noqa: ASYNC221
+    except Exception as exc:
+        app.notify(str(exc), severity="error", timeout=8)
+        return False
+    await app.hub.refresh()
+    return True
+
+
 async def preview(app: ReworkApp, mission_id: str) -> bool:
-    """Run the mission's PR as a preview (ADR 0008): suspend this TUI, hand the
-    terminal to `rework preview <n>`, come back when it exits."""
+    """Run the mission's PR as a preview (ADR 0008): read the PR number and the
+    repo off the mission, then hand over to the shared runner."""
     try:
         mission = await app.hub.data.get_mission(mission_id)
     except Exception as exc:
@@ -129,14 +170,4 @@ async def preview(app: ReworkApp, mission_id: str) -> bool:
             timeout=8,
         )
         return False
-    cmd = ["rework", "preview", match.group(1), "--repo-dir", str(repo_path)]
-    try:
-        app.notify(f"Starting preview of PR {match.group(1)}…", timeout=3)
-        with app.suspend():
-            # blocking on purpose: suspend() handed the terminal to the child
-            subprocess.run(cmd)  # noqa: ASYNC221
-    except Exception as exc:
-        app.notify(str(exc), severity="error", timeout=8)
-        return False
-    await app.hub.refresh()
-    return True
+    return await run_preview(app, match.group(1), str(repo_path))
