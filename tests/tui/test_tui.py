@@ -1205,3 +1205,324 @@ async def test_a_finished_card_shows_its_cost(ids: dict[str, str], env: Path) ->
         card = app.query_one(MissionCard)
         assert card.tail_filled
         assert card.spend > 0, "a finished card must still show what it cost"
+
+
+# -- preview a PR (Mission menu) ---------------------------------------------
+
+
+def _git_dir(tmp_path: Path) -> Path:
+    """A minimal real git repo (only rev-parse --show-toplevel has to work)."""
+    import subprocess
+
+    repo = tmp_path / "preview-repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
+    return repo
+
+
+async def _open_preview_modal(pilot: Any, app: ReworkApp) -> Any:
+    from rework.tui.widgets.modals import Form
+
+    title = next(t for t in app.query(".menu-title") if "Mission" in str(t.render()))
+    await pilot.click(title)
+    await pilot.pause()
+    entry = next(e for e in app.screen.query(".menu-item") if "Preview a PR" in str(e.render()))
+    await pilot.click(entry)
+    await _settle(pilot)
+    form = app.screen
+    assert isinstance(form, Form)
+    return form
+
+
+def _fake_subprocess(monkeypatch: pytest.MonkeyPatch, calls: list[list[str]]) -> None:
+    """Nothing real is launched: both the git check and the preview are stubbed."""
+    from types import SimpleNamespace
+
+    from rework.tui import actions as actions_mod
+
+    def fake_run(cmd: Any, *a: Any, **kw: Any) -> Any:
+        calls.append([str(c) for c in cmd])
+        return SimpleNamespace(returncode=0, stdout="/repo\n", stderr="")
+
+    monkeypatch.setattr(actions_mod, "subprocess", SimpleNamespace(run=fake_run))
+
+
+async def test_menu_preview_a_pr_opens_modal_with_no_mission_focused(
+    ids: dict[str, str], env: Path, tmp_path: Path
+) -> None:
+    """The whole point: no mission focused (action_mission would refuse here)."""
+    repo = _git_dir(tmp_path)
+    store = await _store(env)
+    try:
+        await store.update_mission(ids["running"], repo_path=str(repo))
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        assert app.view("work").convo is None  # nothing opened, no target mission
+        form = await _open_preview_modal(pilot, app)
+        assert form.query_one("#f-repo").value == str(repo)
+        assert form.query_one("#f-pr").value == ""
+
+
+async def _add_mission(
+    store: Any,
+    mid: str,
+    *,
+    created_at: float,
+    project_id: str | None = None,
+    repo_path: str | None = None,
+) -> None:
+    """One extra mission, seeded through the real store (newest = biggest ts)."""
+    from rework.kernel.state.records import Mission, MissionStatus
+
+    await store.create_mission(
+        Mission(
+            id=mid,
+            objective=f"seeded mission {mid}",
+            project_id=project_id,
+            repo_path=repo_path,
+            status=MissionStatus.DONE,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+    )
+
+
+async def _prefill_with_work_project(ids: dict[str, str], pilot: Any, app: ReworkApp) -> str:
+    """Open the modal with the Work tab's project selected (the seed's chat)."""
+    app.query_one("#chat-list", RowList).activate(ids["chat"], via_mouse=True)
+    await _settle(pilot, 1.0)
+    assert app.view("work").project_id == ids["project"]
+    form = await _open_preview_modal(pilot, app)
+    return str(form.query_one("#f-repo").value)
+
+
+async def test_preview_prefill_takes_the_newest_mission_in_the_project(
+    ids: dict[str, str], env: Path, tmp_path: Path
+) -> None:
+    """Newest wins, not oldest: two missions of the selected project, both with
+    a repo path, and the prefill must be the newer one's."""
+    import time as _time
+
+    older = tmp_path / "older-repo"
+    newer = tmp_path / "newer-repo"
+    now = _time.time()
+    store = await _store(env)
+    try:
+        await _add_mission(
+            store,
+            "m-preview000a",
+            created_at=now - 7200,
+            project_id=ids["project"],
+            repo_path=str(older),
+        )
+        await _add_mission(
+            store,
+            "m-preview000b",
+            created_at=now - 60,
+            project_id=ids["project"],
+            repo_path=str(newer),
+        )
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        assert await _prefill_with_work_project(ids, pilot, app) == str(newer)
+
+
+async def test_preview_prefill_prefers_the_selected_project_over_a_newer_mission(
+    ids: dict[str, str], env: Path, tmp_path: Path
+) -> None:
+    """Project-scoped: a NEWER mission outside the selected project must not
+    override an older one inside it."""
+    import time as _time
+
+    inside = tmp_path / "inside-repo"
+    outside = tmp_path / "outside-repo"
+    now = _time.time()
+    store = await _store(env)
+    try:
+        await _add_mission(
+            store,
+            "m-preview000c",
+            created_at=now - 7200,
+            project_id=ids["project"],
+            repo_path=str(inside),
+        )
+        await _add_mission(store, "m-preview000d", created_at=now - 60, repo_path=str(outside))
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        assert await _prefill_with_work_project(ids, pilot, app) == str(inside)
+
+
+async def test_preview_prefill_falls_back_to_the_newest_mission_overall(
+    ids: dict[str, str], env: Path, tmp_path: Path
+) -> None:
+    """The selected project has NO repo_path-bearing mission: the newest mission
+    overall supplies the path (the seed's project missions have none)."""
+    import time as _time
+
+    older = tmp_path / "global-older-repo"
+    newer = tmp_path / "global-newer-repo"
+    now = _time.time()
+    store = await _store(env)
+    try:
+        await _add_mission(store, "m-preview000e", created_at=now - 7200, repo_path=str(older))
+        await _add_mission(store, "m-preview000f", created_at=now - 60, repo_path=str(newer))
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        assert await _prefill_with_work_project(ids, pilot, app) == str(newer)
+
+
+async def test_preview_prefill_ignores_a_newer_mission_without_a_repo_path(
+    ids: dict[str, str], env: Path, tmp_path: Path
+) -> None:
+    """A newer mission with repo_path=None must not shadow an older one that has
+    a path -- neither inside the project nor in the overall fallback."""
+    import time as _time
+
+    has_path = tmp_path / "has-path-repo"
+    now = _time.time()
+    store = await _store(env)
+    try:
+        await _add_mission(
+            store,
+            "m-preview000g",
+            created_at=now - 7200,
+            project_id=ids["project"],
+            repo_path=str(has_path),
+        )
+        # newer, same project, but no path: must be skipped, not returned
+        await _add_mission(store, "m-preview000h", created_at=now - 60, project_id=ids["project"])
+        # newest mission of all, project-less and pathless: also skipped
+        await _add_mission(store, "m-preview000i", created_at=now - 30)
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        assert await _prefill_with_work_project(ids, pilot, app) == str(has_path)
+
+
+async def test_preview_pr_refuses_non_digit_number(
+    ids: dict[str, str], env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _git_dir(tmp_path)
+    calls: list[list[str]] = []
+    _fake_subprocess(monkeypatch, calls)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        form = await _open_preview_modal(pilot, app)
+        form.query_one("#f-pr").value = "abc"
+        form.query_one("#f-repo").value = str(repo)
+        await pilot.click(_btn(app, form, "submit"))
+        await _settle(pilot)
+    assert any("digits" in text for _, text in app.notifications_sent)
+    assert calls == [], calls
+
+
+async def test_preview_pr_refuses_empty_repo_path(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    _fake_subprocess(monkeypatch, calls)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        form = await _open_preview_modal(pilot, app)
+        form.query_one("#f-pr").value = "128"
+        form.query_one("#f-repo").value = "   "
+        await pilot.click(_btn(app, form, "submit"))
+        await _settle(pilot, 1.0)
+    assert any("local git repo" in text for _, text in app.notifications_sent)
+    assert calls == [], calls
+
+
+async def test_preview_pr_refuses_a_path_that_is_not_a_git_repo(
+    ids: dict[str, str], env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from types import SimpleNamespace
+
+    from rework.tui import actions as actions_mod
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        actions_mod,
+        "subprocess",
+        SimpleNamespace(
+            run=lambda cmd, *a, **kw: (
+                calls.append([str(c) for c in cmd])
+                or SimpleNamespace(returncode=128, stdout="", stderr="not a repo")
+            )
+        ),
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        form = await _open_preview_modal(pilot, app)
+        form.query_one("#f-pr").value = "128"
+        form.query_one("#f-repo").value = str(tmp_path / "not-a-repo")
+        await pilot.click(_btn(app, form, "submit"))
+        await _settle(pilot, 1.0)
+    assert any("Not a git repo" in text for _, text in app.notifications_sent)
+    assert all(cmd[:2] != ["rework", "preview"] for cmd in calls), calls
+
+
+async def test_preview_a_pr_end_to_end_through_the_menu(
+    ids: dict[str, str], env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole flow, unbroken: Mission menu -> modal -> validation -> the REAL
+    subprocess.run, against a REAL git repo, with a fake `rework` on PATH.
+
+    Nothing about the wiring is stubbed: a wrong argument order, a missing PATH
+    entry or a changed callback contract fails here. `app.suspend()` runs for
+    real too -- only the headless driver's "can I suspend?" flag is flipped,
+    because HeadlessDriver reports can_suspend == False and Textual would then
+    raise SuspendNotSupported (what the terminal handoff itself does is a no-op
+    off-screen; that part stays unverified, see the handoff note)."""
+    import os
+    import stat
+
+    from textual.drivers.headless_driver import HeadlessDriver
+
+    repo = _git_dir(tmp_path)
+    marker = tmp_path / "marker.txt"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "rework"
+    fake.write_text('#!/bin/sh\nprintf "%s" "$*" > "$MARKER"\n')
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv("MARKER", str(marker))
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(HeadlessDriver, "can_suspend", property(lambda self: True))
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        assert app.view("work").convo is None, "no mission focused: action_mission would refuse"
+        form = await _open_preview_modal(pilot, app)
+        form.query_one("#f-pr").value = "128"
+        form.query_one("#f-repo").value = str(repo)
+        await pilot.click(_btn(app, form, "submit"))
+        await _settle(pilot)
+        await app.workers.wait_for_complete()
+        assert not app.swallowed, app.swallowed
+
+    assert marker.exists(), "the real `rework` on PATH was never run"
+    assert marker.read_text() == f"preview 128 --repo-dir {repo}", marker.read_text()
+    assert any("Starting preview of PR 128" in t for _, t in app.notifications_sent)

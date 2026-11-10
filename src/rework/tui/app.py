@@ -15,6 +15,7 @@ from typing import Any, ClassVar
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
+from textual.notifications import SeverityLevel
 from textual.screen import ModalScreen
 from textual.widgets import ContentSwitcher
 
@@ -86,6 +87,9 @@ def _menus() -> dict[str, list[MenuItem]]:
             MenuItem("Cancel", "app.mission('cancel')"),
             SEPARATOR,
             MenuItem("Fetch result", "app.mission('fetch')"),
+            # not action_mission(): previewing a PR must work with NO mission
+            # focused (action_mission refuses early when there is none)
+            MenuItem("Preview a PR…", "app.preview_pr"),
         ],
         "Help": [
             MenuItem("Keyboard shortcuts", "app.help", "f1"),
@@ -241,12 +245,27 @@ class ReworkApp(App[None]):
             where = clip(mission.objective, 60) if mission else gate.mission_id
             self.announce(f"{clip(gate.question, 120)}", title=f"Gate · {where}")
 
+    def notify(
+        self,
+        message: str,
+        *,
+        title: str = "",
+        severity: SeverityLevel = "information",
+        timeout: float | None = None,
+        markup: bool = True,
+    ) -> None:
+        """Every toast the owner would actually see is recorded here, so tests
+        can assert on notifications (refusals included). Channels follow
+        `settings.notify`, exactly like `announce`."""
+        if "toast" in self.settings.notify:
+            self.notifications_sent.append(("toast", message))
+        super().notify(message, title=title, severity=severity, timeout=timeout, markup=markup)
+
     def announce(self, text: str, *, title: str = "") -> None:
         """A human is needed. Channels per settings: toast, bell, os."""
         channels = self.settings.notify
         if "toast" in channels:
             self.notify(text, title=title, severity="warning", timeout=8)
-            self.notifications_sent.append(("toast", text))
         if "bell" in channels:
             self.bell()
             self.notifications_sent.append(("bell", text))
@@ -384,6 +403,55 @@ class ReworkApp(App[None]):
             self.open_mission(mission_id)
         else:
             self.run_worker(dash.control(mission_id, verb), group="control")
+
+    def preview_repo_default(self) -> str:
+        """What to prefill the repo-path field with: the newest mission (any
+        status) in the project selected in the Work tab, else the newest
+        mission overall. Missions are the only place the TUI records a LOCAL
+        repo path (ADR 0008: never the process cwd, and a project's settings
+        hold repo *references*, not paths)."""
+        project_id = getattr(self.view("work"), "project_id", None)
+        missions = list(self.hub.snapshot.missions)
+        if project_id:
+            for mission in missions:
+                if mission.project_id == project_id and getattr(mission, "repo_path", None):
+                    return str(mission.repo_path)
+        for mission in missions:
+            if getattr(mission, "repo_path", None):
+                return str(mission.repo_path)
+        return ""
+
+    def action_preview_pr(self) -> None:
+        """Preview ANY PR, focused mission or not. The card's Preview button
+        only covers PRs a mission opened; this asks for the two things only the
+        owner knows: which PR, and which local repo to fetch it into."""
+        from rework.tui import actions
+
+        def done(values: dict[str, str] | None) -> None:
+            if not values:
+                return
+            pr = values.get("pr", "").strip()
+            if not pr.isdigit():
+                self.notify("PR number must be digits only", severity="error", timeout=4)
+                return
+            self.run_worker(actions.run_preview(self, pr, values.get("repo", "")), group="preview")
+
+        self.push_screen(
+            Form(
+                "Preview a PR",
+                [
+                    Field("pr", "PR number", placeholder="e.g. 128"),
+                    Field(
+                        "repo",
+                        "Repo path",
+                        value=self.preview_repo_default(),
+                        placeholder="/path/to/a/local/git/repo",
+                    ),
+                ],
+                submit="Preview",
+            ),
+            done,
+        )
 
     def open_mission(self, mission_id: str, run_id: str | None = None) -> None:
         self.action_tab("dashboard")
