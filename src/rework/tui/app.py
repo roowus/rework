@@ -14,6 +14,7 @@ from typing import Any, ClassVar
 
 from textual import events
 from textual.app import App, ComposeResult
+from textual.notifications import SeverityLevel
 from textual.binding import Binding, BindingType
 from textual.screen import ModalScreen
 from textual.widgets import ContentSwitcher
@@ -244,12 +245,27 @@ class ReworkApp(App[None]):
             where = clip(mission.objective, 60) if mission else gate.mission_id
             self.announce(f"{clip(gate.question, 120)}", title=f"Gate · {where}")
 
+    def notify(
+        self,
+        message: str,
+        *,
+        title: str = "",
+        severity: SeverityLevel = "information",
+        timeout: float | None = None,
+        markup: bool = True,
+    ) -> None:
+        """Every toast the owner would actually see is recorded here, so tests
+        can assert on notifications (refusals included). Channels follow
+        `settings.notify`, exactly like `announce`."""
+        if "toast" in self.settings.notify:
+            self.notifications_sent.append(("toast", message))
+        super().notify(message, title=title, severity=severity, timeout=timeout, markup=markup)
+
     def announce(self, text: str, *, title: str = "") -> None:
         """A human is needed. Channels per settings: toast, bell, os."""
         channels = self.settings.notify
         if "toast" in channels:
             self.notify(text, title=title, severity="warning", timeout=8)
-            self.notifications_sent.append(("toast", text))
         if "bell" in channels:
             self.bell()
             self.notifications_sent.append(("bell", text))

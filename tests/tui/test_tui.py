@@ -1332,35 +1332,45 @@ async def test_preview_pr_refuses_a_path_that_is_not_a_git_repo(
     assert all(cmd[:2] != ["rework", "preview"] for cmd in calls), calls
 
 
-async def test_preview_pr_runs_the_shared_preview_flow(
+async def test_preview_a_pr_end_to_end_through_the_menu(
     ids: dict[str, str], env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A valid submission goes through actions.run_preview: suspend + subprocess."""
-    from contextlib import nullcontext
+    """The whole flow, unbroken: Mission menu -> modal -> validation -> the REAL
+    subprocess.run, against a REAL git repo, with a fake `rework` on PATH.
 
-    from rework.tui import actions as actions_mod
+    Nothing about the wiring is stubbed: a wrong argument order, a missing PATH
+    entry or a changed callback contract fails here. `app.suspend()` runs for
+    real too -- only the headless driver's "can I suspend?" flag is flipped,
+    because HeadlessDriver reports can_suspend == False and Textual would then
+    raise SuspendNotSupported (what the terminal handoff itself does is a no-op
+    off-screen; that part stays unverified, see the handoff note)."""
+    import os
+    import stat
+    from textual.drivers.headless_driver import HeadlessDriver
 
     repo = _git_dir(tmp_path)
-    calls: list[list[str]] = []
-    _fake_subprocess(monkeypatch, calls)
-    suspended: list[bool] = []
-
-    def fake_suspend(self: Any) -> Any:
-        suspended.append(True)
-        return nullcontext()
-
-    monkeypatch.setattr(ReworkApp, "suspend", fake_suspend)
+    marker = tmp_path / "marker.txt"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "rework"
+    fake.write_text('#!/bin/sh\nprintf "%s" "$*" > "$MARKER"\n')
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv("MARKER", str(marker))
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(HeadlessDriver, "can_suspend", property(lambda self: True))
 
     app = _app()
     async with app.run_test(size=SIZE) as pilot:
         await _settle(pilot)
+        assert app.view("work").convo is None, "no mission focused: action_mission would refuse"
         form = await _open_preview_modal(pilot, app)
         form.query_one("#f-pr").value = "128"
         form.query_one("#f-repo").value = str(repo)
         await pilot.click(_btn(app, form, "submit"))
-        await _settle(pilot, 1.0)
+        await _settle(pilot)
         await app.workers.wait_for_complete()
+        assert not app.swallowed, app.swallowed
 
-    assert ["rework", "preview", "128", "--repo-dir", str(repo)] in calls, calls
-    assert suspended == [True]
-    assert actions_mod.is_git_repo(str(repo)) is True
+    assert marker.exists(), "the real `rework` on PATH was never run"
+    assert marker.read_text() == f"preview 128 --repo-dir {repo}", marker.read_text()
+    assert any("Starting preview of PR 128" in t for _, t in app.notifications_sent)
