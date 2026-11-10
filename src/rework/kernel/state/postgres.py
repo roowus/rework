@@ -679,17 +679,26 @@ class PostgresStore:
 
     @_serialized
     async def events_since(
-        self, seq: int = 0, mission_id: str | None = None, limit: int = 500
+        self,
+        seq: int = 0,
+        mission_id: str | None = None,
+        limit: int = 500,
+        *,
+        newest_first: bool = False,
     ) -> list[EventRecord]:
+        order = "DESC" if newest_first else "ASC"
         if mission_id is not None:
             rows = await self._fetch_all(
-                "SELECT * FROM events WHERE seq > %s AND mission_id = %s ORDER BY seq LIMIT %s",
+                f"SELECT * FROM events WHERE seq > %s AND mission_id = %s ORDER BY seq {order}"
+                " LIMIT %s",
                 (seq, mission_id, limit),
             )
         else:
             rows = await self._fetch_all(
-                "SELECT * FROM events WHERE seq > %s ORDER BY seq LIMIT %s", (seq, limit)
+                f"SELECT * FROM events WHERE seq > %s ORDER BY seq {order} LIMIT %s", (seq, limit)
             )
+        if newest_first:
+            rows.reverse()  # one window, still oldest-first for the caller
         return [
             EventRecord(
                 seq=int(r["seq"]),

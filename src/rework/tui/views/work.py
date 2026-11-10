@@ -554,11 +554,17 @@ class WorkView(View):
                 # backfill the tail ONCE from the mission's newest events and
                 # then stop, exactly as before.
                 if not card.tail_filled:
+                    # `mission_events` pages FORWARD from seq 0, so on a long
+                    # mission it hands back the oldest window; ask for the
+                    # newest events instead. None = the fetch failed (guard's
+                    # default): keep the card unfilled so the next poll retries
+                    # rather than freezing an empty tail forever.
                     evs = await self.hub.guard(
-                        partial(self.hub.data.mission_events, card.mission_id, 0, 5000), []
+                        partial(self.hub.data.mission_events_newest, card.mission_id, 5000), None
                     )
-                    card.rebuild_tail(evs)
-                    card.tail_filled = True
+                    if evs is not None:
+                        card.rebuild_tail(evs)
+                        card.tail_filled = True
                 continue
             evs = await self.hub.guard(
                 partial(self.hub.data.events_tail, card.mission_id, card.last_seq), []
