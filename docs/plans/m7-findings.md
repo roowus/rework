@@ -132,7 +132,7 @@ coder by respawning on `flash`, audited, finished with an accurate summary.
 | 16 | A queued pending mission was logged 275 times in 4 minutes | `_pickup_pending` logged on every poll | fixed |
 | 17 | PR #9 failed CI on ruff format | coder prompt said "run the test suite"; audits re-ran tests only; CLAUDE.md listed no formatter | fixed: roles run what `.github/workflows` runs |
 | 18 | A finished mission card lost its cost after #9 | the new finished path skipped the spend fetch | fixed (found by checking #9 in the real TUI after merge) |
-| 19 | One full-suite run failed, three reruns passed | a timing-sensitive test under load (a mission was running) | open: watch CI |
+| 19 | test_dashboard_graph_and_tabs_render flaky (about 1 in 5 tests/tui runs) | the poll worker painted after app teardown began; children go first, so NoMatches | fixed: 0 of 16 runs after |
 
 Outcome: PR #7 merged after 5 audit rounds and 3 owner end-to-end runs;
 $7.07 total. The Preview button was verified in a real pty (suspend, preview
