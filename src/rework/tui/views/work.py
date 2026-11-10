@@ -547,7 +547,18 @@ class WorkView(View):
                 )
                 if mission is not None:
                     card.update_from(mission, self.snap.gates_for(card.mission_id))
-            if card.last_seq and card.status not in actions.ACTIVE:
+            if card.status not in actions.ACTIVE:
+                # Finished (done/failed/cancelled): nothing more will arrive,
+                # so the card is never polled again. Whatever lines it had
+                # accumulated early would freeze there (finding #37), so
+                # backfill the tail ONCE from the mission's newest events and
+                # then stop, exactly as before.
+                if not card.tail_filled:
+                    evs = await self.hub.guard(
+                        partial(self.hub.data.mission_events, card.mission_id, 0, 5000), []
+                    )
+                    card.rebuild_tail(evs)
+                    card.tail_filled = True
                 continue
             evs = await self.hub.guard(
                 partial(self.hub.data.events_tail, card.mission_id, card.last_seq), []
