@@ -641,6 +641,95 @@ async def test_prompt_newline_keys_and_image_paste(ids: dict[str, str], tmp_path
         assert len(prompt.text) == 50_000, "long pastes are kept whole"
 
 
+# -- model picker: models this process has no key for -------------------------------
+
+
+def _picker_app(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A catalog with one callable model and one whose key is not in this env."""
+    monkeypatch.delenv("REWORK_TEST_NO_KEY", raising=False)
+    monkeypatch.setenv("REWORK_TEST_KEY", "sk-test")
+    monkeypatch.setenv(
+        "REWORK_MODELS",
+        '[{"id":"keyed","provider":"openai-compatible","model":"k","tier":2,'
+        '"api_key_env":"REWORK_TEST_KEY","base_url":"http://127.0.0.1:1/v1"},'
+        '{"id":"nokey","provider":"openai-compatible","model":"n","tier":1,'
+        '"api_key_env":"REWORK_TEST_NO_KEY","base_url":"http://127.0.0.1:1/v1"}]',
+    )
+
+
+async def test_model_picker_marks_a_model_whose_key_is_missing(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Found live: the picker offered models whose API key is not in this
+    process, and the failure only appeared at the first LLM call. They are
+    marked `· no key` and dimmed — never hidden, never disabled: the owner can
+    pick one and go add the key, and the orchestrator rejects a key-less model
+    with a clear message if it really has none."""
+    from rework.tui.theme import MUTED
+    from rework.tui.widgets.base import Row
+    from rework.tui.widgets.modals import Picker
+
+    _picker_app(monkeypatch)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.view("work").pick("model")
+        await pilot.pause()
+        picker = app.screen
+        assert isinstance(picker, Picker), "the model knob opens the picker"
+        rows = {row.key: row for row in picker.query(Row)}
+        assert set(rows) == {"keyed", "nokey"}
+
+        nokey = rows["nokey"]
+        assert "no key" in str(nokey.render())
+        assert nokey.has_class("-dim")
+        assert nokey.styles.color.hex.lower() == MUTED.lower(), (
+            "the -dim class must actually dim the row, not just sit on it"
+        )
+        assert nokey.display, "a key-less model is still shown"
+
+        keyed = rows["keyed"]
+        assert "no key" not in str(keyed.render())
+        assert not keyed.has_class("-dim")
+
+        # still selectable (RowList has no disabled concept) and sorted after
+        # the callable ones
+        lst = picker.query_one("#picker-list", RowList)
+        assert lst.selectable == ["keyed", "nokey"]
+        await pilot.press("enter")
+        await _settle(pilot)
+        assert app.view("work").model_id == "keyed"
+
+
+async def test_picker_rows_carry_the_option_classes() -> None:
+    """Option.classes reaches RowData/Row (the dim hook the model picker uses)."""
+    from textual.app import App
+
+    from rework.tui.widgets.base import Row
+    from rework.tui.widgets.modals import Option, Picker
+
+    picker = Picker(
+        "Choose model",
+        [Option("a", "a", "meta a"), Option("b", "b", "meta b", classes="-dim")],
+    )
+
+    class PickerApp(App[None]):
+        def on_mount(self) -> None:
+            self.push_screen(picker)
+
+    async with PickerApp().run_test() as pilot:
+        await pilot.pause()
+        rows = {row.key: row for row in picker.query(Row)}
+        assert not rows["a"].has_class("-dim")
+        assert rows["b"].has_class("-dim")
+        # the class survives a re-fill (filtering rebuilds the rows)
+        picker._fill("b")
+        await pilot.pause()
+        rows = {row.key: row for row in picker.query(Row)}
+        assert rows["b"].has_class("-dim")
+        assert "meta b" in str(rows["b"].render())
+
+
 # -- dashboard --------------------------------------------------------------------
 
 

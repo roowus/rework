@@ -20,6 +20,8 @@ class Option:
     value: str
     label: str
     meta: str = ""
+    # per-row CSS classes, e.g. "-dim" for a model this process has no key for
+    classes: str = ""
 
 
 class Picker(ModalScreen[str | None]):
@@ -52,7 +54,7 @@ class Picker(ModalScreen[str | None]):
                 continue
             mark = "● " if opt.value == self.current else "  "
             meta = f"  [{MUTED}]{esc(opt.meta)}[/]" if opt.meta else ""
-            rows.append(RowData(opt.value, f"{mark}{esc(opt.label)}{meta}"))
+            rows.append(RowData(opt.value, f"{mark}{esc(opt.label)}{meta}", opt.classes))
         lst = self.query_one("#picker-list", RowList)
         lst.set_rows(rows)
         keys = lst.keys
