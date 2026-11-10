@@ -145,6 +145,31 @@ async def test_events_seq_cursor(store: StateStore) -> None:
     assert all(e.seq is not None and e.seq > e1.seq for e in after_e1)
 
 
+async def test_events_newest_first_reads_backwards(store: StateStore) -> None:
+    """Finding #37: a forward read with a LIMIT stops at the OLDEST events, so
+    a caller that wants the tail of a long mission must ask for the NEWEST
+    ones. The window is still handed back oldest-first."""
+    m = await store.create_mission(Mission(id=new_id("m"), objective="o"))
+    other = await store.create_mission(Mission(id=new_id("m"), objective="p"))
+    for i in range(6):
+        await store.append_event(
+            EventRecord(mission_id=m.id, type=EventType.INFO, payload={"i": i})
+        )
+    await store.append_event(
+        EventRecord(mission_id=other.id, type=EventType.INFO, payload={"i": 99})
+    )
+
+    oldest = await store.events_since(0, mission_id=m.id, limit=2)
+    assert [e.payload["i"] for e in oldest] == [0, 1]
+
+    newest = await store.events_since(0, mission_id=m.id, limit=2, newest_first=True)
+    assert [e.payload["i"] for e in newest] == [4, 5]
+
+    everything = await store.events_since(0, mission_id=m.id, limit=100, newest_first=True)
+    assert [e.payload["i"] for e in everything] == [0, 1, 2, 3, 4, 5]
+    assert all(e.mission_id == m.id for e in everything)  # still mission-scoped
+
+
 async def test_ledger_sums(store: StateStore) -> None:
     m = await store.create_mission(Mission(id=new_id("m"), objective="o"))
     await store.charge(

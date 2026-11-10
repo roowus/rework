@@ -533,6 +533,76 @@ async def test_reopening_a_chat_replays_its_trajectory(ids: dict[str, str]) -> N
         assert cards[0].tail, "the mission card streams the live trajectory"
 
 
+async def test_a_finished_card_shows_the_newest_events_of_a_long_mission(
+    ids: dict[str, str], env: Path
+) -> None:
+    """Finding #37: the finished-mission backfill used to read FORWARD from seq
+    0, so a mission with more events than one page left the card showing the
+    OLDEST window (the stale lines the fix is about)."""
+    from rework.kernel.state.records import EventRecord, EventType, MissionStatus
+    from rework.tui.widgets.cards import MissionCard
+
+    store = await _store(env)
+    try:
+        await store.update_mission(ids["running"], status=MissionStatus.DONE)
+        for i in range(5200):  # more than the backfill's 5000-event window
+            await store.append_event(
+                EventRecord(
+                    mission_id=ids["running"],
+                    run_id=f"{ids['running']}:code:coder:1",
+                    type=EventType.PROGRESS,
+                    payload={"trajectory": "tool_call", "name": f"tool_{i:04d}", "arguments": ""},
+                )
+            )
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.query_one("#chat-list", RowList).activate(ids["chat"], via_mouse=True)
+        await _settle(pilot, 2.0)
+        card = app.query_one(MissionCard)
+        tail = "\n".join(card.tail)
+        assert card.tail_filled
+    assert "tool_5199" in tail, tail
+    assert "tool_0000" not in tail, tail
+
+
+async def test_a_failed_tail_backfill_does_not_freeze_the_card_empty(
+    ids: dict[str, str], env: Path
+) -> None:
+    """Finding #37 robustness: one transient query failure must not mark the
+    card filled — that would freeze an empty tail forever."""
+    from rework.kernel.state.records import MissionStatus
+    from rework.tui.widgets.cards import MissionCard
+
+    store = await _store(env)
+    try:
+        await store.update_mission(ids["running"], status=MissionStatus.DONE)
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        real = app.hub.data.mission_events_newest
+
+        async def boom(*_a: Any, **_k: Any) -> Any:
+            raise OSError("consuming input failed: Operation timed out")
+
+        app.hub.data.mission_events_newest = boom  # type: ignore[method-assign]
+        app.query_one("#chat-list", RowList).activate(ids["chat"], via_mouse=True)
+        await _settle(pilot, 1.0)
+        card = app.query_one(MissionCard)
+        assert not card.tail_filled, "a failed fetch must not mark the card filled"
+
+        app.hub.data.mission_events_newest = real  # type: ignore[method-assign]
+        await _settle(pilot, 1.5)
+        assert card.tail_filled, "the next successful poll must fill the card"
+        assert card.tail, "the backfill must not leave an empty tail"
+
+
 async def test_typing_after_clicking_the_transcript_reaches_the_prompt(ids: dict[str, str]) -> None:
     """Found driving the real TUI: a click in the chat log moved focus to the
     transcript, and the next keystrokes vanished."""

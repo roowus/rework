@@ -381,6 +381,20 @@ class TuiData:
                 return out
             cursor = max(int(e.seq or 0) for e in batch)
 
+    async def mission_events_newest(self, mission_id: str, limit: int = 5000) -> list[Any]:
+        """The mission's NEWEST `limit` events, oldest-first inside the window.
+
+        `mission_events` pages FORWARD from seq 0, so on a mission with more
+        events than `limit` it answers with the OLDEST ones — rebuilding a
+        finished card's tail from that window freezes stale lines again
+        (finding #37). This asks the store to read backwards instead."""
+        return await self._resilient(
+            f"events_newest:{mission_id}:{limit}",
+            lambda: self._call(
+                lambda s: s.events_since(0, mission_id=mission_id, limit=limit, newest_first=True)
+            ),
+        )
+
     async def run_spend(self, run_id: str) -> float:
         """Exact cost of one run (sum of its charges)."""
 

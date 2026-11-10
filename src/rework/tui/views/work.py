@@ -547,7 +547,24 @@ class WorkView(View):
                 )
                 if mission is not None:
                     card.update_from(mission, self.snap.gates_for(card.mission_id))
-            if card.last_seq and card.status not in actions.ACTIVE:
+            if card.status not in actions.ACTIVE:
+                # Finished (done/failed/cancelled): nothing more will arrive,
+                # so the card is never polled again. Whatever lines it had
+                # accumulated early would freeze there (finding #37), so
+                # backfill the tail ONCE from the mission's newest events and
+                # then stop, exactly as before.
+                if not card.tail_filled:
+                    # `mission_events` pages FORWARD from seq 0, so on a long
+                    # mission it hands back the oldest window; ask for the
+                    # newest events instead. None = the fetch failed (guard's
+                    # default): keep the card unfilled so the next poll retries
+                    # rather than freezing an empty tail forever.
+                    evs = await self.hub.guard(
+                        partial(self.hub.data.mission_events_newest, card.mission_id, 5000), None
+                    )
+                    if evs is not None:
+                        card.rebuild_tail(evs)
+                        card.tail_filled = True
                 continue
             evs = await self.hub.guard(
                 partial(self.hub.data.events_tail, card.mission_id, card.last_seq), []

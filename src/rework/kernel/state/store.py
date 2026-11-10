@@ -120,8 +120,22 @@ class StateStore(Protocol):
         ...
 
     async def events_since(
-        self, seq: int = 0, mission_id: str | None = None, limit: int = 500
-    ) -> list[EventRecord]: ...
+        self,
+        seq: int = 0,
+        mission_id: str | None = None,
+        limit: int = 500,
+        *,
+        newest_first: bool = False,
+    ) -> list[EventRecord]:
+        """Events after `seq` (exclusive), oldest first.
+
+        `newest_first` reads backwards instead: it returns the NEWEST `limit`
+        matching events, still ordered oldest-first inside that window. A
+        forward read stops at the oldest `limit` events, so on a mission with
+        more events than one page it never reaches the end of the stream
+        (finding #37: the finished card's tail was rebuilt from that stale
+        window)."""
+        ...
 
     # -- ledger -----------------------------------------------------------------
     async def charge(self, charge: Charge) -> None: ...

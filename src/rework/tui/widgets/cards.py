@@ -28,6 +28,21 @@ from rework.tui.widgets.base import Btn
 from rework.tui.widgets.trajectory import event_step, role_of
 
 
+def _tail_line(ev: Any) -> str | None:
+    """One tail line for an event, or None when it does not belong on a card.
+
+    Node-enter PROGRESS events (`{"node": ..., "phase": "enter"}`, published by
+    the LangGraph node callback) are trajectory bookkeeping: the Dashboard feed
+    shows them, the mission card's short tail must not (finding #37)."""
+    payload: dict[str, Any] = getattr(ev, "payload", None) or {}
+    if payload.get("node") and payload.get("phase") == "enter":
+        return None
+    step = event_step(ev)
+    if step is None:
+        return None
+    return str(step._head).split("\n")[0]
+
+
 class ProposalCard(Vertical):
     """The orchestrator's proposal. Nothing exists until Launch."""
 
@@ -102,6 +117,8 @@ class MissionCard(Vertical):
         self.last_seq = 0
         self.tail: list[str] = []
         self.active_role = ""
+        # a finished card backfills its tail once, then is never polled again
+        self.tail_filled = False
 
     def compose(self) -> ComposeResult:
         yield Static(f"[{MUTED}]mission {esc(self.mission_id)}[/]", classes="card-body mc-head")
@@ -131,16 +148,30 @@ class MissionCard(Vertical):
         self.paint()
 
     def add_events(self, events: list[Any]) -> None:
+        """Live path: append what is new and keep the last few lines."""
         for ev in events:
             self.last_seq = max(self.last_seq, int(ev.seq or 0))
             if ev.run_id:
                 self.active_role = role_of(ev.run_id)
-            step = event_step(ev)
-            if step is None:
-                continue
-            markup = str(step._head).split("\n")[0]
-            self.tail.append(markup)
+            line = _tail_line(ev)
+            if line is not None:
+                self.tail.append(line)
         self.tail = self.tail[-self.TAIL :]
+        self.paint()
+
+    def rebuild_tail(self, events: list[Any]) -> None:
+        """Replace the tail with the NEWEST renderable events.
+
+        A finished mission is no longer polled (work.py `_poll_cards`), so the
+        lines the card accumulated early — `coder #2 read_file` from hours ago
+        — used to freeze there forever. The Work view hands this method the
+        mission's event list once and the card picks the last few lines the
+        same way the live path would; `last_seq` moves to the newest event so
+        the caller can see it is caught up."""
+        lines = [line for line in (_tail_line(ev) for ev in events) if line is not None]
+        self.tail = lines[-self.TAIL :]
+        if events:
+            self.last_seq = max(self.last_seq, max(int(ev.seq or 0) for ev in events))
         self.paint()
 
     def paint(self) -> None:
