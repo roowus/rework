@@ -86,20 +86,23 @@ checked with `gh run list`, and deployed to rewvis when the daemon changed.
 - [x] Verification stays with roles (owner: the orchestrator never does work):
       the auditor re-runs the tests; a revision coder continues on the previous
       coder's branch instead of starting from base.
-- [ ] Role graph topology on `ROLE_SPAWNED` and node enter events, so the
+- [x] Role graph topology on `ROLE_SPAWNED` and node enter events, so the
       Graph tab shows where each role is inside its own LangGraph.
-- [ ] Run timing (`started_at` / `ended_at`) and compute time in the Cost tab.
-- [ ] `Mission.title` written by the orchestrator for lists.
+- [x] Run timing (`started_at` / `ended_at`) and compute time in the Cost tab
+      (active time stat: PR #5, built by rework).
+- [x] `Mission.title` written by the orchestrator for lists.
 
 ### P4: dogfood
 
-- [ ] Local first (owner): daemon + TUI on the Mac against a local SQLite DB,
+- [x] Local first (owner): daemon + TUI on the Mac against a local SQLite DB,
       missions clone rework from GitHub and open real PRs. Runbook in
-      `docs/ops.md` and `scripts/rework-local` (done); first real PR pending.
+      `docs/ops.md` and `scripts/rework-local`. Merged PRs built this way:
+      #2, #3, #4, #5, #7.
 - [ ] Then deploy to rewvis and run the same loop there.
-- [ ] Run three real rework changes end to end from the TUI: bugs found along
-      the way, TUI work, workflow features. (1/3: the dropdown border,
-      m-0d75f495121a, shipped; delivery fixed afterwards, see findings #19.)
+- [x] Run three real rework changes end to end from the TUI: bugs found along
+      the way, TUI work, workflow features. Done: the dropdown border (#3), the
+      Cost tab active time (#5), PR previews (#7, the first large mission:
+      $7.07, 5 audit rounds, findings 2026-11-09).
 - [x] Cost pass after the first dogfood mission: caching, turn budgets,
       compaction, loop resume, branch continuation ($3.03 -> $0.92 for the same
       task with more work done).
