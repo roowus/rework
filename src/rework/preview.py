@@ -461,7 +461,6 @@ def attach_command(n: int, desc: dict[str, Any]) -> str:
     pdir = preview_dir(n)
     env = {
         "REWORK_DB": str(state_db),
-        "REWORK_HTTP_PORT": str(port),
         "REWORK_DAEMON_URL": daemon_url,
         "REWORK_LIBRARY_DIR": str(pdir / "library"),
         "REWORK_LOG_DIR": str(pdir / "logs"),
@@ -471,7 +470,9 @@ def attach_command(n: int, desc: dict[str, Any]) -> str:
         "REWORK_PREVIEW": str(n),
         "REWORK_TARGET_NAME": f"PREVIEW #{n}",
     }
-    assigns = " ".join(f"{key}={shlex.quote(str(value))}" for key, value in env.items() if value)
+    if port:
+        env["REWORK_HTTP_PORT"] = str(port)
+    assigns = " ".join(f"{key}={shlex.quote(str(value))}" for key, value in env.items())
     # two shell lines, one command: the trailing backslash keeps the whole
     # thing copy-pasteable while staying readable
     return f"{assigns} \\\n  uv run --project {shlex.quote(str(worktree))} rework tui"
