@@ -14,6 +14,7 @@ uv run rework --help         # the CLI
 uv run pytest                # unit + integration (SQLite), smoke excluded by default
 uv run pytest -m smoke       # real-money tests, run manually only
 uv run ruff check .          # lint
+uv run ruff format .         # format (CI runs ruff format --check)
 uv run mypy src              # type check (kernel/ is strict)
 ```
 

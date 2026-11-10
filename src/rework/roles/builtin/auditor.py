@@ -85,7 +85,9 @@ class AuditorSpec(RoleSpec):
             " check the list of changed files first: every file must belong to"
             " the change, and stray files (experiment leftovers, nested git"
             " repos, caches, binaries, files outside the brief's scope) are a"
-            " HIGH finding."
+            " HIGH finding; re-run what the repo's CI runs (.github/workflows:"
+            " tests and lint/format/type checks), and a check that would fail CI"
+            " is a HIGH finding."
         )
 
         async def prepare(state: AuditorState) -> dict[str, Any]:
