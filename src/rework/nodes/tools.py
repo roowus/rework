@@ -210,6 +210,7 @@ class LocalExecutor:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     start_new_session=True,
+                    env=role_env(self._workdir),
                 )
                 mark = _register_command(proc.pid, command)
                 try:
@@ -241,6 +242,35 @@ class LocalExecutor:
         if allowed is None:
             return list(all_specs)
         return [s for s in all_specs if s.name in allowed]
+
+
+def role_env(workdir: Path | None = None) -> dict[str, str]:
+    """The daemon's environment, minus its own Python environment when the
+    worktree is a Python project of its own (pyproject.toml). Found live: the
+    daemon runs from the main checkout's venv (`uv run rework serve`), every role
+    command inherited VIRTUAL_ENV and that venv's bin first on PATH, so a bare
+    `python`/`pytest` in a rework worktree imported the MAIN checkout's source
+    and audits tested the wrong code. A plain repo (no pyproject, e.g. a toy
+    repo whose tests run with `python3 -m pytest`) keeps the daemon's tools."""
+    import os
+    import sys
+
+    env = dict(os.environ)
+    if workdir is not None and not (workdir / "pyproject.toml").exists():
+        return env
+    venvs = {v for v in (env.pop("VIRTUAL_ENV", None),) if v}
+    if sys.prefix != sys.base_prefix:
+        venvs.add(sys.prefix)
+    for key in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV_PROMPT"):
+        env.pop(key, None)
+    roots = [os.path.realpath(v) for v in venvs]
+    keep = [
+        p
+        for p in env.get("PATH", "").split(os.pathsep)
+        if p and not any(os.path.realpath(p).startswith(r + os.sep) for r in roots)
+    ]
+    env["PATH"] = os.pathsep.join(keep)
+    return env
 
 
 def _command_registry() -> Path:

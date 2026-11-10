@@ -329,3 +329,38 @@ async def test_run_command_clears_its_registry_mark(tmp_path) -> None:  # type: 
     out = await LocalExecutor(tmp_path).execute("run_command", {"command": "echo hi"})
     assert "hi" in out
     assert list(_command_registry().glob("*.json")) == []
+
+
+async def test_role_commands_do_not_inherit_the_daemons_venv(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Found live: role commands inherited the daemon's VIRTUAL_ENV and venv
+    bin on PATH, so `pytest` in a worktree imported the main checkout's code."""
+    import os
+    import sys
+
+    from rework.nodes.tools import LocalExecutor
+
+    fake = tmp_path / "daemon-venv"
+    (fake / "bin").mkdir(parents=True)
+    monkeypatch.setenv("VIRTUAL_ENV", str(fake))
+    monkeypatch.setenv("PYTHONPATH", "/somewhere/src")
+    monkeypatch.setenv("PATH", os.pathsep.join([str(fake / "bin"), "/usr/bin", "/bin"]))
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+    out = await LocalExecutor(tmp_path).execute(
+        "run_command",
+        {"command": 'echo "venv=[$VIRTUAL_ENV] pp=[$PYTHONPATH]"; echo "path=$PATH"'},
+    )
+    assert "venv=[] pp=[]" in out
+    assert str(fake) not in out
+    assert "/usr/bin" in out
+    if sys.prefix != sys.base_prefix:  # the test runner's own venv is stripped too
+        assert os.path.join(sys.prefix, "bin") not in out.split("path=", 1)[1]
+
+
+async def test_a_plain_repo_keeps_the_daemons_tools(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """No pyproject: nothing of its own to import, so the daemon's python (with
+    pytest) stays available, as toy repos expect."""
+    from rework.nodes.tools import LocalExecutor
+
+    monkeypatch.setenv("VIRTUAL_ENV", "/daemon/venv")
+    out = await LocalExecutor(tmp_path).execute("run_command", {"command": 'echo "[$VIRTUAL_ENV]"'})
+    assert "[/daemon/venv]" in out
