@@ -358,6 +358,7 @@ class MissionOrchestrator:
         self.history: list[dict[str, Any]] = []
         self.seen: dict[str, str] = {}  # run id -> status already reported
         self.questions_seen: set[str] = set()  # escalation ids already reported
+        self._failed_models: set[str] = set()  # orchestrator models that failed a call
         self.owner_seq = 0  # last owner message delivered
         # every event of the mission, read forward with a seq cursor (found
         # live: events_since(0, limit=N) returns the OLDEST N events, so on a
@@ -527,6 +528,7 @@ class MissionOrchestrator:
         # works on exact prefixes); the live state rides in a trailing message
         # that is never persisted
         state = f"CURRENT STATE (rebuilt from the database for this turn):\n{await self._state()}"
+        self._compact_history()
         messages = [*self.history, {"role": "user", "content": state}]
         request = ChatRequest(
             model=self.entry.model,
@@ -549,6 +551,26 @@ class MissionOrchestrator:
                     payload={"error": f"orchestrator model call failed: {exc}"[:400]},
                 )
             )
+            # switch the orchestrator's OWN model before giving up. Found live:
+            # kimi-k3 timed out 3x on a big context and the mission (work done,
+            # one step from its PR) was failed while flash was healthy
+            self._failed_models.add(self.entry.id)
+            fallback = next(
+                (
+                    e
+                    for e in sorted(self._usable(), key=lambda e: (-e.tier, e.cost_in_per_mtok))
+                    if e.id not in self._failed_models
+                ),
+                None,
+            )
+            if fallback is not None:
+                await self._note(
+                    f"orchestrator model {self.entry.id} failed ({type(exc).__name__}); "
+                    f"switching to {fallback.id}"
+                )
+                self.entry = fallback
+                self._provider = None
+                return await self._think()
             self.finished = ("failed", f"orchestrator model call failed: {exc}"[:300])
             return None
         usage = result.usage
@@ -1047,6 +1069,19 @@ class MissionOrchestrator:
                 )
                 return f"owner: {text} (passed to {run_id})"
         return f"owner: {text}"
+
+    def _compact_history(self) -> int:
+        """Elide old tool results in the in-memory history, the roles' rule
+        (toolloop._compact: past 160k chars, all but the last 12, in one step
+        so the cached prefix stays stable). The stored chat keeps everything.
+        Found live: an 80-turn orchestrator sent 335k chars per turn; with a
+        cold prompt cache kimi-k3 timed out on every call."""
+        from rework.nodes.toolloop import _compact
+
+        elided = _compact(self.history)
+        if elided:
+            log.info("orchestrator history compacted: %d old tool results elided", elided)
+        return elided
 
     async def _turn_cap(self) -> int:
         """MAX_TURNS plus TURN_EXTENSION per approved extension (gate rows, so

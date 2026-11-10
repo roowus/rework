@@ -813,3 +813,57 @@ async def test_the_turn_cap_asks_the_owner_instead_of_failing(
         tc.get("name") == "finish" for m in msgs for tc in (m.body.get("tool_calls") or [])
     )
     assert finished is approved
+
+
+async def test_a_long_orchestrator_history_is_compacted(world: dict[str, Any]) -> None:
+    """Found live: 167 messages / 335k chars per orchestrator turn timed out on
+    a cold prompt cache. Old tool results are elided like the roles' are; the
+    stored chat keeps everything."""
+    from rework.nodes.toolloop import COMPACT_AT, KEEP_RECENT
+    from rework.orchestrator.agent import MissionOrchestrator
+
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    big = "x" * 9000
+    orch.history = []
+    for i in range(40):
+        orch.history.append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": f"c{i}", "name": "wait", "arguments": {}}],
+            }
+        )
+        orch.history.append(
+            {"role": "tool", "tool_call_id": f"c{i}", "name": "wait", "content": big}
+        )
+    assert orch._compact_history() == 40 - KEEP_RECENT
+    size = sum(len(str(m.get("content") or "")) for m in orch.history)
+    assert size < COMPACT_AT
+    assert orch.history[-1]["content"] == big  # recent results intact
+    assert orch._compact_history() == 0  # stable until it grows again
+
+
+async def test_the_orchestrator_switches_its_own_model_when_it_fails(
+    world: dict[str, Any],
+) -> None:
+    """Found live: the orchestrator's own model (kimi-k3) timed out three times
+    and the mission failed, one step from its PR, while flash was healthy."""
+    scripted: ScriptedProvider = world["provider"]
+    scripted.route(MARKER, [turn(call("finish", "f1", outcome="failed", summary="on flash"))])
+
+    class PickyProvider:
+        def __init__(self) -> None:
+            self.models: list[str] = []
+
+        async def complete(self, request: Any) -> Any:
+            self.models.append(request.model)
+            if request.model == "fake-pro":
+                raise TimeoutError("pro is down")
+            return await scripted.complete(request)
+
+    picky = PickyProvider()
+    world["provider"] = picky
+    await asyncio.wait_for(runner(world).run(), timeout=30)
+    assert picky.models[:2] == ["fake-pro", "fake-flash"]
+    msgs = await world["store"].chat_messages(orchestrator_chat_id("mo"))
+    assert any(tc.get("name") == "finish" for m in msgs for tc in (m.body.get("tool_calls") or []))
