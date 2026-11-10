@@ -128,6 +128,11 @@ coder by respawning on `flash`, audited, finished with an accurate summary.
 | 12 | The 80-turn cap failed the mission one step before its PR | runaway cap ended missions outright | fixed: the cap opens a gate ("allow 40 more?") |
 | 13 | kimi-k3 timed out on every orchestrator call though it answers in 0.8s | the orchestrator never compacted (335k chars per turn, cold cache) | fixed: roles' compaction rule (205k -> 50k chars) |
 | 14 | After its own model failed the mission failed, flash healthy | the model switch covered roles only | fixed: the orchestrator switches its own model, fails only when all have failed |
+| 15 | kimi-k3 stalls on 6.2% of calls (flash 0.1%), and a stalled request stalls again when re-sent | provider; three 180s retries cost the orchestrator 9 minutes | fixed: orchestrator timeouts are not retried; the next model answers that turn, the owner's model is back next turn, 3 failed turns in a row switch for good |
+| 16 | A queued pending mission was logged 275 times in 4 minutes | `_pickup_pending` logged on every poll | fixed |
+| 17 | PR #9 failed CI on ruff format | coder prompt said "run the test suite"; audits re-ran tests only; CLAUDE.md listed no formatter | fixed: roles run what `.github/workflows` runs |
+| 18 | A finished mission card lost its cost after #9 | the new finished path skipped the spend fetch | fixed (found by checking #9 in the real TUI after merge) |
+| 19 | One full-suite run failed, three reruns passed | a timing-sensitive test under load (a mission was running) | open: watch CI |
 
 Outcome: PR #7 merged after 5 audit rounds and 3 owner end-to-end runs;
 $7.07 total. The Preview button was verified in a real pty (suspend, preview
