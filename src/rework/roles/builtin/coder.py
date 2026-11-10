@@ -175,7 +175,9 @@ class CoderSpec(RoleSpec):
         async def handoff(state: CoderState) -> dict[str, Any]:
             wt = Path(state["worktree"])
             await stage_all(wt)
-            message = f"{state['objective']}\n\nrework run: {ctx.run.id}"
+            message = commit_message(
+                ctx.mission.title, state["objective"], ctx.run.step, ctx.run.id
+            )
             sha = await git_commit(wt, message, author=ctx.git_author)
             diff = await diff_base(wt, base=state.get("base_sha"))
             artifact = {
@@ -234,3 +236,24 @@ class CoderSpec(RoleSpec):
         graph.add_edge("loop", "handoff")
         graph.add_edge("handoff", END)
         return graph.compile()
+
+
+SUBJECT_MAX = 72
+
+
+def commit_message(title: str | None, objective: str, step: str, run_id: str) -> str:
+    """A short subject, the brief in the body. Found live: the subject was the
+    whole brief, and GitHub's squash merge made that paragraph the commit
+    title on main (#5)."""
+    import re
+
+    subject = (title or "").strip()
+    if not subject:
+        first = re.split(r"(?<=[.!?])\s|\n", objective.strip(), maxsplit=1)[0]
+        subject = first.strip()
+    subject = " ".join(subject.split())
+    if step.startswith("revise"):
+        subject = f"{subject} (revision)"
+    if len(subject) > SUBJECT_MAX:
+        subject = subject[: SUBJECT_MAX - 1].rstrip() + "…"
+    return f"{subject}\n\n{objective.strip()}\n\nrework run: {run_id}"
