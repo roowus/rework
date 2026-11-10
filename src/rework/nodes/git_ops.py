@@ -122,6 +122,19 @@ async def stage_all(worktree: Path) -> str:
     return out
 
 
+async def has_changes(worktree: Path, base: str | None = None) -> bool:
+    """True when the worktree differs from `base`: uncommitted edits, or new
+    commits since base."""
+    code, out = await _run(worktree, "status", "--porcelain")
+    if code == 0 and out.strip():
+        return True
+    if base:
+        code, head = await _run(worktree, "rev-parse", "HEAD")
+        if code == 0 and head.strip() and head.strip() != base:
+            return True
+    return False
+
+
 async def unstage_nested_repos(worktree: Path) -> list[str]:
     """Unstage newly added git repositories inside the worktree: gitlinks
     (a nested clone, mode 160000) and bare-repo layouts (HEAD + objects/ +

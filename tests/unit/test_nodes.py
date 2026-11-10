@@ -364,3 +364,76 @@ async def test_a_plain_repo_keeps_the_daemons_tools(tmp_path, monkeypatch) -> No
     monkeypatch.setenv("VIRTUAL_ENV", "/daemon/venv")
     out = await LocalExecutor(tmp_path).execute("run_command", {"command": 'echo "[$VIRTUAL_ENV]"'})
     assert "[/daemon/venv]" in out
+
+
+@pytest.mark.parametrize("edited", [False, True])
+async def test_a_coder_with_nothing_edited_at_halfway_is_nudged(
+    tmp_path: Path, workdir: Path, edited: bool
+) -> None:
+    """Found live: flash coders spent whole turn budgets exploring and handed
+    off nothing. At half the budget, no changes yet -> one nudge to edit."""
+    store = await _store(tmp_path)
+    reads = [
+        ChatResult(
+            tool_calls=[ToolCall(id=f"r{i}", name="read_file", arguments={"path": "src/app.py"})],
+            usage=Usage(input_tokens=10, output_tokens=5),
+            stop_reason="tool_calls",
+        )
+        for i in range(6)
+    ]
+    fake = FakeProvider([*reads, ChatResult(text="done", usage=Usage(), stop_reason="end_turn")])
+    checks: list[int] = []
+
+    async def progress(state: dict[str, object]) -> bool:
+        checks.append(1)
+        return edited
+
+    node = make_toolloop_node(
+        fake,
+        _catalog(),
+        "fake",
+        LocalExecutor(workdir),
+        "s",
+        store,
+        "m3",
+        "m3:code:coder:1",
+        Budget(),
+        max_iterations=10,
+        progress_check=progress,
+    )
+    await node({"messages": [{"role": "user", "content": "fix it"}]})
+    nudged = [
+        r
+        for r in fake.requests
+        if any("Progress check" in str(m.get("content")) for m in r.messages)
+    ]
+    assert checks == [1], "checked exactly once, at the halfway turn"
+    assert bool(nudged) is (not edited)
+    if nudged:
+        assert "5 of 10 tool rounds" in str(nudged[0].messages[-1]["content"])
+
+
+async def test_has_changes_sees_edits_and_new_commits(tmp_path: Path) -> None:
+    import subprocess
+
+    from rework.nodes.git_ops import has_changes
+
+    def git(*a: str) -> str:
+        return subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", *a],
+            cwd=tmp_path,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    (tmp_path / "a.py").write_text("x = 1\n")
+    git("add", "a.py")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD")
+    assert not await has_changes(tmp_path, base)
+    (tmp_path / "a.py").write_text("x = 2\n")
+    assert await has_changes(tmp_path, base)
+    git("commit", "-qam", "edit")
+    assert await has_changes(tmp_path, base)  # committed: clean tree, new HEAD

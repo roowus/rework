@@ -23,6 +23,7 @@ from rework.nodes.git_ops import (
 from rework.nodes.git_ops import (
     diff_base,
     ensure_worktree,
+    has_changes,
     stage_all,
     unstage_nested_repos,
 )
@@ -219,6 +220,12 @@ class CoderSpec(RoleSpec):
             )
             return {"artifact": artifact}
 
+        async def edited(state: dict[str, Any]) -> bool:
+            wt = state.get("worktree")
+            if not wt:
+                return True  # nothing to check; never nudge blindly
+            return await has_changes(Path(str(wt)), state.get("base_sha"))
+
         loop = make_toolloop_node(
             provider=ctx.provider,
             catalog=ctx.catalog,
@@ -242,6 +249,7 @@ class CoderSpec(RoleSpec):
             bus=ctx.bus,
             resume_file=ctx.workdir / "loop.json",
             on_start=ensure_attached,
+            progress_check=edited,
         )
 
         graph = StateGraph(CoderState)

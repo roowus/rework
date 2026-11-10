@@ -68,6 +68,7 @@ BUDGET_HOLD_GRACE_S = 30.0
 # Tuned on dogfood #2: at 60k/6 a coder re-read dashboard.py ~7 times because
 # its earlier reads had been elided; with prompt caching (~85% hits) keeping
 # context is cheap and re-reading is not.
+PROGRESS_CHECK_MIN = 10  # turn budgets this small get no halfway nudge
 COMPACT_AT = 160_000
 KEEP_RECENT = 12
 STUB_MIN = 600
@@ -212,6 +213,7 @@ def make_toolloop_node(
     bus: Any | None = None,
     on_start: Any | None = None,
     resume_file: Path | None = None,
+    progress_check: Any | None = None,
 ) -> ToolLoopNode:
     """`bus` (optional) turns on TRAJECTORY events: one per model turn and one
     per tool call, so the UI can show the agent loop the way Claude Code and
@@ -318,6 +320,23 @@ def make_toolloop_node(
             if exceeded is not None and not await _wait_for_budget(store, mission_id, budget):
                 stop_note = f"stopped: {exceeded}"
                 break
+            if (
+                progress_check is not None
+                and limit >= PROGRESS_CHECK_MIN
+                and turns == limit // 2
+                and not await progress_check(state)
+            ):
+                # found live: flash coders spent whole budgets exploring and
+                # handed off with nothing edited; a prompt line did not hold
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": f"[Progress check: {turns} of {limit} tool rounds used and "
+                        "nothing is changed yet. Stop exploring and make the change now with "
+                        "what you know; verify after.]",
+                    }
+                )
+                await emit("turn", {"turn": turns, "text": "progress check: nothing edited yet"})
             if limit - turns == 2:
                 messages.append(
                     {
