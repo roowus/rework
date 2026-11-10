@@ -123,7 +123,12 @@ class Form(ModalScreen[dict[str, str] | None]):
                             f.value, placeholder=f.placeholder, id=f"f-{f.name}", compact=True
                         )
             with Horizontal(classes="dialog-actions"):
-                yield Static(f"[{FAINT}]ctrl+s save · esc cancel[/]", classes="dialog-hint")
+                # the hint names what ctrl+s does here ("save" read oddly on
+                # the Preview a PR form)
+                yield Static(
+                    f"[{FAINT}]ctrl+s {esc(self.submit_label.lower())} · esc cancel[/]",
+                    classes="dialog-hint",
+                )
                 yield Btn("Cancel", "cancel", variant="ghost")
                 yield Btn(self.submit_label, "submit", variant="primary")
 

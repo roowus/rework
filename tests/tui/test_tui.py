@@ -1526,3 +1526,14 @@ async def test_preview_a_pr_end_to_end_through_the_menu(
     assert marker.exists(), "the real `rework` on PATH was never run"
     assert marker.read_text() == f"preview 128 --repo-dir {repo}", marker.read_text()
     assert any("Starting preview of PR 128" in t for _, t in app.notifications_sent)
+
+
+async def test_the_form_hint_names_its_submit_action(ids: dict[str, str]) -> None:
+    """'ctrl+s save' read oddly on the Preview a PR form; the hint follows the
+    submit label."""
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        form = await _open_preview_modal(pilot, app)
+        hint = str(form.query_one(".dialog-hint").render())
+        assert "ctrl+s preview" in hint.lower() and "save" not in hint.lower()
