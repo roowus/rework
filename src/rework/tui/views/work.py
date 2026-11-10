@@ -565,6 +565,12 @@ class WorkView(View):
                     if evs is not None:
                         card.rebuild_tail(evs)
                         card.tail_filled = True
+                    # its cost too, once: the finished path skips the live
+                    # poll below (found live: a done card lost its $7.07)
+                    card.spend = await self.hub.guard(
+                        partial(self.hub.data.mission_spend, card.mission_id), card.spend
+                    )
+                    card.paint()
                 continue
             evs = await self.hub.guard(
                 partial(self.hub.data.events_tail, card.mission_id, card.last_seq), []

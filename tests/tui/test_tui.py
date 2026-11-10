@@ -1094,3 +1094,25 @@ async def test_dashboard_orchestrator_output_shows_owner_notes_and_summary(
     assert summary in body, body
     assert body.index(note2) < body.index(summary), body
     assert not app.swallowed
+
+
+async def test_a_finished_card_shows_its_cost(ids: dict[str, str], env: Path) -> None:
+    """Found live after #9: the finished-card backfill skipped the spend fetch,
+    so a done mission's card lost its cost ($7.07 on the PR-preview mission)."""
+    from rework.kernel.state.records import MissionStatus
+    from rework.tui.widgets.cards import MissionCard
+
+    store = await _store(env)
+    try:
+        await store.update_mission(ids["running"], status=MissionStatus.DONE)
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.query_one("#chat-list", RowList).activate(ids["chat"], via_mouse=True)
+        await _settle(pilot, 2.0)
+        card = app.query_one(MissionCard)
+        assert card.tail_filled
+        assert card.spend > 0, "a finished card must still show what it cost"
