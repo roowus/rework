@@ -9,7 +9,6 @@ alt+a / alt+x second; a typed answer rides along to the paused role."""
 from __future__ import annotations
 
 from functools import partial
-
 from typing import Any, ClassVar
 
 from textual import work
@@ -351,9 +350,7 @@ class GatesView(View):
         # one bounded window of the NEWEST events (asking from seq 0 pages
         # FORWARD, so a long mission used to freeze on its OLDEST 500 lines:
         # finding #37). Later ticks only ask for what arrived after this.
-        events = await self.hub.guard(
-            partial(data.mission_events_newest, gate.mission_id, 500), []
-        )
+        events = await self.hub.guard(partial(data.mission_events_newest, gate.mission_id, 500), [])
         if self.selected is None or self.selected.id != gate.id:
             return
         self._steps_seq = max((int(e.seq) for e in events), default=0)

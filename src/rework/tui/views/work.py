@@ -318,9 +318,7 @@ class WorkView(View):
             return
         convo = Conversation(self.hub.data, chat)
         items = await self.hub.guard(convo.items, [])
-        cursor = await self.hub.guard(
-            partial(self.hub.data.chat_messages_max_id, chat_id), 0
-        )
+        cursor = await self.hub.guard(partial(self.hub.data.chat_messages_max_id, chat_id), 0)
         if self._loading_chat != chat_id:
             return
         self.convo = convo

@@ -1553,7 +1553,6 @@ async def test_open_transcript_picks_up_another_instances_turn(
     """The open chat transcript used to be read once by _load_chat: a turn
     persisted by another instance never appeared until the chat was reopened."""
     from rework.kernel.state.records import ChatMessage
-    from rework.tui.widgets.trajectory import Step, user_step
 
     app = _app()
     async with app.run_test(size=SIZE) as pilot:
@@ -1659,7 +1658,11 @@ async def test_own_turn_is_rendered_once_and_not_replayed_by_the_tick(
     it a second time (and must catch its cursor up)."""
     script_provider(
         monkeypatch,
-        [ChatResult(text="looking into it", tool_calls=[], usage=Usage(input_tokens=10, output_tokens=5))],
+        [
+            ChatResult(
+                text="looking into it", tool_calls=[], usage=Usage(input_tokens=10, output_tokens=5)
+            )
+        ],
     )
     app = _app()
     async with app.run_test(size=SIZE) as pilot:
@@ -1672,7 +1675,11 @@ async def test_own_turn_is_rendered_once_and_not_replayed_by_the_tick(
         prompt = app.query_one("#prompt")
         prompt.text = "how is it going?"
         await pilot.press("enter")
-        await _settle(pilot, 1.5)
+        for _ in range(60):  # wait for the scripted turn to finish, not for a fixed time
+            await _settle(pilot, 0.1)
+            if len(app.query("#chat-log Step")) > before and not work._sending:
+                break
+        await _settle(pilot, 0.3)
         after_send = len(app.query("#chat-log Step"))
         assert after_send > before
         await _settle(pilot, 1.2)  # poll ticks with no new rows
@@ -1701,10 +1708,10 @@ async def test_gates_history_list_and_detail_follow_other_instances(
 
         store = await _store(env)
         try:
-            # instance A: the selected gate's mission emits a new event
+            # instance A: the selected gate's own mission emits a new event
             await store.append_event(
                 EventRecord(
-                    mission_id=ids["running"],
+                    mission_id=ids["waiting"],
                     run_id=None,
                     type=EventType.PROGRESS,
                     payload={"trajectory": "turn", "text": "a fresh step from elsewhere"},
@@ -1722,15 +1729,21 @@ async def test_gates_history_list_and_detail_follow_other_instances(
 
         # instance A decides a gate: the history list must show it without a
         # chip toggle (it used to be fetched once per chip change)
+        from rework.tui.widgets.base import ChipGroup
+
+        chips = gates.query_one("#gate-mode", ChipGroup)
+        await pilot.click(next(c for c in chips.query(".chip") if c.value == "decided"))
+        await _settle(pilot, 0.8)
+        assert gates.mode == "decided"
         store = await _store(env)
         try:
             await store.decide_gate(ids["gate"], True, note="from the other laptop")
         finally:
             await store.aclose()
-        gates.query_one("#gate-mode", ChipGroup).select("decided")
-        gates.mode = "decided"
         await _settle(pilot, 1.2)
-        assert ids["gate"] in [g.id for g in gates.history], "the decided gate is in the history list"
+        assert ids["gate"] in [g.id for g in gates.history], (
+            "the decided gate is in the history list"
+        )
         assert not app.swallowed
 
 
