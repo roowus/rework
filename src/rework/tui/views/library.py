@@ -54,6 +54,7 @@ class LibraryView(View):
         self._fingerprint: tuple[Any, ...] | None = None
         self._body_fingerprint: tuple[str, int] | None = None
         self._searching = False
+        self._search_epoch = 0  # bumped by every user search; a stale recheck drops
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="pane-head lib-head"):
@@ -158,6 +159,7 @@ class LibraryView(View):
     @work(exclusive=True, group="lib-search")
     async def _search(self) -> None:
         self._searching = True
+        self._search_epoch += 1
         try:
             items = await self._fetch_items()
         finally:
@@ -251,13 +253,14 @@ class LibraryView(View):
             return
         self._recheck()
 
-    @work(exclusive=True, group="lib-search")
+    @work(exclusive=True, group="lib-recheck")
     async def _recheck(self) -> None:
         if self._searching:
             return  # the user's own search is in flight; don't race it
+        epoch = self._search_epoch
         items = await self.hub.guard(self._fetch_items, None)
-        if items is None:
-            return
+        if items is None or self._searching or self._search_epoch != epoch:
+            return  # a user search started/ran meanwhile: its results win
         items = self._filter(items)
         self.items = items
         fingerprint = tuple(self._item_fingerprint(i) for i in items)

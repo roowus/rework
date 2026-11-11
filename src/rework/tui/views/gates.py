@@ -86,6 +86,7 @@ class GatesView(View):
         # old behaviour) pages FORWARD, so a long mission froze on its OLDEST
         # 500 events (finding #37, same trap the mission cards had).
         self._steps_seq: int = 0
+        self._steps_ready_for: str | None = None  # gate whose detail load finished
         self._steps_lines: list[str] = []
 
     def compose(self) -> ComposeResult:
@@ -170,7 +171,8 @@ class GatesView(View):
             # another instance flips from waiting to answered here) plus the new
             # steps only: the runs/diff read stays on selection, it never changes
             self._paint_detail()
-            self._poll_steps(self.selected)
+            if self._steps_ready_for == self.selected.id:
+                self._poll_steps(self.selected)
 
     def _paint_list(self, gates: list[Any]) -> None:
         rows = []
@@ -301,6 +303,7 @@ class GatesView(View):
     async def _load_detail(self, gate: Any) -> None:
         data = self.hub.data
         self._detail_for = gate.id
+        self._steps_ready_for = None  # no step polling until the real cursor is set
         self._steps_seq = 0
         self._steps_lines = []
         runs = await self.hub.guard(lambda: data.mission_runs(gate.mission_id), [])
@@ -355,6 +358,7 @@ class GatesView(View):
             return
         self._steps_seq = max((int(e.seq) for e in events), default=0)
         self._steps_lines = self._step_lines(gate, events)[-12:]
+        self._steps_ready_for = gate.id
         self._paint_steps()
 
     def _step_lines(self, gate: Any, events: list[Any]) -> list[str]:

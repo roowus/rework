@@ -77,6 +77,7 @@ class TuiData:
 
     def __init__(self) -> None:
         self._store: StateStore | None = None
+        self.own_chat_ids: set[int] = set()
         self._index: LibraryStore | None = None
         self._git: GitLibrary | None = None
         # the last successful result per query, used while the daemon is
@@ -87,8 +88,24 @@ class TuiData:
 
     async def store(self) -> StateStore:
         if self._store is None:
-            self._store = await open_store_from_config(Config.from_env())
+            store = await open_store_from_config(Config.from_env())
+            self._track_own_chat_writes(store)
+            self._store = store
         return self._store
+
+    def _track_own_chat_writes(self, store: StateStore) -> None:
+        """Remember the ids of chat rows THIS process persists (the orchestrator
+        writes through this same handle), so the transcript poller can tell them
+        from other instances' rows, which are the only ones it must render."""
+        original = store.append_chat_message
+
+        async def tracked(message: Any) -> Any:
+            saved = await original(message)
+            if saved.id is not None:
+                self.own_chat_ids.add(int(saved.id))
+            return saved
+
+        setattr(store, "append_chat_message", tracked)  # noqa: B010
 
     async def drop_store(self) -> None:
         """Throw the connection away so the next call reopens it. A store held

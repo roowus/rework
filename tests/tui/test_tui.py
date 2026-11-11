@@ -1688,6 +1688,46 @@ async def test_own_turn_is_rendered_once_and_not_replayed_by_the_tick(
         assert not app.swallowed
 
 
+async def test_foreign_row_written_during_own_turn_is_rendered_once(
+    ids: dict[str, str], env: Path
+) -> None:
+    """Instance A writes while B is mid-turn: B must still render A's row once,
+    and must not re-render its own (already live-rendered) rows."""
+    from rework.kernel.state.records import ChatMessage
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        work = app.view("work")
+        app.query_one("#chat-list", RowList).activate(ids["chat"], via_mouse=True)
+        await _settle(pilot, 0.8)
+
+        def shown() -> str:
+            return "\n".join(str(s.render()) for s in app.query("#chat-log Step"))
+
+        work._sending = True  # B is streaming its own turn
+        try:
+            await app.hub.data.append_chat_note(ids["chat"], "own row from B")  # rendered live
+            store = await _store(env)  # a genuinely separate handle: instance A
+            try:
+                await store.append_chat_message(
+                    ChatMessage(chat_id=ids["chat"], role="note", body={}, display="foreign from A")
+                )
+            finally:
+                await store.aclose()
+            for _ in range(50):  # bounded wait for a tick to pick it up
+                await _settle(pilot, 0.1)
+                if "foreign from A" in shown():
+                    break
+        finally:
+            work._sending = False
+        await _settle(pilot, 2.5)  # more ticks after the turn: still exactly once
+        text = shown()
+        assert text.count("foreign from A") == 1
+        assert "own row from B" not in text, "own rows are never replayed by the poll"
+        assert not app.swallowed
+
+
 async def test_gates_history_list_and_detail_follow_other_instances(
     ids: dict[str, str], env: Path
 ) -> None:

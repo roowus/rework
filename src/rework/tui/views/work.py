@@ -166,11 +166,6 @@ class WorkView(View):
         convo = self.convo
         if convo is None or self._loading_chat == convo.id:
             return  # nothing open, or a load for it is still in flight
-        if self._sending:
-            # Our own turn is rendered live as it streams (`_on_turn`) and only
-            # persisted row by row; re-reading it here would double every step.
-            # `_sync_chat_cursor` catches the cursor up when the turn ends.
-            return
         self._tick_chat(convo.id)
 
     @work(exclusive=True, group="chat-poll")
@@ -187,20 +182,17 @@ class WorkView(View):
             return
         if self.convo is None or self.convo.id != chat_id:
             return
-        self._chat_cursor = int(messages[-1].id or self._chat_cursor)
-        items = items_from_messages(messages)
+        self._chat_cursor = max(self._chat_cursor, *(int(m.id or 0) for m in messages))
+        # rows THIS instance wrote (a streaming turn, a note) are already on
+        # screen, rendered live; only foreign rows are new to this view. This
+        # holds during our own turn too, so it also covers a tick that was in
+        # flight while we persisted.
+        own = data.own_chat_ids
+        fresh = [m for m in messages if int(m.id or 0) not in own]
+        own.difference_update(i for i in list(own) if i <= self._chat_cursor)
+        items = items_from_messages(fresh)
         if items:
             self._render_items(items)
-
-    async def _sync_chat_cursor(self) -> None:
-        """Catch the cursor up after a local write: those rows are already on
-        screen, so the next tick must not render them again."""
-        convo = self.convo
-        if convo is None:
-            return
-        head = await self.hub.guard(partial(self.hub.data.chat_messages_max_id, convo.id), None)
-        if head is not None and self.convo is not None and self.convo.id == convo.id:
-            self._chat_cursor = max(self._chat_cursor, head)
 
     def _paint_chat_list(self) -> None:
         mission_status = {m.id: m.status for m in self.snap.missions}
@@ -317,8 +309,11 @@ class WorkView(View):
             self.toast("Chat not found", severity="warning")
             return
         convo = Conversation(self.hub.data, chat)
-        items = await self.hub.guard(convo.items, [])
-        cursor = await self.hub.guard(partial(self.hub.data.chat_messages_max_id, chat_id), 0)
+        # the cursor comes from the rows actually rendered, so a row committed
+        # while we read can never fall below it unseen
+        messages = await self.hub.guard(partial(self.hub.data.chat_messages, chat_id), [])
+        items = items_from_messages(messages)
+        cursor = max((int(m.id or 0) for m in messages), default=0)
         if self._loading_chat != chat_id:
             return
         self.convo = convo
@@ -433,7 +428,6 @@ class WorkView(View):
                 await self.hub.data.append_chat_note(self.convo.id, f"you → {mission_id}: {text}")
             except Exception:
                 pass
-            await self._sync_chat_cursor()
 
     @work(group="send")
     async def _send(self, text: str, attachments: list[str]) -> None:
@@ -506,7 +500,6 @@ class WorkView(View):
             self.toast(f"Send failed: {clip(str(exc), 200)}", severity="error")
         finally:
             self._sending = False
-            await self._sync_chat_cursor()
 
     def _clear_thinking(self) -> None:
         if self._thinking is not None:
@@ -570,7 +563,6 @@ class WorkView(View):
             await self._launch(proposal)
         finally:
             self._sending = False
-            await self._sync_chat_cursor()
 
     async def _launch(self, proposal: Any) -> None:
         log = self.query_one("#chat-log", Trajectory)
