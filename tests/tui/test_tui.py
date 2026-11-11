@@ -1838,9 +1838,9 @@ async def test_dashboard_report_body_follows_a_run_that_changes_without_a_new_ru
 
     app = _app()
 
-    async def _until(cond: Any, timeout: float = 8.0) -> bool:
+    async def _until(cond: Any, budget_s: float = 8.0) -> bool:
         loop = _asyncio.get_running_loop()
-        end = loop.time() + timeout
+        end = loop.time() + budget_s
         while loop.time() < end:
             if cond():
                 return True
@@ -1871,9 +1871,7 @@ async def test_dashboard_report_body_follows_a_run_that_changes_without_a_new_ru
         # the matching event; the run count stays put.
         store = await _store(env)
         try:
-            coder = next(
-                r for r in await store.list_runs(ids["running"]) if r.role == "coder"
-            )
+            coder = next(r for r in await store.list_runs(ids["running"]) if r.role == "coder")
             await store.update_run(
                 coder.id,
                 status=RunStatus.COMPLETED,
@@ -1898,9 +1896,9 @@ async def test_dashboard_report_body_follows_a_run_that_changes_without_a_new_ru
             await store.aclose()
 
         assert len(dash.runs) == runs_before, "the change added no run"
-        assert await _until(lambda: "handoff written by the other instance" in str(body._markdown)), (
-            "the report body must reload on the run's transition"
-        )
+        assert await _until(
+            lambda: "handoff written by the other instance" in str(body._markdown)
+        ), "the report body must reload on the run's transition"
         after = str(body._markdown)
         assert after != before
         assert dash.report_loaded_for != stamped, "the key moved"
