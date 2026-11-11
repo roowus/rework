@@ -458,7 +458,7 @@ async def test_skill_provenance_is_persisted_in_the_body(tmp_path, library_index
     assert "## Provenance" in promoted_body
     assert "any future, different repo" in promoted_body
 
-    demoted, note = await contribute(
+    demoted, _note = await contribute(
         handle.index,
         handle.git,
         type_=ItemType.SKILL,
