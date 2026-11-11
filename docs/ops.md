@@ -104,6 +104,35 @@ export REWORK_NOTIFY_CMD='curl -s -d "$REWORK_GATE_QUESTION" \
 Set it yourself to use anything else (a webhook, a script); on rewvis put it
 in `~/.rework/rework.env`.
 
+## Models and provider keys
+
+Keys live in `~/.rework/rework.env` on each machine (mode 600): rework reads it
+at startup without overriding the environment, and systemd loads the same file
+on rewvis. Names: `REWORK_FIREWORKS_KEY`, `REWORK_ANTHROPIC_KEY`,
+`REWORK_DEEPSEEK_KEY`, `REWORK_DEEPINFRA_KEY`, `REWORK_ZAI_KEY`, and on the Mac
+only `REWORK_ROUTER_KEY` (9router on localhost:20128).
+
+The catalog is `~/.rework/models.json` (built 2026-11-10 from each provider's
+live model list; a model was kept only if it passed a live tool-call test):
+
+- Anthropic, direct: every model the key can see (Fable, Opus, Sonnet, Haiku).
+  The endpoint is always api.anthropic.com, never `ANTHROPIC_BASE_URL` (the
+  owner's shell points that at 9router for Claude Code).
+- Fireworks: the serverless chat and tool models, priced from the official
+  rate card (fireworks.ai/pricing). Kimi K3 (`pro`) is $3 / $15 per M tokens;
+  the old catalog said $0.60 / $2.50, so costs reported before 2026-11-10 for
+  `pro`-heavy missions were understated about 5x.
+- 9router (Mac only): the GitHub Copilot models that answered, priced $0
+  (subscription). `glm-flash` / `glm-pro` go through it too and hit the GLM
+  plan's usage limit at times.
+- Not in the catalog yet: Z.ai, DeepSeek and DeepInfra have working keys but
+  no balance (429 / 402). After topping one up, rebuild the catalog or add
+  its entries by hand.
+
+Prices for Anthropic come from OpenRouter's list (Anthropic's list prices);
+anything without a known price got a deliberately high estimate so budgets
+stay conservative.
+
 ## Reclaim disk (`rework gc`)
 
 Every role run gets its own git worktree (often with its own virtualenv), and
