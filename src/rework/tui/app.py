@@ -585,11 +585,12 @@ class ReworkApp(App[None]):
         traceback + exit (handoff §7 trap #1). Startup errors still exit: an app
         that never mounted has nothing to show a toast on.
 
-        Whatever happens next, the traceback is in ~/.rework/logs/tui.log
-        FIRST: the owner cannot copy a traceback off a dead full-screen
-        terminal, and the toast (plain text, see notify) may not even fit."""
-        log.error("fatal UI error: %s: %s", type(error).__name__, error, exc_info=error)
+        If the app is going to exit, the traceback goes to
+        ~/.rework/logs/tui.log FIRST: the owner cannot copy a traceback off a
+        dead full-screen terminal, and the toast (plain text, see notify) may
+        not even fit. A swallowed error is logged once, by _swallow."""
         if not self.is_running or not self._exit_renderables_ok():
+            log.error("fatal UI error: %s: %s", type(error).__name__, error, exc_info=error)
             super()._handle_exception(error)
             return
         self._swallow(error)

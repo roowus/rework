@@ -138,6 +138,29 @@ async def test_fatal_exception_is_logged_with_a_traceback_before_exit(
     assert "Traceback (most recent call last)" in fatal[-1]["exc"]
 
 
+async def test_swallowed_exception_is_logged_once_and_not_as_fatal(
+    env: Path, tui_log: Path
+) -> None:
+    """A swallowed error is not fatal: exactly one log record, labelled as
+    swallowed, with the traceback on it."""
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause()
+        assert app.is_running, "the swallow path needs a running app"
+        try:
+            raise RuntimeError("kaboom")  # a real traceback, as Textual hands it over
+        except RuntimeError as exc:
+            app._handle_exception(exc)
+        await pilot.pause()
+    assert app.swallowed, "the error was swallowed, not fatal"
+    records = _records(tui_log)
+    assert [r for r in records if "fatal UI error" in r.get("msg", "")] == [], records
+    swallowed = [r for r in records if "swallowed UI error" in r.get("msg", "")]
+    assert len(swallowed) == 1, records
+    assert swallowed[0]["level"] == "error"
+    assert "RuntimeError: kaboom" in swallowed[0]["exc"], swallowed[0]
+
+
 def test_run_tui_logs_how_the_app_ended(tui_log: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """run_tui is the entrypoint: it logs start, a non-zero return code, and a
     crash (with traceback) before letting the exception out."""
