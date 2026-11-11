@@ -219,6 +219,15 @@ class StateStore(Protocol):
         """Full transcript, oldest first."""
         ...
 
+    async def chat_messages_max_id(self, chat_id: str) -> int:
+        """Highest message id in a chat (0 when empty). The table is append-only
+        and indexed on (chat_id, id), so this is an O(log n) staleness check."""
+        ...
+
+    async def chat_messages_since(self, chat_id: str, after_id: int) -> list[ChatMessage]:
+        """Transcript rows newer than `after_id`, oldest first."""
+        ...
+
     # -- leader lock (one daemon per database; atomic-upsert hardened in M3) --
     async def acquire_lock(self, owner: str, stale_after_s: float = 60.0) -> bool: ...
 

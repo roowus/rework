@@ -1537,3 +1537,375 @@ async def test_the_form_hint_names_its_submit_action(ids: dict[str, str]) -> Non
         form = await _open_preview_modal(pilot, app)
         hint = str(form.query_one(".dialog-hint").render())
         assert "ctrl+s preview" in hint.lower() and "save" not in hint.lower()
+
+
+# -- live sync: another instance's writes appear without a reload -----------------------
+#
+# Every rework instance points at the SAME store; each TUI re-reads it on its poll
+# tick. These tests prove the surfaces that used to fetch once now converge: a write
+# made through instance A's persistence path shows up in instance B's open view, and
+# the tick after that must not duplicate it.
+
+
+async def test_open_transcript_picks_up_another_instances_turn(
+    ids: dict[str, str], env: Path
+) -> None:
+    """The open chat transcript used to be read once by _load_chat: a turn
+    persisted by another instance never appeared until the chat was reopened."""
+    from rework.kernel.state.records import ChatMessage
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        work = app.view("work")
+        app.query_one("#chat-list", RowList).activate(ids["chat"], via_mouse=True)
+        await _settle(pilot, 0.8)
+        assert work.convo is not None and work.convo.id == ids["chat"]
+        before = len(app.query("#chat-log Step"))
+        assert before > 0, "the seeded transcript should have rendered"
+
+        # instance A: a turn lands in the shared store, not in this process
+        store = await _store(env)
+        try:
+            await store.append_chat_message(
+                ChatMessage(
+                    chat_id=ids["chat"],
+                    role="assistant",
+                    body={"role": "assistant", "content": "from the other laptop"},
+                    display="from the other laptop",
+                )
+            )
+        finally:
+            await store.aclose()
+
+        await _settle(pilot, 1.2)  # one poll tick
+        after = app.query("#chat-log Step")
+        assert len(after) == before + 1, "the new turn was appended exactly once"
+        assert "from the other laptop" in str(after[-1].render())
+
+        await _settle(pilot, 1.2)  # a second tick: nothing new, no duplicate
+        assert len(app.query("#chat-log Step")) == before + 1
+        assert not app.swallowed
+
+        # switching chats resets the cursor: reopening replays the full log once
+        app.query_one("#chat-list", RowList).activate(ids["chat"], via_mouse=True)
+        await _settle(pilot, 0.8)
+        assert len(app.query("#chat-log Step")) == before + 1
+
+        # a chat with no messages at all renders nothing (and stays empty)
+        chat = await work.hub.data.new_chat(title="empty one")
+        await _settle(pilot, 0.8)
+        work.new_chat()
+        await _settle(pilot, 0.8)
+        assert work._chat_cursor == 0
+        await work.hub.data.delete_chat(chat.id)
+
+
+async def test_a_new_message_does_not_yank_a_scrolled_up_reader(
+    ids: dict[str, str], env: Path
+) -> None:
+    """Trajectory.add only follows the bottom when the reader is at it."""
+    from rework.kernel.state.records import ChatMessage
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.query_one("#chat-list", RowList).activate(ids["chat"], via_mouse=True)
+        await _settle(pilot, 0.8)
+        store = await _store(env)
+        try:
+            # enough turns that the log is longer than the pane
+            for n in range(40):
+                await store.append_chat_message(
+                    ChatMessage(
+                        chat_id=ids["chat"],
+                        role="user",
+                        body={"role": "user", "content": f"filler {n}"},
+                        display=f"filler {n}",
+                    )
+                )
+        finally:
+            await store.aclose()
+        await _settle(pilot, 1.2)
+        log = app.query_one("#chat-log")
+        assert log.max_scroll_y > 0, "the transcript is longer than the pane"
+        log.scroll_home(animate=False)
+        await pilot.pause()
+        at = log.scroll_y
+        assert not log._at_bottom(), "the reader is scrolled up"
+
+        store = await _store(env)
+        try:
+            await store.append_chat_message(
+                ChatMessage(
+                    chat_id=ids["chat"],
+                    role="user",
+                    body={"role": "user", "content": "while you were reading"},
+                    display="while you were reading",
+                )
+            )
+        finally:
+            await store.aclose()
+        await _settle(pilot, 1.2)
+        assert "while you were reading" in str(app.query("#chat-log Step")[-1].render())
+        assert log.scroll_y == at, "a new line must not scroll the reader"
+
+
+async def test_own_turn_is_rendered_once_and_not_replayed_by_the_tick(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`_send` renders the turn live and persists it; the poll must not render
+    it a second time (and must catch its cursor up)."""
+    script_provider(
+        monkeypatch,
+        [
+            ChatResult(
+                text="looking into it", tool_calls=[], usage=Usage(input_tokens=10, output_tokens=5)
+            )
+        ],
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        work = app.view("work")
+        app.query_one("#chat-list", RowList).activate(ids["chat"], via_mouse=True)
+        await _settle(pilot, 0.8)
+        before = len(app.query("#chat-log Step"))
+
+        prompt = app.query_one("#prompt")
+        prompt.text = "how is it going?"
+        await pilot.press("enter")
+        for _ in range(60):  # wait for the scripted turn to finish, not for a fixed time
+            await _settle(pilot, 0.1)
+            if len(app.query("#chat-log Step")) > before and not work._sending:
+                break
+        await _settle(pilot, 0.3)
+        after_send = len(app.query("#chat-log Step"))
+        assert after_send > before
+        await _settle(pilot, 1.2)  # poll ticks with no new rows
+        assert len(app.query("#chat-log Step")) == after_send
+        assert work._chat_cursor > 0
+        assert not app.swallowed
+
+
+async def test_foreign_row_written_during_own_turn_is_rendered_once(
+    ids: dict[str, str], env: Path
+) -> None:
+    """Instance A writes while B is mid-turn: B must still render A's row once,
+    and must not re-render its own (already live-rendered) rows."""
+    from rework.kernel.state.records import ChatMessage
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        work = app.view("work")
+        app.query_one("#chat-list", RowList).activate(ids["chat"], via_mouse=True)
+        await _settle(pilot, 0.8)
+
+        def shown() -> str:
+            return "\n".join(str(s.render()) for s in app.query("#chat-log Step"))
+
+        work._sending = True  # B is streaming its own turn
+        try:
+            await app.hub.data.append_chat_note(ids["chat"], "own row from B")  # rendered live
+            store = await _store(env)  # a genuinely separate handle: instance A
+            try:
+                await store.append_chat_message(
+                    ChatMessage(chat_id=ids["chat"], role="note", body={}, display="foreign from A")
+                )
+            finally:
+                await store.aclose()
+            for _ in range(50):  # bounded wait for a tick to pick it up
+                await _settle(pilot, 0.1)
+                if "foreign from A" in shown():
+                    break
+        finally:
+            work._sending = False
+        await _settle(pilot, 2.5)  # more ticks after the turn: still exactly once
+        text = shown()
+        assert text.count("foreign from A") == 1
+        assert "own row from B" not in text, "own rows are never replayed by the poll"
+        assert not app.swallowed
+
+
+async def test_gates_history_list_and_detail_follow_other_instances(
+    ids: dict[str, str], env: Path
+) -> None:
+    """Decided gates were fetched once per chip change and the detail pane's
+    steps paged FORWARD from seq 0 (the oldest window). Both now follow the tick."""
+    from rework.kernel.state.records import EventRecord, EventType
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+3")
+        await _settle(pilot, 0.8)
+        gates = app.view("gates")
+        app.query_one("#gate-list", RowList).activate(ids["gate"], via_mouse=True)
+        await _settle(pilot, 0.8)
+        steps = str(app.query_one("#gate-steps").render())
+        assert steps.strip(), "the selected gate's steps rendered"
+
+        store = await _store(env)
+        try:
+            # instance A: the selected gate's own mission emits a new event
+            await store.append_event(
+                EventRecord(
+                    mission_id=ids["waiting"],
+                    run_id=None,
+                    type=EventType.PROGRESS,
+                    payload={"trajectory": "turn", "text": "a fresh step from elsewhere"},
+                )
+            )
+        finally:
+            await store.aclose()
+
+        await _settle(pilot, 1.2)
+        steps = str(app.query_one("#gate-steps").render())
+        assert "a fresh step from elsewhere" in steps, "the new event was appended"
+        first = steps
+        await _settle(pilot, 1.2)  # a second tick must not duplicate the line
+        assert str(app.query_one("#gate-steps").render()) == first
+
+        # instance A decides a gate: the history list must show it without a
+        # chip toggle (it used to be fetched once per chip change)
+        from rework.tui.widgets.base import ChipGroup
+
+        chips = gates.query_one("#gate-mode", ChipGroup)
+        await pilot.click(next(c for c in chips.query(".chip") if c.value == "decided"))
+        await _settle(pilot, 0.8)
+        assert gates.mode == "decided"
+        store = await _store(env)
+        try:
+            await store.decide_gate(ids["gate"], True, note="from the other laptop")
+        finally:
+            await store.aclose()
+        await _settle(pilot, 1.2)
+        assert ids["gate"] in [g.id for g in gates.history], (
+            "the decided gate is in the history list"
+        )
+        assert not app.swallowed
+
+
+async def test_library_results_and_body_follow_the_index(ids: dict[str, str], env: Path) -> None:
+    """The Library tab had no on_snapshot at all: results and the reader body
+    were fetched once. An item added or rewritten elsewhere now appears."""
+    import os
+
+    await seed_library(str(env), os.environ["REWORK_LIBRARY_DIR"])
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+4")
+        await _settle(pilot, 1.0)
+        lib = app.view("library")
+        lst = app.query_one("#lib-list", RowList)
+        target = next(k for k in lst.selectable)
+        lst.activate(target, via_mouse=True)
+        await _settle(pilot, 0.8)
+        body_before = str(app.query_one("#lib-md")._markdown)
+        assert body_before.strip(), "the selected item's body rendered"
+
+        from rework.library.store import open_library_store
+
+        index = await open_library_store(str(env))
+        try:
+            item = await index.get_item(target)
+            assert item is not None
+            item.description = "rewritten by the other instance"
+            await index.upsert_item(item)
+        finally:
+            await index.aclose()
+
+        await _settle(pilot, 1.2)
+        assert any(i.description.startswith("rewritten") for i in lib.items)
+        assert lib.selected is not None and lib.selected.description.startswith("rewritten")
+        assert not app.swallowed
+
+
+async def test_dashboard_report_body_follows_a_run_that_changes_without_a_new_run(
+    ids: dict[str, str], env: Path
+) -> None:
+    """The report body reload key was `mission_id:len(runs)`, so a run flipping
+    RUNNING -> COMPLETED with an artifact — which rewrites the body but adds no
+    run — left the report stale forever. The key is now the mission's event seq."""
+    import asyncio as _asyncio
+
+    from textual.widgets import Markdown
+
+    from rework.kernel.state.records import EventRecord, EventType, RunStatus
+    from rework.tui.widgets.base import ChipGroup
+
+    app = _app()
+
+    async def _until(cond: Any, budget_s: float = 8.0) -> bool:
+        loop = _asyncio.get_running_loop()
+        end = loop.time() + budget_s
+        while loop.time() < end:
+            if cond():
+                return True
+            await pilot.pause(0.15)
+        return cond()
+
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.open_mission(ids["running"])
+        await _settle(pilot, 0.8)
+        dash = app.view("dashboard")
+        tabs = app.query_one("#m-tabs", ChipGroup)
+        await pilot.click(next(c for c in tabs.query(".chip") if c.value == "report"))
+        await _settle(pilot, 0.8)
+        body = app.query_one("#m-report-body", Markdown)
+        assert await _until(lambda: dash.report_loaded_for is not None), "the report loaded"
+        before = str(body._markdown)
+        assert before.strip(), "the report body rendered"
+        stamped = dash.report_loaded_for
+        runs_before = len(dash.runs)
+
+        # a tick with nothing new must NOT re-render (no per-tick flicker)
+        await _settle(pilot, 1.0)
+        assert dash.report_loaded_for == stamped, "an unchanged tick must not reload"
+
+        # instance A: the coder run completes with an artifact, adding no run.
+        # The engine does update_run(...COMPLETED, artifact=...) and publishes
+        # the matching event; the run count stays put.
+        store = await _store(env)
+        try:
+            coder = next(r for r in await store.list_runs(ids["running"]) if r.role == "coder")
+            await store.update_run(
+                coder.id,
+                status=RunStatus.COMPLETED,
+                artifact={
+                    "kind": "coder_handoff",
+                    "branch": "rework/from-the-other-laptop",
+                    "commit": "0" * 40,
+                    "summary": "handoff written by the other instance",
+                    "diff": "--- a/x\n+++ b/x\n",
+                    "run_stats": {"model_calls": 9, "cost_usd": 1.5, "elapsed_seconds": 12.0},
+                },
+            )
+            await store.append_event(
+                EventRecord(
+                    mission_id=ids["running"],
+                    run_id=coder.id,
+                    type=EventType.ROLE_COMPLETED,
+                    payload={"role": "coder", "status": "completed"},
+                )
+            )
+        finally:
+            await store.aclose()
+
+        assert len(dash.runs) == runs_before, "the change added no run"
+        assert await _until(
+            lambda: "handoff written by the other instance" in str(body._markdown)
+        ), "the report body must reload on the run's transition"
+        after = str(body._markdown)
+        assert after != before
+        assert dash.report_loaded_for != stamped, "the key moved"
+
+        # and the settled key must not reload again on the next quiet tick
+        settled = dash.report_loaded_for
+        await _settle(pilot, 1.0)
+        assert dash.report_loaded_for == settled, "a quiet tick must not reload"
+        assert str(body._markdown) == after
+        assert not app.swallowed

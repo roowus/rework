@@ -12,6 +12,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.timer import Timer
 from textual.widgets import Input, Markdown, Static
 
+from rework.tui.hub import Snapshot
 from rework.tui.theme import (
     ACCENT,
     FAINT,
@@ -48,6 +49,12 @@ class LibraryView(View):
         self._debounce: Timer | None = None
         self._loaded = False
         self.mode = ""
+        # cheap fingerprints of what is on screen, so the heartbeat only
+        # repaints when something actually changed (no flicker, no lost input)
+        self._fingerprint: tuple[Any, ...] | None = None
+        self._body_fingerprint: tuple[str, int] | None = None
+        self._searching = False
+        self._search_epoch = 0  # bumped by every user search; a stale recheck drops
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="pane-head lib-head"):
@@ -151,6 +158,18 @@ class LibraryView(View):
 
     @work(exclusive=True, group="lib-search")
     async def _search(self) -> None:
+        self._searching = True
+        self._search_epoch += 1
+        try:
+            items = await self._fetch_items()
+        finally:
+            self._searching = False
+        self.items = self._filter(items)
+        self._fingerprint = tuple(self._item_fingerprint(i) for i in self.items)
+        self._body_fingerprint = None
+        self._paint_list()
+
+    async def _fetch_items(self) -> list[Any]:
         data = self.hub.data
         q = self.query_text.strip()
         self.mode = ""
@@ -175,13 +194,15 @@ class LibraryView(View):
                 for i in everything
                 if needle in f"{i.name} {i.description} {' '.join(i.tags)}".lower()
             ]
-        self.items = [
+        return list(items)
+
+    def _filter(self, items: list[Any]) -> list[Any]:
+        return [
             i
             for i in items
             if (self.type_filter == "all" or _v(i.type) == self.type_filter)
             and (self.status_filter == "all" or _v(i.status) == self.status_filter)
         ]
-        self._paint_list()
 
     def _paint_list(self) -> None:
         rows = []
@@ -209,6 +230,69 @@ class LibraryView(View):
         lst.select(self.selected.id if self.selected is not None else None)
         mode = f" · {self.mode}" if self.mode else ""
         self.query_one("#lib-count", Static).update(f"{len(rows)} ITEMS{mode.upper()}")
+
+    def _item_fingerprint(self, item: Any) -> tuple[Any, ...]:
+        return (
+            item.id,
+            _v(item.status),
+            item.version,
+            item.updated_at,
+            item.name,
+            item.description,
+            tuple(item.tags),
+        )
+
+    # -- hub ---------------------------------------------------------------
+
+    def on_snapshot(self, snap: Snapshot) -> None:
+        """The library index is shared: another instance (or a chat card) can
+        add, retire or rewrite an item while this tab sits open. Re-run the
+        current search when the tab is the active one and nothing the user is
+        typing has changed, and re-read the open body when its version moved."""
+        if self.rw.active_tab != self.TAB or not self._loaded:
+            return
+        self._recheck()
+
+    @work(exclusive=True, group="lib-recheck")
+    async def _recheck(self) -> None:
+        if self._searching:
+            return  # the user's own search is in flight; don't race it
+        epoch = self._search_epoch
+        items = await self.hub.guard(self._fetch_items, None)
+        if items is None or self._searching or self._search_epoch != epoch:
+            return  # a user search started/ran meanwhile: its results win
+        items = self._filter(items)
+        self.items = items
+        fingerprint = tuple(self._item_fingerprint(i) for i in items)
+        if fingerprint != self._fingerprint:
+            self._fingerprint = fingerprint
+            self._paint_list()
+        if self.selected is not None:
+            # the index row is authoritative for the reader's metadata
+            fresh = next((i for i in items if i.id == self.selected.id), None)
+            if fresh is not None and fresh is not self.selected:
+                self.selected = fresh
+                self._paint_reader()
+        await self._recheck_body()
+
+    async def _recheck_body(self) -> None:
+        item = self.selected
+        if item is None:
+            return
+        try:
+            fresh, body = await self.hub.data.library_body(item.id)
+        except Exception:
+            return
+        if fresh is None or self.selected is None or self.selected.id != item.id:
+            return
+        fingerprint = (item.id, int(fresh.version))
+        if fingerprint == self._body_fingerprint:
+            return
+        self._body_fingerprint = fingerprint
+        self.selected = fresh
+        self._paint_reader()
+        if body is not None:
+            await self.query_one("#lib-md", Markdown).update(body)
 
     def on_row_list_activated(self, event: RowList.Activated) -> None:
         event.stop()
@@ -269,6 +353,7 @@ class LibraryView(View):
         _item, body = result
         if self.selected is None or self.selected.id != item_id:
             return
+        self._body_fingerprint = (_item.id, int(_item.version)) if _item is not None else None
         if body is None:
             body = (
                 "_The body is not on this machine._\n\nThe library git repo lives with the "

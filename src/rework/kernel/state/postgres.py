@@ -981,6 +981,23 @@ class PostgresStore:
         return [self._chat_message(r) for r in rows]
 
     @_serialized
+    async def chat_messages_max_id(self, chat_id: str) -> int:
+        row = await self._fetch_one(
+            "SELECT COALESCE(MAX(id), 0) AS max_id FROM chat_messages WHERE chat_id = %s",
+            (chat_id,),
+        )
+        assert row is not None
+        return int(row["max_id"] or 0)
+
+    @_serialized
+    async def chat_messages_since(self, chat_id: str, after_id: int) -> list[ChatMessage]:
+        rows = await self._fetch_all(
+            "SELECT * FROM chat_messages WHERE chat_id = %s AND id > %s ORDER BY id",
+            (chat_id, after_id),
+        )
+        return [self._chat_message(r) for r in rows]
+
+    @_serialized
     async def mission_spend(self, mission_id: str) -> BudgetState:
         row = await self._fetch_one(
             "SELECT COALESCE(SUM(input_tokens), 0) AS i, COALESCE(SUM(output_tokens), 0) AS o,"
