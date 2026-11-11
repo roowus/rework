@@ -746,6 +746,9 @@ class MissionOrchestrator:
                     + ", ".join(r.id for r in live)
                     + ". Wait for them or cancel them first."
                 )
+            # Enforce "revise until clean" for fix/fix-pr playbooks
+            if outcome == "done" and self.playbook in ("fix", "fix-pr"):
+                await self._enforce_audit_clean()
             self.finished = (outcome, str(args.get("summary") or ""))
             await self._note(f"finished ({outcome}): {self.finished[1]}"[:400], to_owner=True)
             return "finished"
@@ -1229,6 +1232,90 @@ class MissionOrchestrator:
             raise ToolError("empty instruction")
         await self.store.update_run(run_id, redirect=instruction[:2000])
         return f"{run_id} will see it at its next turn"
+
+    async def _has_owner_ship_approval(self) -> bool:
+        """Check if the owner explicitly approved shipping via ask_owner permission gate."""
+        from rework.kernel.state.records import GateKind
+
+        gates = await self.store.list_gates(self.mid)
+        for gate in gates:
+            if gate.status == GateStatus.APPROVED and gate.kind == GateKind.PERMISSION:
+                spec = gate.spec or {}
+                # Permission gates created by ask_owner with orchestrator as asker
+                if spec.get("asked_by") == "orchestrator":
+                    # Check if this looks like a ship approval (not budget/turn_cap)
+                    if not spec.get("budget_to") and not spec.get("turn_cap"):
+                        return True
+        return False
+
+    async def _enforce_audit_clean(self) -> None:
+        """Enforce the 'revise until clean' rule for finish(outcome='done').
+
+        Raises ToolError if:
+          - No auditor has completed yet
+          - A coder completed after the last audit (unaudited changes)
+          - The last audit has medium+ findings or requests changes
+
+        Allowed only if owner explicitly approved shipping via ask_owner.
+        """
+        # Check for owner approval escape hatch first
+        if await self._has_owner_ship_approval():
+            return
+
+        runs = await self.store.list_runs(self.mid)
+        completed = [r for r in runs if r.status == RunStatus.COMPLETED]
+
+        # Find all completed auditor and coder runs
+        audits = [r for r in completed if r.role == "auditor"]
+        coders = [r for r in completed if r.role == "coder"]
+
+        # (a) No auditor has completed yet
+        if not audits:
+            raise ToolError(
+                "no auditor has completed yet; spawn an auditor on the coder's branch "
+                "before finishing with outcome='done'"
+            )
+
+        # Get the last completed audit and coder
+        last_audit = audits[-1]
+        last_coder = coders[-1] if coders else None
+
+        # (b) A coder completed after the last audit (unaudited changes)
+        if last_coder is not None:
+            # Compare by attempt number as a proxy for completion order
+            # (runs are created sequentially, so higher attempt = completed later)
+            if last_coder.attempt > last_audit.attempt:
+                raise ToolError(
+                    f"coder {last_coder.id} finished after the last audit {last_audit.id}; "
+                    "spawn an auditor on its branch before finishing with outcome='done'"
+                )
+
+        # (c) Check the last audit's verdict for medium+ findings or changes requested
+        artifact = last_audit.artifact or {}
+        findings = artifact.get("findings", [])
+
+        # Check for medium or higher severity findings
+        has_medium_plus = any(
+            str(f.get("severity", "")).lower() in ("medium", "high", "critical")
+            for f in findings
+        )
+        if has_medium_plus:
+            severities = [str(f.get("severity", "")).lower() for f in findings]
+            sev_summary = ", ".join(s for s in severities if s in ("medium", "high", "critical"))
+            raise ToolError(
+                f"the last audit ({last_audit.id}) found medium-or-higher findings ({sev_summary}); "
+                "revise and re-audit before finishing with outcome='done'"
+            )
+
+        # Check mechanical verdict for "request changes"
+        from rework.nodes.report_sections import mechanical_verdict
+
+        verdict = mechanical_verdict(artifact)
+        if verdict == "request changes":
+            raise ToolError(
+                f"the last audit ({last_audit.id}) verdict is 'request changes'; "
+                "revise and re-audit before finishing with outcome='done'"
+            )
 
     async def _owner_messages(self) -> list[Any]:
         return [

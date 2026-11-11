@@ -7,6 +7,7 @@ tool errors fed back, fixed final gates, persistence and resume after a kill."""
 
 from __future__ import annotations
 
+import json
 import asyncio
 import shutil
 import subprocess
@@ -992,3 +993,197 @@ async def test_a_long_outage_still_fails(
     await asyncio.wait_for(runner(world).run(), timeout=30)
     mission = await world["store"].get_mission("mo")
     assert mission is not None and (mission.result or {}).get("outcome") == "failed"
+
+
+async def test_finish_done_blocked_when_coder_after_audit(world: dict[str, Any]) -> None:
+    """fix/fix-pr playbook: finish(done) refused when coder completed after last audit."""
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+
+    provider.route(
+        MARKER,
+        [
+            # Spawn coder
+            turn(
+                call("spawn_role", "o1", role="coder", step="code", brief="fix add()"),
+                call("wait", "o2"),
+            ),
+            # Spawn auditor
+            turn(
+                call("spawn_role", "o3", role="auditor", step="audit", brief="review"),
+                call("wait", "o4"),
+            ),
+            # Spawn revision coder (after audit)
+            turn(
+                call("spawn_role", "o5", role="coder", step="code-rev", brief="revise"),
+                call("wait", "o6"),
+            ),
+            # Try to finish - should be refused with ToolError
+            turn(call("finish", "o7", outcome="done", summary="done"), text="trying to finish"),
+            # Spawn another auditor
+            turn(
+                call("spawn_role", "o8", role="auditor", step="audit-rev", brief="re-audit"),
+                call("wait", "o9"),
+            ),
+            # Now finish should work
+            turn(call("finish", "o10", outcome="done", summary="all clean")),
+        ],
+    )
+    script_roles(provider)
+
+    task = asyncio.create_task(runner(world).run())
+    await approve_next_gate(world)  # ship gate
+    await asyncio.wait_for(task, timeout=30)
+
+    mission = await store.get_mission("mo")
+    assert mission is not None and mission.status == MissionStatus.DONE
+
+    # Check that the first finish was refused with ToolError
+    msgs = await store.chat_messages(orchestrator_chat_id("mo"))
+    tool_results = [
+        m.body.get("content", "")
+        for m in msgs
+        if m.role == "tool" and m.body.get("name") == "finish"
+    ]
+    # First finish should have error about unaudited changes
+    assert any("error:" in str(r) and "finished after" in str(r) for r in tool_results[:1])
+    # Second finish should succeed
+    assert tool_results[-1] == "finished"
+
+
+async def test_finish_done_blocked_on_medium_finding(world: dict[str, Any]) -> None:
+    """fix/fix-pr playbook: finish(done) refused when last audit has medium+ finding."""
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+
+    # Create audit with a medium finding
+    audit_medium = json.dumps({
+        "summary": "Found a medium issue",
+        "findings": [
+            {
+                "title": "Medium issue",
+                "detail": "This needs attention",
+                "severity": "medium",
+                "verdict": "CONFIRMED",
+                "confidence": 0.8,
+            }
+        ],
+        "standing_assessments": {},
+        "warnings": [],
+        "blockers": [],
+    })
+
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call("spawn_role", "o1", role="coder", step="code", brief="fix"),
+                call("wait", "o2"),
+            ),
+            turn(
+                call("spawn_role", "o3", role="auditor", step="audit", brief="review"),
+                call("wait", "o4"),
+            ),
+            # Try to finish - should be refused, then spawn revision coder
+            turn(
+                call("finish", "o5", outcome="done", summary="done"),
+                text="trying to finish but should be refused",
+            ),
+            # After refusal, spawn revision
+            turn(
+                call("spawn_role", "o6", role="coder", step="code-rev", brief="revise"),
+                call("wait", "o7"),
+            ),
+            # Spawn clean audit
+            turn(
+                call("spawn_role", "o8", role="auditor", step="audit-rev", brief="re-audit"),
+                call("wait", "o9"),
+            ),
+            # Now can finish
+            turn(call("finish", "o10", outcome="done", summary="all clean")),
+        ],
+    )
+    # Override auditor: first returns medium finding, second returns clean
+    provider.route("GOAL: Audit", _auditor_script(audit_medium) + _auditor_script(AUDIT_CLEAN))
+    provider.route("GOAL: One general", _coder_script("fixed") + _coder_script("revised"))
+
+    task = asyncio.create_task(runner(world).run())
+    await approve_next_gate(world)  # ship gate
+    await asyncio.wait_for(task, timeout=30)
+
+    # Check that the first finish was refused
+    msgs = await store.chat_messages(orchestrator_chat_id("mo"))
+    tool_results = [
+        m.body.get("content", "")
+        for m in msgs
+        if m.role == "tool" and m.body.get("name") == "finish"
+    ]
+    # First finish should have error about medium finding
+    assert any("error:" in str(r) and "medium-or-higher" in str(r).lower() for r in tool_results[:-1])
+    # Final finish should succeed
+    assert tool_results[-1] == "finished"
+
+    mission = await store.get_mission("mo")
+    assert mission is not None and mission.status == MissionStatus.DONE
+
+
+async def test_finish_failed_always_allowed(world: dict[str, Any]) -> None:
+    """finish(failed) succeeds regardless of audit/coder state."""
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+
+    provider.route(
+        MARKER,
+        [
+            # Try to finish with failed immediately, no auditor ever run
+            turn(call("finish", "o1", outcome="failed", summary="cannot proceed")),
+        ],
+    )
+
+    task = asyncio.create_task(runner(world).run())
+    await asyncio.wait_for(task, timeout=30)
+
+    mission = await store.get_mission("mo")
+    assert mission is not None
+    # outcome='failed' is stored in result, mission status is still DONE
+    assert (mission.result or {}).get("outcome") == "failed"
+    assert (mission.result or {}).get("summary") == "cannot proceed"
+
+
+async def test_finish_done_blocked_when_no_auditor(world: dict[str, Any]) -> None:
+    """fix/fix-pr playbook: finish(done) refused when no auditor has run yet."""
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call("spawn_role", "o1", role="coder", step="code", brief="fix"),
+                call("wait", "o2"),
+            ),
+            # Try to finish without auditor - should be refused
+            turn(call("finish", "o3", outcome="done", summary="done")),
+        ],
+    )
+    provider.route("GOAL: One general", _coder_script("fixed"))
+
+    task = asyncio.create_task(runner(world).run())
+    await asyncio.sleep(3)  # Give it time to try
+
+    # Check that finish was refused
+    msgs = await store.chat_messages(orchestrator_chat_id("mo"))
+    tool_results = [
+        m.body.get("content", "")
+        for m in msgs
+        if m.role == "tool" and m.body.get("name") == "finish"
+    ]
+    assert any("error:" in str(r) and "no auditor" in str(r) for r in tool_results)
+
+    # Cancel to clean up
+    await store.update_mission("mo", status=MissionStatus.CANCELLED)
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
