@@ -35,11 +35,16 @@ class Candidate:
 
 
 def _size(path: Path) -> int:
+    """Bytes deleting `path` actually frees: files hard-linked elsewhere (uv
+    links virtualenv files from its cache on Linux) free nothing, so they do
+    not count (found on rewvis: 913 MB 'to free' in a 648 MB directory)."""
     total = 0
     for p in path.rglob("*"):
         try:
             if p.is_file() and not p.is_symlink():
-                total += p.stat().st_size
+                st = p.stat()
+                if st.st_nlink == 1:
+                    total += st.st_size
         except OSError:
             continue
     return total

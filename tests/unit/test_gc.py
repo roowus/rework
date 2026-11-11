@@ -73,3 +73,14 @@ def test_mission_of() -> None:
     assert mission_of(Path("m-58d05d4101c7_code6_coder_1")) == "m-58d05d4101c7"
     assert mission_of(Path("missions")) is None
     assert mission_of(Path("m-02a838292537")) is None
+
+
+def test_hard_linked_files_are_not_counted_as_freed(tmp_path: Path) -> None:
+    import os
+
+    cache = tmp_path / "uv-cache.bin"
+    cache.write_bytes(b"y" * 5000)
+    run = _run_dir(tmp_path / "work", "m-bbbbbbbbbbbb_code_coder_1")
+    os.link(cache, run / "worktree" / "linked.bin")
+    found = collect(tmp_path / "work", {"m-bbbbbbbbbbbb": ("done", 0.0)}, DAY, now=NOW)
+    assert found[0].bytes == 1000  # big.bin only; the linked file frees nothing
