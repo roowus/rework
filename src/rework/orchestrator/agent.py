@@ -1303,8 +1303,8 @@ class MissionOrchestrator:
             severities = [str(f.get("severity", "")).lower() for f in findings]
             sev_summary = ", ".join(s for s in severities if s in ("medium", "high", "critical"))
             raise ToolError(
-                f"the last audit ({last_audit.id}) found medium-or-higher findings ({sev_summary}); "
-                "revise and re-audit before finishing with outcome='done'"
+                f"the last audit ({last_audit.id}) found medium-or-higher findings "
+                f"({sev_summary}); revise and re-audit before finishing with outcome='done'"
             )
 
         # Check mechanical verdict for "request changes"
