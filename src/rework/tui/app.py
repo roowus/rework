@@ -30,6 +30,10 @@ log = logging.getLogger("rework.tui")
 
 TABS = ["work", "dashboard", "gates", "library", "cost"]
 
+# Identical errors inside this window are counted, not re-toasted (see
+# _swallow). Found live: a MarkupError storm toasted itself thousands of times.
+ERROR_STORM_WINDOW = 5.0
+
 # Found live: alt+N worked under Pilot and NEVER in a real macOS terminal.
 # Option+digit reaches Textual as a character (¡ ™ £ ¢ ∞; Textual even maps
 # ESC+digit to those), and while a text input has focus Textual deliberately
@@ -134,6 +138,11 @@ class ReworkApp(App[None]):
         self._seen_gates: set[str] | None = None  # None until the first load
         self.swallowed: list[BaseException] = []  # surprises turned into toasts
         self.notifications_sent: list[tuple[str, str]] = []  # (channel, text), for tests
+        # error-storm guard: (type name, message) of the last toast plus when it
+        # was shown, and how many identical repeats were collapsed into it
+        self._last_error: tuple[str, str] | None = None
+        self._last_error_at = 0.0
+        self._suppressed_errors = 0
 
     # -- layout ------------------------------------------------------------
 
@@ -252,11 +261,19 @@ class ReworkApp(App[None]):
         title: str = "",
         severity: SeverityLevel = "information",
         timeout: float | None = None,
-        markup: bool = True,
+        markup: bool = False,
     ) -> None:
         """Every toast the owner would actually see is recorded here, so tests
         can assert on notifications (refusals included). Channels follow
-        `settings.notify`, exactly like `announce`."""
+        `settings.notify`, exactly like `announce`.
+
+        `markup` defaults to False ON PURPOSE: nearly every toast here embeds
+        runtime text (an exception message, a model name, mission text). A
+        message containing `[` used to be parsed as markup, raising a
+        MarkupError inside the toast, which `_handle_exception` swallowed and
+        toasted again — an unbounded storm that took the TUI down. Callers who
+        really want markup must ask for it, and must escape what they
+        interpolate."""
         if "toast" in self.settings.notify:
             self.notifications_sent.append(("toast", message))
         super().notify(message, title=title, severity=severity, timeout=timeout, markup=markup)
@@ -265,7 +282,7 @@ class ReworkApp(App[None]):
         """A human is needed. Channels per settings: toast, bell, os."""
         channels = self.settings.notify
         if "toast" in channels:
-            self.notify(text, title=title, severity="warning", timeout=8)
+            self.notify(text, title=title, severity="warning", timeout=8, markup=False)
         if "bell" in channels:
             self.bell()
             self.notifications_sent.append(("bell", text))
@@ -358,7 +375,7 @@ class ReworkApp(App[None]):
             text = focused.copy_value()
         if text:
             self.copy_to_clipboard(text)
-            self.notify(f"Copied {len(text)} chars", timeout=1.5)
+            self.notify(f"Copied {len(text)} chars", timeout=1.5, markup=False)
         else:
             self.notify("Select text with the mouse, then ctrl+c", timeout=2)
 
@@ -389,6 +406,7 @@ class ReworkApp(App[None]):
             f"rework {__version__}. Talk to the orchestrator; it runs the roles.",
             title="About",
             timeout=5,
+            markup=False,
         )
 
     def action_mission(self, verb: str) -> None:
@@ -488,10 +506,10 @@ class ReworkApp(App[None]):
                 name = repo.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") or "repo"
                 settings["repos"] = [{"name": name, "kind": "git", "url": repo}]
                 await store.update_project(project.id, settings=settings)
-            self.notify(f"Project {project.name} created", timeout=3)
+            self.notify(f"Project {project.name} created", timeout=3, markup=False)
             await self.hub.refresh()
         except Exception as exc:
-            self.notify(f"Could not create project: {exc}", severity="error")
+            self.notify(f"Could not create project: {exc}", severity="error", markup=False)
 
     def action_new_library_item(self) -> None:
         self.action_tab("library")
@@ -534,17 +552,43 @@ class ReworkApp(App[None]):
     # -- resilience ------------------------------------------------------------------
 
     def _swallow(self, exc: BaseException) -> None:
+        """Never crash, never storm. Found live: a MarkupError whose own text
+        was "auto closing tag ([/]) has nothing to close" was toasted with
+        markup ON, the toast raised a second MarkupError, that was swallowed
+        and toasted again — 1000+ toasts until the app fell apart. So: the
+        toast is plain text, and an identical error repeating inside
+        ERROR_STORM_WINDOW is counted, not re-toasted."""
         self.swallowed.append(exc)
         log.exception("swallowed UI error", exc_info=exc)
+        key = (type(exc).__name__, str(exc))
+        now = time.monotonic()
+        if key == self._last_error and now - self._last_error_at < ERROR_STORM_WINDOW:
+            self._last_error_at = now
+            self._suppressed_errors += 1
+            return
+        suppressed, self._suppressed_errors = self._suppressed_errors, 0
+        self._last_error = key
+        self._last_error_at = now
+        more = f" ({suppressed} more identical, suppressed)" if suppressed else ""
         try:
-            self.notify(f"{type(exc).__name__}: {clip(str(exc), 160)}", severity="error", timeout=6)
+            self.notify(
+                f"{type(exc).__name__}: {clip(str(exc), 160)}{more}",
+                severity="error",
+                timeout=6,
+                markup=False,  # exception text is untrusted, never parse it
+            )
         except Exception:
             pass
 
     def _handle_exception(self, error: Exception) -> None:
         """Turn surprises into a toast instead of Textual's full-screen
         traceback + exit (handoff §7 trap #1). Startup errors still exit: an app
-        that never mounted has nothing to show a toast on."""
+        that never mounted has nothing to show a toast on.
+
+        Whatever happens next, the traceback is in ~/.rework/logs/tui.log
+        FIRST: the owner cannot copy a traceback off a dead full-screen
+        terminal, and the toast (plain text, see notify) may not even fit."""
+        log.error("fatal UI error: %s: %s", type(error).__name__, error, exc_info=error)
         if not self.is_running or not self._exit_renderables_ok():
             super()._handle_exception(error)
             return
@@ -600,5 +644,13 @@ def run_tui() -> None:
 
     setup_logging("tui")  # file only: the TUI owns the terminal
     log.info("tui start")
-    ReworkApp().run()
-    log.info("tui exit")
+    app = ReworkApp()
+    try:
+        app.run()
+    except BaseException:
+        log.exception("tui crashed")  # traceback in tui.log before it escapes
+        raise
+    if app.return_code:
+        log.error("tui exit with code %s", app.return_code)
+    else:
+        log.info("tui exit")
