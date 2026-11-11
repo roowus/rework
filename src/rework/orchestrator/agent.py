@@ -1282,9 +1282,9 @@ class MissionOrchestrator:
 
         # (b) A coder completed after the last audit (unaudited changes)
         if last_coder is not None:
-            # Compare by attempt number as a proxy for completion order
-            # (runs are created sequentially, so higher attempt = completed later)
-            if last_coder.attempt > last_audit.attempt:
+            # Compare by creation timestamp to determine completion order
+            # (runs are created sequentially, so later created_at = completed later)
+            if last_coder.created_at > last_audit.created_at:
                 raise ToolError(
                     f"coder {last_coder.id} finished after the last audit {last_audit.id}; "
                     "spawn an auditor on its branch before finishing with outcome='done'"

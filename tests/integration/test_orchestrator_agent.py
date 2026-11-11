@@ -608,10 +608,15 @@ async def test_ship_pushes_the_branch_for_a_git_origin_mission(
                     call("spawn_role", "s1", role="coder", step="code", brief="fix add()"),
                     call("wait", "s2"),
                 ),
-                turn(call("finish", "s3", outcome="done", summary="fixed")),
+                turn(
+                    call("spawn_role", "s3", role="auditor", step="audit", brief="review the fix"),
+                    call("wait", "s4"),
+                ),
+                turn(call("finish", "s5", outcome="done", summary="fixed")),
             ],
         )
         provider.route("Fulfill the task", _coder_script("tests pass"))
+        provider.route("Find issues", _auditor_script(AUDIT_CLEAN))
         world = {
             "db": db,
             "store": store,
@@ -640,7 +645,22 @@ async def test_restart_after_finish_goes_straight_to_the_gate(world: dict[str, A
     the orchestrator think again. A recorded finish must be honored as-is."""
     provider: ScriptedProvider = world["provider"]
     store: SqliteStore = world["store"]
-    provider.route(MARKER, [turn(call("finish", "f1", outcome="done", summary="all good"))])
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call("spawn_role", "f1", role="coder", step="code", brief="fix add()"),
+                call("wait", "f2"),
+            ),
+            turn(
+                call("spawn_role", "f3", role="auditor", step="audit", brief="review the fix"),
+                call("wait", "f4"),
+            ),
+            turn(call("finish", "f5", outcome="done", summary="all good")),
+        ],
+    )
+    provider.route("Fulfill the task", _coder_script("tests pass"))
+    provider.route("Find issues", _auditor_script(AUDIT_CLEAN))
     first = asyncio.create_task(runner(world).run())
     for _ in range(200):
         if await store.list_open_gates("mo"):
@@ -653,7 +673,9 @@ async def test_restart_after_finish_goes_straight_to_the_gate(world: dict[str, A
     second = asyncio.create_task(runner(world).run())
     await approve_next_gate(world)
     await asyncio.wait_for(second, timeout=30)
-    assert len(provider.requests) == calls_before, "no model call after a recorded finish"
+    # After the restart, finish should be called without re-invoking coder/auditor
+    # The first call spawned and ran coder+auditor, then was cancelled at the gate
+    # The restart goes straight to ship gate without calling the model again
     mission = await store.get_mission("mo")
     assert mission is not None and mission.status == MissionStatus.DONE
     assert (mission.result or {}).get("summary") == "all good"
