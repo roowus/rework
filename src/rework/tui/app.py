@@ -19,9 +19,10 @@ from textual.notifications import SeverityLevel
 from textual.screen import ModalScreen
 from textual.widgets import ContentSwitcher
 
+from rework.runtime import CODE_CHANGED, CodeChangeWatcher
 from rework.tui.hub import Hub, Snapshot
 from rework.tui.settings import Settings
-from rework.tui.theme import THEME, clip
+from rework.tui.theme import THEME, WARN, clip
 from rework.tui.views.base import View
 from rework.tui.widgets.chrome import SEPARATOR, HintBar, MenuBar, MenuItem, TabBar
 from rework.tui.widgets.modals import Field, Form, Help
@@ -33,6 +34,12 @@ TABS = ["work", "dashboard", "gates", "library", "cost"]
 # Identical errors inside this window are counted, not re-toasted (see
 # _swallow). Found live: a MarkupError storm toasted itself thousands of times.
 ERROR_STORM_WINDOW = 5.0
+
+# How often the shell asks whether the code on disk changed (finding 28: the
+# owner's TUI ran code older than its checkout and the traceback lied). A stat
+# walk of the package is cheap but not free, and a merge is rare, so this stays
+# off the 2s heartbeat: its own slow interval.
+CODE_CHECK_SECONDS = 60.0
 
 # Found live: alt+N worked under Pilot and NEVER in a real macOS terminal.
 # Option+digit reaches Textual as a character (¡ ™ £ ¢ ∞; Textual even maps
@@ -143,6 +150,9 @@ class ReworkApp(App[None]):
         self._last_error: tuple[str, str] | None = None
         self._last_error_at = 0.0
         self._suppressed_errors = 0
+        # "the code on disk moved under us": recorded here, said once (see
+        # _check_code); None until the shell is mounted and can paint a note
+        self._code_watcher: CodeChangeWatcher | None = None
 
     # -- layout ------------------------------------------------------------
 
@@ -183,6 +193,8 @@ class ReworkApp(App[None]):
         self._paint_hints()
         self._kick()
         self.set_interval(self.poll_seconds, self._kick)
+        self._code_watcher = CodeChangeWatcher()
+        self.set_interval(CODE_CHECK_SECONDS, self._check_code)
 
     def get_theme_variable_defaults(self) -> dict[str, str]:
         # the stylesheet references $bg/$fg/… before any theme switch happens
@@ -305,6 +317,20 @@ class ReworkApp(App[None]):
             await proc.wait()
         except Exception:
             log.debug("osascript failed", exc_info=True)
+
+    # -- code on disk ----------------------------------------------------------
+
+    def _check_code(self) -> None:
+        """A merge landed in the checkout this process was started from. The
+        modules in memory are the OLD ones, so say so in the status bar and in
+        tui.log, once. Never restart: that is the owner's call (finding 28)."""
+        if self._code_watcher is None or not self._code_watcher.poll():
+            return
+        log.warning("%s", CODE_CHANGED)
+        try:
+            self.set_note(f"[{WARN}]{CODE_CHANGED}[/]")
+        except Exception:  # a missing widget must not kill the tick
+            log.debug("code-change note failed", exc_info=True)
 
     # -- chrome helpers --------------------------------------------------------
 
