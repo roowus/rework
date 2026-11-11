@@ -657,7 +657,7 @@ class DashboardView(View):
                 body = f"[{FAINT}]No diff yet. The coder hands one off when it finishes.[/]"
             self.query_one("#m-diff-body", Static).update(body)
         elif tab == "report":
-            if self.report_loaded_for != f"{self.mission_id}:{len(self.runs)}":
+            if self.report_loaded_for != self._report_key():
                 self._load_report()
         elif tab == "gates":
             self._paint_gates()
@@ -710,12 +710,22 @@ class DashboardView(View):
                 out[ev.run_id] = (nodes, str(p["node"]))
         return out
 
+    def _report_key(self) -> str:
+        """What the report body is rendered from: the mission's newest event
+        seq (already fetched by the tick) plus the tick's budget totals. Keying
+        on the run count alone missed a run flipping RUNNING -> COMPLETED with
+        an artifact, which rewrites the body without adding a run. Charges
+        publish no event, so the budget totals stand in for them until the
+        next one."""
+        spent = self.budget.spent_usd if self.budget is not None else 0.0
+        return f"{self.mission_id}:{self.last_seq}:{spent}"
+
     @work(exclusive=True, group="dash-report")
     async def _load_report(self) -> None:
         mission_id = self.mission_id
         if not mission_id:
             return
-        key = f"{mission_id}:{len(self.runs)}"
+        key = self._report_key()
         md = await self.hub.guard(lambda: self.hub.data.mission_report(mission_id), "")
         if self.mission_id != mission_id:
             return

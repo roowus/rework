@@ -1821,3 +1821,93 @@ async def test_library_results_and_body_follow_the_index(ids: dict[str, str], en
         assert any(i.description.startswith("rewritten") for i in lib.items)
         assert lib.selected is not None and lib.selected.description.startswith("rewritten")
         assert not app.swallowed
+
+
+async def test_dashboard_report_body_follows_a_run_that_changes_without_a_new_run(
+    ids: dict[str, str], env: Path
+) -> None:
+    """The report body reload key was `mission_id:len(runs)`, so a run flipping
+    RUNNING -> COMPLETED with an artifact — which rewrites the body but adds no
+    run — left the report stale forever. The key is now the mission's event seq."""
+    import asyncio as _asyncio
+
+    from textual.widgets import Markdown
+
+    from rework.kernel.state.records import EventRecord, EventType, RunStatus
+    from rework.tui.widgets.base import ChipGroup
+
+    app = _app()
+
+    async def _until(cond: Any, timeout: float = 8.0) -> bool:
+        loop = _asyncio.get_running_loop()
+        end = loop.time() + timeout
+        while loop.time() < end:
+            if cond():
+                return True
+            await pilot.pause(0.15)
+        return cond()
+
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.open_mission(ids["running"])
+        await _settle(pilot, 0.8)
+        dash = app.view("dashboard")
+        tabs = app.query_one("#m-tabs", ChipGroup)
+        await pilot.click(next(c for c in tabs.query(".chip") if c.value == "report"))
+        await _settle(pilot, 0.8)
+        body = app.query_one("#m-report-body", Markdown)
+        assert await _until(lambda: dash.report_loaded_for is not None), "the report loaded"
+        before = str(body._markdown)
+        assert before.strip(), "the report body rendered"
+        stamped = dash.report_loaded_for
+        runs_before = len(dash.runs)
+
+        # a tick with nothing new must NOT re-render (no per-tick flicker)
+        await _settle(pilot, 1.0)
+        assert dash.report_loaded_for == stamped, "an unchanged tick must not reload"
+
+        # instance A: the coder run completes with an artifact, adding no run.
+        # The engine does update_run(...COMPLETED, artifact=...) and publishes
+        # the matching event; the run count stays put.
+        store = await _store(env)
+        try:
+            coder = next(
+                r for r in await store.list_runs(ids["running"]) if r.role == "coder"
+            )
+            await store.update_run(
+                coder.id,
+                status=RunStatus.COMPLETED,
+                artifact={
+                    "kind": "coder_handoff",
+                    "branch": "rework/from-the-other-laptop",
+                    "commit": "0" * 40,
+                    "summary": "handoff written by the other instance",
+                    "diff": "--- a/x\n+++ b/x\n",
+                    "run_stats": {"model_calls": 9, "cost_usd": 1.5, "elapsed_seconds": 12.0},
+                },
+            )
+            await store.append_event(
+                EventRecord(
+                    mission_id=ids["running"],
+                    run_id=coder.id,
+                    type=EventType.ROLE_COMPLETED,
+                    payload={"role": "coder", "status": "completed"},
+                )
+            )
+        finally:
+            await store.aclose()
+
+        assert len(dash.runs) == runs_before, "the change added no run"
+        assert await _until(lambda: "handoff written by the other instance" in str(body._markdown)), (
+            "the report body must reload on the run's transition"
+        )
+        after = str(body._markdown)
+        assert after != before
+        assert dash.report_loaded_for != stamped, "the key moved"
+
+        # and the settled key must not reload again on the next quiet tick
+        settled = dash.report_loaded_for
+        await _settle(pilot, 1.0)
+        assert dash.report_loaded_for == settled, "a quiet tick must not reload"
+        assert str(body._markdown) == after
+        assert not app.swallowed
