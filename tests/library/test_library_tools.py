@@ -186,7 +186,10 @@ async def test_read_accepts_the_name_as_fallback(tmp_path, library_index) -> Non
         body="body by name",
         tags=[],
     )
-    assert await handle.read_text("Named Skill") == "body by name"
+    # demoted (no reusable_because) -> body carries a provenance footer (see
+    # test_skill_provenance_is_persisted_in_the_body); the original body is
+    # still there verbatim, just with the audit trail appended.
+    assert (await handle.read_text("Named Skill")).startswith("body by name")
 
 
 async def test_read_miss_names_what_is_available(tmp_path, library_index) -> None:
@@ -387,6 +390,90 @@ async def test_skill_generality_ok_heuristics_directly() -> None:
         "how to write CliRunner tests", "general technique", "applies broadly to future tasks"
     )
     assert ok and reason == ""
+
+
+async def test_skill_generality_ok_rejects_lazy_justifications() -> None:
+    """Audit finding (medium): a lazy one-word or self-assertive justification
+    must not be enough to make the gate pass. These three exact strings were
+    observed to bypass the old gate and land as live skills."""
+    from rework.library.curation import skill_generality_ok
+
+    for lazy in ("yes", "because it is reusable", "reusable because I say so"):
+        ok, reason = skill_generality_ok(
+            "some generic sounding skill name", "a plain description", lazy
+        )
+        assert not ok, f"{lazy!r} should not pass the gate"
+        assert reason, f"{lazy!r} should carry a clear reason"
+
+    # a genuine justification -- substantive AND naming a generality signal --
+    # still passes
+    ok, reason = skill_generality_ok(
+        "how to write CliRunner tests with a tmp sqlite db",
+        "general pytest technique for CLI commands",
+        "this generalizes to any future command-line tool test, not just this one",
+    )
+    assert ok and reason == ""
+
+
+async def test_lazy_justification_contribute_demotes_to_report(tmp_path, library_index) -> None:
+    """Same three strings, exercised through contribute() end to end: they
+    must not land as ACTIVE skills in the spawn menu."""
+    handle = _handle(tmp_path, library_index)
+    for lazy in ("yes", "because it is reusable", "reusable because I say so"):
+        item, note = await contribute(
+            handle.index,
+            handle.git,
+            type_=ItemType.SKILL,
+            name=f"some skill name {lazy!r}",
+            description="a plain description",
+            body="b",
+            tags=[],
+            reusable_because=lazy,
+        )
+        assert item.type is ItemType.REPORT, lazy
+        assert "saved as a report" in note, lazy
+    menu = await handle.menu()
+    assert "some skill name" not in menu
+
+
+async def test_skill_provenance_is_persisted_in_the_body(tmp_path, library_index) -> None:
+    """Audit finding (medium): the justification/demotion reason were
+    computed and then discarded. They must now survive in the stored body,
+    with no schema migration and no change to the model's existing fields."""
+    handle = _handle(tmp_path, library_index)
+
+    promoted, _ = await contribute(
+        handle.index,
+        handle.git,
+        type_=ItemType.SKILL,
+        name="how to do xyz generally",
+        description="a reusable technique",
+        body="the technique body",
+        tags=[],
+        reusable_because="this applies to any future, different repo, not just this one",
+    )
+    assert promoted.type is ItemType.SKILL
+    promoted_body = await handle.read_text(promoted.id)
+    assert "the technique body" in promoted_body
+    assert "## Provenance" in promoted_body
+    assert "any future, different repo" in promoted_body
+
+    demoted, note = await contribute(
+        handle.index,
+        handle.git,
+        type_=ItemType.SKILL,
+        name="plain name",
+        description="plain desc",
+        body="the demoted body",
+        tags=[],
+        reusable_because="yes",
+    )
+    assert demoted.type is ItemType.REPORT
+    demoted_body = await handle.read_text(demoted.id)
+    assert "the demoted body" in demoted_body
+    assert "## Provenance" in demoted_body
+    assert "demoted to report" in demoted_body
+    assert "too thin" in demoted_body or "generalize" in demoted_body
 
 
 async def test_existing_skill_items_are_untouched_by_the_gate(tmp_path, library_index) -> None:

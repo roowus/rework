@@ -63,20 +63,26 @@ def build_mcp_server(index: LibraryStore, git: GitLibrary, hybrid: Any | None = 
         tags: list[str] | None = None,
         project: str | None = None,
         reusable_because: str | None = None,
+        force: bool = False,
     ) -> str:
         """Contribute to the Library. Pick the type carefully:
         - skill: a GENERAL, REUSABLE technique you would apply again on a
           DIFFERENT task (e.g. "how to make a TUI look good", "how to write
           CliRunner tests with a tmp sqlite db"). Name it by the technique,
-          not the task, and pass reusable_because (one sentence on why it
-          generalizes). A skill with no justification, or that reads as a
-          recap of this task (e.g. "toyrepo add() planted-bug: one-line fix
-          flips both tests green"), is saved as a report instead -- not
+          not the task, and pass reusable_because: a real sentence on WHY it
+          generalizes (not just asserting that it does). A skill with a
+          missing, too-thin, or merely-asserted justification, or that reads
+          as a recap of this task (e.g. "toyrepo add() planted-bug: one-line
+          fix flips both tests green"), is saved as a report instead -- not
           dropped.
         - report: a finished artifact, or a one-off task summary/outcome.
         - memory: a single fact worth remembering.
         Tools are supply chain: they arrive proposed and wait for a human
-        `rework library activate`."""
+        `rework library activate`.
+        `force=True` is the human escape hatch (same as the CLI's --force):
+        a human driving this MCP tool directly is never blocked by the
+        generality gate -- use it only when a person, not an autonomous
+        agent, is making the call."""
         try:
             type_ = ItemType(item_type)
         except ValueError:
@@ -91,6 +97,7 @@ def build_mcp_server(index: LibraryStore, git: GitLibrary, hybrid: Any | None = 
             tags=tags or [],
             project=project,
             reusable_because=reusable_because,
+            force=force,
         )
         return f"{note}\n{item.id}"
 
