@@ -23,6 +23,7 @@ from rework.kernel.state.records import EventRecord, EventType, MissionStatus
 from rework.kernel.state.store import StateStore
 from rework.orchestrator.engine import CheckpointerFactory, MissionRunner
 from rework.roles.registry import RoleRegistry
+from rework.runtime import CODE_CHANGED, CodeChangeWatcher
 
 log = logging.getLogger("rework.daemon")
 
@@ -119,6 +120,7 @@ class Daemon:
         self._runners: dict[str, asyncio.Task[None]] = {}
         self._bg: set[asyncio.Task[None]] = set()
         self._owner = f"daemon-{uuid.uuid4().hex[:8]}"
+        self._code: CodeChangeWatcher | None = None
 
     async def run_forever(self) -> None:
         # staleness must be a small multiple of the heartbeat period, or a
@@ -131,13 +133,23 @@ class Daemon:
             )
         try:
             await self._recover()
+            self._code = CodeChangeWatcher()
             while True:
                 await self._store.heartbeat_lock(self._owner)
                 await self._pickup_pending()
                 self._reap()
+                self._check_code()
                 await asyncio.sleep(self._config.poll_interval_s)
         finally:
             await self._store.release_lock(self._owner)
+
+    def _check_code(self) -> None:
+        """The checkout this daemon was started from changed (a merge landed in
+        the same tree): the modules in memory are the OLD ones. Say so once and
+        keep running: the running missions must not be dropped, and restarting
+        is the owner's call (docs/plans/m7-findings.md, finding 28)."""
+        if self._code is not None and self._code.poll():
+            log.warning("%s", CODE_CHANGED)
 
     async def _recover(self) -> None:
         for status in (
