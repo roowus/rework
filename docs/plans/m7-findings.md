@@ -139,6 +139,11 @@ coder by respawning on `flash`, audited, finished with an accurate summary.
 | 23 | Replies cut at max_tokens were accepted as final (two 8192-token investigator reports) | the adapter reported every text reply as end_turn | fixed: `max_tokens` stop reason; the loop asks for the rest |
 | 24 | The halfway progress check | measured on m-58d05d4101c7: fired at turn 20 of 40 with nothing edited; the coder then produced +257 lines | working |
 | 25 | "ctrl+s save" on the Preview a PR form | the form hint was fixed text | fixed (found running #11 end to end) |
+| 26 | The owner's TUI crashed: 1000+ MarkupErrors, then the app came apart | `_swallow` toasted exception text with markup on; a MarkupError's own message contains `[/]`, so every toast failed into another toast | fixed by rework: #12 (plain-text toasts, storm guard, fatal errors logged), #13 (only errors that end the app are logged as fatal) |
+| 27 | A paste was inserted twice (the owner's crash-night message had every sentence doubled) | `PromptArea._on_paste` called `super()._on_paste` though Textual dispatches it on every class, and the app forwarded the paste back | fixed by rework in #12; checked in a real terminal |
+| 28 | The crash traceback pointed at the wrong lines | the owner's TUI ran code older than its checkout (merges pulled into the same tree) | open: the TUI should notice its code changed and say so |
+| 29 | Anthropic calls went to the owner's 9router | the SDK read `ANTHROPIC_BASE_URL` from the shell | fixed: the catalog's endpoint, never the environment |
+| 30 | Kimi K3 (`pro`) priced at $0.60 / $2.50, actual $3 / $15 | the catalog price was a guess | fixed; earlier `pro` costs were understated about 5x |
 
 Outcome: PR #7 merged after 5 audit rounds and 3 owner end-to-end runs;
 $7.07 total. The Preview button was verified in a real pty (suspend, preview
