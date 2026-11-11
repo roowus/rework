@@ -104,6 +104,21 @@ export REWORK_NOTIFY_CMD='curl -s -d "$REWORK_GATE_QUESTION" \
 Set it yourself to use anything else (a webhook, a script); on rewvis put it
 in `~/.rework/rework.env`.
 
+## Reclaim disk (`rework gc`)
+
+Every role run gets its own git worktree (often with its own virtualenv), and
+nothing removes them on its own: 160 of them held 8.1 GB on the Mac. `rework
+gc` deletes the run worktrees of missions that are finished (done, failed or
+cancelled) and idle for `--older-than-days` (default 2). It keeps each
+mission's clone (`missions/<id>/repo`, which the Preview button uses), never
+touches an active mission, and skips directories of missions this database
+does not know. `--dry-run` lists what it would remove.
+
+```bash
+scripts/rework-local gc --dry-run      # the Mac
+rework gc --older-than-days 3          # rewvis
+```
+
 ## rewvis (the deployment)
 
 The daemon runs as `rework.service` (systemd, User=ubuntu) on rewvis

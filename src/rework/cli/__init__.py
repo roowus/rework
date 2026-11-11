@@ -999,6 +999,50 @@ def attach(mission_id: str, follow: bool = True) -> None:
         typer.echo("\ndetached")
 
 
+def daemon_workroot(config: Any) -> Path:
+    """Where the daemon keeps mission clones and role worktrees."""
+    from rework.config import DEFAULT_STATE_DIR
+
+    if config.is_postgres:
+        return DEFAULT_STATE_DIR / "work"
+    return Path(config.db).expanduser().parent / "work"
+
+
+@app.command()
+def gc(
+    older_than_days: float = typer.Option(
+        2.0, "--older-than-days", help="Only missions finished at least this long ago."
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="List what would be removed."),
+) -> None:
+    """Remove role worktrees of finished missions (mission clones are kept)."""
+    from rework import gc as gc_mod
+    from rework.config import Config, open_store_from_config
+
+    config = Config.from_env()
+    workroot = daemon_workroot(config)
+
+    async def go() -> dict[str, tuple[str, float]]:
+        store = await open_store_from_config(config)
+        try:
+            return gc_mod.mission_table(await store.list_missions(limit=100_000))
+        finally:
+            await store.aclose()
+
+    missions = asyncio.run(go())
+    found = gc_mod.collect(workroot, missions, older_than_days * 86400)
+    total = sum(c.bytes for c in found)
+    for c in found:
+        typer.echo(
+            f"{'would remove' if dry_run else 'remove'} {c.path.name}  {gc_mod.human(c.bytes)}"
+        )
+    if dry_run:
+        typer.echo(f"{len(found)} run dirs, {gc_mod.human(total)} (dry run; nothing removed)")
+        return
+    freed = gc_mod.remove(found, workroot)
+    typer.echo(f"removed {len(found)} run dirs, freed {gc_mod.human(freed)} from {workroot}")
+
+
 @app.command()
 def tui() -> None:
     """Open the TUI dashboard (the same one bare `rework` starts)."""
@@ -1070,20 +1114,15 @@ def preview(
 @app.command()
 def serve() -> None:
     """Run the headless daemon (one per database; leader-locked)."""
-    from pathlib import Path
-
     from rework.logs import setup_logging
 
     log_path = setup_logging("daemon", console=True)
     typer.echo(f"logs: {log_path}")
 
-    from rework.config import DEFAULT_STATE_DIR, Config, load_catalog, open_store_from_config
+    from rework.config import Config, load_catalog, open_store_from_config
 
     config = Config.from_env()
-    if config.is_postgres:
-        workroot = DEFAULT_STATE_DIR / "work"
-    else:
-        workroot = Path(config.db).expanduser().parent / "work"
+    workroot = daemon_workroot(config)
 
     async def go() -> None:
         from rework.logs import asyncio_exception_handler
