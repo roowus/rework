@@ -248,7 +248,11 @@ async def test_orchestrator_resumes_after_a_kill(world: dict[str, Any]) -> None:
                 call("spawn_role", "k1", role="coder", step="code", brief="fix add()"),
                 call("wait", "k2"),
             ),
-            turn(call("finish", "k3", outcome="done", summary="fixed after restart")),
+            turn(
+                call("spawn_role", "k3", role="auditor", step="audit", brief="review the fix"),
+                call("wait", "k4"),
+            ),
+            turn(call("finish", "k5", outcome="done", summary="fixed after restart")),
         ],
     )
     # the coder hangs until we release it, so the kill lands mid-wait
@@ -266,6 +270,7 @@ async def test_orchestrator_resumes_after_a_kill(world: dict[str, Any]) -> None:
     gated = Gate()
     gated._queues = provider._queues
     gated.route("Fulfill the task", coder_turns)
+    gated.route("Find issues", _auditor_script(AUDIT_CLEAN))
     world["provider"] = gated
 
     first = asyncio.create_task(runner(world).run())
@@ -284,7 +289,7 @@ async def test_orchestrator_resumes_after_a_kill(world: dict[str, Any]) -> None:
     await asyncio.wait_for(second, timeout=30)
 
     runs = await store.list_runs("mo")
-    assert [r.id for r in runs] == ["mo:code:coder:1"], "no duplicate spawn after resume"
+    assert sorted([r.id for r in runs]) == ["mo:audit:auditor:1", "mo:code:coder:1"], "no duplicate spawn after resume"
     mission = await store.get_mission("mo")
     assert mission is not None and mission.status == MissionStatus.DONE
     assert (mission.result or {}).get("summary") == "fixed after restart"
@@ -1029,7 +1034,9 @@ async def test_finish_done_blocked_when_coder_after_audit(world: dict[str, Any])
             turn(call("finish", "o10", outcome="done", summary="all clean")),
         ],
     )
-    script_roles(provider)
+    provider.route("Fulfill the task", _coder_script("fixed") + _coder_script("revised"))
+    provider.route("Find issues", _auditor_script(AUDIT_CLEAN) + _auditor_script(AUDIT_CLEAN))
+
 
     task = asyncio.create_task(runner(world).run())
     await approve_next_gate(world)  # ship gate
@@ -1104,8 +1111,8 @@ async def test_finish_done_blocked_on_medium_finding(world: dict[str, Any]) -> N
         ],
     )
     # Override auditor: first returns medium finding, second returns clean
-    provider.route("GOAL: Audit", _auditor_script(audit_medium) + _auditor_script(AUDIT_CLEAN))
-    provider.route("GOAL: One general", _coder_script("fixed") + _coder_script("revised"))
+    provider.route("Find issues", _auditor_script(audit_medium) + _auditor_script(AUDIT_CLEAN))
+    provider.route("Fulfill the task", _coder_script("fixed") + _coder_script("revised"))
 
     task = asyncio.create_task(runner(world).run())
     await approve_next_gate(world)  # ship gate
