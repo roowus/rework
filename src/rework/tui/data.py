@@ -350,6 +350,19 @@ class TuiData:
             f"chat_messages:{chat_id}", lambda: self._call(lambda s: s.chat_messages(chat_id))
         )
 
+    async def chat_messages_max_id(self, chat_id: str) -> int:
+        """Cheap append-only staleness check for an open transcript."""
+        return await self._resilient(
+            f"chat_messages_max_id:{chat_id}",
+            lambda: self._call(lambda s: s.chat_messages_max_id(chat_id)),
+        )
+
+    async def chat_messages_since(self, chat_id: str, after_id: int) -> list[Any]:
+        return await self._resilient(
+            f"chat_messages_since:{chat_id}",
+            lambda: self._call(lambda s: s.chat_messages_since(chat_id, after_id)),
+        )
+
     async def update_chat(self, chat_id: str, **fields: Any) -> Any:
         store = await self.store()
         return await store.update_chat(chat_id, **fields)

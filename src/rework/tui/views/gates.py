@@ -8,6 +8,8 @@ alt+a / alt+x second; a typed answer rides along to the paused role."""
 
 from __future__ import annotations
 
+from functools import partial
+
 from typing import Any, ClassVar
 
 from textual import work
@@ -80,6 +82,12 @@ class GatesView(View):
         self.selected: Any = None
         self.history: list[Any] = []
         self._detail_for: str | None = None
+        # newest event seq already rendered in the detail pane's steps box.
+        # events_since(seq) is the indexed monotonic cursor: asking from 0 (the
+        # old behaviour) pages FORWARD, so a long mission froze on its OLDEST
+        # 500 events (finding #37, same trap the mission cards had).
+        self._steps_seq: int = 0
+        self._steps_lines: list[str] = []
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -154,6 +162,16 @@ class GatesView(View):
                     # decided elsewhere (another machine, the CLI, a chat card)
                     self.selected = None
                     self._paint_detail()
+        else:
+            # decided gates are not in the snapshot: re-read the history list so
+            # a gate decided by another instance stops reading as open
+            self._load_history()
+        if self.selected is not None:
+            # cheap re-paint of the selected gate's head/state (a gate decided in
+            # another instance flips from waiting to answered here) plus the new
+            # steps only: the runs/diff read stays on selection, it never changes
+            self._paint_detail()
+            self._poll_steps(self.selected)
 
     def _paint_list(self, gates: list[Any]) -> None:
         rows = []
@@ -186,10 +204,13 @@ class GatesView(View):
     @work(exclusive=True, group="gate-history")
     async def _load_history(self) -> None:
         gates = await self.hub.guard(lambda: self.hub.data.gates(), [])
-        self.history = sorted(
+        fresh = sorted(
             [g for g in gates if g.status.value != "open"],
             key=lambda g: -float(g.decided_at or g.created_at or 0),
         )[:200]
+        if [g.id for g in fresh] == [g.id for g in self.history]:
+            return  # nothing new: repainting would only flicker (RowList.set_rows)
+        self.history = fresh
         if self.mode == "decided":
             self._paint_list(self.history)
 
@@ -280,6 +301,9 @@ class GatesView(View):
     @work(exclusive=True, group="gate-detail")
     async def _load_detail(self, gate: Any) -> None:
         data = self.hub.data
+        self._detail_for = gate.id
+        self._steps_seq = 0
+        self._steps_lines = []
         runs = await self.hub.guard(lambda: data.mission_runs(gate.mission_id), [])
         if self.selected is None or self.selected.id != gate.id:
             return
@@ -324,18 +348,48 @@ class GatesView(View):
                 )
             diff_box.update("\n\n".join(parts))
 
-        steps_box = self.query_one("#gate-steps", Static)
-        events = await self.hub.guard(lambda: data.events_tail(gate.mission_id, 0, limit=500), [])
+        # one bounded window of the NEWEST events (asking from seq 0 pages
+        # FORWARD, so a long mission used to freeze on its OLDEST 500 lines:
+        # finding #37). Later ticks only ask for what arrived after this.
+        events = await self.hub.guard(
+            partial(data.mission_events_newest, gate.mission_id, 500), []
+        )
         if self.selected is None or self.selected.id != gate.id:
             return
-        relevant = [e for e in events if not gate.for_run or e.run_id in (gate.for_run, None)]
+        self._steps_seq = max((int(e.seq) for e in events), default=0)
+        self._steps_lines = self._step_lines(gate, events)[-12:]
+        self._paint_steps()
+
+    def _step_lines(self, gate: Any, events: list[Any]) -> list[str]:
         lines = []
-        for ev in relevant[-12:]:
+        for ev in events:
+            if gate.for_run and ev.run_id not in (gate.for_run, None):
+                continue
             step = event_step(ev)
             if step is not None:
                 lines.append(str(step._head).split("\n")[0])
-        self.query_one("#gate-steps-label").display = steps_box.display = bool(lines)
-        steps_box.update("\n".join(lines))
+        return lines
+
+    def _paint_steps(self) -> None:
+        steps_box = self.query_one("#gate-steps", Static)
+        self.query_one("#gate-steps-label").display = steps_box.display = bool(self._steps_lines)
+        steps_box.update("\n".join(self._steps_lines))
+
+    @work(exclusive=True, group="gate-steps")
+    async def _poll_steps(self, gate: Any) -> None:
+        """Only the events that arrived since the last look: bounded, indexed
+        by seq, and it appends instead of rebuilding the pane."""
+        events = await self.hub.guard(
+            partial(self.hub.data.events_tail, gate.mission_id, self._steps_seq, 500), []
+        )
+        if not events or self.selected is None or self.selected.id != gate.id:
+            return
+        self._steps_seq = max(self._steps_seq, max(int(e.seq) for e in events))
+        fresh = self._step_lines(gate, events)
+        if not fresh:
+            return
+        self._steps_lines = (self._steps_lines + fresh)[-12:]
+        self._paint_steps()
 
     def _paint_choices(self, gate: Any) -> None:
         box = self.query_one("#gate-choices", Horizontal)

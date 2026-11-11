@@ -19,7 +19,13 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Input, Static, TextArea
 
 from rework.tui import actions
-from rework.tui.conversation import Conversation, Item, args_text, default_model
+from rework.tui.conversation import (
+    Conversation,
+    Item,
+    args_text,
+    default_model,
+    items_from_messages,
+)
 from rework.tui.hub import Snapshot
 from rework.tui.theme import (
     ACCENT,
@@ -81,6 +87,10 @@ class WorkView(View):
         self._sending = False
         self._streamed: list[Step] = []
         self._loading_chat: str | None = None
+        # cursor for the open transcript: the highest chat_messages.id already
+        # rendered. The table is append-only, so a tick only has to ask for
+        # rows newer than this (indexed, O(log n)) and append those.
+        self._chat_cursor: int = 0
         # where the next message goes: None = the chat orchestrator (proposes
         # missions); a mission id = that mission's orchestrator (ADR 0007)
         self.target: str | None = None
@@ -147,6 +157,50 @@ class WorkView(View):
         self._paint_head()
         self._paint_knobs()
         self._refresh_cards()
+        self._poll_chat()
+
+    def _poll_chat(self) -> None:
+        """Another instance's turns are persisted to the shared store; an
+        already-open transcript has to re-read them. Cheap max-id probe first,
+        then only the new rows are appended (no re-mount, no full replay)."""
+        convo = self.convo
+        if convo is None or self._loading_chat == convo.id:
+            return  # nothing open, or a load for it is still in flight
+        if self._sending:
+            # Our own turn is rendered live as it streams (`_on_turn`) and only
+            # persisted row by row; re-reading it here would double every step.
+            # `_sync_chat_cursor` catches the cursor up when the turn ends.
+            return
+        self._tick_chat(convo.id)
+
+    @work(exclusive=True, group="chat-poll")
+    async def _tick_chat(self, chat_id: str) -> None:
+        data = self.hub.data
+        head = await self.hub.guard(partial(data.chat_messages_max_id, chat_id), None)
+        if head is None or head <= self._chat_cursor:
+            return  # None = the probe failed; <= means nothing new
+        messages = await self.hub.guard(
+            partial(data.chat_messages_since, chat_id, self._chat_cursor), []
+        )
+        # the open chat may have changed while we were away: drop the result
+        if not messages or self._loading_chat == chat_id:
+            return
+        if self.convo is None or self.convo.id != chat_id:
+            return
+        self._chat_cursor = int(messages[-1].id or self._chat_cursor)
+        items = items_from_messages(messages)
+        if items:
+            self._render_items(items)
+
+    async def _sync_chat_cursor(self) -> None:
+        """Catch the cursor up after a local write: those rows are already on
+        screen, so the next tick must not render them again."""
+        convo = self.convo
+        if convo is None:
+            return
+        head = await self.hub.guard(partial(self.hub.data.chat_messages_max_id, convo.id), None)
+        if head is not None and self.convo is not None and self.convo.id == convo.id:
+            self._chat_cursor = max(self._chat_cursor, head)
 
     def _paint_chat_list(self) -> None:
         mission_status = {m.id: m.status for m in self.snap.missions}
@@ -248,15 +302,29 @@ class WorkView(View):
     @work(exclusive=True, group="load-chat")
     async def _load_chat(self, chat_id: str) -> None:
         self._loading_chat = chat_id
+        try:
+            await self._read_chat(chat_id)
+        finally:
+            # `_loading_chat` means "a load is in flight"; leaving it set made
+            # the transcript poller think a load was still running forever
+            if self._loading_chat == chat_id:
+                self._loading_chat = None
+
+    async def _read_chat(self, chat_id: str) -> None:
+        self._chat_cursor = 0  # never carry a cursor across chats
         chat = await self.hub.guard(lambda: self.hub.data.chat(chat_id), None)
         if chat is None:
             self.toast("Chat not found", severity="warning")
             return
         convo = Conversation(self.hub.data, chat)
         items = await self.hub.guard(convo.items, [])
+        cursor = await self.hub.guard(
+            partial(self.hub.data.chat_messages_max_id, chat_id), 0
+        )
         if self._loading_chat != chat_id:
             return
         self.convo = convo
+        self._chat_cursor = cursor
         self._target_auto = True
         self.project_id = chat.project_id
         self.model_id = chat.model_id or self.model_id
@@ -274,6 +342,7 @@ class WorkView(View):
 
     def new_chat(self) -> None:
         self.convo = None
+        self._chat_cursor = 0
         self._target_auto = True
         self.target = None
         self.query_one("#chat-log", Trajectory).clear()
@@ -366,6 +435,7 @@ class WorkView(View):
                 await self.hub.data.append_chat_note(self.convo.id, f"you → {mission_id}: {text}")
             except Exception:
                 pass
+            await self._sync_chat_cursor()
 
     @work(group="send")
     async def _send(self, text: str, attachments: list[str]) -> None:
@@ -438,6 +508,7 @@ class WorkView(View):
             self.toast(f"Send failed: {clip(str(exc), 200)}", severity="error")
         finally:
             self._sending = False
+            await self._sync_chat_cursor()
 
     def _clear_thinking(self) -> None:
         if self._thinking is not None:
@@ -501,6 +572,7 @@ class WorkView(View):
             await self._launch(proposal)
         finally:
             self._sending = False
+            await self._sync_chat_cursor()
 
     async def _launch(self, proposal: Any) -> None:
         log = self.query_one("#chat-log", Trajectory)
