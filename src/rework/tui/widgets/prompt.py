@@ -102,6 +102,15 @@ class Prompt(TextArea):
         self.move_cursor(self.document.end)
 
     async def _on_paste(self, event: events.Paste) -> None:
+        """Image paths attach; everything else is plain text.
+
+        Pasting used to insert the text TWICE, for two reasons, both fixed
+        here: (1) `super()._on_paste(event)` re-ran `TextArea._on_paste` even
+        though Textual already dispatches `_on_paste` to every class in the
+        MRO — TextArea's handler runs on its own, exactly once, so Prompt must
+        not call it again; (2) the paste was left to bubble to the App, whose
+        `on_event` forwards pastes to the focused widget, which re-entered this
+        handler and inserted the same text a second time."""
         images = image_paths(event.text)
         if images:
             event.stop()
@@ -109,7 +118,9 @@ class Prompt(TextArea):
             self.attachments.extend(p for p in images if p not in self.attachments)
             self.post_message(self.AttachmentsChanged(self))
             return
-        await super()._on_paste(event)
+        # plain text: TextArea._on_paste (via MRO dispatch) does the insert.
+        # Stop the bubble so App.on_event does not forward it back to us.
+        event.stop()
 
     def submit(self) -> None:
         text = self.text.strip()
