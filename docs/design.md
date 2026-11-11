@@ -162,6 +162,15 @@ Two-tier memory: project-local namespaces + a global catalog with origin info. R
 metadata search now, pgvector semantic (hybrid ranking) at scale, one `search()` interface.
 Curation is tiered: skills/memories/reports auto-accept; tools always human-gated;
 external items only from user-permissioned sites with explicit approval + verification.
+A skill also needs evidence of generality: a skill is a general, reusable technique an
+agent would apply again on a DIFFERENT task (e.g. "how to make a TUI look good"), not a
+recap of the one task it just finished (e.g. "toyrepo add() planted-bug: one-line fix
+flips both tests green") -- those are reports/memories. An agent contribution of type
+skill needs a `reusable_because` justification and must not read like a one-off recap
+(deterministic, conservative checks: see `skill_generality_ok()` in
+`rework.library.curation`); if it fails, it is auto-accepted as a REPORT instead, never
+dropped, with a note telling the caller why and how to resubmit. A human at the CLI
+(`--force`) or the TUI new-item form is never blocked by this gate.
 An MCP server exposes search/get/contribute so any harness mounts the same library.
 
 ### Evals

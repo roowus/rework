@@ -41,8 +41,10 @@ async def test_contribute_gates_tools(tmp_path, library_index) -> None:
         tags=["t"],
         mission_id="m-1",
         role="coder",
+        reusable_because="general technique, applies to any future toy repo bug",
     )
     assert skill.status is ItemStatus.ACTIVE
+    assert skill.type is ItemType.SKILL
     assert "proposed" not in note1
 
     tool, note2 = await contribute(
@@ -86,6 +88,7 @@ async def test_library_aware_executor(tmp_path, library_index) -> None:
         description="how to fix the toyrepo",
         body="run pytest, flip the sign",
         tags=["toyrepo"],
+        force=True,  # exercising search/read wiring, not the generality gate
     )
     inner = _StubInner()
     ex = LibraryAwareExecutor(inner, handle, "m-1", "m-1:code:coder:1", "coder")
@@ -134,6 +137,7 @@ async def test_menu_lists_active_skills_only(tmp_path, library_index) -> None:
         description="useful",
         body="b",
         tags=[],
+        reusable_because="a general technique reused across unrelated future missions",
     )
     await contribute(
         handle.index,
@@ -163,6 +167,7 @@ async def test_menu_carries_ids_so_read_can_be_called(tmp_path, library_index) -
         description="command verified procedure",
         body="the body",
         tags=[],
+        force=True,  # testing menu/id wiring, not the generality gate
     )
     menu = await handle.menu()
     assert skill.id in menu
@@ -267,3 +272,139 @@ async def test_multiword_natural_search(tmp_path, library_index) -> None:
     assert "toyrepo planted bug recipe" in out
     out = await handle.search_text("how do I fix the toyrepo?")
     assert "toyrepo planted bug recipe" in out
+
+
+# -- generality gate (M7): a skill must be general/reusable, not a task recap ----
+
+
+async def test_general_skill_with_justification_stays_a_skill(tmp_path, library_index) -> None:
+    handle = _handle(tmp_path, library_index)
+    item, note = await contribute(
+        handle.index,
+        handle.git,
+        type_=ItemType.SKILL,
+        name="how to write CliRunner tests with a tmp sqlite db",
+        description="general pytest technique for CLI commands backed by sqlite state",
+        body="b",
+        tags=[],
+        reusable_because="applies to testing any future CLI command, not just this one",
+    )
+    assert item.type is ItemType.SKILL
+    assert item.status is ItemStatus.ACTIVE
+    assert "saved as a report" not in note
+
+
+async def test_task_specific_skill_is_demoted_to_report(tmp_path, library_index) -> None:
+    handle = _handle(tmp_path, library_index)
+    item, note = await contribute(
+        handle.index,
+        handle.git,
+        type_=ItemType.SKILL,
+        name="toyrepo add() planted-bug: one-line fix flips both tests green",
+        description="fix the planted bug in toyrepo's calc.py",
+        body="b",
+        tags=[],
+        reusable_because="this fixed the toyrepo bug",
+    )
+    assert item.type is ItemType.REPORT
+    assert item.status is ItemStatus.ACTIVE  # reports still auto-accept
+    assert "saved as a report, not a skill" in note
+    assert "resubmit" in note.lower()
+
+
+async def test_skill_without_justification_is_demoted(tmp_path, library_index) -> None:
+    handle = _handle(tmp_path, library_index)
+    item, note = await contribute(
+        handle.index,
+        handle.git,
+        type_=ItemType.SKILL,
+        name="some generic sounding name",
+        description="a plain description",
+        body="b",
+        tags=[],
+    )
+    assert item.type is ItemType.REPORT
+    assert "no reusable_because" in note
+
+
+async def test_reports_and_memories_unaffected_by_the_gate(tmp_path, library_index) -> None:
+    handle = _handle(tmp_path, library_index)
+    report, note1 = await contribute(
+        handle.index,
+        handle.git,
+        type_=ItemType.REPORT,
+        name="m-abc123de fixed the toyrepo planted-bug",
+        description="one-off recap",
+        body="b",
+        tags=[],
+    )
+    assert report.type is ItemType.REPORT
+    assert "saved as a report" not in note1  # it already WAS a report, nothing to say
+
+    memory, note2 = await contribute(
+        handle.index,
+        handle.git,
+        type_=ItemType.MEMORY,
+        name="polystats pins numpy 2",
+        description="fact",
+        body="b",
+        tags=[],
+    )
+    assert memory.type is ItemType.MEMORY
+    assert "saved as a report" not in note2
+
+
+async def test_force_lets_a_human_keep_a_task_specific_name_as_a_skill(
+    tmp_path, library_index
+) -> None:
+    """CLI --force / the TUI form: an explicit human choice is never
+    second-guessed by the gate."""
+    handle = _handle(tmp_path, library_index)
+    item, note = await contribute(
+        handle.index,
+        handle.git,
+        type_=ItemType.SKILL,
+        name="toyrepo add() planted-bug: one-line fix flips both tests green",
+        description="fix the planted bug in toyrepo's calc.py",
+        body="b",
+        tags=[],
+        force=True,
+    )
+    assert item.type is ItemType.SKILL
+    assert "saved as a report" not in note
+
+
+async def test_skill_generality_ok_heuristics_directly() -> None:
+    from rework.library.curation import skill_generality_ok
+
+    ok, reason = skill_generality_ok("x", "y", None)
+    assert not ok and "reusable_because" in reason
+
+    ok, reason = skill_generality_ok("x", "y", "fixed mission m-0d75f495121a, done")
+    assert not ok and "mission or item id" in reason
+
+    ok, reason = skill_generality_ok(
+        "how to write CliRunner tests", "general technique", "applies broadly to future tasks"
+    )
+    assert ok and reason == ""
+
+
+async def test_existing_skill_items_are_untouched_by_the_gate(tmp_path, library_index) -> None:
+    """Reading/listing a pre-existing SKILL item (simulating the library's
+    existing rows) never gets rewritten or reclassified: the gate only runs
+    on NEW contribute() calls, never on reads."""
+    from rework.library.model import LibraryItem, Provenance
+
+    pre_existing = LibraryItem(
+        type=ItemType.SKILL,
+        name="toyrepo planted-bug recipe: one-line add() fix",
+        description="a pre-existing, task-specific skill from before this gate existed",
+        tags=[],
+        provenance=Provenance(origin=Origin.INTERNAL),
+        status=ItemStatus.ACTIVE,
+    )
+    await library_index.upsert_item(pre_existing)
+    fetched = await library_index.get_item(pre_existing.id)
+    assert fetched is not None
+    assert fetched.type is ItemType.SKILL
+    assert fetched.status is ItemStatus.ACTIVE

@@ -1361,10 +1361,31 @@ def library_add(
     tag: list[str] = typer.Option([], "--tag", help="Repeatable."),  # noqa: B008
     project: str | None = typer.Option(None, help="Provenance: project id."),
     mission: str | None = typer.Option(None, help="Provenance: mission id."),
+    reusable_because: str | None = typer.Option(
+        None,
+        "--reusable-because",
+        help=(
+            "Required for --type skill (unless --force): one sentence on why this"
+            " generalizes to a future, DIFFERENT task, not a recap of this one."
+        ),
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help=(
+            "You are a human at the keyboard: keep --type skill as given, skipping the"
+            " generality check (owners are never blocked)."
+        ),
+    ),
 ) -> None:
     """Add an item: the body file goes into the library git repo, the metadata
     into the index. Skills/reports/memories auto-accept; TOOLS always start
-    proposed and need `rework library activate` (supply-chain gate)."""
+    proposed and need `rework library activate` (supply-chain gate).
+
+    A skill also needs evidence of generality: a general, reusable technique
+    (e.g. "how to write CliRunner tests with a tmp sqlite db"), not a recap of
+    one task (e.g. "toyrepo add() planted-bug: one-line fix flips both tests
+    green"). Pass --reusable-because, or --force if you are certain."""
     from rework.config import Config
     from rework.library.curation import contribute
     from rework.library.model import ItemType
@@ -1393,6 +1414,8 @@ def library_add(
                 tags=list(tag),
                 mission_id=mission,
                 project=project,
+                reusable_because=reusable_because,
+                force=force,
             )
         finally:
             await index.aclose()

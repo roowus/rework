@@ -62,11 +62,21 @@ def build_mcp_server(index: LibraryStore, git: GitLibrary, hybrid: Any | None = 
         description: str = "",
         tags: list[str] | None = None,
         project: str | None = None,
+        reusable_because: str | None = None,
     ) -> str:
-        """Contribute knowledge to the Library so future missions are cheaper:
-        a reusable procedure (skill), a finished artifact (report), a fact
-        worth remembering (memory). Tools are supply chain: they arrive
-        proposed and wait for a human `rework library activate`."""
+        """Contribute to the Library. Pick the type carefully:
+        - skill: a GENERAL, REUSABLE technique you would apply again on a
+          DIFFERENT task (e.g. "how to make a TUI look good", "how to write
+          CliRunner tests with a tmp sqlite db"). Name it by the technique,
+          not the task, and pass reusable_because (one sentence on why it
+          generalizes). A skill with no justification, or that reads as a
+          recap of this task (e.g. "toyrepo add() planted-bug: one-line fix
+          flips both tests green"), is saved as a report instead -- not
+          dropped.
+        - report: a finished artifact, or a one-off task summary/outcome.
+        - memory: a single fact worth remembering.
+        Tools are supply chain: they arrive proposed and wait for a human
+        `rework library activate`."""
         try:
             type_ = ItemType(item_type)
         except ValueError:
@@ -80,6 +90,7 @@ def build_mcp_server(index: LibraryStore, git: GitLibrary, hybrid: Any | None = 
             body=body,
             tags=tags or [],
             project=project,
+            reusable_because=reusable_because,
         )
         return f"{note}\n{item.id}"
 

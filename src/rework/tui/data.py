@@ -478,8 +478,11 @@ class TuiData:
         tags: list[str],
         project: str | None = None,
     ) -> tuple[Any, str]:
-        """Same path as `rework library add`: git body + index row, curation
-        rules applied (tools start proposed)."""
+        """Same path as `rework library add --force`: git body + index row,
+        curation rules applied (tools start proposed). force=True because this
+        is a human typing into the TUI form, choosing the type explicitly --
+        the owner-trusted path (same reasoning as the CLI's --force), not an
+        agent asserting its own output is a skill."""
         from rework.library.curation import contribute
         from rework.library.model import ItemType
 
@@ -494,6 +497,7 @@ class TuiData:
             tags=tags,
             mission_id=None,
             project=project,
+            force=True,
         )
 
     # -- library ----------------------------------------------------------

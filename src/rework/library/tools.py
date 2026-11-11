@@ -112,6 +112,7 @@ class LibraryHandle(BaseModel):
             mission_id=str(args.get("mission_id") or "") or None,
             role=str(args.get("role") or "") or None,
             requested_status=ItemStatus.ACTIVE,
+            reusable_because=str(args.get("reusable_because") or "") or None,
         )
         _ = _item  # the note carries the id/status text the agent sees
         return note
@@ -142,10 +143,19 @@ LIBRARY_SPECS: list[ToolSpec] = [
     ToolSpec(
         name="library_contribute",
         description=(
-            "Contribute what you learned to the Library so future missions are"
-            " cheaper: a reusable procedure (skill), a finished artifact worth"
-            " keeping (report), a fact worth remembering (memory). Tools are"
-            " owner-gated. Args: {type, name, description, body, tags?, role?}"
+            "Contribute to the Library. Pick the type carefully:\n"
+            " - skill: a GENERAL, REUSABLE technique/procedure you would apply again on"
+            " a DIFFERENT task -- e.g. 'how to make a TUI look good', 'how to write"
+            " CliRunner tests with a tmp sqlite db'. Name it by the technique, write it"
+            " in task-independent terms, and pass reusable_because (one sentence on why"
+            " it generalizes). A skill without that justification, or one that reads as"
+            " a recap of this task (e.g. 'toyrepo add() planted-bug: one-line fix flips"
+            " both tests green', 'add pytest CLI tests for rework commands') is saved as"
+            " a report instead, not dropped.\n"
+            " - report: a finished artifact / one-off task summary or outcome.\n"
+            " - memory: a single fact worth remembering.\n"
+            "Tools are owner-gated (always start proposed)."
+            " Args: {type, name, description, body, tags?, role?, reusable_because?}"
         ),
         input_schema={
             "type": "object",
@@ -156,6 +166,13 @@ LIBRARY_SPECS: list[ToolSpec] = [
                 "body": {"type": "string"},
                 "tags": {"type": "array", "items": {"type": "string"}},
                 "role": {"type": "string"},
+                "reusable_because": {
+                    "type": "string",
+                    "description": (
+                        "Required for type=skill: one sentence on why this applies to a"
+                        " future, different task (not this one)."
+                    ),
+                },
             },
             "required": ["type", "name", "body"],
         },
