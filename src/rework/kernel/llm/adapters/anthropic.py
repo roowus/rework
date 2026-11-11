@@ -58,7 +58,8 @@ def translate_request(request: ChatRequest) -> dict[str, Any]:
                 }
             )
         elif role == "assistant" and msg.get("tool_calls"):
-            blocks: list[dict[str, Any]] = []
+            # thinking blocks first, exactly as received (the API checks them)
+            blocks: list[dict[str, Any]] = list(msg.get("thinking_blocks") or [])
             if msg.get("content"):
                 blocks.append({"type": "text", "text": msg["content"]})
             for tc in msg["tool_calls"]:
@@ -113,22 +114,35 @@ def translate_request(request: ChatRequest) -> dict[str, Any]:
             for t in request.tools
         ]
     if request.effort:
-        # Anthropic expresses effort as an extended-thinking budget. The API
-        # requires max_tokens > budget_tokens and temperature unset while
-        # thinking is enabled, so lift max_tokens and drop temperature.
-        budget = {"low": 2_048, "medium": 8_192, "high": 24_576}.get(request.effort, 8_192)
-        payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
-        payload["max_tokens"] = max(int(payload.get("max_tokens") or 0), budget + 1_024)
+        if request.model in _BUDGET_THINKING:
+            # older models: an extended-thinking budget. The API requires
+            # max_tokens > budget_tokens and temperature unset while thinking.
+            budget = {"low": 2_048, "medium": 8_192, "high": 24_576}.get(request.effort, 8_192)
+            payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            payload["max_tokens"] = max(int(payload.get("max_tokens") or 0), budget + 1_024)
+        else:
+            # current models refuse a fixed budget (found live on
+            # claude-sonnet-5): adaptive thinking, effort in output_config
+            payload["thinking"] = {"type": "adaptive"}
+            payload["output_config"] = {"effort": request.effort}
         payload.pop("temperature", None)
     return payload
+
+
+# models that rejected adaptive thinking and take a budget instead (learned
+# at runtime, see AnthropicProvider.complete)
+_BUDGET_THINKING: set[str] = set()
 
 
 def translate_response(data: Any) -> ChatResult:
     """Anthropic response JSON to ChatResult."""
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
+    thinking: list[dict[str, Any]] = []
     for block in data.get("content", []):
-        if block.get("type") == "text":
+        if block.get("type") in ("thinking", "redacted_thinking"):
+            thinking.append({k: v for k, v in block.items() if v is not None})
+        elif block.get("type") == "text":
             text_parts.append(block.get("text", ""))
         elif block.get("type") == "tool_use":
             tool_calls.append(
@@ -148,22 +162,51 @@ def translate_response(data: Any) -> ChatResult:
             cached_tokens=int(cached),
         ),
         stop_reason=_STOP_MAP.get(data.get("stop_reason", "end_turn"), "end_turn"),
+        thinking_blocks=thinking,
     )
+
+
+ANTHROPIC_API = "https://api.anthropic.com"
+IDLE_TIMEOUT_S = 90.0  # no bytes for this long = a dead request
 
 
 class AnthropicProvider:
     name = "anthropic"
 
-    def __init__(self, api_key: str | None = None) -> None:
+    def __init__(self, api_key: str | None = None, base_url: str | None = None) -> None:
         from anthropic import AsyncAnthropic
 
+        # the endpoint comes from rework's catalog, never ANTHROPIC_BASE_URL:
+        # found live, the owner's shell points that at a local router for
+        # Claude Code, and rework's Anthropic calls went there and failed 401
+        url = base_url or ANTHROPIC_API
         self._client = (
-            AsyncAnthropic(api_key=api_key, timeout=180.0, max_retries=0)
+            AsyncAnthropic(api_key=api_key, base_url=url, timeout=180.0, max_retries=0)
             if api_key
-            else AsyncAnthropic(timeout=180.0, max_retries=0)
+            else AsyncAnthropic(base_url=url, timeout=180.0, max_retries=0)
         )
 
     async def complete(self, request: ChatRequest) -> ChatResult:
-        payload = translate_request(request)
-        response = await self._client.messages.create(**payload)
-        return translate_response(response.model_dump())
+        """Streamed, so long answers are never refused or cut by a flat
+        timeout (as for openai_compat; the SDK idles out after 90s of
+        silence). A model that rejects adaptive thinking is remembered and
+        retried once with a thinking budget."""
+        from anthropic import BadRequestError
+
+        try:
+            return await self._stream(translate_request(request))
+        except BadRequestError as exc:
+            text = str(exc)
+            if not request.effort or request.model in _BUDGET_THINKING or "adaptive" not in text:
+                raise
+            _BUDGET_THINKING.add(request.model)
+            return await self._stream(translate_request(request))
+
+    async def _stream(self, payload: dict[str, Any]) -> ChatResult:
+        from anthropic import Timeout
+
+        async with self._client.messages.stream(
+            **payload, timeout=Timeout(IDLE_TIMEOUT_S, connect=30.0)
+        ) as stream:
+            message = await stream.get_final_message()
+        return translate_response(message.model_dump())

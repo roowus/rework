@@ -1274,6 +1274,10 @@ def eval_history(task: str | None = typer.Argument(None)) -> None:
 def main() -> None:
     import sys
 
+    from rework.config import load_env_file
+
+    load_env_file()  # provider keys: ~/.rework/rework.env, never overriding the env
+
     # bare `rework` (no arguments at all) opens the TUI dashboard; everything
     # else keeps the command surface (`rework --help`, `rework new ...`)
     if len(sys.argv) == 1:

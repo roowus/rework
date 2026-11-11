@@ -15,6 +15,38 @@ if TYPE_CHECKING:
     from rework.kernel.state.store import StateStore
 
 DEFAULT_STATE_DIR = Path.home() / ".rework"
+
+
+def load_env_file(path: Path | None = None) -> list[str]:
+    """Read KEY=VALUE lines from ~/.rework/rework.env (REWORK_ENV_FILE) into
+    the environment without overriding anything already set. The same file
+    systemd loads on rewvis, so provider keys live in one place per machine
+    instead of the owner's shell profile (where every program inherits them).
+    Returns the names it set (never the values)."""
+    import os
+
+    path = path or Path(os.environ.get("REWORK_ENV_FILE", str(DEFAULT_STATE_DIR / "rework.env")))
+    try:
+        lines = path.expanduser().read_text().splitlines()
+    except OSError:
+        return []
+    added: list[str] = []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :]
+        name, _, value = line.partition("=")
+        name, value = name.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        if name and name not in os.environ:
+            os.environ[name] = value
+            added.append(name)
+    return added
+
+
 # User-facing artifacts live in a VISIBLE directory on purpose: fetched results
 # and reports are deliverables the owner asked for, not machinery. ~/.rework
 # stays hidden and keeps only internal state (env, checkpoints, caches).

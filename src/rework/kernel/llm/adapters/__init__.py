@@ -37,7 +37,7 @@ def _build(entry: ModelEntry, extra: dict[str, Any] | None = None) -> ModelProvi
         return FakeProvider()
     if entry.provider == "anthropic":
         key = os.environ.get(entry.api_key_env or "ANTHROPIC_API_KEY")
-        return AnthropicProvider(api_key=key)
+        return AnthropicProvider(api_key=key, base_url=entry.base_url)
     if entry.provider == "openai":
         key = os.environ.get(entry.api_key_env or "OPENAI_API_KEY")
         return OpenAIProvider(api_key=key)

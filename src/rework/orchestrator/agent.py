@@ -626,6 +626,8 @@ class MissionOrchestrator:
             )
         )
         message: dict[str, Any] = {"role": "assistant", "content": result.text or ""}
+        if result.thinking_blocks:
+            message["thinking_blocks"] = result.thinking_blocks
         if result.tool_calls:
             message["tool_calls"] = [
                 {"id": tc.id, "name": tc.name, "arguments": dict(tc.arguments or {})}

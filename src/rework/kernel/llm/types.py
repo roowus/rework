@@ -59,3 +59,8 @@ class ChatResult(BaseModel):
     tool_calls: list[ToolCall] = Field(default_factory=list)
     usage: Usage = Field(default_factory=Usage)
     stop_reason: str = "end_turn"
+    # provider reasoning blocks that must go back with this turn (Anthropic:
+    # thinking/redacted_thinking blocks are required on the next request of a
+    # tool loop). Callers store them on the assistant message as
+    # "thinking_blocks"; adapters that do not use them ignore the key.
+    thinking_blocks: list[dict[str, Any]] = Field(default_factory=list)

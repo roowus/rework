@@ -374,16 +374,17 @@ def make_toolloop_node(
                     "tokens": result.usage.input_tokens + result.usage.output_tokens,
                 },
             )
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": result.text,
-                    "tool_calls": [
-                        {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
-                        for tc in result.tool_calls
-                    ],
-                }
-            )
+            turn_msg: dict[str, Any] = {
+                "role": "assistant",
+                "content": result.text,
+                "tool_calls": [
+                    {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                    for tc in result.tool_calls
+                ],
+            }
+            if result.thinking_blocks:
+                turn_msg["thinking_blocks"] = result.thinking_blocks
+            messages.append(turn_msg)
             if not result.tool_calls:
                 if result.stop_reason == "max_tokens" and cut_offs < MAX_CUT_OFFS:
                     # found live: 8192-token investigator reports were cut at
