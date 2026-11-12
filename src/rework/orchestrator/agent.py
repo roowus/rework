@@ -36,8 +36,8 @@ from rework.kernel.state.records import (
     RunStatus,
 )
 from rework.kernel.state.records import run_id as make_run_id
-from rework.nodes.report_sections import blocking_findings, open_blockers
 from rework.logs import bind
+from rework.nodes.report_sections import blocking_findings, open_blockers
 
 log = logging.getLogger("rework.orchestrator")
 
@@ -867,7 +867,9 @@ class MissionOrchestrator:
             return
         covered = {str(a.get("finding") or "").strip().lower() for a in accepted}
         missing = [
-            item for item in open_items if not any(_covers(covered_key, item) for covered_key in covered)
+            item
+            for item in open_items
+            if not any(_covers(covered_key, item) for covered_key in covered)
         ]
         if missing:
             raise ToolError(
