@@ -28,7 +28,16 @@ app = typer.Typer(
 
 
 @app.callback()
-def root() -> None:
+def root(
+    target: str | None = typer.Option(
+        None,
+        "--target",
+        help=(
+            "Named connection target from ~/.rework/targets.toml (see `rework"
+            " targets`). Defaults to REWORK_TARGET, then the file's `default`."
+        ),
+    ),
+) -> None:
     """rework: see `rework --help` for commands."""
 
 
@@ -1289,11 +1298,34 @@ def eval_history(task: str | None = typer.Argument(None)) -> None:
 
 
 def main() -> None:
+    import os as _os
     import sys
 
     from rework.config import load_env_file
 
     load_env_file()  # provider keys: ~/.rework/rework.env, never overriding the env
+
+    # Named connection targets (~/.rework/targets.toml), BEFORE anything reads
+    # REWORK_DB / REWORK_DAEMON_URL: apply what the launch asked for (--target
+    # NAME, else REWORK_TARGET, else the file's default) with setdefault
+    # semantics, so an explicit REWORK_DB still wins (previews, systemd).
+    _argv = sys.argv[1:]
+    _flag = None
+    if "--target" in _argv:
+        _i = _argv.index("--target")
+        if _i + 1 < len(_argv):
+            _flag = _argv[_i + 1]
+        else:  # `rework --target <subcommand>`: the NAME itself was skipped
+            typer.secho("--target needs a name (see `rework targets`)", fg=typer.colors.RED)
+            raise typer.Exit(2)
+    if _flag is not None:
+        try:
+            from rework.targets import resolve_target
+
+            resolve_target(flag=_flag, env_var=_os.environ.get("REWORK_TARGET"))
+        except KeyError as exc:
+            typer.secho(str(exc.args[0]), fg=typer.colors.RED, err=True)
+            raise SystemExit(2) from None
 
     # bare `rework` (no arguments at all) opens the TUI dashboard; everything
     # else keeps the command surface (`rework --help`, `rework new ...`)
@@ -1302,11 +1334,219 @@ def main() -> None:
 
         run_tui()
         return
-    if sys.argv[1] not in ("serve", "logs", "library-mcp"):
+    if _flag is not None and not _argv[2:]:
+        # `rework --target NAME` with no subcommand: the TUI (like bare rework)
+        from rework.tui import run_tui
+
+        run_tui()
+        return
+    if _argv[0] not in ("serve", "logs", "library-mcp"):
         from rework.logs import setup_logging
 
         setup_logging("cli")
     app()
+
+
+@app.command("targets")
+def targets_cmd() -> None:
+    """List named targets from ~/.rework/targets.toml: which is default, is
+    the database reachable, does the daemon answer /healthz."""
+    import httpx as _httpx
+
+    from rework.config import DEFAULT_STATE_DIR
+    from rework.targets import TARGETS_PATH, load_targets_file
+
+    file = load_targets_file()
+    if not file.targets:
+        typer.echo(f"no targets configured ({TARGETS_PATH} missing or empty)")
+        typer.echo("see docs/ops.md, section 'Targets': set one up, then use rework --target NAME")
+        raise typer.Exit(1)
+
+    def _db_reachable_sync(db: str) -> bool:
+        if db.startswith(("postgresql://", "postgres://")):
+            import psycopg
+
+            try:
+                with psycopg.connect(db, connect_timeout=3, autocommit=True) as conn:
+                    conn.execute("SELECT 1")
+                return True
+            except Exception:
+                return False
+        path = Path(db).expanduser()
+        if not path.suffix and not path.exists():
+            return False  # not a path that exists, not a URL scheme: unresolvable
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=3)
+            conn.execute("SELECT 1")
+            conn.close()
+            return True
+        except Exception:
+            return False
+
+    async def db_reachable(db: str) -> bool:
+        return await asyncio.to_thread(_db_reachable_sync, db)
+
+    def daemon_reachable(url: str) -> bool:
+        try:
+            resp = _httpx.get(url.rstrip("/") + "/healthz", timeout=3.0)
+        except Exception:
+            return False
+        return resp.status_code == 200 and "ok" in resp.text[:2048]
+
+    async def check(target: Any) -> tuple[bool, bool]:
+        assert target.db and target.daemon_url
+        return (
+            await db_reachable(target.db),
+            await asyncio.to_thread(daemon_reachable, target.daemon_url),
+        )
+
+    async def check_all() -> dict[str, tuple[bool, bool]]:
+        names = list(file.targets)
+        return dict(
+            zip(
+                names,
+                await asyncio.gather(*(check(file.targets[n]) for n in names)),
+                strict=True,
+            )
+        )
+
+    results = asyncio.run(check_all())
+    for name, target in file.targets.items():
+        db_ok, daemon_ok = results[name]
+        mark = "*" if name == file.default else " "
+        typer.echo(
+            f"{mark} {name:<12}"
+            f" db={'up' if db_ok else 'UNREACHABLE':<12}"
+            f" daemon={'up' if daemon_ok else 'UNREACHABLE':<12}"
+            f" {target.ssh or '-'}"
+        )
+    typer.echo(
+        f"default marked *; REWORK_DB/REWORK_DAEMON_URL/REWORK_LIBRARY_DIR come"
+        f" from {DEFAULT_STATE_DIR / 'targets.toml'}"
+    )
+
+
+@app.command("sync-config")
+def sync_config_cmd(
+    target_name: str = typer.Argument(..., help="A target with an `ssh` host in targets.toml."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Show what would change; never touch the remote host."
+    ),
+) -> None:
+    """Copy ~/.rework/models.json and the REWORK_*_KEY lines of
+    ~/.rework/rework.env to the target's ssh host. Prints key NAMES and value
+    LENGTHS only, never a secret. REWORK_DB / REWORK_DAEMON_URL and every
+    other line in the remote rework.env are left untouched."""
+    import subprocess as _sp
+
+    from rework.config import DEFAULT_STATE_DIR
+    from rework.targets import TARGETS_PATH, load_targets_file
+
+    file = load_targets_file()
+    target = file.targets.get(target_name)
+    if target is None:
+        typer.secho(
+            f"no target named {target_name!r} in {TARGETS_PATH} (see `rework targets`)",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(1)
+    if not target.ssh:
+        typer.secho(
+            f"target {target_name!r} has no `ssh` host in {TARGETS_PATH}; add one, e.g."
+            f' ssh = "ubuntu@100.107.125.118"',
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(1)
+    host = target.ssh
+
+    def ssh_run(cmd: str, *, input_text: str | None = None) -> str:
+        proc = _sp.run(
+            ["ssh", host, cmd],
+            input=input_text,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return proc.stdout
+
+    local_env = DEFAULT_STATE_DIR / "rework.env"
+    try:
+        local_lines = local_env.expanduser().read_text().splitlines()
+    except OSError:
+        local_lines = []
+    local_keys: dict[str, str] = {}
+    for raw in local_lines:
+        line = raw.strip()
+        if (
+            line
+            and not line.startswith("#")
+            and line.startswith("REWORK_")
+            and line.endswith("KEY") is False
+            and "=" in line
+        ):
+            key = line.split("=", 1)[0].strip()
+            if key.endswith("_KEY"):
+                value = line.split("=", 1)[1].strip()
+                local_keys[key] = value
+
+    # remote rework.env: keep every line, replace/insert only REWORK_*_KEY ones
+    remote_raw = ssh_run("cat ~/.rework/rework.env 2>/dev/null || true")
+    remote_lines: list[str] = remote_raw.splitlines()
+    covered: set[str] = set()
+    merged: list[str] = []
+    for line in remote_lines:
+        stripped = line.strip()
+        key = stripped.split("=", 1)[0].strip() if "=" in stripped else ""
+        if key in local_keys:
+            merged.append(f"{key}={local_keys[key]}")
+            covered.add(key)
+        else:
+            merged.append(line)
+    for key, value in local_keys.items():
+        if key not in covered:
+            merged.append(f"{key}={value}")
+    if merged and not merged[-1].strip():
+        merged = merged[:-1]  # a trailing blank line, not two
+    merged_text = "\n".join(merged) + ("\n" if merged else "")
+    added = sorted(k for k in local_keys if k not in covered)
+    updated = sorted(k for k in local_keys if k in covered)
+    if added or updated:
+        typer.echo(f"REWORK_*_KEY lines from {local_env}:")
+        for key in added:
+            typer.echo(f"  add     {key}: {len(local_keys[key])} chars")
+        for key in updated:
+            typer.echo(f"  replace {key}: {len(local_keys[key])} chars")
+    else:
+        typer.echo(f"no REWORK_*_KEY lines in {local_env}: nothing to merge")
+
+    models = DEFAULT_STATE_DIR / "models.json"
+    exists = models.exists()
+    typer.echo(
+        f"{'would copy' if dry_run else 'copy'} models.json: {models}",
+        f"    -> {host}:~/.rework/models.json",
+    )
+
+    if dry_run:
+        typer.echo("dry run: nothing was sent to the remote host")
+        return
+    if local_keys:
+        mkdir = ssh_run(
+            "mkdir -p ~/.rework && touch ~/.rework/rework.env && chmod 600 ~/.rework/rework.env"
+        )
+        _ = mkdir
+        ssh_run(
+            "cat > ~/.rework/rework.env && chmod 600 ~/.rework/rework.env", input_text=merged_text
+        )
+        typer.echo(f"merged rework.env written to {host} (mode 600 preserved)")
+    if exists:
+        _sp.run(["scp", str(models), f"{host}:.rework/models.json"], check=True)
+        typer.echo("models.json copied")
+    else:
+        typer.echo(f"no local {models}: models.json not copied")
 
 
 @app.command()

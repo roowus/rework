@@ -380,3 +380,148 @@ def test_library_backfill_bodies_command(
     again = runner.invoke(app, ["library", "backfill-bodies"])
     assert again.exit_code == 0, again.output
     assert "backfilled 0 item body/bodies" in again.output
+
+
+# --- named connection targets (rework targets / sync-config) -----------------
+
+
+TARGETS_TOML = """\
+default = "rewvis"
+
+[targets.rewvis]
+db_env = "REWORK_TEST_REWVIS_DB"
+daemon_url = "http://100.107.125.118:8941"
+ssh = "ubuntu@100.107.125.118"
+
+[targets.sandbox]
+db = "sqlite:////tmp/rework-sandbox.db"
+daemon_url = "http://127.0.0.1:8941"
+ssh = "ubuntu@100.107.125.118"
+"""
+
+
+@pytest.fixture()
+def targets_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """targets.toml with a real sandbox sqlite db; monkeypatched into place."""
+    from rework import targets as targets_mod
+
+    db = tmp_path / "sandbox.db"
+    db.write_bytes(b"")  # an empty file is a valid sqlite database
+    path = tmp_path / "targets.toml"
+    path.write_text(TARGETS_TOML.replace("sqlite:////tmp/rework-sandbox.db", f"sqlite:///{db}"))
+    monkeypatch.setattr(targets_mod, "TARGETS_PATH", path)
+    monkeypatch.setenv("REWORK_TEST_REWVIS_DB", "postgresql://nobody:nobody@127.0.0.1:1/nope")
+    for name in ("REWORK_TARGET", "REWORK_TARGET_NAME", "REWORK_DAEMON_URL"):
+        monkeypatch.delenv(name, raising=False)
+    return path
+
+
+def test_targets_lists_each_target_and_survives_unreachable(
+    targets_file: Path, rework_db: Path
+) -> None:
+    result = runner.invoke(app, ["targets"])
+    if result.exit_code != 0:
+        print(result.output)
+    # unreachable hosts must be REPORTED, not raised: both rows printed
+    assert "rewvis" in result.output and "sandbox" in result.output
+    assert "UNREACHABLE" in result.output
+    assert result.exit_code == 0
+
+
+def test_targets_without_any_targets_file_exits_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rework import targets as targets_mod
+
+    monkeypatch.setattr(targets_mod, "TARGETS_PATH", tmp_path / "nope.toml")
+    result = runner.invoke(app, ["targets"])
+    assert result.exit_code == 1
+    assert "no targets configured" in result.output
+
+
+def test_sync_config_merges_only_key_lines_and_never_prints_values(
+    targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rework.config import DEFAULT_STATE_DIR
+
+    envdir = tmp_path / "state"
+    envdir.mkdir()
+    (envdir / "rework.env").write_text(
+        "# local keys\nREWORK_FIREWORKS_KEY=supersecretvalue123\nOTHER=stay\n"
+    )
+    import rework.config as config_mod
+
+    monkeypatch.setattr(config_mod, "DEFAULT_STATE_DIR", envdir)
+
+    argvs: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> object:
+        argvs.append(list(cmd))
+        if cmd[:1] == ["ssh"] and len(cmd) > 2 and cmd[2].startswith("cat"):
+            stdout = "REWORK_FIREWORKS_KEY=old\nREWORK_DB=keepme\n"
+            return type("P", (), {"stdout": stdout, "returncode": 0})()
+        return type("P", (), {"stdout": "", "returncode": 0})()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    result = runner.invoke(app, ["sync-config", "sandbox"])
+    if result.exit_code != 0:
+        print(result.output)
+    assert result.exit_code == 0
+    out = result.output
+    # key NAMES and lengths only, never values
+    assert "REWORK_FIREWORKS_KEY: 20 chars" in out
+    assert "supersecretvalue123" not in out
+    # what was sent over ssh: keys replaced, REWORK_DB untouched, mode 600 kept
+    ssh_writes = [argv for argv in argvs if argv[:1] == ["ssh"] and "cat >" in argv[2]]
+    assert ssh_writes, "the merged rework.env was never written"
+    sent = ssh_writes[-1][2]
+    assert "REWORK_FIREWORKS_KEY=supersecretvalue123" in sent
+    assert "REWORK_DB=keepme" in sent  # remote non-KEY line preserved verbatim
+    assert "chmod 600" in sent
+    assert any(argv[:1] == ["scp"] for argv in argvs), "models.json was not copied"
+
+
+def test_sync_config_dry_run_touches_nothing(
+    targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rework.config import DEFAULT_STATE_DIR
+
+    envdir = tmp_path / "state"
+    envdir.mkdir()
+    (envdir / "rework.env").write_text("REWORK_FIREWORKS_KEY=supersecretvalue123\n")
+    import rework.config as config_mod
+
+    monkeypatch.setattr(config_mod, "DEFAULT_STATE_DIR", envdir)
+
+    called: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> object:
+        called.append(list(cmd))
+        return type("P", (), {"stdout": "", "returncode": 0})()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    result = runner.invoke(app, ["sync-config", "rewvis", "--dry-run"])
+    if result.exit_code != 0:
+        print(result.output)
+    assert result.exit_code == 0
+    assert "would copy" in result.output
+    assert "dry run: nothing was sent" in result.output
+    assert "REWORK_FIREWORKS_KEY: 20 chars" in result.output
+    assert "supersecretvalue123" not in result.output
+    assert not [argv for argv in called if argv[0] in ("ssh", "scp")]
+
+
+def test_sync_config_requires_an_ssh_host(targets_file: Path) -> None:
+    path = targets_file
+    path.write_text('[targets.localonly]\ndb = "sqlite:///x.db"\ndaemon_url = "http://h:1"\n')
+    result = runner.invoke(app, ["sync-config", "localonly"])
+    assert result.exit_code == 1
+    assert "no `ssh` host" in result.output
+
+
+def test_sync_config_unknown_target_errors(targets_file: Path) -> None:
+    result = runner.invoke(app, ["sync-config", "ghost"])
+    assert result.exit_code == 1
+    assert "no target named" in result.output

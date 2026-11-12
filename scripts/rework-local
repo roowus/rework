@@ -1,29 +1,22 @@
 #!/usr/bin/env bash
-# rework against a LOCAL daemon + LOCAL SQLite state (never the deployment DB).
+# rework against the SANDBOX target (local daemon + local SQLite state, never
+# the deployment DB). Just a named target now: the real values live in
+# ~/.rework/targets.toml ([targets.sandbox]; see docs/ops.md, "Targets").
 #
 #   scripts/rework-local serve        # terminal 1: the local daemon
 #   scripts/rework-local              # terminal 2: the TUI
 #   scripts/rework-local <command>    # any CLI command, same local state
 #
-# Your shell may export REWORK_DB / REWORK_DAEMON_URL for rewvis; this script
-# overrides them for this one process only.
-set -euo pipefail
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-state="${REWORK_LOCAL_STATE:-$HOME/.rework}"
-export REWORK_DB="$state/local.sqlite3"
-export REWORK_CHECKPOINTS_DB="$state/local-checkpoints.sqlite3"
-export REWORK_HTTP_HOST=127.0.0.1
-export REWORK_HTTP_PORT="${REWORK_LOCAL_PORT:-8941}"
-export REWORK_DAEMON_URL="http://127.0.0.1:${REWORK_HTTP_PORT}"
-# a sleeping Mac freezes every mission (asyncio timers stop with the clock);
-# keep it awake while the daemon serves. caffeinate cannot stop a lid-close
-# sleep on battery: use rewvis for long missions away from the desk.
+# One-time setup (this wrapper does NOT create the target for you):
+#   chmod 600 ~/.rework/targets.toml   # it is yours; keep it private
+# and a [targets.sandbox] entry with the sandbox db and daemon_url.
+#
 # a macOS banner when a gate opens (a budget gate once sat 4.5 hours unseen);
 # set REWORK_NOTIFY_CMD yourself for something else, e.g. an ntfy push
 if [[ "${1:-}" == "serve" && -z "${REWORK_NOTIFY_CMD:-}" ]] && command -v osascript >/dev/null 2>&1; then
   export REWORK_NOTIFY_CMD='osascript -e "display notification (system attribute \"REWORK_GATE_QUESTION\") with title \"rework needs you\""'
 fi
 if [[ "${1:-}" == "serve" ]] && command -v caffeinate >/dev/null 2>&1; then
-  exec caffeinate -i uv run --project "$here" rework "$@"
+  exec caffeinate -i uv run --project "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" rework --target sandbox "$@"
 fi
-exec uv run --project "$here" rework "$@"
+exec uv run --project "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" rework --target sandbox "$@"
