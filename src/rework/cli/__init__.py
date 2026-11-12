@@ -1297,6 +1297,60 @@ def eval_history(task: str | None = typer.Argument(None)) -> None:
         )
 
 
+def _target_usage_error(message: str) -> SystemExit:
+    """One error shape for every --target problem: stderr, exit 2.
+
+    SystemExit rather than typer.Exit because these fire BEFORE app() runs:
+    a typer.Exit raised in main() itself is never seen by click's exception
+    handling and falls out of the console entrypoint as a traceback."""
+    typer.secho(message, fg=typer.colors.RED, err=True)
+    return SystemExit(2)
+
+
+def parse_target_flag(argv: list[str]) -> tuple[str | None, list[str]]:
+    """The global `--target NAME` / `--target=NAME` from the argv prefix.
+
+    Global options belong BEFORE the subcommand, so the scan stops at the
+    first non-flag token (the command name) or at `--`: `rework --target
+    sandbox ls` parses to ("sandbox", ["ls"]), while `rework ls --target
+    sandbox` parses to (None, ["ls", ...]) — main() turns that into a usage
+    error before anything is applied (the silent wrong-target run this
+    feature exists to prevent). The NAME itself is only consumed when it
+    cannot be a command: anything starting with `-` (like `--help`) is left
+    alone, so `rework --target --help` is a missing name, not a target
+    literally called `--help`. Returns (name_or_None, rest): rest is the
+    argv AFTER the parsed global prefix (empty = no subcommand, the TUI).
+    """
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            return None, argv[i:]  # end of options, by definition
+        if arg.startswith("-") and arg != "-":
+            if arg == "--target":
+                if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                    return argv[i + 1], argv[i + 2 :]
+                return None, argv[i:]  # a missing NAME: env/default decide
+            if arg.startswith("--target="):
+                value = arg[len("--target=") :]
+                return (value or None), argv[i + 1 :]  # --target= is a missing name
+            if not arg.startswith("--") and len(arg) > 2:
+                i += 2  # a short option with a value glued on (-n3), not a flag
+            else:
+                i += 1  # some other global flag; its args are not ours to parse
+            continue
+        return None, argv[i:]  # the subcommand: the global-option scan is over
+    return None, []
+
+
+def _subcommand_names() -> set[str]:
+    """Top-level command and group names (used to flag `rework --target ls`
+    as a missing NAME rather than "no target named 'ls'")."""
+    from typer.main import get_command as _get_command
+
+    return set(getattr(_get_command(app), "commands", {}))
+
+
 def main() -> None:
     import os as _os
     import sys
@@ -1309,38 +1363,50 @@ def main() -> None:
     # REWORK_DB / REWORK_DAEMON_URL: apply what the launch asked for (--target
     # NAME, else REWORK_TARGET, else the file's default) with setdefault
     # semantics, so an explicit REWORK_DB still wins (previews, systemd).
+    # Resolution runs on EVERY invocation: REWORK_TARGET and targets.toml's
+    # `default` must reach bare `rework` and every subcommand, not just
+    # launches that spelled out --target (the pre-fix bug: a bare `rework`
+    # with REWORK_TARGET set silently talked to the wrong instance).
     _argv = sys.argv[1:]
-    _flag = None
-    if "--target" in _argv:
-        _i = _argv.index("--target")
-        if _i + 1 < len(_argv):
-            _flag = _argv[_i + 1]
-        else:  # `rework --target <subcommand>`: the NAME itself was skipped
-            typer.secho("--target needs a name (see `rework targets`)", fg=typer.colors.RED)
-            raise typer.Exit(2)
-    if _flag is not None:
-        try:
-            from rework.targets import resolve_target
+    _flag, _rest = parse_target_flag(_argv)
+    _explicit = any(a == "--target" or a.startswith("--target=") for a in _argv)
+    if _explicit and _flag is None:
+        # --target on the argv line without a consumable NAME: either it was
+        # left off entirely (`rework --target --help`, `rework --target=`, the
+        # trailing `--target`), or it sits after the subcommand, where it is
+        # NOT a global option and must not be guessed at. Either way: a clear
+        # usage error BEFORE anything is applied (no env writes on a broken
+        # invocation — the silent wrong-target run this feature prevents).
+        raise _target_usage_error(
+            "--target needs a name and must come before the subcommand,"
+            " e.g. `rework --target sandbox ls` (see `rework targets`)"
+        )
+    if _flag in _subcommand_names():
+        # `rework --target version`: the NAME would have to be the subcommand
+        # itself, which is not a target; a clear usage error beats Typer's
+        # generic "missing command" and beats inventing a target named `ls`.
+        raise _target_usage_error("--target needs a name (see `rework targets`)")
 
-            resolve_target(flag=_flag, env_var=_os.environ.get("REWORK_TARGET"))
-        except KeyError as exc:
-            typer.secho(str(exc.args[0]), fg=typer.colors.RED, err=True)
-            raise SystemExit(2) from None
+    # Resolution runs on EVERY invocation, flag or not: REWORK_TARGET and
+    # targets.toml's `default` must reach bare `rework` and every subcommand,
+    # not just launches that spelled out --target (the pre-fix bug: a bare
+    # `rework` with REWORK_TARGET set silently talked to the wrong instance).
+    try:
+        from rework.targets import resolve_target
 
-    # bare `rework` (no arguments at all) opens the TUI dashboard; everything
-    # else keeps the command surface (`rework --help`, `rework new ...`)
-    if len(sys.argv) == 1:
+        resolve_target(flag=_flag, env_var=_os.environ.get("REWORK_TARGET"))
+    except KeyError as exc:
+        raise _target_usage_error(str(exc.args[0])) from None
+
+    # bare `rework` (no arguments at all, or `rework --target NAME` with no
+    # subcommand) opens the TUI dashboard; everything else keeps the command
+    # surface (`rework --help`, `rework new ...`)
+    if not _rest:
         from rework.tui import run_tui
 
         run_tui()
         return
-    if _flag is not None and not _argv[2:]:
-        # `rework --target NAME` with no subcommand: the TUI (like bare rework)
-        from rework.tui import run_tui
-
-        run_tui()
-        return
-    if _argv[0] not in ("serve", "logs", "library-mcp"):
+    if _rest[0] not in ("serve", "logs", "library-mcp"):
         from rework.logs import setup_logging
 
         setup_logging("cli")
@@ -1362,31 +1428,10 @@ def targets_cmd() -> None:
         typer.echo("see docs/ops.md, section 'Targets': set one up, then use rework --target NAME")
         raise typer.Exit(1)
 
-    def _db_reachable_sync(db: str) -> bool:
-        if db.startswith(("postgresql://", "postgres://")):
-            import psycopg
-
-            try:
-                with psycopg.connect(db, connect_timeout=3, autocommit=True) as conn:
-                    conn.execute("SELECT 1")
-                return True
-            except Exception:
-                return False
-        path = Path(db).expanduser()
-        if not path.suffix and not path.exists():
-            return False  # not a path that exists, not a URL scheme: unresolvable
-        try:
-            import sqlite3
-
-            sconn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=3)
-            sconn.execute("SELECT 1")
-            sconn.close()
-            return True
-        except Exception:
-            return False
-
     async def db_reachable(db: str) -> bool:
-        return await asyncio.to_thread(_db_reachable_sync, db)
+        from rework.targets import db_reachable as _probe
+
+        return await asyncio.to_thread(_probe, db)
 
     def daemon_reachable(url: str) -> bool:
         try:

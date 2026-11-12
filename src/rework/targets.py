@@ -12,13 +12,22 @@ no TOML writer). Format:
     daemon_url = "http://100.107.125.118:8941"
     ssh = "ubuntu@100.107.125.118"     # optional, for sync-config
     library_dir = "/home/ubuntu/.rework/library"  # optional
+    checkpoints_db = "/home/ubuntu/.rework/checkpoints.sqlite3"  # optional
+    checkpoints_db_env = "REWORK_REWVIS_CHECKPOINTS_DB"          # optional
 
 Precedence (highest wins): (1) REWORK_DB / REWORK_DAEMON_URL /
-REWORK_LIBRARY_DIR already in the environment (previews and the systemd unit
-depend on that winning), (2) --target NAME, (3) the REWORK_TARGET env var,
-(4) the file's `default`. Selection applies each key with setdefault
-semantics and sets REWORK_TARGET_NAME (again only if unset) so the TUI's
-status bar shows it. No targets file at all = today's behavior, unchanged.
+REWORK_LIBRARY_DIR / REWORK_CHECKPOINTS_DB already in the environment
+(previews and the systemd unit depend on that winning), (2) --target NAME,
+(3) the REWORK_TARGET env var, (4) the file's `default`. Selection applies
+each key with setdefault semantics and sets REWORK_TARGET_NAME (again only
+if unset) so the TUI's status bar shows it. No targets file at all = today's
+behavior, unchanged.
+
+Checkpoints: a sqlite target gets REWORK_CHECKPOINTS_DB setdefaulted to
+`checkpoints.sqlite3` next to its db (or to the explicit `checkpoints_db` /
+`checkpoints_db_env` value), so a sandbox target is self-contained the way
+the old scripts/rework-local env exports were. Postgres targets share the
+main database for checkpoints and touch no checkpoints variable.
 """
 
 from __future__ import annotations
@@ -40,6 +49,7 @@ class Target:
     daemon_url: str | None = None
     ssh: str | None = None
     library_dir: str | None = None
+    checkpoints_db: str | None = None  # resolved; None = derive from db (sqlite)
 
 
 @dataclass(frozen=True)
@@ -88,12 +98,17 @@ def load_targets_file(path: Path | None = None) -> TargetsFile:
                 db = os.environ.get(str(db_env), db)  # db_env wins; fall back to db
             if not db or not entry.get("daemon_url"):
                 continue
+            checkpoints = entry.get("checkpoints_db")
+            checkpoints_env = entry.get("checkpoints_db_env")
+            if checkpoints_env:
+                checkpoints = os.environ.get(str(checkpoints_env), checkpoints)
             targets[str(name)] = Target(
                 name=str(name),
                 db=str(db),
                 daemon_url=str(entry["daemon_url"]),
                 ssh=entry.get("ssh"),
                 library_dir=entry.get("library_dir"),
+                checkpoints_db=str(checkpoints) if checkpoints else None,
             )
     default = raw.get("default")
     return TargetsFile(targets=targets, default=str(default) if default else None)
@@ -125,9 +140,82 @@ def resolve_target(
     if target.library_dir:
         _setdefault("REWORK_LIBRARY_DIR", target.library_dir)
     _setdefault("REWORK_TARGET_NAME", target.name)
+    if target.checkpoints_db:
+        _setdefault("REWORK_CHECKPOINTS_DB", target.checkpoints_db)
+    else:
+        derived = _default_checkpoints_db(target.db)
+        if derived:
+            _setdefault("REWORK_CHECKPOINTS_DB", derived)
     return selected
+
+
+def _default_checkpoints_db(db: str | None) -> str | None:
+    """The sandbox-self-contained default: a plain-path sqlite target keeps its
+    checkpoints next to the state db (the same default Config.from_env picks).
+    Postgres shares the main db for checkpoints (no separate file to point at)
+    and a `sqlite:///` URL has no plain directory to anchor to, so neither
+    derives one."""
+    if not db or "://" in db:
+        return None
+    return str(Path(db).expanduser().parent / "checkpoints.sqlite3")
 
 
 def _setdefault(name: str, value: str | None) -> None:
     if value and name not in os.environ:
         os.environ[name] = value
+
+
+def sqlite_db_path(db: str) -> Path | None:
+    """The file behind a db string, or None when db is not a sqlite file
+    reference (a postgres URL, say). Three forms reach a connection in this
+    codebase: a bare path (Config.from_env's default), the `sqlite:////abs`
+    URL docs/ops.md puts in targets.toml, and its `sqlite:///rel` sibling.
+    `Path(db)` alone mangles the URL forms into bogus relative paths, which is
+    exactly how `rework targets` reported healthy sqlite targets unreachable."""
+    if db.startswith(("postgresql://", "postgres://")):
+        return None
+    if db.startswith("sqlite:"):
+        rest = db[len("sqlite:") :]
+        if not rest.startswith("//"):
+            return Path(rest)  # scheme + relative path (sqlite:path)
+        if not db.startswith("sqlite:///"):
+            return None  # a named authority (sqlite://host/x.db): not a local file
+        stripped = rest.lstrip("/")
+        if not stripped:
+            return None  # no path at all behind the scheme
+        if db.startswith("sqlite:////"):
+            return Path("/" + stripped)  # the absolute form: sqlite:////abs/x.db
+        return Path(stripped)  # the relative form: sqlite:///rel/x.db
+    return Path(db)
+
+
+def db_reachable(db: str, timeout: float = 3.0) -> bool:
+    """Can this db string be opened RIGHT NOW? Postgres gets a short connect
+    timeout; sqlite gets a read-only SELECT 1 through sqlite_db_path (a
+    missing file is unreachable; a fresh empty file is a valid database). One
+    shared probe so every reachability check agrees instead of hand-parsing
+    the URL again."""
+    if db.startswith(("postgresql://", "postgres://")):
+        try:
+            import psycopg
+
+            with psycopg.connect(db, connect_timeout=int(timeout), autocommit=True) as conn:
+                conn.execute("SELECT 1")
+            return True
+        except Exception:
+            return False
+    path = sqlite_db_path(db)
+    if path is None:
+        return False
+    path = path.expanduser()
+    if not path.suffix and not path.exists():
+        return False  # not a path that exists, not a URL scheme: unresolvable
+    try:
+        import sqlite3
+
+        sconn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+        sconn.execute("SELECT 1")
+        sconn.close()
+        return True
+    except Exception:
+        return False

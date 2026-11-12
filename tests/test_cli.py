@@ -535,3 +535,144 @@ def test_sync_config_unknown_target_errors(targets_file: Path) -> None:
     result = runner.invoke(app, ["sync-config", "ghost"])
     assert result.exit_code == 1
     assert "no target named" in result.output
+
+
+# --- main()'s own dispatch, END TO END --------------------------------------
+# The audit's root cause: CliRunner tests bypass main() entirely, so
+# REWORK_TARGET / default selection and the --target argv handling there were
+# never exercised. These run the real console entrypoint (rework.cli:main) in
+# a subprocess with a temp HOME + REWORK_TARGETS, and cover exactly the cases
+# the audit probed live.
+
+MAIN_TARGETS_TOML = """\
+default = "sandbox"
+
+[targets.sandbox]
+db = "sqlite:////tmp/probe/sandbox.db"
+daemon_url = "http://127.0.0.1:8941"
+
+[targets.rewvis]
+db = "postgresql://nobody:nobody@127.0.0.1:1/nope"
+daemon_url = "http://100.107.125.118:8941"
+"""
+
+
+def _run_main(
+    argv: list[str], home: Path, env_extra: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    # `python -m rework ...`: the same main() the console entrypoint runs
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "REWORK_TARGETS": str(home / "targets.toml"),
+        "PYTHONPATH": "src",
+        "REWORK_LOG_DIR": str(home / "logs"),
+        "REWORK_DB": "",  # never inherited: selection must come from the target
+    }
+    env = {k: v for k, v in env.items() if v != "" or k == "REWORK_DB"}
+    env.update(env_extra or {})
+    return subprocess.run(
+        [sys.executable, "-m", "rework", *argv],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        check=False,
+    )
+
+
+@pytest.fixture()
+def main_home(tmp_path: Path) -> Path:
+    home = tmp_path / "home"
+    (home / ".rework").mkdir(parents=True)
+    (home / ".rework" / "targets.toml").write_text(
+        MAIN_TARGETS_TOML.replace("/tmp/probe/sandbox.db", str(tmp_path / "sandbox.db"))
+    )
+    (tmp_path / "sandbox.db").write_bytes(b"")  # a valid empty sqlite database
+    return home
+
+
+def test_main_rework_target_env_selects_end_to_end(main_home: Path) -> None:
+    # BLOCKER 1: bare `rework` with only REWORK_TARGET set must still resolve
+    # (the pre-fix bug: main() resolved targets only when "--target" was in argv)
+    result = _run_main(["version"], main_home, {"REWORK_TARGET": "rewvis"})
+    assert result.returncode == 2, result.stderr  # unknown-target, exit 2, stderr
+    assert "REWORK_TARGET: no target named" not in result.stdout
+    ok = _run_main(["targets"], main_home, {"REWORK_TARGET": "sandbox"})
+    assert ok.returncode == 0
+    assert "sandbox" in ok.stdout
+
+
+def test_main_default_only_selection_reaches_subcommands(main_home: Path) -> None:
+    # BLOCKER 1: no flag, no REWORK_TARGET: the file's `default = "sandbox"`
+    # applies to any subcommand, and an unknown DEFAULT never kills the CLI
+    result = _run_main(["version"], main_home, {})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("rework ")
+    # and `rework --target ghost` IS an error (explicit names are checked)
+    bad = _run_main(["--target", "ghost", "version"], main_home, {})
+    assert bad.returncode == 2
+    assert "no target named 'ghost'" in bad.stderr
+
+
+def test_main_target_equals_form_and_missing_name(main_home: Path) -> None:
+    # BLOCKER 2a: `--target=NAME` works end to end; 2c: a NAME that looks like
+    # a flag or is a subcommand is a usage error, not a target name
+    ok = _run_main(["--target=sandbox", "version"], main_home, {})
+    assert ok.returncode == 0, ok.stderr
+    for argv in (["--target", "--help"], ["--target=", "version"], ["--target"]):
+        bad = _run_main(argv, main_home, {})
+        assert bad.returncode == 2, (argv, bad.stderr)
+        assert "needs a name" in bad.stderr
+
+
+def test_main_target_after_subcommand_is_rejected_before_applying(
+    main_home: Path,
+) -> None:
+    # BLOCKER 2b: after the subcommand --target is not a global option: a
+    # usage error, exit 2, and (checked in test_main_flag_never_mutates_env)
+    # no env mutation before the rejection
+    for argv in (["ls", "--target", "sandbox"], ["ls", "--target=sandbox"]):
+        bad = _run_main(argv, main_home, {"REWORK_TEST_MARK": "1"})
+        assert bad.returncode == 2, (argv, bad.stdout, bad.stderr)
+        assert "must come before the subcommand" in bad.stderr
+
+
+def test_main_flag_never_mutates_env_on_error(main_home: Path) -> None:
+    # the wrong-target guard: a rejected invocation writes NOTHING to the env.
+    # Prove it by re-running `version` as a child with a snapshot comparison:
+    # `python -m rework --version` prints the version WITHOUT resolution side
+    # effects, so instead compare against a direct python -c run of main().
+    probe = (
+        "import os, sys; sys.argv=['rework','ls','--target','sandbox'];"
+        "from rework.cli import main;\n"
+        "try:\n    main()\nexcept SystemExit:\n    pass\n"
+        "print('REWORK_DB' in os.environ, 'REWORK_TARGET_NAME' in os.environ)"
+    )
+    env = {
+        **os.environ,
+        "HOME": str(main_home),
+        "REWORK_TARGETS": str(main_home / "targets.toml"),
+        "PYTHONPATH": "src",
+        "REWORK_LOG_DIR": str(main_home / "logs"),
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=60, env=env
+    )
+    assert result.stdout.strip() == "False False", result.stdout + result.stderr
+
+
+def test_main_stderr_and_exit_code_are_consistent(main_home: Path) -> None:
+    # BLOCKER 2d: one error shape — all --target errors on stderr, exit 2
+    for argv, needle in (
+        (["--target", "ghost", "version"], "no target named 'ghost'"),
+        (["--target", "rewvis", "version"], None),  # postgres target is fine to SELECT
+    ):
+        result = _run_main(argv, main_home, {})
+        if needle is None:
+            assert result.returncode == 0, result.stderr
+            assert result.stdout.startswith("rework ")
+            continue
+        assert result.returncode == 2
+        assert needle in result.stderr
+        assert needle not in result.stdout

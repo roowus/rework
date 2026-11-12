@@ -44,6 +44,7 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "REWORK_LIBRARY_DIR",
         "REWORK_TARGET_NAME",
         "REWORK_TARGET",
+        "REWORK_CHECKPOINTS_DB",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -144,3 +145,108 @@ def test_env_var_selection_via_rework_target(targets_file: Path) -> None:
 def test_target_is_a_carry_only_dataclass() -> None:
     t = Target(name="x")
     assert t.db is None and t.ssh is None
+
+
+# --- main()'s argv scan and the sqlite reachability helpers ------------------
+
+
+def test_parse_target_flag_forms() -> None:
+    from rework.cli import parse_target_flag
+
+    assert parse_target_flag(["ls"]) == (None, ["ls"])
+    assert parse_target_flag(["--target", "sandbox", "ls"]) == ("sandbox", ["ls"])
+    assert parse_target_flag(["--target=sandbox", "ls"]) == ("sandbox", ["ls"])
+    assert parse_target_flag(["--target", "sandbox"]) == ("sandbox", [])
+    assert parse_target_flag([]) == (None, [])
+    # after the subcommand: never a global flag (main() must reject, not guess)
+    assert parse_target_flag(["ls", "--target", "sandbox"]) == (
+        None,
+        ["ls", "--target", "sandbox"],
+    )
+    assert parse_target_flag(["ls", "--target=sandbox"]) == (
+        None,
+        ["ls", "--target=sandbox"],
+    )
+    assert parse_target_flag(["ls", "--", "--target", "sandbox"]) == (
+        None,
+        ["ls", "--", "--target", "sandbox"],
+    )
+    # a NAME that looks like a flag is not consumed (`--target --help`)
+    assert parse_target_flag(["--target", "--help"]) == (None, ["--target", "--help"])
+    assert parse_target_flag(["--target"]) == (None, ["--target"])
+    assert parse_target_flag(["--target="]) == (None, [])
+    # other global flags are skipped without eating their neighbours
+    assert parse_target_flag(["--help", "--target", "sandbox", "ls"]) == ("sandbox", ["ls"])
+
+
+def test_sqlite_db_path_forms() -> None:
+    from rework.targets import sqlite_db_path
+
+    assert sqlite_db_path("postgresql://h/db") is None
+    assert sqlite_db_path("/abs/state.db") == Path("/abs/state.db")
+    assert sqlite_db_path("rel/state.db") == Path("rel/state.db")
+    # the docs/ops.md form: the one a bare Path(db) mangles into a relative path
+    assert sqlite_db_path("sqlite:////Users/you/.rework/sandbox.db") == Path(
+        "/Users/you/.rework/sandbox.db"
+    )
+    assert sqlite_db_path("sqlite:///rel/state.db") == Path("rel/state.db")
+    assert sqlite_db_path("sqlite:x.db") == Path("x.db")
+    assert sqlite_db_path("sqlite://host/x.db") is None  # a remote authority
+    assert sqlite_db_path("sqlite:///") is None
+
+
+def test_db_reachable_on_a_sqlite_url(tmp_path: Path) -> None:
+    from rework.targets import db_reachable
+
+    good = tmp_path / "sandbox.db"
+    good.write_bytes(b"")  # an empty file is a valid sqlite database
+    assert db_reachable(str(good))  # a plain path
+    assert db_reachable(f"sqlite:///{good}")  # the docs/ops.md URL form
+    assert not db_reachable(f"sqlite:///{tmp_path}/nope.db")  # missing file
+    assert not db_reachable("postgresql://nobody:nobody@127.0.0.1:1/nope")
+
+
+def test_checkpoints_db_applied_and_never_clobbered(tmp_path: Path) -> None:
+    os.environ.pop("REWORK_CHECKPOINTS_DB", None)
+    path = tmp_path / "targets.toml"
+    path.write_text(
+        '[targets.sandbox]\ndb = "/tmp/rework/state.sqlite3"'
+        '\ndaemon_url = "http://127.0.0.1:8941"\n'
+    )
+    resolve_target(flag="sandbox", path=path)
+    # a sqlite target is self-contained: checkpoints land next to the state db
+    assert os.environ["REWORK_CHECKPOINTS_DB"] == "/tmp/rework/checkpoints.sqlite3"
+    # an explicit env always wins (setdefault-only, like every other key)
+    os.environ["REWORK_CHECKPOINTS_DB"] = "/tmp/mine/ck.db"
+    resolve_target(flag="sandbox", path=path)
+    assert os.environ["REWORK_CHECKPOINTS_DB"] == "/tmp/mine/ck.db"
+    del os.environ["REWORK_CHECKPOINTS_DB"]
+
+
+def test_checkpoints_db_field_and_env_beat_the_default(tmp_path: Path) -> None:
+    os.environ.pop("REWORK_CHECKPOINTS_DB", None)
+    path = tmp_path / "targets.toml"
+    path.write_text(
+        '[targets.sandbox]\ndb = "/tmp/rework/state.sqlite3"'
+        '\ndaemon_url = "http://127.0.0.1:8941"'
+        '\ncheckpoints_db = "/tmp/other/ck.db"\n'
+    )
+    resolve_target(flag="sandbox", path=path)
+    assert os.environ["REWORK_CHECKPOINTS_DB"] == "/tmp/other/ck.db"
+    os.environ.pop("REWORK_CHECKPOINTS_DB")
+    path.write_text(
+        '[targets.sandbox]\ndb = "/tmp/rework/state.sqlite3"'
+        '\ndaemon_url = "http://127.0.0.1:8941"'
+        '\ncheckpoints_db_env = "REWORK_TEST_CK_DB"\n'
+    )
+    os.environ["REWORK_TEST_CK_DB"] = "/tmp/from-env/ck.db"
+    resolve_target(flag="sandbox", path=path)
+    assert os.environ["REWORK_CHECKPOINTS_DB"] == "/tmp/from-env/ck.db"
+    os.environ.pop("REWORK_CHECKPOINTS_DB")
+    os.environ.pop("REWORK_TEST_CK_DB")
+
+
+def test_postgres_target_touches_no_checkpoints_var(targets_file: Path) -> None:
+    os.environ.pop("REWORK_CHECKPOINTS_DB", None)
+    resolve_target(flag="rewvis")  # postgres shares the main db
+    assert "REWORK_CHECKPOINTS_DB" not in os.environ
