@@ -49,9 +49,12 @@ complaints drive changes the way public opinion drives policy.
 
 5. **The loop closes.** A complaint that becomes a code change gets its status set
    to resolved with the fixing commit; the eval suite gains the scenario that caused
-   it where possible. Complaints are one of the Library's memory item sources: the
-   lesson "auditors need the test output to review coverage" becomes a skill other
-   missions retrieve.
+   it where possible. Complaints are one of the Library's memory item sources: a
+   complaint that distills into a GENERAL, reusable lesson (e.g. "auditors need the
+   test output to review coverage") can become a skill other missions retrieve --
+   but only when it reads as a technique, not a recap of the mission that raised it
+   (the Library's generality gate, M7: `rework.library.curation.skill_generality_ok`);
+   otherwise it is filed as a report.
 
 ## Consequences
 

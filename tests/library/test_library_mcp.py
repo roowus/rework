@@ -31,9 +31,16 @@ async def _seed(env: dict[str, str]) -> None:
             git,
             type_=ItemType.SKILL,
             name="toy recipe",
-            description="how to fix the toyrepo",
+            description="how to flip a sign and rerun pytest to confirm a fix",
             body="run pytest, flip the sign",
             tags=["toyrepo"],
+            # a genuine justification: this must stay an ACTIVE skill (not get
+            # demoted to a report) so the MCP round trip really exercises the
+            # active-skill path, not just "any item is readable"
+            reusable_because=(
+                "this generalizes to any future numeric off-by-one bug: run the"
+                " failing test, flip the sign, rerun, confirm green"
+            ),
         )
     finally:
         await index.aclose()
@@ -59,9 +66,10 @@ async def test_mcp_stdio_round_trip(tmp_path: Path, mcp_env: dict[str, str]) -> 
             res = await session.call_tool("search", {"query": "toyrepo"})
             text = res.content[0].text
             assert "toy recipe" in text
+            assert "[skill]" in text  # the seed is an ACTIVE skill, not demoted
             item_id = text.split()[0]
 
-            # get serves the body
+            # get serves the body of that active skill
             res = await session.call_tool("get", {"item_id": item_id})
             assert "flip the sign" in res.content[0].text
 
