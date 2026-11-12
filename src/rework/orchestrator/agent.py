@@ -843,7 +843,9 @@ class MissionOrchestrator:
             )
         last_audit = audits[-1]
         coders = await self._completed_runs("coder")
-        after = [r for r in coders if r.created_at > last_audit.created_at]
+        # a coder that FINISHED after the audit STARTED changed the branch after
+        # the auditor looked (they can run in parallel): compare finish to start
+        after = [r for r in coders if (r.updated_at or r.created_at) > last_audit.created_at]
         if after:
             raise ToolError(
                 f"coder {after[-1].id} ran after the last completed audit {last_audit.id}: "

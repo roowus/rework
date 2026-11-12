@@ -1349,3 +1349,41 @@ async def test_accepted_findings_survive_a_restart_at_the_gate(world: dict[str, 
     assert orch.accepted_findings == full
     await orch._enforce_audit_fresh()  # audited, and nothing ran after the audit
     await orch._enforce_findings_accepted(orch.accepted_findings)  # still fully covered
+
+
+async def test_a_coder_that_finished_after_the_audit_started_is_unaudited(
+    world: dict[str, Any],
+) -> None:
+    """A coder started BEFORE the last audit but finishing AFTER it began (the
+    two ran in parallel) changed the branch after the auditor looked: what the
+    rail compares is the coder's finish against the audit's start."""
+    from rework.kernel.state.records import Run
+    from rework.orchestrator.agent import MissionOrchestrator, ToolError
+
+    store: SqliteStore = world["store"]
+    t0 = 1_000_000.0
+    await store.create_run(
+        Run(
+            id="mo:code:coder:1",
+            mission_id="mo",
+            role="coder",
+            step="code",
+            status=RunStatus.COMPLETED,
+            created_at=t0,
+            updated_at=t0 + 300,
+        )
+    )
+    await store.create_run(
+        Run(
+            id="mo:audit:auditor:1",
+            mission_id="mo",
+            role="auditor",
+            step="audit",
+            status=RunStatus.COMPLETED,
+            created_at=t0 + 100,
+            updated_at=t0 + 200,
+        )
+    )
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    with pytest.raises(ToolError, match="after the last completed audit"):
+        await orch._enforce_audit_fresh()
