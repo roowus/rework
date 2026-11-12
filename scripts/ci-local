@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Run the CI checks (.github/workflows/ci.yml) locally.
+#
+#   scripts/ci-local          # this checkout, as it is
+#   scripts/ci-local 18       # PR #18 merged onto main, in a scratch clone
+#
+# Exits non-zero if any check fails.
+set -uo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ $# -gt 0 ]]; then
+  pr=$1
+  dir="${TMPDIR:-/tmp}/rework-ci-pr$pr"
+  rm -rf "$dir"
+  git clone -q "$(git -C "$here" remote get-url origin)" "$dir" || exit 2
+  cd "$dir" || exit 2
+  git fetch -q origin "pull/$pr/head:pr-$pr" || exit 2
+  git -c user.name=ci -c user.email=ci@localhost merge -q --no-edit "pr-$pr" >/dev/null \
+    || { echo "PR #$pr does not merge cleanly onto main"; exit 3; }
+  echo "PR #$pr merged onto main in $dir"
+else
+  cd "$here" || exit 2
+fi
+unset VIRTUAL_ENV  # never test the caller's environment (see role_env in nodes/tools.py)
+uv sync -q || exit 2
+fail=0
+step() { local name=$1; shift; if "$@"; then echo "ok    $name"; else echo "FAIL  $name"; fail=1; fi; }
+step "ruff check" uv run ruff check . -q
+step "ruff format" uv run ruff format --check -q .
+step "mypy" bash -c 'uv run mypy src | tail -1'
+step "pytest" bash -c 'uv run pytest -m "not smoke" -q -p no:cacheprovider 2>&1 | tail -1; exit ${PIPESTATUS[0]}'
+exit $fail

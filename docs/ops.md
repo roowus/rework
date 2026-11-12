@@ -133,6 +133,19 @@ Prices for Anthropic come from OpenRouter's list (Anthropic's list prices);
 anything without a known price got a deliberately high estimate so budgets
 stay conservative.
 
+## Checks before merging (`scripts/ci-local`)
+
+rework never uses GitHub Actions: coders and auditors run the checks
+themselves. `.github/workflows/ci.yml` lists those checks and runs only when
+started by hand (on every push it used the private repo's whole free
+allowance, 2,000 minutes, by 2026-11-11, and GitHub refused all jobs).
+Before merging a PR, run the same checks locally on it merged onto main:
+
+```bash
+scripts/ci-local 18      # PR #18 onto main, in a scratch clone
+scripts/ci-local         # this checkout as it is
+```
+
 ## Reclaim disk (`rework gc`)
 
 Every role run gets its own git worktree (often with its own virtualenv), and
@@ -149,6 +162,21 @@ rework gc --older-than-days 3          # rewvis
 ```
 
 ## rewvis (the deployment)
+
+**Is it up?** rewvis is a long-running box (48 days of uptime on 2026-11-12)
+and is essentially always up. The Mac's own tailnet path drops for minutes at
+a time, which makes rewvis LOOK down from the Mac; twice that was misread as
+an outage. Check it like this, and retry for a couple of minutes before
+concluding anything:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" https://agent.rewis/   # 200 = up (HTTPS; http:// is not the test)
+ssh -o ConnectTimeout=15 ubuntu@100.107.125.118 uptime         # the box itself
+```
+
+ICMP `ping` and `tailscale ping` failing alone prove nothing. If the owner
+can open https://agent.rewis/ in a browser, rewvis is up and the problem is
+the path from where you are.
 
 The daemon runs as `rework.service` (systemd, User=ubuntu) on rewvis
 (tailnet 100.107.125.118), state in Postgres `rework_state` on the
