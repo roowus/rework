@@ -13,6 +13,9 @@ real ~/.rework/state.sqlite3.
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -572,7 +575,7 @@ def _run_main(
     env = {k: v for k, v in env.items() if v != "" or k == "REWORK_DB"}
     env.update(env_extra or {})
     return subprocess.run(
-        [sys.executable, "-m", "rework", *argv],
+        [sys.executable, str(Path(sys.executable).parent / "rework"), *argv],
         capture_output=True,
         text=True,
         timeout=60,
@@ -585,7 +588,7 @@ def _run_main(
 def main_home(tmp_path: Path) -> Path:
     home = tmp_path / "home"
     (home / ".rework").mkdir(parents=True)
-    (home / ".rework" / "targets.toml").write_text(
+    (home / "targets.toml").write_text(
         MAIN_TARGETS_TOML.replace("/tmp/probe/sandbox.db", str(tmp_path / "sandbox.db"))
     )
     (tmp_path / "sandbox.db").write_bytes(b"")  # a valid empty sqlite database
@@ -596,11 +599,17 @@ def test_main_rework_target_env_selects_end_to_end(main_home: Path) -> None:
     # BLOCKER 1: bare `rework` with only REWORK_TARGET set must still resolve
     # (the pre-fix bug: main() resolved targets only when "--target" was in argv)
     result = _run_main(["version"], main_home, {"REWORK_TARGET": "rewvis"})
-    assert result.returncode == 2, result.stderr  # unknown-target, exit 2, stderr
-    assert "REWORK_TARGET: no target named" not in result.stdout
+    # rewvis IS defined (postgres, unreachable — but selection is not reachability):
+    # resolution must succeed and the command must run
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("rework ")
     ok = _run_main(["targets"], main_home, {"REWORK_TARGET": "sandbox"})
     assert ok.returncode == 0
     assert "sandbox" in ok.stdout
+    # an unknown REWORK_TARGET is the error case: exit 2, on stderr
+    bad = _run_main(["version"], main_home, {"REWORK_TARGET": "ghost"})
+    assert bad.returncode == 2
+    assert "no target named 'ghost'" in bad.stderr
 
 
 def test_main_default_only_selection_reaches_subcommands(main_home: Path) -> None:
@@ -656,6 +665,7 @@ def test_main_flag_never_mutates_env_on_error(main_home: Path) -> None:
         "PYTHONPATH": "src",
         "REWORK_LOG_DIR": str(main_home / "logs"),
     }
+    env = {k: v for k, v in env.items() if not k.startswith("REWORK_DB")}
     result = subprocess.run(
         [sys.executable, "-c", probe], capture_output=True, text=True, timeout=60, env=env
     )
