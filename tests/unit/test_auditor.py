@@ -32,10 +32,16 @@ def test_verdict_mapping() -> None:
     high = {"findings": [{"severity": "low"}, {"severity": "high"}]}
     clean = {"findings": [{"severity": "low"}]}
     empty = {"findings": []}
+    blockers = {"findings": [], "blockers": [{"question": "is prod affected?"}]}
     assert mechanical_verdict(critical) == "request changes"
     assert mechanical_verdict(high) == "approve with fixes"
     assert mechanical_verdict(clean) == "approve"
     assert mechanical_verdict(empty) == "approve"
+    # fail-closed: nothing to audit is NOT an approval
+    assert mechanical_verdict(None) == "not audited"
+    assert mechanical_verdict({}) == "not audited"
+    # open blockers count, and they were ignored before this change
+    assert mechanical_verdict(blockers) == "request changes"
 
 
 # -- scripted audit ----------------------------------------------------------------
