@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
+from rework.library.curation import backfill_bodies, contribute
 from rework.library.model import (
     ItemStatus,
     ItemType,
@@ -11,7 +14,7 @@ from rework.library.model import (
     Origin,
     Provenance,
 )
-from rework.library.store import GitLibrary
+from rework.library.store import GitLibrary, open_library_store, read_item_body
 
 
 def _item(name: str = "toyrepo fix recipe", **kw) -> LibraryItem:
@@ -129,3 +132,188 @@ async def test_postgres_reads_leave_no_open_transaction(library_index) -> None: 
     ):
         await read()
         assert library_index._conn.info.transaction_status == TransactionStatus.IDLE
+
+
+# -- body in the DB row (cross-machine reads) -------------------------------
+
+
+async def test_body_round_trips_through_the_row(library_index) -> None:
+    """The body is a column, not just a file: it must survive a fresh read."""
+    item = _item("row body skill")
+    item.body = "# from the row\nstep one\n"
+    await library_index.upsert_item(item)
+
+    got = await library_index.get_item(item.id)
+    assert got is not None
+    assert got.body == "# from the row\nstep one\n"
+
+    # an update rewrites the body (write-through, not write-once)
+    item.body = "# edited\n"
+    item.touch()
+    await library_index.upsert_item(item)
+    got2 = await library_index.get_item(item.id)
+    assert got2 is not None and got2.body == "# edited\n"
+
+    # a fresh store handle on the same DB sees it too (new connection)
+    listed = await library_index.list_items()
+    assert [i.body for i in listed if i.id == item.id] == ["# edited\n"]
+
+
+async def test_row_body_wins_over_the_git_file(tmp_path) -> None:
+    """The row is the source of truth: a stale local file must not shadow it."""
+
+    db = tmp_path / "state.sqlite3"
+    index = await open_library_store(str(db))
+    try:
+        item = _item("stale file skill")
+        item.body_path = "skills/stale-file-skill.md"
+        item.body = "# the row version\n"
+        await index.upsert_item(item)
+
+        git = GitLibrary(tmp_path / "lib")
+        git.ensure_repo()
+        dest = git.root / item.body_path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text("# the stale file version\n")
+
+        got = await index.get_item(item.id)
+        assert got is not None
+        assert read_item_body(got, git) == "# the row version\n"
+    finally:
+        await index.aclose()
+
+
+async def test_body_readable_on_a_machine_with_no_git_folder(tmp_path, library_index) -> None:
+    """THE cross-machine case: written with git folder A, read with git folder
+    B (a different, empty library dir -- i.e. a second machine sharing only
+    the index). The body must still come back."""
+    machine_a = GitLibrary(tmp_path / "machine-a" / "library")
+    item, _note = await contribute(
+        library_index,
+        machine_a,
+        type_=ItemType.SKILL,
+        name="cross machine recipe",
+        description="how to read a body on another machine",
+        body="run the failing test, then fix it\n",
+        tags=["cross-machine"],
+        reusable_because="generalizes to any future cross-machine library read",
+    )
+    assert machine_a.read_body(item) is not None  # file exists on machine A
+
+    machine_b = GitLibrary(tmp_path / "machine-b" / "library")
+    assert not machine_b.root.exists()
+    assert machine_b.read_body(item) is None  # no local file on machine B
+
+    fresh = await library_index.get_item(item.id)
+    assert fresh is not None
+    body = read_item_body(fresh, machine_b)
+    assert body is not None and "run the failing test" in body
+    assert body == machine_a.read_body(item)
+
+    # and deleting machine A's file does not matter either: the row has it
+    for path in (machine_a.root / item.body_path).parent.glob("*.md"):
+        path.unlink()
+    assert machine_a.read_body(item) is None
+    assert read_item_body(fresh, machine_a) == body
+
+
+async def test_contribute_persists_the_git_body_text(tmp_path, library_index) -> None:
+    """contribute() still writes the git file (local history) AND the row."""
+    git = GitLibrary(tmp_path / "lib")
+    item, _note = await contribute(
+        library_index,
+        git,
+        type_=ItemType.REPORT,
+        name="report with a body",
+        description="d",
+        body="# report\nfindings here\n",
+        tags=[],
+    )
+    fresh = await library_index.get_item(item.id)
+    assert fresh is not None
+    assert "findings here" in fresh.body
+    # the file and the row agree (the file is the mirror, the row the truth)
+    assert (git.root / (item.body_path or "")).read_text() == fresh.body
+
+
+async def test_backfill_bodies_from_the_local_files(tmp_path) -> None:
+    """A pre-migration row (body column empty, file on disk) is filled by the
+    backfill and stays readable after the file goes away."""
+    db = tmp_path / "state.sqlite3"
+    index = await open_library_store(str(db))
+    git = GitLibrary(tmp_path / "lib")
+    try:
+        # simulate the old world: file written, row has only body_path
+        legacy = _item("legacy skill")
+        legacy.body_path = await asyncio.to_thread(
+            git.write_body, legacy, "# legacy body\n", "library: add skill"
+        )
+        assert legacy.body == ""
+        await index.upsert_item(legacy)
+        assert (await index.get_item(legacy.id)).body == ""  # type: ignore[union-attr]
+
+        # a row whose file is NOT on this machine is skipped, not failed
+        orphan = _item("orphan skill")
+        orphan.body_path = "skills/orphan-skill.md"
+        await index.upsert_item(orphan)
+
+        filled, skipped = await backfill_bodies(index, git)
+        assert (filled, skipped) == (1, 1)
+        got = await index.get_item(legacy.id)
+        assert got is not None and got.body == "# legacy body\n"
+
+        # idempotent: a second run is a no-op (and skips the orphan again)
+        assert await backfill_bodies(index, git) == (0, 1)
+
+        # the row alone is enough: remove the file, the body survives
+        (git.root / legacy.body_path).unlink()
+        again = await index.get_item(legacy.id)
+        assert again is not None
+        assert read_item_body(again, git) == "# legacy body\n"
+    finally:
+        await index.aclose()
+
+
+async def test_sqlite_migration_adds_body_without_data_loss(tmp_path) -> None:
+    """An existing sqlite DB created before the column existed must gain it
+    (PRAGMA table_info + ALTER), keeping its rows."""
+    import aiosqlite
+
+    from rework.library.store import _SQLITE_DDL
+
+    db = tmp_path / "old.sqlite3"
+    # the DDL as it was before the column existed (drop just the body line)
+    old_ddl = [d.replace("        body TEXT,\n", "") for d in _SQLITE_DDL]
+    assert all("body TEXT" not in d for d in old_ddl)
+    conn = await aiosqlite.connect(str(db))
+    for ddl in old_ddl:
+        await conn.execute(ddl)
+    await conn.execute(
+        "INSERT INTO library_items (id, type, name, description, body_path, tags,"
+        " provenance, status, version, uses, created_at, updated_at, vectors)"
+        " VALUES ('l-old', 'skill', 'old skill', 'd', 'skills/old-skill.md', '[]',"
+        " '{}', 'active', 1, 0, 1.0, 1.0, '{}')"
+    )
+    await conn.commit()
+    cur = await conn.execute("PRAGMA table_info(library_items)")
+    cols = {row[1] for row in await cur.fetchall()}
+    assert "body" not in cols
+    await conn.close()
+
+    index = await open_library_store(str(db))
+    try:
+        got = await index.get_item("l-old")
+        assert got is not None
+        assert got.name == "old skill"  # no data loss
+        assert got.body == ""  # new column, empty for the pre-existing row
+        got.body = "# filled in later\n"
+        await index.upsert_item(got)
+        assert (await index.get_item("l-old")).body == "# filled in later\n"  # type: ignore[union-attr]
+    finally:
+        await index.aclose()
+    # re-opening is a no-op, not an error (ALTER only when missing)
+    index2 = await open_library_store(str(db))
+    try:
+        assert (await index2.get_item("l-old")).body == "# filled in later\n"  # type: ignore[union-attr]
+    finally:
+        await index2.aclose()

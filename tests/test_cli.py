@@ -333,3 +333,50 @@ def test_report_md_shows_accepted_findings(rework_db: Path) -> None:
     text = out.read_text(encoding="utf-8")
     assert "### Accepted findings (shipped knowingly)" in text
     assert "**No test for the zero-results path** — issue filed" in text
+
+
+def test_library_backfill_bodies_command(
+    rework_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`rework library backfill-bodies` fills rows that predate the body
+    column from this machine's library git folder, and is safe to re-run."""
+    from rework.library.model import ItemStatus, ItemType, LibraryItem
+    from rework.library.store import GitLibrary, open_library_store
+
+    lib_root = tmp_path / "library"
+    monkeypatch.setenv("REWORK_LIBRARY_DIR", str(lib_root))
+
+    async def seed() -> str:
+        index = await open_library_store(str(rework_db))
+        git = GitLibrary(lib_root)
+        try:
+            legacy = LibraryItem(type=ItemType.SKILL, name="legacy skill", status=ItemStatus.ACTIVE)
+            legacy.body_path = await asyncio.to_thread(
+                git.write_body, legacy, "# legacy body\n", "library: add skill"
+            )
+            await index.upsert_item(legacy)  # row with an empty body: pre-migration
+            return legacy.id
+        finally:
+            await index.aclose()
+
+    item_id = asyncio.run(seed())
+
+    out = runner.invoke(app, ["library", "backfill-bodies"])
+    assert out.exit_code == 0, out.output
+    assert "backfilled 1 item body/bodies" in out.output
+    assert "skipped" not in out.output
+
+    async def body_of() -> str:
+        index = await open_library_store(str(rework_db))
+        try:
+            got = await index.get_item(item_id)
+            return got.body if got else "<missing>"
+        finally:
+            await index.aclose()
+
+    assert asyncio.run(body_of()) == "# legacy body\n"
+
+    # idempotent: nothing left to fill
+    again = runner.invoke(app, ["library", "backfill-bodies"])
+    assert again.exit_code == 0, again.output
+    assert "backfilled 0 item body/bodies" in again.output
