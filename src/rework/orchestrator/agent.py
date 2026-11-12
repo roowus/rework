@@ -235,6 +235,11 @@ TOOLS: list[ToolSpec] = [
                 },
                 "options": {"type": "array", "items": {"type": "string"}},
                 "run_id": {"type": "string"},
+                "ship_approval": {
+                    "type": "boolean",
+                    "description": "Set to true when asking the owner to approve "
+                    "shipping despite audit findings (revise-until-clean enforcement bypass).",
+                },
             },
             "required": ["question"],
         },
@@ -1090,6 +1095,10 @@ class MissionOrchestrator:
             spec: dict[str, Any] = {"_call": call_id, "asked_by": "orchestrator"}
             if options:
                 spec["options"] = options
+            # Include ship_approval marker if this is a ship-approval request
+            ship_approval = args.get("ship_approval")
+            if ship_approval is True:
+                spec["ship_approval"] = True
             gate = await self.r._gates.request(
                 self.mid, kind=kind, question=question, for_run=run_id, spec=spec
             )
@@ -1245,16 +1254,8 @@ class MissionOrchestrator:
         for gate in gates:
             if gate.status == GateStatus.APPROVED and gate.kind == GateKind.PERMISSION:
                 spec = gate.spec or {}
-                # Explicit ship-approval marker (defense-in-depth: also check the old pattern)
+                # Only recognize explicit ship_approval=True marker
                 if spec.get("ship_approval") is True:
-                    return True
-                # Legacy pattern: orchestrator ask_owner without budget_to or turn_cap
-                # (kept for defense-in-depth, but new code should use ship_approval=True)
-                if (
-                    spec.get("asked_by") == "orchestrator"
-                    and not spec.get("budget_to")
-                    and not spec.get("turn_cap")
-                ):
                     return True
         return False
 

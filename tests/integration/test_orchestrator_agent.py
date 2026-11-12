@@ -671,12 +671,16 @@ async def test_restart_after_finish_goes_straight_to_the_gate(world: dict[str, A
     first.cancel()
     with pytest.raises(asyncio.CancelledError):
         await first
+    # Record how many model calls happened before the restart
+    calls_before = len(provider.requests)
     second = asyncio.create_task(runner(world).run())
     await approve_next_gate(world)
     await asyncio.wait_for(second, timeout=30)
     # After the restart, finish should be called without re-invoking coder/auditor
     # The first call spawned and ran coder+auditor, then was cancelled at the gate
     # The restart goes straight to ship gate without calling the model again
+    # Verify no extra model call was made (accounting for the auditor step in the script)
+    assert len(provider.requests) == calls_before, "restart should not make extra model calls"
     mission = await store.get_mission("mo")
     assert mission is not None and mission.status == MissionStatus.DONE
     assert (mission.result or {}).get("summary") == "all good"
@@ -1267,6 +1271,7 @@ async def test_finish_done_allowed_with_owner_ship_approval(world: dict[str, Any
                     "o6",
                     question="Ship despite medium finding?",
                     kind="permission",
+                    ship_approval=True,
                 ),
                 call("wait", "o7"),
             ),
@@ -1295,8 +1300,8 @@ async def test_finish_done_allowed_with_owner_ship_approval(world: dict[str, Any
     assert gate is not None, "ship approval gate should have been created"
 
     # Approve the ship-approval gate
-    # The gate was created by orchestrator's ask_owner with asked_by="orchestrator"
-    # and no budget_to/turn_cap, so _has_owner_ship_approval will recognize it
+    # The gate was created by orchestrator's ask_owner with ship_approval=True,
+    # so _has_owner_ship_approval will recognize it
     from rework.kernel.gates import GateManager
 
     await GateManager(store, InProcessEventBus(store)).decide(gate.id, approved=True)
