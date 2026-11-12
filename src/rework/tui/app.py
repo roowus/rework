@@ -150,6 +150,12 @@ class ReworkApp(App[None]):
         self._last_error: tuple[str, str] | None = None
         self._last_error_at = 0.0
         self._suppressed_errors = 0
+        # toast-log guard: the (severity, title, message) of the last toast
+        # written to tui.log plus when, so a burst of identical toasts cannot
+        # flood the log (the same shape as the storm guard above)
+        self._last_toast: tuple[str, str, str] | None = None
+        self._last_toast_at = 0.0
+        self._suppressed_toasts = 0
         # "the code on disk moved under us": recorded here, said once (see
         # _check_code); None until the shell is mounted and can paint a note
         self._code_watcher: CodeChangeWatcher | None = None
@@ -274,10 +280,22 @@ class ReworkApp(App[None]):
         severity: SeverityLevel = "information",
         timeout: float | None = None,
         markup: bool = False,
+        _logged: bool = False,
     ) -> None:
         """Every toast the owner would actually see is recorded here, so tests
         can assert on notifications (refusals included). Channels follow
         `settings.notify`, exactly like `announce`.
+
+        Every toast also writes ONE line to tui.log (visible in `rework logs
+        tui`): once a toast fades it is gone, and only errors that went through
+        `_swallow` used to reach the log. Severity picks the level — warning,
+        error, and information for anything else — and the line carries both
+        title and message. Identical toasts inside ERROR_STORM_WINDOW collapse
+        to debug, the way `_swallow` collapses its toasts.
+
+        `_logged` marks a toast whose error `_swallow` already logged with a
+        traceback: that one is logged at debug, never twice at error level. It
+        is private and is NOT forwarded to Textual.
 
         `markup` defaults to False ON PURPOSE: nearly every toast here embeds
         runtime text (an exception message, a model name, mission text). A
@@ -288,7 +306,37 @@ class ReworkApp(App[None]):
         interpolate."""
         if "toast" in self.settings.notify:
             self.notifications_sent.append(("toast", message))
+        self._log_toast(severity, title, message, logged=_logged)
         super().notify(message, title=title, severity=severity, timeout=timeout, markup=markup)
+
+    def _log_toast(
+        self, severity: SeverityLevel, title: str, message: str, *, logged: bool
+    ) -> None:
+        """One log record per toast, a burst of identical ones counted not
+        repeated (see notify). `logged` toasts are debug-only: `_swallow`
+        already wrote the traceback at error level."""
+        text = f"{title}: {message}" if title else message
+        key = (severity, title or "", message)
+        now = time.monotonic()
+        same = key == self._last_toast
+        if same and now - self._last_toast_at < ERROR_STORM_WINDOW:
+            self._last_toast_at = now  # sliding window, as _swallow
+            self._suppressed_toasts += 1
+            return
+        # a different message is its own burst: the count belongs to the last one
+        suppressed = self._suppressed_toasts if same else 0
+        self._suppressed_toasts = 0
+        self._last_toast = key
+        self._last_toast_at = now
+        more = f" ({suppressed} more identical, suppressed)" if suppressed else ""
+        if logged:
+            log.debug("%s%s", text, more)
+        elif severity == "error":
+            log.error("%s%s", text, more)
+        elif severity == "warning":
+            log.warning("%s%s", text, more)
+        else:
+            log.info("%s%s", text, more)
 
     def announce(self, text: str, *, title: str = "") -> None:
         """A human is needed. Channels per settings: toast, bell, os."""
@@ -602,6 +650,7 @@ class ReworkApp(App[None]):
                 severity="error",
                 timeout=6,
                 markup=False,  # exception text is untrusted, never parse it
+                _logged=True,  # the traceback is already in tui.log, above
             )
         except Exception:
             pass
