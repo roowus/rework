@@ -355,9 +355,13 @@ class LibraryView(View):
             return
         self._body_fingerprint = (_item.id, int(_item.version)) if _item is not None else None
         if body is None:
+            # bodies ride in the index row now, so this is a genuinely missing
+            # body: a row written before that column existed (and never
+            # backfilled) whose file is not on this machine either.
             body = (
-                "_The body is not on this machine._\n\nThe library git repo lives with the "
-                "daemon; this device shares only the index. Mirror the repo to read bodies here."
+                "_This item has no body._\n\nIt was indexed before bodies were stored with "
+                "the index and its file is not on this machine. Run `rework library "
+                "backfill-bodies` where the body file lives."
             )
         await md.update(body)
 

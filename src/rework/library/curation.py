@@ -215,6 +215,9 @@ async def contribute(
     item.body_path = await _asyncio.to_thread(
         git.write_body, item, body_to_write, f"library: add {item.type.value} {name!r}"
     )
+    # the git file is a local-history mirror; the row carries the body so
+    # other machines (same index, different library dir) can read it
+    item.body = body_to_write
     await index.upsert_item(item)
     note = f"contributed: {item.id} [{item.type.value}/{item.status.value}]"
     if item.status is ItemStatus.PROPOSED:
@@ -228,3 +231,29 @@ async def contribute(
             " this really generalizes."
         )
     return item, note
+
+
+async def backfill_bodies(index: Any, git: Any) -> tuple[int, int]:
+    """Copy body files from this machine's library git folder into the index
+    row for items that have none. Rows written before `body` was a column (or
+    by a machine that never had the file) have an empty body; the row is the
+    source of truth now, so this is the one-time bridge.
+
+    Idempotent: a row that already has a body is left untouched, and a row
+    whose file is not on this machine is skipped, so re-running is free.
+    Returns (backfilled, skipped)."""
+    import asyncio as _asyncio
+
+    backfilled = 0
+    skipped = 0
+    for item in await index.list_items(limit=100_000):
+        if item.body:
+            continue
+        text = await _asyncio.to_thread(git.read_body, item)
+        if not text:
+            skipped += 1
+            continue
+        item.body = text
+        await index.upsert_item(item)
+        backfilled += 1
+    return backfilled, skipped

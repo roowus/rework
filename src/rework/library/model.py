@@ -58,6 +58,11 @@ class LibraryItem(BaseModel):
     name: str
     description: str = ""
     body_path: str | None = None  # relative to the library repo root
+    # the body TEXT itself: the DB row is the source of truth so a role on
+    # another machine (sharing the index, not the git folder) can read an
+    # item. Empty on rows written before this column existed -> backfill /
+    # git-file fallback.
+    body: str = ""
     tags: list[str] = Field(default_factory=list)
     provenance: Provenance = Field(default_factory=Provenance)
     status: ItemStatus = ItemStatus.PROPOSED
@@ -81,6 +86,7 @@ def item_to_row(item: LibraryItem) -> dict[str, Any]:
         "name": item.name,
         "description": item.description,
         "body_path": item.body_path,
+        "body": item.body,
         "tags": item.tags,
         "provenance": item.provenance.model_dump(mode="json"),
         "status": item.status.value,

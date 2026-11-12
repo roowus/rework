@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict
 from rework.kernel.llm.types import ToolSpec
 from rework.library.curation import contribute
 from rework.library.model import ItemStatus, ItemType
-from rework.library.store import GitLibrary, LibraryStore
+from rework.library.store import GitLibrary, LibraryStore, read_item_body
 
 
 class LibraryHandle(BaseModel):
@@ -88,7 +88,9 @@ class LibraryHandle(BaseModel):
             )
         if item.status is not ItemStatus.ACTIVE:
             return f"error: {item.name} is {item.status.value}; only active items are served"
-        body = await asyncio.to_thread(self.git.read_body, item)
+        # DB row first: the body travels with the index, so a role on another
+        # machine reads items whose files live elsewhere (git = fallback only)
+        body = await asyncio.to_thread(read_item_body, item, self.git)
         await self.index.record_use(item.id)
         return body or f"(item {item.id} has no body file)"
 
