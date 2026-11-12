@@ -1,5 +1,23 @@
 # Running rework
 
+## One instance (since 2026-11-12)
+
+There is ONE rework: the Postgres database on rewvis (`rework_state`) is the
+source of truth for missions, runs, events, gates, chats, costs and the
+Library index, and the rewvis daemon runs every mission. The Mac's TUI talks
+to the same database (the owner's shell exports `REWORK_DB` and
+`REWORK_DAEMON_URL` for rewvis), so both machines show the same thing.
+
+- `scripts/rework-local` (SQLite on the Mac) is now a SANDBOX for isolated
+  experiments, not a second instance. Anything worth keeping can be moved into
+  rewvis with `scripts/merge_local_into.py` (dry run first; back up first:
+  `docker exec rework-dev-pg pg_dump -U postgres rework_state | gzip >
+  ~/backups/...`). The Mac's history was merged on 2026-11-12: 18 missions,
+  26 chats, 17 Library items (backup in `~/backups/` on rewvis).
+- Library item BODIES are still files in each machine's `~/.rework/library`
+  until the bodies-in-the-database change lands; until then both folders hold
+  the same 23 items (synced by hand on 2026-11-12).
+
 ## Local (the Mac): the dogfood loop, step one
 
 Everything runs on your machine against a local SQLite state file
