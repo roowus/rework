@@ -45,7 +45,7 @@ from rework.kernel.state.records import (
 )
 from rework.kernel.state.store import StateStore
 from rework.logs import bind
-from rework.nodes.report_sections import mechanical_verdict
+from rework.nodes.report_sections import accepted_findings_section, mechanical_verdict
 from rework.roles.base import EscalationKind, RoleBuildCtx
 from rework.roles.registry import RoleRegistry
 
@@ -581,9 +581,7 @@ class MissionRunner:
         if "ship" in gates_spec:
             gate = await self._latest_gate_of_kind(GateKind.SHIP)
             if gate is None:
-                verdict = (
-                    mechanical_verdict(last_audit_artifact) if last_audit_artifact else "approve"
-                )
+                verdict = mechanical_verdict(last_audit_artifact)
                 gate = await self._gates.request(
                     mission.id,
                     kind=GateKind.SHIP,
@@ -608,9 +606,7 @@ class MissionRunner:
         if "open_pr" in gates_spec:
             gate = await self._latest_gate_of_kind(GateKind.OPEN_PR)
             if gate is None:
-                verdict = (
-                    mechanical_verdict(last_audit_artifact) if last_audit_artifact else "approve"
-                )
+                verdict = mechanical_verdict(last_audit_artifact)
                 gate = await self._gates.request(
                     mission.id,
                     kind=GateKind.OPEN_PR,
@@ -681,21 +677,31 @@ class MissionRunner:
         )
 
     def _pr_body(
-        self, mission: Mission, coder_artifact: dict[str, Any], audit_run: Run | None
+        self,
+        mission: Mission,
+        coder_artifact: dict[str, Any],
+        audit_run: Run | None,
+        finish_summary: str = "",
+        accepted_findings: list[dict[str, str]] | None = None,
     ) -> str:
-        """The PR description, assembled mechanically from typed artifacts:
-        the coder's summary, the audit's verdict + findings + warnings, and the
-        run-stats table. Never LLM-written (same rule as the md report)."""
+        """The PR description, assembled mechanically from typed artifacts.
+
+        The mission is described by the ORCHESTRATOR's finish summary and the
+        audit (verdict, findings, what was knowingly accepted); the last coder
+        handoff is supplementary "implementation detail" in an appendix. Found
+        live: sourcing this from the coder handoff alone made PR #16 describe a
+        variable rename while the mission was much bigger. Never LLM-written
+        (same rule as the md report)."""
         lines: list[str] = [
             f"Produced by rework mission `{mission.id}`.",
             "",
             "## What changed",
             "",
-            str(coder_artifact.get("summary") or "")[:4000],
+            (finish_summary or str(coder_artifact.get("summary") or ""))[:6000],
             "",
         ]
         audit_artifact = (audit_run.artifact if audit_run else None) or {}
-        verdict = mechanical_verdict(audit_artifact) if audit_artifact else "no audit"
+        verdict = mechanical_verdict(audit_artifact)
         lines += ["## Audit", "", f"Verdict: **{verdict}** (mechanical mapping)."]
         findings = audit_artifact.get("findings", [])
         if findings:
@@ -709,11 +715,25 @@ class MissionRunner:
                     lines += ["", "Evidence: " + " · ".join(f"`{e}`" for e in evidence)]
         else:
             lines += ["", "No findings (clean audit)."]
+        accepted_section = accepted_findings_section(accepted_findings)
+        if accepted_section:
+            lines += ["", *accepted_section]
         warnings = audit_artifact.get("warnings", [])
         if warnings:
             lines += ["", "### Audit warnings (coverage limits)", ""]
             for w in warnings:
                 lines.append(f"- {w}")
+        # the coder's own handoff is an implementation detail, not the story
+        coder_summary = str(coder_artifact.get("summary") or "").strip()
+        if coder_summary:
+            lines += [
+                "",
+                "<details><summary>Implementation detail (last coder handoff)</summary>",
+                "",
+                coder_summary[:4000],
+                "",
+                "</details>",
+            ]
         stats = coder_artifact.get("run_stats")
         if stats:
             elapsed = f"{stats.get('elapsed_seconds', 0.0):.1f}s"
@@ -771,7 +791,15 @@ class MissionRunner:
         # a PR title is one line (found live: PR #2 carried the whole objective)
         name = mission.title or mission.objective.strip().splitlines()[0]
         title = f"rework: {name if len(name) <= 72 else name[:71].rstrip() + '…'}"
-        body = self._pr_body(mission, coder_run.artifact, results.get("audit"))
+        current = await self._store.get_mission(mission.id)
+        result = (current.result if current else None) or (mission.result or {})
+        body = self._pr_body(
+            mission,
+            coder_run.artifact,
+            results.get("audit"),
+            finish_summary=str(result.get("summary") or ""),
+            accepted_findings=list(result.get("accepted_findings") or []),
+        )
         await push_branch(worktree, branch)
         url = await pr_create(worktree, head=branch, title=title, body=body)
         await self._bus.publish(
@@ -789,6 +817,7 @@ class MissionRunner:
         ship_decision: bool | None,
         outcome: str | None = None,
         summary: str = "",
+        accepted_findings: list[dict[str, str]] | None = None,
     ) -> None:
         """`outcome` (the orchestrator's finish) overrides the mechanical
         latest-attempt rule: an orchestrator may abandon a failed run and
@@ -805,6 +834,8 @@ class MissionRunner:
         result: dict[str, Any] = {"artifacts": artifacts}
         if summary:
             result["summary"] = summary
+        if accepted_findings:
+            result["accepted_findings"] = list(accepted_findings)
         if outcome is not None:
             result["outcome"] = outcome
             failed = [] if outcome == "done" else list(latest.values())

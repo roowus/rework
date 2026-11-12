@@ -14,7 +14,7 @@ import typer
 
 from rework import __version__
 from rework.config import default_results_dir
-from rework.nodes.report_sections import mechanical_verdict
+from rework.nodes.report_sections import accepted_findings_section, mechanical_verdict
 
 app = typer.Typer(
     name="rework",
@@ -599,6 +599,12 @@ def _render_md(runs: list[tuple[Any, dict[str, Any]]], spend: Any, mission: Any)
         f" (cached {spend.cached_tokens:,})",
         "",
     ]
+    result = getattr(mission, "result", None) or {}
+    accepted_section = accepted_findings_section(result.get("accepted_findings"))
+    if accepted_section:
+        # what the mission shipped with knowingly open, and why: same text as
+        # the PR body (one renderer, so the two cannot drift)
+        out += [*accepted_section, ""]
     for run, artifact in runs:
         out.append(f"## {run.step} ({run.role}) attempt {run.attempt}: {run.status.value}")
         out.append("")

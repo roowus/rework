@@ -37,6 +37,7 @@ from rework.kernel.state.records import (
 )
 from rework.kernel.state.records import run_id as make_run_id
 from rework.logs import bind
+from rework.nodes.report_sections import blocking_findings, open_blockers
 
 log = logging.getLogger("rework.orchestrator")
 
@@ -52,6 +53,9 @@ OUTAGE_WAITS_S = (15.0, 30.0, 60.0, 120.0, 240.0)
 MAX_IDLE_NUDGES = 3
 PROVIDER_FAILURE_LIMIT = 2  # failed runs on one model before spawn_role refuses it
 
+STRICTNESS_LEVELS = ("light", "standard", "strict")
+DEFAULT_STRICTNESS = "standard"
+
 PLAYBOOKS: dict[str, str] = {
     "echo": (
         "Plumbing check: spawn the `echo` role once with the objective as its brief, "
@@ -60,20 +64,29 @@ PLAYBOOKS: dict[str, str] = {
     "fix": (
         "Usual shape: an investigator finds out what is going on (cheap model, quick "
         "depth unless the problem is unclear); a coder implements the change in its "
-        "own worktree and runs the tests; an auditor reviews the coder's diff. Then "
-        "LOOP: while the audit requests changes or reports any medium-or-higher "
-        "finding, spawn the coder again with those findings in its brief (it continues "
-        "on the previous coder's branch automatically) and audit again. Low-severity "
-        "notes alone do not need a revision. If three rounds have not converged, "
-        "ask_owner whether to continue. Skip the investigator when the change is small "
-        "and obvious. After you finish, the owner decides whether to ship."
+        "own worktree and runs the tests; an auditor reviews the coder's diff. Every "
+        "audit gets a `strictness` (light | standard | strict): pick it from RISK, not "
+        "habit: change size, blast radius (auth, money, migrations, core control flow "
+        "=> high), and what the last round found. Re-decide it EVERY round from the "
+        "latest report: a first round that turned up real problems earns a stricter "
+        "second round. Then LOOP: while the audit requests changes or reports a "
+        "medium-or-higher finding that you are not willing to ship with, spawn the "
+        "coder again with those findings in its brief (it continues on the previous "
+        "coder's branch automatically) and audit again. Severity is the auditor's "
+        "call, not a mechanical trigger: low notes alone do not need a revision, and "
+        "shipping with a medium finding still open is YOUR judgment to make and to "
+        "record in finish(accepted_findings=[...]) with a reason. If three rounds have "
+        "not converged, ask_owner whether to continue. Skip the investigator when the "
+        "change is small and obvious. After you finish, the owner decides whether to ship."
     ),
     "fix-pr": (
         "Same shape and same revise-until-clean loop as fix: investigate (optional for "
         "small changes), code, audit, revise while the audit requests changes or has "
-        "medium-or-higher findings (ask_owner after three rounds). After you finish, "
-        "the ENGINE pushes the last coder's branch and opens the pull request when the "
-        "owner approves the gate; agents never merge."
+        "medium-or-higher findings you are not willing to ship (ask_owner after three "
+        "rounds). Pick each audit's `strictness` from risk (size, blast radius, prior "
+        "findings) and re-decide it every round from the latest report, never once for "
+        "the whole mission. After you finish, the ENGINE pushes the last coder's branch "
+        "and opens the pull request when the owner approves the gate; agents never merge."
     ),
 }
 
@@ -155,6 +168,17 @@ TOOLS: list[ToolSpec] = [
                     "enum": ["quick", "deep"],
                     "description": "Investigators only: quick (default) answers the brief and "
                     "stops; deep chases hypotheses to ground truth (costs more).",
+                },
+                "strictness": {
+                    "type": "string",
+                    "enum": list(STRICTNESS_LEVELS),
+                    "description": "Auditors only: how hard the review looks. light = does it"
+                    " do what the brief says, do tests and CI pass. standard (default) = light"
+                    " + edge cases, scope, regressions. strict = standard + adversarial: hunt"
+                    " failure modes, run the feature as the owner would, verify every claim in"
+                    " the coder's summary. Pick it from risk and re-decide it EVERY round:"
+                    " a fix that touched auth or core control flow after a round of findings"
+                    " deserves strict even if round one was standard.",
                 },
             },
             "required": ["role", "brief"],
@@ -274,12 +298,42 @@ TOOLS: list[ToolSpec] = [
     ),
     ToolSpec(
         name="finish",
-        description="End the mission. outcome done = goal met; failed = it cannot be met.",
+        description=(
+            "End the mission. outcome done = goal met; failed = it cannot be met. "
+            "Refused when no auditor has run, or a coder ran after the last audit: "
+            "ship only what a fresh audit has seen. When the latest audit still has "
+            "open medium-or-higher findings or blockers, `done` needs accepted_findings "
+            "with one reasoned entry per open finding."
+        ),
         input_schema={
             "type": "object",
             "properties": {
                 "outcome": {"type": "string", "enum": ["done", "failed"]},
-                "summary": {"type": "string", "description": "What happened, for the owner."},
+                "summary": {
+                    "type": "string",
+                    "description": "What happened, for the owner: what changed, why, and what "
+                    "the audit found. This leads the PR body, so write it for a reviewer.",
+                },
+                "accepted_findings": {
+                    "type": "array",
+                    "description": "Judgment, not a bypass: for every open medium-or-higher "
+                    "finding or blocker in the latest audit that you are shipping anyway, "
+                    "say which one and why it is acceptable. Missing coverage is refused.",
+                    "items": {
+                        "type": "object",
+                        "required": ["finding", "reason"],
+                        "properties": {
+                            "finding": {
+                                "type": "string",
+                                "description": "The finding's title or id, as the audit wrote it.",
+                            },
+                            "reason": {
+                                "type": "string",
+                                "description": "Why shipping with this open is the right call.",
+                            },
+                        },
+                    },
+                },
             },
             "required": ["outcome", "summary"],
         },
@@ -370,6 +424,10 @@ class MissionOrchestrator:
         self._events: list[Any] = []
         self._event_cursor = 0
         self.finished: tuple[str, str] | None = None
+        # findings the orchestrator shipped with, and its reason for each: the
+        # one mechanical rail that blocks finish(done) requires them (see
+        # _enforce_findings_accepted), and they lead the mission report/PR body
+        self.accepted_findings: list[dict[str, str]] = []
         self._providers: dict[str, Any] = {}
 
     def _usable(self) -> list[Any]:
@@ -476,7 +534,13 @@ class MissionOrchestrator:
                 self.mission, results, audit.artifact if audit else None
             )
         self.r._pr_url = pr_url
-        await self.r._synthesize(self.mid, ship, outcome=outcome, summary=summary)
+        await self.r._synthesize(
+            self.mid,
+            ship,
+            outcome=outcome,
+            summary=summary,
+            accepted_findings=self.accepted_findings,
+        )
 
     async def _loop(self) -> None:
         idle = 0
@@ -687,6 +751,7 @@ class MissionOrchestrator:
             for call in message.get("tool_calls") or []:
                 if call.get("name") == "finish" and answered.get(call.get("id")) == "finished":
                     args = call.get("arguments") or {}
+                    self.accepted_findings = _accepted_findings(args.get("accepted_findings"))
                     return (str(args.get("outcome") or "done"), str(args.get("summary") or ""))
         return None
 
@@ -746,10 +811,76 @@ class MissionOrchestrator:
                     + ", ".join(r.id for r in live)
                     + ". Wait for them or cancel them first."
                 )
+            accepted: list[dict[str, str]] = []
+            if outcome == "done":
+                accepted = _accepted_findings(args.get("accepted_findings"))
+                await self._enforce_audit_fresh()
+                await self._enforce_findings_accepted(accepted)
             self.finished = (outcome, str(args.get("summary") or ""))
+            self.accepted_findings = accepted
             await self._note(f"finished ({outcome}): {self.finished[1]}"[:400], to_owner=True)
             return "finished"
         raise ToolError(f"unknown tool {name!r}")
+
+    async def _completed_runs(self, role: str) -> list[Run]:
+        return [
+            r
+            for r in await self.store.list_runs(self.mid)
+            if r.role == role and r.status == RunStatus.COMPLETED
+        ]
+
+    async def _enforce_audit_fresh(self) -> None:
+        """The ONE mechanical rail on finish(done), not bypassable by anything
+        the orchestrator can call: what ships must have been audited. Refuses
+        when no auditor ever completed, or when a coder completed after the
+        last completed audit (unaudited changes). The only way through is to
+        spawn a fresh audit and wait for it."""
+        audits = await self._completed_runs("auditor")
+        if not audits:
+            raise ToolError(
+                "no auditor has completed in this mission: spawn an auditor on the coder's "
+                "branch and wait for it before finishing with outcome='done'"
+            )
+        last_audit = audits[-1]
+        coders = await self._completed_runs("coder")
+        after = [r for r in coders if r.created_at > last_audit.created_at]
+        if after:
+            raise ToolError(
+                f"coder {after[-1].id} ran after the last completed audit {last_audit.id}: "
+                "those changes are unaudited. Spawn an auditor on the current branch and "
+                "wait for it, then finish."
+            )
+
+    async def _enforce_findings_accepted(self, accepted: list[dict[str, str]]) -> None:
+        """finish(done) with open medium-or-higher findings or blockers is the
+        orchestrator's JUDGMENT, not a mechanical block: it is allowed only when
+        every such open item is named in accepted_findings with a reason. This
+        replaces the old fixed 'medium-or-higher always blocks' rule."""
+        audits = await self._completed_runs("auditor")
+        if not audits:
+            return  # _enforce_audit_fresh already refused this
+        artifact = audits[-1].artifact or {}
+        open_items = [str(f.get("title") or "") for f in blocking_findings(artifact)]
+        open_items += [str(b.get("question") or "") for b in open_blockers(artifact)]
+        open_items = [item for item in open_items if item]
+        if not open_items:
+            return
+        covered = {str(a.get("finding") or "").strip().lower() for a in accepted}
+        covered.discard("")
+        missing = [
+            item
+            for item in open_items
+            if not any(_covers(covered_key, item) for covered_key in covered)
+        ]
+        if missing:
+            raise ToolError(
+                "the latest audit still has open medium-or-higher findings/blockers that "
+                "accepted_findings does not cover: "
+                + "; ".join(missing)
+                + ". Either spawn the coder again with these in its brief and re-audit, or "
+                "call finish again with accepted_findings listing each one and why you are "
+                "shipping with it open."
+            )
 
     async def _spawn(self, call_id: str, args: dict[str, Any]) -> str:
         role = str(args.get("role") or "").strip()
@@ -797,6 +928,15 @@ class MissionOrchestrator:
         if args.get("depth") in ("quick", "deep"):
             context["depth"] = args["depth"]
         context["max_turns"] = _turn_budget(role, args)
+        if role == "auditor":
+            # the strictness is the orchestrator's per-round judgment (light /
+            # standard / strict); it reaches the auditor's prompt as a mode
+            level = str(args.get("strictness") or DEFAULT_STRICTNESS).strip().lower()
+            if level not in STRICTNESS_LEVELS:
+                raise ToolError(
+                    f"strictness must be one of {', '.join(STRICTNESS_LEVELS)}; got {level!r}"
+                )
+            context["strictness"] = level
         if role == "coder" and not args.get("fresh"):
             # a revision continues the last finished coder's branch; the diff
             # base stays the original, so the auditor still sees the whole change
@@ -1357,6 +1497,46 @@ class MissionOrchestrator:
 
 
 DEFAULT_TURNS = {"investigator": 20, "coder": 40, "auditor": 25}
+
+
+def _accepted_findings(raw: Any) -> list[dict[str, str]]:
+    """Sanitize the finish tool's accepted_findings: entries without both a
+    finding reference and a reason are the model filling the field in to get
+    past the rail, so they are dropped (and then refused as uncovered)."""
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        finding = str(item.get("finding") or item.get("title") or item.get("id") or "").strip()
+        reason = str(item.get("reason") or "").strip()
+        if finding and reason:
+            out.append({"finding": finding, "reason": reason})
+    return out
+
+
+_COVER_MIN_CHARS = 20  # a containment match needs real title, not a fragment
+
+
+def _covers(accepted_key: str, open_item: str) -> bool:
+    """Does an accepted_findings entry name this open finding/blocker? Exact
+    match first, then a containment match either way so a long title quoted
+    slightly differently still counts (the model quotes titles imperfectly).
+
+    Containment is deliberately strict: the excerpt must be at least
+    _COVER_MIN_CHARS long, so one vague entry ("tests", "the caller may
+    crash") cannot silently cover several unrelated findings. This is a soft
+    matching heuristic for the judgment-call path, never a bypass of the
+    audit-fresh rail (_enforce_audit_fresh), which is mechanical and exact."""
+    if not accepted_key:
+        return False
+    item = open_item.strip().lower()
+    if accepted_key == item:
+        return True
+    if len(accepted_key) < _COVER_MIN_CHARS:
+        return False
+    return accepted_key in item or item in accepted_key
 
 
 def _turn_budget(role: str, args: dict[str, Any]) -> int:

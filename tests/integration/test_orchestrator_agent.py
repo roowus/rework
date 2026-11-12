@@ -8,6 +8,7 @@ tool errors fed back, fixed final gates, persistence and resume after a kill."""
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import subprocess
 from collections.abc import AsyncIterator
@@ -247,9 +248,14 @@ async def test_orchestrator_resumes_after_a_kill(world: dict[str, Any]) -> None:
                 call("spawn_role", "k1", role="coder", step="code", brief="fix add()"),
                 call("wait", "k2"),
             ),
-            turn(call("finish", "k3", outcome="done", summary="fixed after restart")),
+            turn(
+                call("spawn_role", "k3", role="auditor", step="audit", brief="review the fix"),
+                call("wait", "k4"),
+            ),
+            turn(call("finish", "k5", outcome="done", summary="fixed after restart")),
         ],
     )
+    provider.route("Find issues", _auditor_script(AUDIT_CLEAN))
     # the coder hangs until we release it, so the kill lands mid-wait
     release = asyncio.Event()
     coder_turns = _coder_script("tests pass")
@@ -283,7 +289,9 @@ async def test_orchestrator_resumes_after_a_kill(world: dict[str, Any]) -> None:
     await asyncio.wait_for(second, timeout=30)
 
     runs = await store.list_runs("mo")
-    assert [r.id for r in runs] == ["mo:code:coder:1"], "no duplicate spawn after resume"
+    assert [r.id for r in runs] == ["mo:code:coder:1", "mo:audit:auditor:1"], (
+        "no duplicate spawn after resume"
+    )
     mission = await store.get_mission("mo")
     assert mission is not None and mission.status == MissionStatus.DONE
     assert (mission.result or {}).get("summary") == "fixed after restart"
@@ -602,10 +610,15 @@ async def test_ship_pushes_the_branch_for_a_git_origin_mission(
                     call("spawn_role", "s1", role="coder", step="code", brief="fix add()"),
                     call("wait", "s2"),
                 ),
-                turn(call("finish", "s3", outcome="done", summary="fixed")),
+                turn(
+                    call("spawn_role", "s3", role="auditor", step="audit", brief="review the fix"),
+                    call("wait", "s4"),
+                ),
+                turn(call("finish", "s5", outcome="done", summary="fixed")),
             ],
         )
         provider.route("Fulfill the task", _coder_script("tests pass"))
+        provider.route("Find issues", _auditor_script(AUDIT_CLEAN))
         world = {
             "db": db,
             "store": store,
@@ -634,7 +647,17 @@ async def test_restart_after_finish_goes_straight_to_the_gate(world: dict[str, A
     the orchestrator think again. A recorded finish must be honored as-is."""
     provider: ScriptedProvider = world["provider"]
     store: SqliteStore = world["store"]
-    provider.route(MARKER, [turn(call("finish", "f1", outcome="done", summary="all good"))])
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call("spawn_role", "f1", role="auditor", step="audit", brief="review the branch"),
+                call("wait", "f2"),
+            ),
+            turn(call("finish", "f3", outcome="done", summary="all good")),
+        ],
+    )
+    provider.route("Find issues", _auditor_script(AUDIT_CLEAN))
     first = asyncio.create_task(runner(world).run())
     for _ in range(200):
         if await store.list_open_gates("mo"):
@@ -992,3 +1015,337 @@ async def test_a_long_outage_still_fails(
     await asyncio.wait_for(runner(world).run(), timeout=30)
     mission = await world["store"].get_mission("mo")
     assert mission is not None and (mission.result or {}).get("outcome") == "failed"
+
+
+# -- audit rails: strictness, the fresh-audit rail, findings acceptance -------
+
+AUDIT_MEDIUM = json.dumps(
+    {
+        "summary": "One real gap and one unproven risk: the zero-results path is untested.",
+        "findings": [
+            {
+                "title": "No test for the zero-results path",
+                "detail": "fetch_all() returns [] but nothing exercises it.",
+                "evidence": ["calc.py:2"],
+                "severity": "medium",
+                "verdict": "CONFIRMED",
+                "confidence": 0.8,
+            },
+            {
+                "title": "Zero results may crash the caller",
+                "detail": "The caller iterates the result without a None check.",
+                "evidence": ["calc.py:3"],
+                "severity": "high",
+                "verdict": "PLAUSIBLE",
+                "confidence": 0.5,
+            },
+        ],
+        "standing_assessments": {
+            "proportionality": "proportionate",
+            "complexity": "trivial, appropriate",
+            "priority": "appropriate",
+            "coverage": "gap: zero-results path untested",
+            "business_logic_risk": "caller may crash on empty input",
+        },
+        "warnings": [],
+        "blockers": [],
+    }
+)
+
+
+async def test_strictness_reaches_the_auditor_prompt(world: dict[str, Any]) -> None:
+    """The orchestrator's per-round strictness is not a dead constant: it is
+    interpolated into the auditor's rendered system prompt, and the levels are
+    actually different text."""
+    from rework.roles.builtin.auditor import SEVERITY_RUBRIC, STRICTNESS_PROMPTS
+
+    assert len({STRICTNESS_PROMPTS[k] for k in ("light", "standard", "strict")}) == 3
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call(
+                    "spawn_role",
+                    "u1",
+                    role="auditor",
+                    step="audit",
+                    brief="review the diff",
+                    strictness="strict",
+                ),
+                call("wait", "u2"),
+            ),
+            turn(
+                call(
+                    "spawn_role",
+                    "u3",
+                    role="auditor",
+                    step="audit-light",
+                    brief="quick look",
+                    strictness="light",
+                ),
+                call("wait", "u4"),
+            ),
+            turn(call("finish", "u5", outcome="failed", summary="audited only")),
+        ],
+    )
+    provider.route("Find issues", _auditor_script(AUDIT_CLEAN) * 2)
+    await asyncio.wait_for(runner(world).run(), timeout=30)
+
+    strict_run = await store.get_run("mo:audit:auditor:1")
+    light_run = await store.get_run("mo:audit-light:auditor:1")
+    assert strict_run is not None and strict_run.context.get("strictness") == "strict"
+    assert light_run is not None and light_run.context.get("strictness") == "light"
+    systems = [
+        r.system or ""
+        for r in provider.requests
+        if "REVIEW MODE (" in (r.system or "") and MARKER not in (r.system or "")
+    ]
+    assert any(
+        "REVIEW MODE (strict)" in sys and STRICTNESS_PROMPTS["strict"] in sys for sys in systems
+    ), "the strict mode text reached the prompt"
+    assert any(
+        "REVIEW MODE (light)" in sys and STRICTNESS_PROMPTS["light"] in sys for sys in systems
+    ), "a light round renders its own text"
+    assert all(SEVERITY_RUBRIC in sys for sys in systems), "the severity rubric is interpolated"
+    assert all(
+        STRICTNESS_PROMPTS["strict"] not in sys for sys in systems if "REVIEW MODE (light)" in sys
+    ), "the modes do not bleed into each other"
+
+
+async def test_finish_done_is_refused_without_a_fresh_audit(world: dict[str, Any]) -> None:
+    """The one mechanical rail: what ships must have been audited. No audit at
+    all, and a coder that ran after the last completed audit, both refuse."""
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call("spawn_role", "n1", role="coder", step="code", brief="fix add()"),
+                call("wait", "n2"),
+            ),
+            turn(call("finish", "n3", outcome="done", summary="shipping")),  # no audit yet
+            turn(
+                call("spawn_role", "n4", role="auditor", step="audit", brief="review"),
+                call("wait", "n5"),
+            ),
+            turn(
+                call("spawn_role", "n6", role="coder", step="code", brief="one more change"),
+                call("wait", "n7"),
+            ),
+            turn(call("finish", "n8", outcome="done", summary="shipping again")),  # unaudited
+            turn(call("finish", "n9", outcome="failed", summary="stopped, not shipping")),
+        ],
+    )
+    provider.route("Fulfill the task", _coder_script("first") + _coder_script("second"))
+    provider.route("Find issues", _auditor_script(AUDIT_CLEAN))
+    await asyncio.wait_for(runner(world).run(), timeout=30)
+
+    out = [
+        m.body.get("content", "")
+        for m in await store.chat_messages(orchestrator_chat_id("mo"))
+        if m.role == "tool"
+    ]
+    assert any("no auditor has completed" in t for t in out)
+    assert any("ran after the last completed audit" in t for t in out)
+    mission = await store.get_mission("mo")
+    assert mission is not None and mission.status == MissionStatus.FAILED, "it never shipped"
+
+
+async def test_finish_done_needs_every_open_finding_accepted(world: dict[str, Any]) -> None:
+    """A medium+ finding blocks done unless accepted_findings names it with a
+    reason: no acceptance refused, partial acceptance refused, full accepted."""
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+    full = [
+        {
+            "finding": "No test for the zero-results path",
+            "reason": "separate coverage issue filed; the branch itself does not regress",
+        },
+        {
+            "finding": "Zero results may crash the caller",
+            "reason": "caller is the CLI which guards empty input already; verified by hand",
+        },
+    ]
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call("spawn_role", "q1", role="coder", step="code", brief="fix add()"),
+                call("wait", "q2"),
+            ),
+            turn(
+                call("spawn_role", "q3", role="auditor", step="audit", brief="review"),
+                call("wait", "q4"),
+            ),
+            turn(call("finish", "q5", outcome="done", summary="shipping")),  # no acceptance
+            turn(
+                call(
+                    "finish", "q6", outcome="done", summary="shipping", accepted_findings=[full[0]]
+                )
+            ),  # partial
+            turn(
+                call(
+                    "finish",
+                    "q7",
+                    outcome="done",
+                    summary="shipping knowingly",
+                    accepted_findings=full,
+                )
+            ),
+        ],
+    )
+    provider.route("Fulfill the task", _coder_script("tests pass"))
+    provider.route("Find issues", _auditor_script(AUDIT_MEDIUM))
+    task = asyncio.create_task(runner(world).run())
+    # the accepted finish proceeds to the mission's ship gate; approve it
+    for _ in range(200):
+        gates = await store.list_open_gates("mo")
+        if gates:
+            second = await open_sqlite(world["db"])
+            try:
+                await GateManager(second, InProcessEventBus(second)).decide(
+                    gates[0].id, approved=True
+                )
+            finally:
+                await second.aclose()
+            break
+        await asyncio.sleep(0.05)
+    await asyncio.wait_for(task, timeout=30)
+
+    out = [
+        m.body.get("content", "")
+        for m in await store.chat_messages(orchestrator_chat_id("mo"))
+        if m.role == "tool"
+    ]
+    assert any(
+        "accepted_findings does not cover" in t and "No test for the zero-results path" in t
+        for t in out
+    ), "unaccepted findings refuse finish(done)"
+    assert any(
+        "accepted_findings does not cover" in t and "Zero results may crash the caller" in t
+        for t in out
+    ), "a partially covered audit still refuses"
+    assert any(t.strip() == "finished" for t in out), "full acceptance is allowed through"
+    mission = await store.get_mission("mo")
+    assert mission is not None
+    assert (mission.result or {}).get("accepted_findings") == full, (
+        "the reasons travel into the mission result (report/PR data)"
+    )
+
+
+async def test_pr_body_describes_the_mission_not_the_last_coder_line(
+    world: dict[str, Any],
+) -> None:
+    """Found live: PR #16 described a variable rename while the mission was much
+    bigger. The body's primary description is the finish summary + the audit;
+    the coder handoff is a supplementary appendix."""
+    from rework.kernel.state.records import Run
+
+    audit = Run(
+        id="mo:audit:auditor:1",
+        mission_id="mo",
+        role="auditor",
+        step="audit",
+        artifact=json.loads(AUDIT_CLEAN),
+    )
+    body = runner(world)._pr_body(
+        world["mission"],
+        {"summary": "renamed a variable"},
+        audit,
+        finish_summary="Moved the audit gate into the orchestrator and added accepted_findings.",
+        accepted_findings=[
+            {"finding": "No test for the zero-results path", "reason": "follow-up issue filed"}
+        ],
+    )
+    primary = body.split("<details>")[0]
+    assert "Moved the audit gate into the orchestrator" in primary
+    assert "renamed a variable" not in primary, "the trivial coder line is not the story"
+    assert "Verdict: **approve**" in primary, "the audit is part of the primary description"
+    assert "<details>" in body and "renamed a variable" in body, "kept as an appendix"
+    assert "Accepted findings (shipped knowingly)" in body
+    assert "follow-up issue filed" in body
+
+
+async def test_accepted_findings_survive_a_restart_at_the_gate(world: dict[str, Any]) -> None:
+    """A mission that shipped with findings accepted knowingly, and then
+    restarted while it waited at its final gate, must come back with the SAME
+    accepted reasons and reach the same decision without spending another model
+    call. (The recorded finish is re-honored; the audit-fresh rail is not
+    re-litigated into a different answer.)"""
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+    full = [
+        {
+            "finding": "No test for the zero-results path",
+            "reason": "separate coverage issue filed; the branch itself does not regress",
+        },
+        {
+            "finding": "Zero results may crash the caller",
+            "reason": "caller is the CLI which guards empty input already; verified by hand",
+        },
+    ]
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call("spawn_role", "v1", role="coder", step="code", brief="fix add()"),
+                call("wait", "v2"),
+            ),
+            turn(
+                call("spawn_role", "v3", role="auditor", step="audit", brief="review the fix"),
+                call("wait", "v4"),
+            ),
+            turn(
+                call(
+                    "finish",
+                    "v5",
+                    outcome="done",
+                    summary="shipped with two findings accepted",
+                    accepted_findings=full,
+                )
+            ),
+        ],
+    )
+    provider.route("Fulfill the task", _coder_script("tests pass"))
+    provider.route("Find issues", _auditor_script(AUDIT_MEDIUM))
+
+    first = asyncio.create_task(runner(world).run())
+    # the accepted finish is let through the rail and reaches the ship gate; the
+    # kill lands while the mission waits there
+    for _ in range(300):
+        if await store.list_open_gates("mo"):
+            break
+        await asyncio.sleep(0.05)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    before = await store.get_mission("mo")
+    assert before is not None and before.status == MissionStatus.AWAITING_GATE
+    # the recorded finish is in the conversation with its accepted reasons
+    calls_before = len(provider.requests)
+    second = asyncio.create_task(runner(world).run())
+    await approve_next_gate(world)
+    await asyncio.wait_for(second, timeout=30)
+
+    mission = await store.get_mission("mo")
+    assert mission is not None and mission.status == MissionStatus.DONE
+    assert (mission.result or {}).get("accepted_findings") == full, (
+        "the owner's recorded reasons survive a restart unchanged"
+    )
+    assert (mission.result or {}).get("summary") == "shipped with two findings accepted"
+    assert len(provider.requests) == calls_before, "a recorded finish costs no model call"
+
+    # the rail is still computed the same way on the reloaded state: a fresh
+    # session over the same store re-derives the acceptance decision identically
+    from rework.orchestrator.agent import MissionOrchestrator
+
+    orch = MissionOrchestrator(runner(world), mission)
+    await orch._load()
+    assert orch._recorded_finish() == ("done", "shipped with two findings accepted")
+    assert orch.accepted_findings == full
+    await orch._enforce_audit_fresh()  # audited, and nothing ran after the audit
+    await orch._enforce_findings_accepted(orch.accepted_findings)  # still fully covered

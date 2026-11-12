@@ -32,10 +32,16 @@ def test_verdict_mapping() -> None:
     high = {"findings": [{"severity": "low"}, {"severity": "high"}]}
     clean = {"findings": [{"severity": "low"}]}
     empty = {"findings": []}
+    blockers = {"findings": [], "blockers": [{"question": "is prod affected?"}]}
     assert mechanical_verdict(critical) == "request changes"
     assert mechanical_verdict(high) == "approve with fixes"
     assert mechanical_verdict(clean) == "approve"
     assert mechanical_verdict(empty) == "approve"
+    # fail-closed: nothing to audit is NOT an approval
+    assert mechanical_verdict(None) == "not audited"
+    assert mechanical_verdict({}) == "not audited"
+    # open blockers count, and they were ignored before this change
+    assert mechanical_verdict(blockers) == "request changes"
 
 
 # -- scripted audit ----------------------------------------------------------------
@@ -159,3 +165,40 @@ async def test_auditor_reads_context_and_reports(audit_ctx: RoleBuildCtx) -> Non
     assert "GOAL:" in first.system
     tool_messages = [m for m in final["messages"] if m.get("role") == "tool"]
     assert any("def add" in m["content"] for m in tool_messages)
+
+
+# -- accepted_findings: soft matching + the one shared renderer ----------------
+
+
+def test_covers_needs_a_real_title_not_a_fragment() -> None:
+    from rework.orchestrator.agent import _covers
+
+    open_item = "No test for the zero-results path"
+    # an exact title, or a long enough excerpt of it, covers
+    assert _covers(open_item.lower(), open_item)
+    assert _covers("the zero-results path", open_item)
+    assert _covers("no test for the zero-results", open_item)
+    # a short, vague entry must NOT cover it (nor an unrelated one)
+    assert not _covers("tests", open_item)
+    assert not _covers("the caller may crash", open_item)
+    assert not _covers("", open_item)
+
+
+def test_accepted_findings_section_is_shared_by_pr_body_and_report() -> None:
+    """One renderer: the PR body and the markdown report cannot drift."""
+    from rework.nodes.report_sections import accepted_findings_section
+
+    accepted = [
+        {"finding": "No test for the zero-results path", "reason": "follow-up filed"},
+        {"finding": "Zero results may crash the caller", "reason": ""},
+        {"finding": "", "reason": "dropped: no finding named"},
+    ]
+    section = accepted_findings_section(accepted)
+    assert section == [
+        "### Accepted findings (shipped knowingly)",
+        "",
+        "- **No test for the zero-results path** — follow-up filed",
+        "- **Zero results may crash the caller** — no reason recorded",
+    ], "entries without a reason still render; entries without a finding do not"
+    assert accepted_findings_section(None) == []
+    assert accepted_findings_section([]) == []

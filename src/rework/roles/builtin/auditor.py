@@ -31,7 +31,53 @@ from rework.roles.base import RoleBuildCtx, RoleSpec
 if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
 
-__all__ = ["AuditorSpec", "mechanical_verdict"]
+__all__ = ["SEVERITY_RUBRIC", "STRICTNESS_PROMPTS", "AuditorSpec", "mechanical_verdict"]
+
+# How hard this round looks. The orchestrator picks one per round from risk
+# (change size, blast radius, what the last round found), and re-decides it
+# every round rather than once per mission.
+STRICTNESS_PROMPTS: dict[str, str] = {
+    "light": (
+        "Does the change do what the brief says, and do the tests and CI pass?"
+        " Nothing else: no edge-case hunt, no style notes. Use this for a small,"
+        " well-understood change with a clean prior audit."
+    ),
+    "standard": (
+        "light plus the consequences a reviewer would check: edge cases the change"
+        " does not handle, files touched that are outside the brief's scope, and"
+        " regressions in behaviour that used to work."
+    ),
+    "strict": (
+        "standard plus ADVERSARIAL review. Actively hunt failure modes: wrong input,"
+        " empty/boundary values, concurrency and error paths, partial failure. Run"
+        " the feature the way the owner would from the CLI/UI, not just the unit"
+        " tests. Verify EVERY claim in the coder's summary against the code and the"
+        " commands you ran: a claim you cannot reproduce is a high finding."
+    ),
+}
+
+# Fixed, example-based severity scale. It does NOT change with strictness: the
+# mode decides how hard you look, this decides what a given defect is worth, so
+# labels stay comparable across rounds and missions.
+SEVERITY_RUBRIC = (
+    "SEVERITY RUBRIC (fixed, applies at every review mode; pick by blast radius,"
+    " not by how hard the defect was to find):\n"
+    "- critical: data loss or corruption, a security hole (injection, secret"
+    " printed, auth bypassed), or the build/CI is broken (tests fail, does not"
+    " import/compile). Example: `add(2, 3)` returns `-1` and existing tests fail;"
+    " an API token logged to stdout.\n"
+    "- high: the feature does not do what the brief says, or a regression in"
+    " behaviour that worked before. Example: the brief asked for retries on 5xx"
+    " and the code retries on every error; a rename silently changes a public"
+    " function signature. A CI check that would fail (lint, type) is also high.\n"
+    "- medium: real gap that a user could hit but not on the happy path: an edge"
+    " case unhandled (empty list, missing key, non-UTF8 name), or a real scenario"
+    " with no test coverage. Example: `fetch_all()` crashes on zero results; the"
+    " new branch is only exercised manually.\n"
+    "- low: style, naming, a nit, non-blocking polish, a docstring that lags."
+    " Example: a variable shadowing a builtin; a comment stating the old"
+    " behaviour. Low findings never block on their own."
+)
 
 
 class AuditorState(TypedDict, total=False):
@@ -57,6 +103,7 @@ class AuditorSpec(RoleSpec):
         "investigation",
         "prior_dispositions",
         "worktree_path",
+        "strictness",
     }
 
     def build_graph(self, ctx: RoleBuildCtx) -> CompiledStateGraph:
@@ -69,11 +116,16 @@ class AuditorSpec(RoleSpec):
         workspace = run_ctx.get("worktree_path")
         executor = LocalExecutor(Path(workspace) if workspace else ctx.read_root)
 
+        strictness = str(run_ctx.get("strictness") or "standard").strip().lower()
+        mode = STRICTNESS_PROMPTS.get(strictness, STRICTNESS_PROMPTS["standard"])
+
         system_prompt = (
             f"GOAL: {self.goal}\n\n"
             "You are the auditor role in a multi-agent pipeline. Review the"
             " change you are given: read the code, trace consequences, and"
             " report findings honestly.\n\n"
+            f"REVIEW MODE ({strictness}): {mode}\n\n"
+            f"{SEVERITY_RUBRIC}\n\n"
             "Rules: findings carry file:line evidence you actually read (never"
             " invented); verdict CONFIRMED only when you traced the consequence,"
             " PLAUSIBLE when it is a suspicion; do not nitpick: if the change"
