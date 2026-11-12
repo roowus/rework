@@ -107,9 +107,11 @@ async def main() -> None:
     # chats (any whose mission moved, plus chats with no mission), and messages
     moved = {m["id"] for m in new_missions}
     chats = [
-        c for c in rows(src, "SELECT * FROM chats")
-        if (c.get("mission_id") in moved) or not c.get("mission_id")
-        or c["id"].startswith("orch-") and c["id"][5:] in moved
+        c
+        for c in rows(src, "SELECT * FROM chats")
+        if (c.get("mission_id") in moved)
+        or not c.get("mission_id")
+        or (c["id"].startswith("orch-") and c["id"][5:] in moved)
     ]
     have_chats = await existing(pg, "chats", [c["id"] for c in chats])
     for c in chats:
@@ -120,7 +122,8 @@ async def main() -> None:
             c["project_id"] = project_map.get(c["project_id"], c["project_id"])
         await insert(pg, "chats", c, a.apply)
         note("chats")
-        for msg in rows(src, "SELECT * FROM chat_messages WHERE chat_id = ? ORDER BY id", (c["id"],)):
+        sql = "SELECT * FROM chat_messages WHERE chat_id = ? ORDER BY id"
+        for msg in rows(src, sql, (c["id"],)):
             msg.pop("id")
             await insert(pg, "chat_messages", msg, a.apply)
             note("chat_messages")
