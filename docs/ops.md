@@ -14,9 +14,13 @@ to the same database (the owner's shell exports `REWORK_DB` and
   `docker exec rework-dev-pg pg_dump -U postgres rework_state | gzip >
   ~/backups/...`). The Mac's history was merged on 2026-11-12: 18 missions,
   26 chats, 17 Library items (backup in `~/backups/` on rewvis).
-- Library item BODIES are still files in each machine's `~/.rework/library`
-  until the bodies-in-the-database change lands; until then both folders hold
-  the same 23 items (synced by hand on 2026-11-12).
+- The Library lives in the database too (#19): item bodies are stored on the
+  row, and each machine's `~/.rework/library` git folder is only a fallback
+  and local history. The daemon backfills empty bodies from its files on
+  start (23 on 2026-11-12). Checked: all 23 items read from the Mac with an
+  empty library folder.
+- The Mac runs no daemon. The last local mission (m-899f95a66990) was merged
+  in a second pass; the local SQLite is a sandbox from here on.
 
 ## Local (the Mac): the dogfood loop, step one
 
