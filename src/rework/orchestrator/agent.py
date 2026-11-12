@@ -1234,18 +1234,28 @@ class MissionOrchestrator:
         return f"{run_id} will see it at its next turn"
 
     async def _has_owner_ship_approval(self) -> bool:
-        """Check if the owner explicitly approved shipping via ask_owner permission gate."""
+        """Check if the owner explicitly approved shipping via ask_owner permission gate.
+
+        Returns True if there's an approved permission gate with ship_approval=True,
+        explicitly created by the orchestrator asking the owner to ship despite audit issues.
+        """
         from rework.kernel.state.records import GateKind
 
         gates = await self.store.list_gates(self.mid)
         for gate in gates:
             if gate.status == GateStatus.APPROVED and gate.kind == GateKind.PERMISSION:
                 spec = gate.spec or {}
-                # Permission gates created by ask_owner with orchestrator as asker
-                if spec.get("asked_by") == "orchestrator":
-                    # Check if this looks like a ship approval (not budget/turn_cap)
-                    if not spec.get("budget_to") and not spec.get("turn_cap"):
-                        return True
+                # Explicit ship-approval marker (defense-in-depth: also check the old pattern)
+                if spec.get("ship_approval") is True:
+                    return True
+                # Legacy pattern: orchestrator ask_owner without budget_to or turn_cap
+                # (kept for defense-in-depth, but new code should use ship_approval=True)
+                if (
+                    spec.get("asked_by") == "orchestrator"
+                    and not spec.get("budget_to")
+                    and not spec.get("turn_cap")
+                ):
+                    return True
         return False
 
     async def _enforce_audit_clean(self) -> None:
@@ -1282,7 +1292,12 @@ class MissionOrchestrator:
 
         # (b) A coder completed after the last audit (unaudited changes)
         if last_coder is not None:
-            # Compare by creation timestamp to determine completion order
+            # Compare by creation timestamp to determine completion order.
+            # In the orchestrator's sequential spawn->wait->spawn->wait flow, runs are
+            # created sequentially, so later created_at implies later completion.
+            # ASSUMPTION: This relies on runs not being spawned in parallel within a single
+            # orchestrator turn for the same role. If that changes, this logic would need
+            # to use actual completion timestamps (not currently available on Run records).
             # (runs are created sequentially, so later created_at = completed later)
             if last_coder.created_at > last_audit.created_at:
                 raise ToolError(
@@ -1296,8 +1311,7 @@ class MissionOrchestrator:
 
         # Check for medium or higher severity findings
         has_medium_plus = any(
-            str(f.get("severity", "")).lower() in ("medium", "high", "critical")
-            for f in findings
+            str(f.get("severity", "")).lower() in ("medium", "high", "critical") for f in findings
         )
         if has_medium_plus:
             severities = [str(f.get("severity", "")).lower() for f in findings]

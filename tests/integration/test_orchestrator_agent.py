@@ -289,9 +289,9 @@ async def test_orchestrator_resumes_after_a_kill(world: dict[str, Any]) -> None:
     await asyncio.wait_for(second, timeout=30)
 
     runs = await store.list_runs("mo")
-    assert sorted([r.id for r in runs]) == [
-        "mo:audit:auditor:1", "mo:code:coder:1"
-    ], "no duplicate spawn after resume"
+    assert sorted([r.id for r in runs]) == ["mo:audit:auditor:1", "mo:code:coder:1"], (
+        "no duplicate spawn after resume"
+    )
     mission = await store.get_mission("mo")
     assert mission is not None and mission.status == MissionStatus.DONE
     assert (mission.result or {}).get("summary") == "fixed after restart"
@@ -667,6 +667,8 @@ async def test_restart_after_finish_goes_straight_to_the_gate(world: dict[str, A
     for _ in range(200):
         if await store.list_open_gates("mo"):
             break
+        await asyncio.sleep(0.05)
+    first.cancel()
     with pytest.raises(asyncio.CancelledError):
         await first
     second = asyncio.create_task(runner(world).run())
@@ -1058,7 +1060,6 @@ async def test_finish_done_blocked_when_coder_after_audit(world: dict[str, Any])
     provider.route("Fulfill the task", _coder_script("fixed") + _coder_script("revised"))
     provider.route("Find issues", _auditor_script(AUDIT_CLEAN) + _auditor_script(AUDIT_CLEAN))
 
-
     task = asyncio.create_task(runner(world).run())
     await approve_next_gate(world)  # ship gate
     await asyncio.wait_for(task, timeout=30)
@@ -1085,21 +1086,23 @@ async def test_finish_done_blocked_on_medium_finding(world: dict[str, Any]) -> N
     store: SqliteStore = world["store"]
 
     # Create audit with a medium finding
-    audit_medium = json.dumps({
-        "summary": "Found a medium issue",
-        "findings": [
-            {
-                "title": "Medium issue",
-                "detail": "This needs attention",
-                "severity": "medium",
-                "verdict": "CONFIRMED",
-                "confidence": 0.8,
-            }
-        ],
-        "standing_assessments": {},
-        "warnings": [],
-        "blockers": [],
-    })
+    audit_medium = json.dumps(
+        {
+            "summary": "Found a medium issue",
+            "findings": [
+                {
+                    "title": "Medium issue",
+                    "detail": "This needs attention",
+                    "severity": "medium",
+                    "verdict": "CONFIRMED",
+                    "confidence": 0.8,
+                }
+            ],
+            "standing_assessments": {},
+            "warnings": [],
+            "blockers": [],
+        }
+    )
 
     provider.route(
         MARKER,
@@ -1147,8 +1150,7 @@ async def test_finish_done_blocked_on_medium_finding(world: dict[str, Any]) -> N
         if m.role == "tool" and m.body.get("name") == "finish"
     ]
     assert any(
-        "error:" in str(r) and "medium-or-higher" in str(r).lower()
-        for r in tool_results[:-1]
+        "error:" in str(r) and "medium-or-higher" in str(r).lower() for r in tool_results[:-1]
     )
     # Final finish should succeed
 
@@ -1216,3 +1218,105 @@ async def test_finish_done_blocked_when_no_auditor(world: dict[str, Any]) -> Non
         await task
     except asyncio.CancelledError:
         pass
+
+
+async def test_finish_done_allowed_with_owner_ship_approval(world: dict[str, Any]) -> None:
+    """finish(done) allowed when owner explicitly approves ship despite findings."""
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+
+    # Create audit with a medium finding
+    audit_medium = json.dumps(
+        {
+            "summary": "Found a medium issue",
+            "findings": [
+                {
+                    "title": "Medium issue",
+                    "detail": "This needs attention",
+                    "severity": "medium",
+                    "verdict": "CONFIRMED",
+                    "confidence": 0.8,
+                }
+            ],
+            "standing_assessments": {},
+            "warnings": [],
+            "blockers": [],
+        }
+    )
+
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call("spawn_role", "o1", role="coder", step="code", brief="fix"),
+                call("wait", "o2"),
+            ),
+            turn(
+                call("spawn_role", "o3", role="auditor", step="audit", brief="review"),
+                call("wait", "o4"),
+            ),
+            # Try to finish - should be refused due to medium finding
+            turn(
+                call("finish", "o5", outcome="done", summary="done"),
+                text="trying to finish but should be refused",
+            ),
+            # Ask owner for ship approval despite findings
+            turn(
+                call(
+                    "ask_owner",
+                    "o6",
+                    question="Ship despite medium finding?",
+                    kind="permission",
+                ),
+                call("wait", "o7"),
+            ),
+            # Now can finish after owner approval
+            turn(call("finish", "o8", outcome="done", summary="shipped with owner approval")),
+        ],
+    )
+    provider.route("Find issues", _auditor_script(audit_medium))
+    provider.route("Fulfill the task", _coder_script("fixed"))
+
+    task = asyncio.create_task(runner(world).run())
+
+    # Wait for and approve the ship-approval gate
+    gate = None
+    for _ in range(300):
+        gates = await store.list_open_gates("mo")
+        # Look for the ship approval gate (not the final ship gate)
+        for g in gates:
+            if "Ship despite" in g.question:
+                gate = g
+                break
+        if gate:
+            break
+        await asyncio.sleep(0.05)
+
+    assert gate is not None, "ship approval gate should have been created"
+
+    # Approve the ship-approval gate
+    # The gate was created by orchestrator's ask_owner with asked_by="orchestrator"
+    # and no budget_to/turn_cap, so _has_owner_ship_approval will recognize it
+    from rework.kernel.gates import GateManager
+
+    await GateManager(store, InProcessEventBus(store)).decide(gate.id, approved=True)
+
+    # Approve the final ship gate
+    await approve_next_gate(world)
+    await asyncio.wait_for(task, timeout=30)
+
+    # Check that finish succeeded
+    mission = await store.get_mission("mo")
+    assert mission is not None and mission.status == MissionStatus.DONE
+    assert (mission.result or {}).get("summary") == "shipped with owner approval"
+
+    # Verify the first finish was refused
+    msgs = await store.chat_messages(orchestrator_chat_id("mo"))
+    tool_results = [
+        m.body.get("content", "")
+        for m in msgs
+        if m.role == "tool" and m.body.get("name") == "finish"
+    ]
+    assert len(tool_results) == 2
+    assert "error:" in str(tool_results[0]) and "medium-or-higher" in str(tool_results[0]).lower()
+    assert tool_results[1] == "finished"
