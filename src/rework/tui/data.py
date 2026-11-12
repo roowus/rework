@@ -17,7 +17,12 @@ from rework.config import (
 )
 from rework.kernel.state.records import Mission, Project, Run
 from rework.kernel.state.store import StateStore
-from rework.library.store import GitLibrary, LibraryStore, open_library_store
+from rework.library.store import (
+    GitLibrary,
+    LibraryStore,
+    open_library_store,
+    read_item_body,
+)
 
 
 def library_root() -> Path:
@@ -527,7 +532,9 @@ class TuiData:
         item = await index.get_item(item_id)
         if item is None:
             return None, None
-        return item, git.read_body(item)
+        # DB row first: the body comes with the index, so the reader works on
+        # a machine that has no copy of the library git folder
+        return item, await asyncio.to_thread(read_item_body, item, git)
 
     # -- writes ------------------------------------------------------------
 

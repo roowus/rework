@@ -1151,6 +1151,17 @@ def serve() -> None:
             library = LibraryHandle(
                 index=index, git=GitLibrary(_library_root(), author=config.git_author)
             )
+            # one-time-ish bridge for rows indexed before `body` was a column:
+            # cheap and idempotent (empty rows only), and never fatal (a
+            # backfill failure must not cost roles their library)
+            try:
+                from rework.library.curation import backfill_bodies
+
+                filled, _skipped = await backfill_bodies(index, library.git)
+                if filled:
+                    typer.secho(f"backfilled {filled} library bod(y/ies)", fg=typer.colors.CYAN)
+            except Exception as exc:
+                typer.secho(f"library body backfill skipped ({exc})", fg=typer.colors.YELLOW)
             typer.secho(f"library at {_library_root()}", fg=typer.colors.CYAN)
         except Exception as exc:
             typer.secho(
@@ -1488,12 +1499,15 @@ def library_add_external(
 
     async def go() -> str:
         lib = GitLibrary(_library_root(), author=Config.from_env().git_author)
+        body_text = await asyncio.to_thread(src.read_text)
         item.body_path = await asyncio.to_thread(
             lib.write_body,
             item,
-            await asyncio.to_thread(src.read_text),
+            body_text,
             f"library: add external skill {name!r} from {source_url}",
         )
+        # the row carries the body too: the git file is only local history
+        item.body = body_text
         index = await open_library_index(Config.from_env().db)
         try:
             await index.upsert_item(item)
@@ -1584,7 +1598,7 @@ def library_ls(
 def library_show(item_id: str) -> None:
     """One item: metadata plus its body."""
     from rework.config import Config
-    from rework.library.store import GitLibrary
+    from rework.library.store import GitLibrary, read_item_body
 
     async def go() -> str:
         index = await open_library_index(Config.from_env().db)
@@ -1595,7 +1609,8 @@ def library_show(item_id: str) -> None:
         if item is None:
             raise typer.BadParameter(f"item not found: {item_id}")
         lib = GitLibrary(_library_root())
-        body = await asyncio.to_thread(lib.read_body, item)
+        # DB row first; the git file is only the fallback for pre-migration rows
+        body = await asyncio.to_thread(read_item_body, item, lib)
         meta = (
             f"{item.id}  [{item.type.value}/{item.status.value}] v{item.version}"
             f"  uses={item.uses}\n"
@@ -1607,6 +1622,31 @@ def library_show(item_id: str) -> None:
         return meta + "\n" + (body or "(no body)")
 
     typer.echo(asyncio.run(go()))
+
+
+@library_app.command("backfill-bodies")
+def library_backfill_bodies() -> None:
+    """Copy this machine's library body files into the index rows that have
+    no body yet (rows written before the body column existed).
+
+    Safe to re-run: rows that already carry a body are left alone, and rows
+    whose file is not on this machine are skipped."""
+    from rework.config import Config
+    from rework.library.curation import backfill_bodies
+    from rework.library.store import GitLibrary
+
+    async def go() -> tuple[int, int]:
+        index = await open_library_index(Config.from_env().db)
+        try:
+            git = GitLibrary(_library_root(), author=Config.from_env().git_author)
+            return await backfill_bodies(index, git)
+        finally:
+            await index.aclose()
+
+    filled, skipped = asyncio.run(go())
+    typer.echo(f"backfilled {filled} item body/bodies from {_library_root()}")
+    if skipped:
+        typer.echo(f"skipped {skipped} (no local body file on this machine)")
 
 
 @library_app.command("search")

@@ -28,6 +28,7 @@ _DDL = [
         name TEXT NOT NULL,
         description TEXT NOT NULL DEFAULT '',
         body_path TEXT,
+        body TEXT,
         tags TEXT NOT NULL DEFAULT '[]',
         provenance TEXT NOT NULL DEFAULT '{}',
         status TEXT NOT NULL,
@@ -51,6 +52,13 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
         "vectors",
         "ALTER TABLE library_items ADD COLUMN vectors TEXT NOT NULL DEFAULT '{}'",
     ),
+    ("library_items", "body", "ALTER TABLE library_items ADD COLUMN body TEXT"),
+]
+
+# sqlite has no information_schema: PRAGMA table_info + conditional ALTER, the
+# additive path the state store already uses (kernel/state/sqlite.py).
+_SQLITE_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("library_items", "body", "ALTER TABLE library_items ADD COLUMN body TEXT"),
 ]
 
 
@@ -65,12 +73,17 @@ def _row_to_item(row: Any) -> LibraryItem:
     except (KeyError, IndexError):
         raw_vectors = None
     vectors = json.loads(raw_vectors) if raw_vectors else {}
+    try:
+        raw_body = row["body"]
+    except (KeyError, IndexError):
+        raw_body = None
     item = LibraryItem(
         id=row["id"],
         type=ItemType(row["type"]),
         name=row["name"],
         description=row["description"],
         body_path=row["body_path"],
+        body=raw_body or "",
         tags=json.loads(row["tags"] or "[]"),
         provenance=Provenance(**json.loads(prov)),
         status=ItemStatus(row["status"]),
@@ -160,13 +173,14 @@ class SqliteLibraryStore:
 
         r = item_to_row(item)
         await self._conn.execute(
-            "INSERT INTO library_items (id, type, name, description, body_path, tags,"
-            " provenance, status, version, uses, created_at, updated_at, vectors)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO library_items (id, type, name, description, body_path, body,"
+            " tags, provenance, status, version, uses, created_at, updated_at, vectors)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT(id) DO UPDATE SET"
             " type=excluded.type, name=excluded.name, description=excluded.description,"
-            " body_path=excluded.body_path, tags=excluded.tags, provenance=excluded.provenance,"
-            " status=excluded.status, version=excluded.version, uses=excluded.uses,"
+            " body_path=excluded.body_path, body=excluded.body, tags=excluded.tags,"
+            " provenance=excluded.provenance, status=excluded.status,"
+            " version=excluded.version, uses=excluded.uses,"
             " updated_at=excluded.updated_at, vectors=excluded.vectors",
             (
                 r["id"],
@@ -174,6 +188,7 @@ class SqliteLibraryStore:
                 r["name"],
                 r["description"],
                 r["body_path"],
+                r["body"],
                 _j(r["tags"]),
                 _j(r["provenance"]),
                 r["status"],
@@ -254,11 +269,12 @@ class PostgresLibraryStore:
             r = item_to_row(item)
             await self._conn.execute(
                 "INSERT INTO library_items (id, type, name, description, body_path,"
-                " tags, provenance, status, version, uses, created_at, updated_at, vectors)"
-                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                " body, tags, provenance, status, version, uses, created_at, updated_at,"
+                " vectors)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
                 " ON CONFLICT (id) DO UPDATE SET"
                 " type=EXCLUDED.type, name=EXCLUDED.name, description=EXCLUDED.description,"
-                " body_path=EXCLUDED.body_path, tags=EXCLUDED.tags,"
+                " body_path=EXCLUDED.body_path, body=EXCLUDED.body, tags=EXCLUDED.tags,"
                 " provenance=EXCLUDED.provenance, status=EXCLUDED.status,"
                 " version=EXCLUDED.version, uses=EXCLUDED.uses,"
                 " updated_at=EXCLUDED.updated_at, vectors=EXCLUDED.vectors",
@@ -268,6 +284,7 @@ class PostgresLibraryStore:
                     r["name"],
                     r["description"],
                     r["body_path"],
+                    r["body"],
                     _j(r["tags"]),
                     _j(r["provenance"]),
                     r["status"],
@@ -380,6 +397,18 @@ async def apply_library_migrations(conn: Any) -> None:
                 await conn.execute("SET lock_timeout = 0")
 
 
+async def apply_sqlite_library_migrations(conn: Any) -> None:
+    """SQLite's counterpart to apply_library_migrations: PRAGMA table_info to
+    see what the file actually has, ALTER only what is missing (additive and
+    idempotent; an existing ~/.rework/state.sqlite3 predates every column
+    added after it was created)."""
+    for table, column, alter in _SQLITE_MIGRATIONS:
+        async with conn.execute(f"PRAGMA table_info({table})") as cur:
+            names = {row[1] for row in await cur.fetchall()}
+        if names and column not in names:
+            await conn.execute(alter)
+
+
 async def open_library_store(db: str) -> LibraryStore:
     """Open the library index on the same database substrate as the state
     store (sqlite path or postgresql:// URL)."""
@@ -406,8 +435,19 @@ async def open_library_store(db: str) -> LibraryStore:
     sqlite_conn.row_factory = aiosqlite.Row
     for ddl in _SQLITE_DDL:
         await sqlite_conn.execute(ddl)
+    await apply_sqlite_library_migrations(sqlite_conn)
     await sqlite_conn.commit()
     return SqliteLibraryStore(sqlite_conn)
+
+
+def read_item_body(item: LibraryItem, git: GitLibrary) -> str | None:
+    """The body, DB row first. The git file is only the fallback for rows
+    written before the body column existed (or before backfill ran); a role on
+    another machine shares the index but not the git folder, so the row has to
+    win. Returns None only when neither source has the body."""
+    if item.body:
+        return item.body
+    return git.read_body(item)
 
 
 class GitLibrary:

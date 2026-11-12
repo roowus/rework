@@ -6,8 +6,8 @@ stdio transport; run with `rework library-mcp` and mount with e.g.
 
 Tools: search / get (read body) / contribute (subject to the same curation
 rules as roles: tools arrive proposed and wait for `rework library activate`).
-The index sits on the state DB substrate; bodies in the library git repo
-(REWORK_LIBRARY_DIR, default ~/.rework/library).
+The index sits on the state DB substrate and carries the body text (the
+library git repo, REWORK_LIBRARY_DIR, is an optional local-history mirror).
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from typing import Any
 
 from rework.library.curation import contribute
 from rework.library.model import ItemStatus, ItemType
-from rework.library.store import GitLibrary, LibraryStore
+from rework.library.store import GitLibrary, LibraryStore, read_item_body
 
 
 def build_mcp_server(index: LibraryStore, git: GitLibrary, hybrid: Any | None = None) -> Any:
@@ -50,7 +50,7 @@ def build_mcp_server(index: LibraryStore, git: GitLibrary, hybrid: Any | None = 
             return f"error: no library item {item_id}"
         if item.status is not ItemStatus.ACTIVE:
             return f"error: {item.name} is {item.status.value}; only active items are served"
-        body = git.read_body(item)
+        body = read_item_body(item, git)  # DB row first; git file is the fallback
         await index.record_use(item_id)
         return body or f"(item {item_id} has no body file)"
 
