@@ -45,7 +45,7 @@ from rework.kernel.state.records import (
 )
 from rework.kernel.state.store import StateStore
 from rework.logs import bind
-from rework.nodes.report_sections import mechanical_verdict
+from rework.nodes.report_sections import accepted_findings_section, mechanical_verdict
 from rework.roles.base import EscalationKind, RoleBuildCtx
 from rework.roles.registry import RoleRegistry
 
@@ -715,11 +715,9 @@ class MissionRunner:
                     lines += ["", "Evidence: " + " · ".join(f"`{e}`" for e in evidence)]
         else:
             lines += ["", "No findings (clean audit)."]
-        accepted = accepted_findings or []
-        if accepted:
-            lines += ["", "### Accepted findings (shipped knowingly)", ""]
-            for a in accepted:
-                lines.append(f"- **{a.get('finding')}** — {a.get('reason')}")
+        accepted_section = accepted_findings_section(accepted_findings)
+        if accepted_section:
+            lines += ["", *accepted_section]
         warnings = audit_artifact.get("warnings", [])
         if warnings:
             lines += ["", "### Audit warnings (coverage limits)", ""]

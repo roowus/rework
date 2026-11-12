@@ -302,3 +302,34 @@ def test_new_mechanical_keeps_the_legacy_pipeline(rework_db: Path) -> None:
     assert mission is not None
     assert "orchestrator" not in (mission.plan or {})
     assert [s["step"] for s in (mission.plan or {})["steps"]] == ["investigate", "code", "audit"]
+
+
+def test_report_md_shows_accepted_findings(rework_db: Path) -> None:
+    """What the mission shipped with knowingly open belongs in the human report,
+    with the same wording the PR body uses (one shared renderer)."""
+
+    async def seed() -> None:
+        store = await open_sqlite(str(rework_db))
+        try:
+            await store.create_mission(
+                Mission(id="m-acc", objective="ship knowingly", status=MissionStatus.DONE)
+            )
+            await store.update_mission(
+                "m-acc",
+                result={
+                    "summary": "shipped with one finding accepted",
+                    "accepted_findings": [
+                        {"finding": "No test for the zero-results path", "reason": "issue filed"}
+                    ],
+                },
+            )
+        finally:
+            await store.aclose()
+
+    asyncio.run(seed())
+    out = rework_db.parent / "report.md"
+    result = runner.invoke(app, ["report", "m-acc", "--md", "--out", str(out)])
+    assert result.exit_code == 0, result.output
+    text = out.read_text(encoding="utf-8")
+    assert "### Accepted findings (shipped knowingly)" in text
+    assert "**No test for the zero-results path** — issue filed" in text

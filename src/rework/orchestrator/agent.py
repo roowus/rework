@@ -866,6 +866,7 @@ class MissionOrchestrator:
         if not open_items:
             return
         covered = {str(a.get("finding") or "").strip().lower() for a in accepted}
+        covered.discard("")
         missing = [
             item
             for item in open_items
@@ -1515,16 +1516,27 @@ def _accepted_findings(raw: Any) -> list[dict[str, str]]:
     return out
 
 
+_COVER_MIN_CHARS = 20  # a containment match needs real title, not a fragment
+
+
 def _covers(accepted_key: str, open_item: str) -> bool:
     """Does an accepted_findings entry name this open finding/blocker? Exact
-    match first, then a containment match either way so a full title or a
-    distinctive fragment both count (the model quotes titles imperfectly)."""
+    match first, then a containment match either way so a long title quoted
+    slightly differently still counts (the model quotes titles imperfectly).
+
+    Containment is deliberately strict: the excerpt must be at least
+    _COVER_MIN_CHARS long, so one vague entry ("tests", "the caller may
+    crash") cannot silently cover several unrelated findings. This is a soft
+    matching heuristic for the judgment-call path, never a bypass of the
+    audit-fresh rail (_enforce_audit_fresh), which is mechanical and exact."""
     if not accepted_key:
         return False
     item = open_item.strip().lower()
     if accepted_key == item:
         return True
-    return len(accepted_key) >= 8 and (accepted_key in item or item in accepted_key)
+    if len(accepted_key) < _COVER_MIN_CHARS:
+        return False
+    return accepted_key in item or item in accepted_key
 
 
 def _turn_budget(role: str, args: dict[str, Any]) -> int:

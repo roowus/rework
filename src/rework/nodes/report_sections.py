@@ -362,6 +362,23 @@ def blocking_findings(audit_artifact: dict[str, Any] | None) -> list[dict[str, A
     ]
 
 
+ACCEPTED_FINDINGS_TITLE = "Accepted findings (shipped knowingly)"
+
+
+def accepted_findings_section(accepted: list[dict[str, Any]] | None, level: int = 3) -> list[str]:
+    """The one rendering of `accepted_findings` (what the mission shipped with
+    open, and why): the PR body and the markdown report both build it from
+    here so the two can never drift. Returns [] when nothing was accepted."""
+    entries = [a for a in (accepted or []) if isinstance(a, dict) and str(a.get("finding") or "")]
+    if not entries:
+        return []
+    out = [f"{'#' * level} {ACCEPTED_FINDINGS_TITLE}", ""]
+    for a in entries:
+        reason = str(a.get("reason") or "").strip() or "no reason recorded"
+        out.append(f"- **{a.get('finding')}** — {reason}")
+    return out
+
+
 def mechanical_verdict(audit_artifact: dict[str, Any] | None) -> str:
     """The truss verdict mapping, applied mechanically and FAIL-CLOSED: no
     artifact (or an empty one) is 'not audited', never 'approve'; any critical

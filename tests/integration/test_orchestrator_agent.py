@@ -248,9 +248,14 @@ async def test_orchestrator_resumes_after_a_kill(world: dict[str, Any]) -> None:
                 call("spawn_role", "k1", role="coder", step="code", brief="fix add()"),
                 call("wait", "k2"),
             ),
-            turn(call("finish", "k3", outcome="done", summary="fixed after restart")),
+            turn(
+                call("spawn_role", "k3", role="auditor", step="audit", brief="review the fix"),
+                call("wait", "k4"),
+            ),
+            turn(call("finish", "k5", outcome="done", summary="fixed after restart")),
         ],
     )
+    provider.route("Find issues", _auditor_script(AUDIT_CLEAN))
     # the coder hangs until we release it, so the kill lands mid-wait
     release = asyncio.Event()
     coder_turns = _coder_script("tests pass")
@@ -284,7 +289,9 @@ async def test_orchestrator_resumes_after_a_kill(world: dict[str, Any]) -> None:
     await asyncio.wait_for(second, timeout=30)
 
     runs = await store.list_runs("mo")
-    assert [r.id for r in runs] == ["mo:code:coder:1"], "no duplicate spawn after resume"
+    assert [r.id for r in runs] == ["mo:code:coder:1", "mo:audit:auditor:1"], (
+        "no duplicate spawn after resume"
+    )
     mission = await store.get_mission("mo")
     assert mission is not None and mission.status == MissionStatus.DONE
     assert (mission.result or {}).get("summary") == "fixed after restart"
@@ -603,10 +610,15 @@ async def test_ship_pushes_the_branch_for_a_git_origin_mission(
                     call("spawn_role", "s1", role="coder", step="code", brief="fix add()"),
                     call("wait", "s2"),
                 ),
-                turn(call("finish", "s3", outcome="done", summary="fixed")),
+                turn(
+                    call("spawn_role", "s3", role="auditor", step="audit", brief="review the fix"),
+                    call("wait", "s4"),
+                ),
+                turn(call("finish", "s5", outcome="done", summary="fixed")),
             ],
         )
         provider.route("Fulfill the task", _coder_script("tests pass"))
+        provider.route("Find issues", _auditor_script(AUDIT_CLEAN))
         world = {
             "db": db,
             "store": store,
@@ -635,7 +647,17 @@ async def test_restart_after_finish_goes_straight_to_the_gate(world: dict[str, A
     the orchestrator think again. A recorded finish must be honored as-is."""
     provider: ScriptedProvider = world["provider"]
     store: SqliteStore = world["store"]
-    provider.route(MARKER, [turn(call("finish", "f1", outcome="done", summary="all good"))])
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call("spawn_role", "f1", role="auditor", step="audit", brief="review the branch"),
+                call("wait", "f2"),
+            ),
+            turn(call("finish", "f3", outcome="done", summary="all good")),
+        ],
+    )
+    provider.route("Find issues", _auditor_script(AUDIT_CLEAN))
     first = asyncio.create_task(runner(world).run())
     for _ in range(200):
         if await store.list_open_gates("mo"):
@@ -1245,3 +1267,85 @@ async def test_pr_body_describes_the_mission_not_the_last_coder_line(
     assert "<details>" in body and "renamed a variable" in body, "kept as an appendix"
     assert "Accepted findings (shipped knowingly)" in body
     assert "follow-up issue filed" in body
+
+
+async def test_accepted_findings_survive_a_restart_at_the_gate(world: dict[str, Any]) -> None:
+    """A mission that shipped with findings accepted knowingly, and then
+    restarted while it waited at its final gate, must come back with the SAME
+    accepted reasons and reach the same decision without spending another model
+    call. (The recorded finish is re-honored; the audit-fresh rail is not
+    re-litigated into a different answer.)"""
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+    full = [
+        {
+            "finding": "No test for the zero-results path",
+            "reason": "separate coverage issue filed; the branch itself does not regress",
+        },
+        {
+            "finding": "Zero results may crash the caller",
+            "reason": "caller is the CLI which guards empty input already; verified by hand",
+        },
+    ]
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call("spawn_role", "v1", role="coder", step="code", brief="fix add()"),
+                call("wait", "v2"),
+            ),
+            turn(
+                call("spawn_role", "v3", role="auditor", step="audit", brief="review the fix"),
+                call("wait", "v4"),
+            ),
+            turn(
+                call(
+                    "finish",
+                    "v5",
+                    outcome="done",
+                    summary="shipped with two findings accepted",
+                    accepted_findings=full,
+                )
+            ),
+        ],
+    )
+    provider.route("Fulfill the task", _coder_script("tests pass"))
+    provider.route("Find issues", _auditor_script(AUDIT_MEDIUM))
+
+    first = asyncio.create_task(runner(world).run())
+    # the accepted finish is let through the rail and reaches the ship gate; the
+    # kill lands while the mission waits there
+    for _ in range(300):
+        if await store.list_open_gates("mo"):
+            break
+        await asyncio.sleep(0.05)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    before = await store.get_mission("mo")
+    assert before is not None and before.status == MissionStatus.AWAITING_GATE
+    # the recorded finish is in the conversation with its accepted reasons
+    calls_before = len(provider.requests)
+    second = asyncio.create_task(runner(world).run())
+    await approve_next_gate(world)
+    await asyncio.wait_for(second, timeout=30)
+
+    mission = await store.get_mission("mo")
+    assert mission is not None and mission.status == MissionStatus.DONE
+    assert (mission.result or {}).get("accepted_findings") == full, (
+        "the owner's recorded reasons survive a restart unchanged"
+    )
+    assert (mission.result or {}).get("summary") == "shipped with two findings accepted"
+    assert len(provider.requests) == calls_before, "a recorded finish costs no model call"
+
+    # the rail is still computed the same way on the reloaded state: a fresh
+    # session over the same store re-derives the acceptance decision identically
+    from rework.orchestrator.agent import MissionOrchestrator
+
+    orch = MissionOrchestrator(runner(world), mission)
+    await orch._load()
+    assert orch._recorded_finish() == ("done", "shipped with two findings accepted")
+    assert orch.accepted_findings == full
+    await orch._enforce_audit_fresh()  # audited, and nothing ran after the audit
+    await orch._enforce_findings_accepted(orch.accepted_findings)  # still fully covered
