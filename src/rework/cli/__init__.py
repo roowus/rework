@@ -1378,9 +1378,9 @@ def targets_cmd() -> None:
         try:
             import sqlite3
 
-            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=3)
-            conn.execute("SELECT 1")
-            conn.close()
+            sconn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=3)
+            sconn.execute("SELECT 1")
+            sconn.close()
             return True
         except Exception:
             return False
@@ -1526,8 +1526,8 @@ def sync_config_cmd(
     models = DEFAULT_STATE_DIR / "models.json"
     exists = models.exists()
     typer.echo(
-        f"{'would copy' if dry_run else 'copy'} models.json: {models}",
-        f"    -> {host}:~/.rework/models.json",
+        f"{'would copy' if dry_run else 'copy'} models.json: {models}"
+        f"    -> {host}:~/.rework/models.json"
     )
 
     if dry_run:

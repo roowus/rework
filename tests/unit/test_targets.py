@@ -94,7 +94,9 @@ def test_unknown_flag_raises_unknown_default_falls_back(targets_file: Path) -> N
     with pytest.raises(KeyError):
         file.resolve_name(flag="nope")
     path = targets_file.with_name("bad-default.toml")
-    path.write_text('default = "ghost"\n[targets.rewvis]\ndb = "sqlite:///x"\ndaemon_url = "http://h"\n')
+    path.write_text(
+        'default = "ghost"\n[targets.rewvis]\ndb = "sqlite:///x"\ndaemon_url = "http://h"\n'
+    )
     bad = load_targets_file(path)
     assert bad.resolve_name() is None  # a typo'd default must not take the CLI down
     assert bad.resolve_name(flag="rewvis") == "rewvis"

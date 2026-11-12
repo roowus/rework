@@ -442,21 +442,23 @@ def test_targets_without_any_targets_file_exits_cleanly(
 def test_sync_config_merges_only_key_lines_and_never_prints_values(
     targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from rework.config import DEFAULT_STATE_DIR
 
     envdir = tmp_path / "state"
     envdir.mkdir()
     (envdir / "rework.env").write_text(
         "# local keys\nREWORK_FIREWORKS_KEY=supersecretvalue123\nOTHER=stay\n"
     )
+    (envdir / "models.json").write_text("{}")  # a local catalog exists to copy
     import rework.config as config_mod
 
     monkeypatch.setattr(config_mod, "DEFAULT_STATE_DIR", envdir)
 
-    argvs: list[list[str]] = []
+    # (argv, stdin): the merged env travels over the ssh process's stdin, not
+    # the command line (a command line is visible in `ps` on the remote host)
+    calls: list[tuple[list[str], object]] = []
 
     def fake_run(cmd: list[str], **kwargs: object) -> object:
-        argvs.append(list(cmd))
+        calls.append((list(cmd), kwargs.get("input")))
         if cmd[:1] == ["ssh"] and len(cmd) > 2 and cmd[2].startswith("cat"):
             stdout = "REWORK_FIREWORKS_KEY=old\nREWORK_DB=keepme\n"
             return type("P", (), {"stdout": stdout, "returncode": 0})()
@@ -470,22 +472,23 @@ def test_sync_config_merges_only_key_lines_and_never_prints_values(
     assert result.exit_code == 0
     out = result.output
     # key NAMES and lengths only, never values
-    assert "REWORK_FIREWORKS_KEY: 20 chars" in out
+    assert "REWORK_FIREWORKS_KEY: 19 chars" in out
     assert "supersecretvalue123" not in out
     # what was sent over ssh: keys replaced, REWORK_DB untouched, mode 600 kept
-    ssh_writes = [argv for argv in argvs if argv[:1] == ["ssh"] and "cat >" in argv[2]]
+    ssh_writes = [
+        (argv, stdin) for argv, stdin in calls if argv[:1] == ["ssh"] and "cat >" in argv[2]
+    ]
     assert ssh_writes, "the merged rework.env was never written"
-    sent = ssh_writes[-1][2]
-    assert "REWORK_FIREWORKS_KEY=supersecretvalue123" in sent
-    assert "REWORK_DB=keepme" in sent  # remote non-KEY line preserved verbatim
-    assert "chmod 600" in sent
-    assert any(argv[:1] == ["scp"] for argv in argvs), "models.json was not copied"
+    write_cmd, stdin = ssh_writes[-1]
+    assert stdin is not None and "REWORK_FIREWORKS_KEY=supersecretvalue123" in str(stdin)
+    assert "REWORK_DB=keepme" in str(stdin)  # remote non-KEY line preserved verbatim
+    assert any("chmod 600" in part for part in write_cmd)
+    assert any(argv[0] == "scp" for argv, _ in calls), "models.json was not copied"
 
 
 def test_sync_config_dry_run_touches_nothing(
     targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from rework.config import DEFAULT_STATE_DIR
 
     envdir = tmp_path / "state"
     envdir.mkdir()
@@ -508,9 +511,16 @@ def test_sync_config_dry_run_touches_nothing(
     assert result.exit_code == 0
     assert "would copy" in result.output
     assert "dry run: nothing was sent" in result.output
-    assert "REWORK_FIREWORKS_KEY: 20 chars" in result.output
+    assert "REWORK_FIREWORKS_KEY: 19 chars" in result.output
     assert "supersecretvalue123" not in result.output
-    assert not [argv for argv in called if argv[0] in ("ssh", "scp")]
+    # dry-run may READ the remote env (the read-only cat, to know add vs
+    # replace) but must never WRITE anything: no heredoc/cat>, no chmod, no scp
+    writes = [
+        argv
+        for argv in called
+        if argv[0] == "scp" or (argv[0] == "ssh" and ("cat >" in argv[2] or "chmod" in argv[2]))
+    ]
+    assert not writes, f"dry run wrote to the remote host: {writes}"
 
 
 def test_sync_config_requires_an_ssh_host(targets_file: Path) -> None:
