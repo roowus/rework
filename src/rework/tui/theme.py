@@ -188,10 +188,15 @@ def clip(text: str, width: int) -> str:
 
 
 def esc(text: object) -> str:
-    """Escape markup in user/agent text (Textual content markup)."""
-    from textual.markup import escape
+    """Escape markup in user/agent text (Textual content markup).
 
-    return escape(str(text if text is not None else ""))
+    Escapes EVERY "[". Found live: textual.markup.escape only escapes brackets
+    that look like tags, so agent text such as '["git", "-c", "commit"]' or
+    '[n] for n in nodes]' still raised MarkupError: 1,447 errors on the mission
+    cards, a chat that could not show the owner's message, and a Gates view that
+    broke and took the TUI down. A backslash-escaped "[" is literal in Textual
+    markup, and this round-trips exactly (see tests/unit/test_esc.py)."""
+    return str(text if text is not None else "").replace("[", "\\[")
 
 
 def m(colour: str, text: object) -> str:
