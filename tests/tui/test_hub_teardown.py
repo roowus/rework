@@ -128,7 +128,7 @@ async def test_a_no_matches_listener_is_excused_only_while_closing(caplog) -> No
     """The negative control: a live NoMatches is a real bug (wrong selector)
     and must keep its traceback."""
 
-    def missing() -> None:
+    def missing(snapshot: Any) -> None:
         raise NoMatches("No nodes match 'MenuBar' on Screen(id='_default')")
 
     hub = Hub()  # type: ignore[arg-type]
@@ -136,12 +136,17 @@ async def test_a_no_matches_listener_is_excused_only_while_closing(caplog) -> No
     caplog.set_level(logging.DEBUG, logger="rework.tui")
 
     hub._broadcast()
-    assert [r.levelname for r in _records(caplog, logging.ERROR)] == ["ERROR"]
+    live = _records(caplog, logging.ERROR)
+    assert [r.getMessage() for r in live] == ["hub listener failed"]
+    assert live[0].exc_info is not None, "a live NoMatches keeps its traceback"
 
     caplog.clear()
     hub._closing = True
     hub._broadcast()
     assert _records(caplog, logging.ERROR) == []
+    assert [r.getMessage() for r in _records(caplog, logging.DEBUG)] == [
+        "listener queried a torn-down DOM during shutdown"
+    ], "the torn-down query is still noted, at debug"
 
 
 async def test_a_broken_listener_still_reports_while_closing(caplog) -> None:  # type: ignore[no-untyped-def]
@@ -149,7 +154,7 @@ async def test_a_broken_listener_still_reports_while_closing(caplog) -> None:  #
     and a broken listener must still not starve the others."""
     seen: list[Any] = []
 
-    def broken() -> None:
+    def broken(snapshot: Any) -> None:
         raise RuntimeError("listener bug")
 
     hub = Hub()  # type: ignore[arg-type]
