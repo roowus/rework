@@ -538,8 +538,10 @@ def test_role_env_redirects_rework_state_dirs_to_scratch(tmp_path: Path) -> None
     from rework.nodes.tools import role_env
 
     # Monkeypatch to ensure REWORK_TARGETS/etc are not already set
-    env_backup = {k: os.environ.pop(k, None) for k in
-                  ("REWORK_TARGETS", "REWORK_ENV_FILE", "REWORK_TUI_SETTINGS", "REWORK_LOG_DIR")}
+    env_backup = {
+        k: os.environ.pop(k, None)
+        for k in ("REWORK_TARGETS", "REWORK_ENV_FILE", "REWORK_TUI_SETTINGS", "REWORK_LOG_DIR")
+    }
     try:
         result = role_env(tmp_path)
     finally:
@@ -558,9 +560,7 @@ def test_role_env_redirects_rework_state_dirs_to_scratch(tmp_path: Path) -> None
         f"REWORK_TARGETS {targets!r} points inside the real ~/.rework"
     )
     # Must point inside the per-run scratch dir under workdir
-    assert targets.startswith(str(scratch)), (
-        f"REWORK_TARGETS {targets!r} should be under {scratch}"
-    )
+    assert targets.startswith(str(scratch)), f"REWORK_TARGETS {targets!r} should be under {scratch}"
 
     # Same for REWORK_ENV_FILE
     env_file = result.get("REWORK_ENV_FILE", "")
@@ -570,15 +570,11 @@ def test_role_env_redirects_rework_state_dirs_to_scratch(tmp_path: Path) -> None
 
     # Same for REWORK_TUI_SETTINGS
     tui = result.get("REWORK_TUI_SETTINGS", "")
-    assert tui.startswith(str(scratch)), (
-        f"REWORK_TUI_SETTINGS {tui!r} should be under {scratch}"
-    )
+    assert tui.startswith(str(scratch)), f"REWORK_TUI_SETTINGS {tui!r} should be under {scratch}"
 
     # Same for REWORK_LOG_DIR
     log_dir = result.get("REWORK_LOG_DIR", "")
-    assert log_dir.startswith(str(scratch)), (
-        f"REWORK_LOG_DIR {log_dir!r} should be under {scratch}"
-    )
+    assert log_dir.startswith(str(scratch)), f"REWORK_LOG_DIR {log_dir!r} should be under {scratch}"
 
     # Scratch dir was created
     assert scratch.is_dir(), "scratch dir should be created by role_env"

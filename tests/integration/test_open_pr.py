@@ -265,7 +265,7 @@ async def orch_world(pr_env_orch: dict[str, Any]) -> AsyncIterator[dict[str, Any
         await store.aclose()
 
 
-def _orch_pr_script() -> list[ChatResult]:  # type: ignore[no-untyped-def]
+def _orch_pr_script() -> list[Any]:
     """Scripted orchestrator tool calls: investigate -> code -> audit -> finish."""
     from rework.kernel.llm.types import ChatResult, ToolCall, Usage
 
@@ -279,8 +279,14 @@ def _orch_pr_script() -> list[ChatResult]:  # type: ignore[no-untyped-def]
 
     return [
         turn(
-            call("spawn_role", "p1", role="investigator", step="investigate",
-                 brief="find add() bug", model="flash"),
+            call(
+                "spawn_role",
+                "p1",
+                role="investigator",
+                step="investigate",
+                brief="find add() bug",
+                model="flash",
+            ),
             call("wait", "p2"),
             text="Investigating.",
         ),
@@ -354,6 +360,5 @@ async def test_pr_body_leads_with_orchestrator_summary(
     # Coder handoff text should NOT appear in "What changed" (it goes to appendix)
     what_changed = pr_body.split("## What changed", 1)[1].split("##", 1)[0]
     assert CODER_HANDOFF not in what_changed, (
-        f"PR body 'What changed' should not contain coder handoff.\n"
-        f"Section:\n{what_changed[:400]}"
+        f"PR body 'What changed' should not contain coder handoff.\nSection:\n{what_changed[:400]}"
     )
