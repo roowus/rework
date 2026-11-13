@@ -337,6 +337,32 @@ def test_mechanical_escalation_falls_back_to_the_strongest_usable(
     assert _escalation_entry(keyless, "flash") == "pro"
 
 
+def test_mechanical_escalation_uses_the_strongest_usable_when_the_configured_one_is_current(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The branch that makes the configured-model fallback mechanical.
+
+    `escalation_model_id()` resolves a keyless/missing configured id to the
+    strongest USABLE entry, so by the time the engine looks again that id IS in
+    the catalog and usable: the only thing left is that it must not be the
+    model we are already on. This is the one case the first branch cannot
+    answer, and the same-provider tier step must NOT answer it either (here
+    there is no higher same-provider tier at all), so a bare promote() would
+    hand back nothing while a stronger usable model exists."""
+    cat = ModelCatalog(
+        [
+            _entry("flash", tier=1),
+            _entry(ESCALATION_MODEL_ID, tier=3),
+            _entry("mid", tier=4, provider="anthropic"),  # strongest, other provider
+        ]
+    )
+    monkeypatch.delenv(ESCALATION_MODEL_ENV, raising=False)
+    assert escalation_model_id(cat) == ESCALATION_MODEL_ID  # usable, so no fallback yet
+    assert cat.strongest_usable().id == "mid"
+    assert cat.promote(ESCALATION_MODEL_ID) is None  # no higher same-provider tier
+    assert _escalation_entry(cat, ESCALATION_MODEL_ID) == "mid"
+
+
 def test_mechanical_escalation_keeps_promote_as_the_last_resort(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
