@@ -68,6 +68,10 @@ class Hub:
         self._failures = 0
         self._next_try = 0.0
         self._on_offline: Callable[[str], None] | None = None
+        # set BEFORE the first await in aclose(): a refresh suspended in its
+        # queries resumes during teardown, and its failure must not be
+        # reported as an outage (see aclose + docs/TUI-HANDOFF.md trap #1)
+        self._closing = False
 
     def subscribe(self, fn: Callable[[Snapshot], None]) -> None:
         self._listeners.append(fn)
@@ -79,7 +83,7 @@ class Hub:
     async def refresh(self) -> Snapshot:
         """One poll. Single-flight: an overlapping call returns the current
         snapshot instead of stacking queries on a slow link."""
-        if self._busy or time.monotonic() < self._next_try:
+        if self._closing or self._busy or time.monotonic() < self._next_try:
             return self.snapshot
         self._busy = True
         try:
@@ -105,12 +109,20 @@ class Hub:
                 self._failures = 0
                 self._next_try = 0.0
             except Exception as exc:  # stale data with an offline marker
+                if self._closing:
+                    # the store went away under us: that is teardown, not an
+                    # outage. Do not count it, log it, or repaint.
+                    return self.snapshot
                 self._failures += 1
                 if self._failures == 1:  # log the transition, not every poll
                     log.warning("offline: %s", exc)
                 self._next_try = time.monotonic() + min(30.0, 2.0**self._failures)
                 snap.online = False
                 snap.error = f"{type(exc).__name__}: {exc}"[:200]
+            if self._closing:
+                # an await above ran us into teardown: keep the last snapshot
+                # rather than broadcasting into a torn-down DOM
+                return self.snapshot
             snap.at = time.time()
             self.snapshot = snap
             self._broadcast()
@@ -134,9 +146,19 @@ class Hub:
         return sum(float(r.get("cost_usd") or 0) for r in rows)
 
     def _broadcast(self) -> None:
+        from textual.css.query import NoMatches
+
         for fn in list(self._listeners):
             try:
                 fn(self.snapshot)
+            except NoMatches:
+                # teardown removed the widgets this listener paints into.
+                # While closing that is expected; a live NoMatches is a real
+                # bug (wrong selector) and keeps its traceback.
+                if self._closing:
+                    log.debug("listener queried a torn-down DOM during shutdown")
+                else:
+                    log.exception("hub listener failed")
             except Exception:  # a broken view must not starve the others
                 log.exception("hub listener failed")
 
@@ -145,6 +167,8 @@ class Hub:
         try:
             return await call()
         except Exception as exc:
+            if self._closing:
+                return default  # a query dying with the store is not an outage
             if self.snapshot.online:
                 log.warning("query failed: %s", exc)
                 self.snapshot.online = False
@@ -153,6 +177,7 @@ class Hub:
             return default
 
     async def aclose(self) -> None:
+        self._closing = True  # first statement: before any await
         try:
             await self.data.aclose()
         except Exception:
