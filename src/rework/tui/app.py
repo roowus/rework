@@ -258,6 +258,17 @@ class ReworkApp(App[None]):
             log.warning("tick failed: %s", exc)
 
     def _on_snapshot(self, snap: Snapshot) -> None:
+        if not self.is_running:
+            # Textual's shutdown removes the children (App._close_all) before
+            # it dispatches Unmount -> hub.aclose(), so a poll resuming in that
+            # window still reaches this listener with MenuBar already gone: the
+            # query raised NoMatches, the Hub logged it as a live bug, and
+            # tui.log grew an error the owner never saw (tests/tui/
+            # test_toast_log.py::test_a_swallowed_error_is_logged_exactly_once).
+            # `_running` is False from the first line of _shutdown, so this is
+            # the one point that is reliably teardown: a snapshot arriving now
+            # has nothing left to paint.
+            return
         self.query_one(MenuBar).set_status(
             online=snap.online,
             gates=len(snap.gates),
