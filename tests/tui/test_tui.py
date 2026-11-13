@@ -2437,3 +2437,534 @@ async def test_dashboard_graph_revision_edges(env: Path) -> None:
         assert len(edges) >= 3, f"Expected at least 3 edges between nodes, got {len(edges)}"
 
         assert not app.swallowed
+
+
+@pytest.mark.asyncio
+async def test_dashboard_graph_two_parallel_layers(env: Path) -> None:
+    """Test two separate parallel layers - round 1 has 2 auditors, round 2 has 2 auditors.
+
+    Each .glayer Horizontal should hold exactly its own 2 nodes, not duplicated.
+    """
+    import os
+    import time
+
+    from rework.kernel.state.records import Mission, MissionStatus, Run, RunStatus
+    from rework.kernel.state.sqlite import open_sqlite
+
+    store = await open_sqlite(os.environ["REWORK_DB"])
+    try:
+        mission = await store.create_mission(
+            Mission(
+                id="m-twoparallel1",
+                objective="Test two parallel layers",
+                status=MissionStatus.RUNNING,
+                plan={
+                    "orchestrator": {"model": "pro"},
+                    "playbook": "standard",
+                    "gates": ["ship"],
+                },
+            )
+        )
+
+        base_time = time.time()
+
+        # Round 1: coder + 2 parallel auditors
+        await store.create_run(
+            Run(
+                id=f"{mission.id}:code:coder:1",
+                mission_id=mission.id,
+                role="coder",
+                step="code",
+                attempt=1,
+                status=RunStatus.COMPLETED,
+                created_at=base_time,
+                artifact={"branch": "rework/m-twoparallel1"},
+            )
+        )
+        # Two auditors spawned together (within 2s window)
+        await store.create_run(
+            Run(
+                id=f"{mission.id}:audit:auditor:1",
+                mission_id=mission.id,
+                role="auditor",
+                step="audit",
+                attempt=1,
+                status=RunStatus.COMPLETED,
+                created_at=base_time + 10,
+                context={"strictness": "standard"},
+                artifact={
+                    "findings": [
+                        {
+                            "title": "Issue A",
+                            "severity": "high",
+                            "detail": "...",
+                            "evidence": [],
+                            "verdict": "CONFIRMED",
+                            "confidence": 0.9,
+                        }
+                    ]
+                },
+            )
+        )
+        await store.create_run(
+            Run(
+                id=f"{mission.id}:audit:auditor:2",
+                mission_id=mission.id,
+                role="auditor",
+                step="audit",
+                attempt=2,
+                status=RunStatus.COMPLETED,
+                created_at=base_time + 10.5,  # Within 2s window = parallel
+                context={"strictness": "strict"},
+                artifact={"findings": []},
+            )
+        )
+
+        # Round 2: coder revision + 2 parallel auditors
+        await store.create_run(
+            Run(
+                id=f"{mission.id}:code:coder:2",
+                mission_id=mission.id,
+                role="coder",
+                step="code",
+                attempt=2,
+                status=RunStatus.COMPLETED,
+                created_at=base_time + 120,  # Well after round 1
+                artifact={"branch": "rework/m-twoparallel1"},
+            )
+        )
+        await store.create_run(
+            Run(
+                id=f"{mission.id}:audit:auditor:3",
+                mission_id=mission.id,
+                role="auditor",
+                step="audit",
+                attempt=3,
+                status=RunStatus.COMPLETED,
+                created_at=base_time + 180,
+                context={"strictness": "standard"},
+                artifact={"findings": []},
+            )
+        )
+        await store.create_run(
+            Run(
+                id=f"{mission.id}:audit:auditor:4",
+                mission_id=mission.id,
+                role="auditor",
+                step="audit",
+                attempt=4,
+                status=RunStatus.COMPLETED,
+                created_at=base_time + 180.5,  # Within 2s window = parallel
+                context={"strictness": "strict"},
+                artifact={"findings": []},
+            )
+        )
+
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.open_mission("m-twoparallel1")
+        await _settle(pilot, 1.0)
+
+        from rework.tui.widgets.base import ChipGroup
+
+        tabs = app.query_one("#m-tabs", ChipGroup)
+        graph_chip = next(c for c in tabs.query(".chip") if c.value == "graph")
+        await pilot.click(graph_chip)
+        await _settle(pilot, 0.6)
+
+        # Should have 2 parallel layers (one for each round's 2 auditors)
+        parallel_layers = list(app.query(".glayer"))
+        assert len(parallel_layers) == 2, f"Expected 2 parallel layers, got {len(parallel_layers)}"
+
+        # Each layer should have exactly 2 nodes
+        for i, layer in enumerate(parallel_layers):
+            nodes_in_layer = list(layer.query(".gnode"))
+            assert len(nodes_in_layer) == 2, (
+                f"Layer {i} should have 2 nodes, got {len(nodes_in_layer)}"
+            )
+            # They should have different run IDs
+            run_ids = [n.node.run_id for n in nodes_in_layer]
+            assert len(set(run_ids)) == 2, f"Layer {i} nodes should be distinct: {run_ids}"
+
+        # Verify total: orch + coder1 + 2 auditors + coder2 + 2 auditors + gate + end = 9
+        all_nodes = list(app.query(".gnode"))
+        assert len(all_nodes) == 9, f"Expected 9 nodes total, got {len(all_nodes)}"
+
+        assert not app.swallowed
+
+
+@pytest.mark.asyncio
+async def test_dashboard_graph_mixed_artifacts(env: Path) -> None:
+    """Test that layers are not dropped when some runs have artifacts and some don't.
+
+    Regression test for the bug where mission_layers silently dropped layers when
+    some audit runs had artifact=None or empty findings.
+    """
+    import os
+    import time
+
+    from rework.kernel.state.records import Mission, MissionStatus, Run, RunStatus
+    from rework.kernel.state.sqlite import open_sqlite
+
+    store = await open_sqlite(os.environ["REWORK_DB"])
+    try:
+        mission = await store.create_mission(
+            Mission(
+                id="m-mixedartif1",
+                objective="Test mixed artifact presence",
+                status=MissionStatus.RUNNING,
+                plan={
+                    "orchestrator": {"model": "pro"},
+                    "playbook": "standard",
+                    "gates": ["ship"],
+                },
+            )
+        )
+
+        base_time = time.time()
+
+        # Round 1: coder + auditor WITH findings
+        await store.create_run(
+            Run(
+                id=f"{mission.id}:code:coder:1",
+                mission_id=mission.id,
+                role="coder",
+                step="code",
+                attempt=1,
+                status=RunStatus.COMPLETED,
+                created_at=base_time,
+                artifact={"branch": "rework/m-mixedartif1"},
+            )
+        )
+        await store.create_run(
+            Run(
+                id=f"{mission.id}:audit:auditor:1",
+                mission_id=mission.id,
+                role="auditor",
+                step="audit",
+                attempt=1,
+                status=RunStatus.COMPLETED,
+                created_at=base_time + 60,
+                context={"strictness": "standard"},
+                artifact={
+                    "findings": [
+                        {
+                            "title": "Bug",
+                            "severity": "high",
+                            "detail": "...",
+                            "evidence": [],
+                            "verdict": "CONFIRMED",
+                            "confidence": 0.9,
+                        }
+                    ]
+                },
+            )
+        )
+
+        # Round 2: coder + auditor WITHOUT artifact (still running or no findings yet)
+        await store.create_run(
+            Run(
+                id=f"{mission.id}:code:coder:2",
+                mission_id=mission.id,
+                role="coder",
+                step="code",
+                attempt=2,
+                status=RunStatus.COMPLETED,
+                created_at=base_time + 120,
+                artifact={"branch": "rework/m-mixedartif1"},
+            )
+        )
+        await store.create_run(
+            Run(
+                id=f"{mission.id}:audit:auditor:2",
+                mission_id=mission.id,
+                role="auditor",
+                step="audit",
+                attempt=2,
+                status=RunStatus.RUNNING,  # Still running - no artifact yet
+                created_at=base_time + 180,
+                context={"strictness": "standard"},
+                artifact=None,  # No artifact
+            )
+        )
+
+        # Round 3: coder + auditor with EMPTY artifact
+        await store.create_run(
+            Run(
+                id=f"{mission.id}:code:coder:3",
+                mission_id=mission.id,
+                role="coder",
+                step="code",
+                attempt=3,
+                status=RunStatus.COMPLETED,
+                created_at=base_time + 240,
+                artifact={"branch": "rework/m-mixedartif1"},
+            )
+        )
+        await store.create_run(
+            Run(
+                id=f"{mission.id}:audit:auditor:3",
+                mission_id=mission.id,
+                role="auditor",
+                step="audit",
+                attempt=3,
+                status=RunStatus.COMPLETED,
+                created_at=base_time + 300,
+                context={"strictness": "standard"},
+                artifact={},  # Empty artifact
+            )
+        )
+
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.open_mission("m-mixedartif1")
+        await _settle(pilot, 1.0)
+
+        from rework.tui.widgets.base import ChipGroup
+
+        tabs = app.query_one("#m-tabs", ChipGroup)
+        graph_chip = next(c for c in tabs.query(".chip") if c.value == "graph")
+        await pilot.click(graph_chip)
+        await _settle(pilot, 0.6)
+
+        # Check that all 6 runs are rendered as nodes (plus orchestrator, gate, end)
+        all_nodes = list(app.query(".gnode"))
+        node_keys = [n.node.key for n in all_nodes]
+
+        # Expected: orchestrator + 3 coders + 3 auditors + gate + end = 9 nodes
+        assert len(all_nodes) == 9, (
+            f"Expected 9 nodes (all runs visible), got {len(all_nodes)}: {node_keys}"
+        )
+
+        # Verify each run is present
+        expected_runs = [
+            f"{mission.id}:code:coder:1",
+            f"{mission.id}:audit:auditor:1",
+            f"{mission.id}:code:coder:2",
+            f"{mission.id}:audit:auditor:2",
+            f"{mission.id}:code:coder:3",
+            f"{mission.id}:audit:auditor:3",
+        ]
+        for run_id in expected_runs:
+            assert run_id in node_keys, f"Missing node for run {run_id}"
+
+        assert not app.swallowed
+
+
+@pytest.mark.asyncio
+async def test_dashboard_graph_sequential_not_merged(env: Path) -> None:
+    """Test that sequential revision-loop spawns are NOT merged into parallel groups.
+
+    Regression test for the brittle parallel-detection heuristic: sequential runs
+    (coder -> auditor -> coder) should each be their own layer, even if their
+    spawn events have adjacent sequence numbers.
+    """
+    import os
+    import time
+
+    from rework.kernel.state.records import Mission, MissionStatus, Run, RunStatus
+    from rework.kernel.state.sqlite import open_sqlite
+
+    store = await open_sqlite(os.environ["REWORK_DB"])
+    try:
+        mission = await store.create_mission(
+            Mission(
+                id="m-sequential1",
+                objective="Test sequential runs stay separate",
+                status=MissionStatus.DONE,
+                plan={
+                    "orchestrator": {"model": "pro"},
+                    "playbook": "standard",
+                    "gates": [],
+                },
+            )
+        )
+
+        base_time = time.time()
+
+        # 3 sequential rounds, each spawned well apart in time
+        # Even if their event seq numbers were 1,2,3,4,5,6, they should NOT merge
+        for i in range(3):
+            # Each round is 100 seconds apart (well beyond the 2s parallel window)
+            round_time = base_time + (i * 100)
+            await store.create_run(
+                Run(
+                    id=f"{mission.id}:code:coder:{i + 1}",
+                    mission_id=mission.id,
+                    role="coder",
+                    step="code",
+                    attempt=i + 1,
+                    status=RunStatus.COMPLETED,
+                    created_at=round_time,
+                    artifact={"branch": f"rework/m-sequential1-{i + 1}"},
+                )
+            )
+            await store.create_run(
+                Run(
+                    id=f"{mission.id}:audit:auditor:{i + 1}",
+                    mission_id=mission.id,
+                    role="auditor",
+                    step="audit",
+                    attempt=i + 1,
+                    status=RunStatus.COMPLETED,
+                    created_at=round_time + 50,  # 50 seconds later
+                    context={"strictness": "standard"},
+                    artifact={
+                        "findings": []
+                        if i == 2
+                        else [
+                            {
+                                "title": "Issue",
+                                "severity": "high",
+                                "detail": "...",
+                                "evidence": [],
+                                "verdict": "CONFIRMED",
+                                "confidence": 0.9,
+                            }
+                        ]
+                    },
+                )
+            )
+
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.open_mission("m-sequential1")
+        await _settle(pilot, 1.0)
+
+        from rework.tui.widgets.base import ChipGroup
+
+        tabs = app.query_one("#m-tabs", ChipGroup)
+        graph_chip = next(c for c in tabs.query(".chip") if c.value == "graph")
+        await pilot.click(graph_chip)
+        await _settle(pilot, 0.6)
+
+        # Should NOT have any parallel layers - all runs should be sequential
+        parallel_layers = list(app.query(".glayer"))
+        assert len(parallel_layers) == 0, (
+            f"Expected 0 parallel layers (all sequential), got {len(parallel_layers)}"
+        )
+
+        # Each run should be in its own layer - 6 runs = 6 run layers
+        # Plus orchestrator + end = 8 total layers
+        # Count by edges (n layers = n-1 edges for a linear graph)
+        edges = list(app.query(".gedge"))
+        # orchestrator -> coder1 -> audit1 -> coder2 -> audit2 -> coder3 -> audit3 -> end = 7 edges
+        assert len(edges) == 7, f"Expected 7 edges (8 layers), got {len(edges)}"
+
+        assert not app.swallowed
+
+
+@pytest.mark.asyncio
+async def test_dashboard_graph_collapse_many_rounds(env: Path) -> None:
+    """Test that graphs with many rounds collapse old rounds correctly.
+
+    Tests: title says "rounds 1-N" with correct round count, status reflects
+    actual run statuses, and the right number of rounds are visible.
+    """
+    import os
+    import time
+
+    from rework.kernel.state.records import Mission, MissionStatus, Run, RunStatus
+    from rework.kernel.state.sqlite import open_sqlite
+
+    store = await open_sqlite(os.environ["REWORK_DB"])
+    try:
+        mission = await store.create_mission(
+            Mission(
+                id="m-manyround1",
+                objective="Test collapse of many rounds",
+                status=MissionStatus.DONE,
+                plan={
+                    "orchestrator": {"model": "pro"},
+                    "playbook": "standard",
+                    "gates": [],
+                },
+            )
+        )
+
+        base_time = time.time()
+
+        # Create 7 rounds (more than COLLAPSE_ROUND_THRESHOLD=5)
+        # This should trigger collapsing to keep ~4 visible
+        for i in range(7):
+            round_time = base_time + (i * 100)
+            status = RunStatus.COMPLETED
+            # Make one early round failed to test status derivation
+            if i == 1:
+                status = RunStatus.FAILED
+            await store.create_run(
+                Run(
+                    id=f"{mission.id}:code:coder:{i + 1}",
+                    mission_id=mission.id,
+                    role="coder",
+                    step="code",
+                    attempt=i + 1,
+                    status=status,
+                    created_at=round_time,
+                    artifact={"branch": f"rework/m-manyround1-{i + 1}"},
+                )
+            )
+            await store.create_run(
+                Run(
+                    id=f"{mission.id}:audit:auditor:{i + 1}",
+                    mission_id=mission.id,
+                    role="auditor",
+                    step="audit",
+                    attempt=i + 1,
+                    status=RunStatus.COMPLETED,
+                    created_at=round_time + 50,
+                    context={"strictness": "standard"},
+                    artifact={"findings": []},
+                )
+            )
+
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.open_mission("m-manyround1")
+        await _settle(pilot, 1.0)
+
+        from rework.tui.widgets.base import ChipGroup
+
+        tabs = app.query_one("#m-tabs", ChipGroup)
+        graph_chip = next(c for c in tabs.query(".chip") if c.value == "graph")
+        await pilot.click(graph_chip)
+        await _settle(pilot, 0.6)
+
+        # Find the collapsed summary node
+        all_nodes = list(app.query(".gnode"))
+        collapsed_nodes = [n for n in all_nodes if "collapsed" in n.node.key]
+
+        assert len(collapsed_nodes) == 1, f"Expected 1 collapsed node, got {len(collapsed_nodes)}"
+
+        collapsed = collapsed_nodes[0].node
+        # Title should say "rounds 1-X (collapsed)" where X is the round count, not group count
+        assert "rounds 1-" in collapsed.title.lower(), (
+            f"Title should start with 'rounds 1-': {collapsed.title}"
+        )
+        assert "(collapsed)" in collapsed.title.lower(), (
+            f"Title should contain '(collapsed)': {collapsed.title}"
+        )
+
+        # Status should reflect the failed run (round 2 had a failed coder)
+        # The collapsed status should be "failed" since there's a failure in the collapsed rounds
+        assert collapsed.status == "failed", (
+            f"Collapsed status should be 'failed' (round 2 failed), got: {collapsed.status}"
+        )
+
+        assert not app.swallowed

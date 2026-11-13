@@ -369,6 +369,65 @@ def _mission_nodes_per_run(
     return nodes
 
 
+# Constants for parallel detection and collapse thresholds
+PARALLEL_SPAWN_WINDOW_SECONDS = 2.0  # Spawns within this window are considered parallel
+COLLAPSE_ROUND_THRESHOLD = 5  # Collapse when more than this many rounds
+COLLAPSE_KEEP_ROUNDS = 4  # Keep the last N rounds visible after collapse
+
+
+def _count_rounds(run_groups: list[list[Any]]) -> int:
+    """Count the number of distinct rounds (coder+audit pairs) in run groups.
+
+    A round is a coder run followed by its audit. Parallel auditors count as
+    one round. A coder without a following audit is a partial round.
+    """
+    round_count = 0
+    seen_coder = False
+
+    for group in run_groups:
+        roles_in_group = {run.role for run in group}
+        if "coder" in roles_in_group:
+            if seen_coder:
+                # Previous coder had no audit - count it as a round
+                round_count += 1
+            seen_coder = True
+        if "auditor" in roles_in_group and seen_coder:
+            # Coder + auditor = one round
+            round_count += 1
+            seen_coder = False
+
+    # Final coder without audit
+    if seen_coder:
+        round_count += 1
+
+    return max(round_count, 1) if run_groups else 0
+
+
+def _derive_collapsed_status(runs: list[Any]) -> str:
+    """Derive a summary status for collapsed runs.
+
+    Returns:
+    - "completed" if all runs completed successfully
+    - "failed" if any run failed
+    - "mixed" if there's a mix of outcomes
+    """
+    if not runs:
+        return "completed"
+
+    statuses = {status_value(r.status) for r in runs}
+
+    if statuses == {"completed"}:
+        return "completed"
+    if "failed" in statuses:
+        return "failed"
+    if "cancelled" in statuses:
+        return "cancelled"
+    if statuses - {"completed", "running", "pending", "intent"}:
+        # Has some non-success terminal states
+        return "mixed"
+    return "completed"
+
+
 def mission_layers(
     mission: Any,
     runs: list[Any],
@@ -406,31 +465,60 @@ def mission_layers(
     )
     layers.append(GLayer(nodes=[orch_node], edge_to_next=GEdge()))
 
-    # Group runs by spawn events to detect parallel execution
+    # Group runs by spawn timing to detect parallel execution
     run_groups = _group_parallel_runs(runs, events)
 
     # Track revision loops: when an audit's findings trigger another coder run
     prev_audit_run: Any = None
 
-    # Collapse >4 rounds if needed (count total rounds, not run groups)
-    total_runs = sum(len(group) for group in run_groups)
-    if total_runs > 8:  # More than 6 runs (3 rounds of coder+audit pairs)
-        # Collapse early rounds, keep last 3 round groups
-        collapsed_count = len(run_groups) - 3
-        collapsed_runs = [r for group in run_groups[:collapsed_count] for r in group]
+    # Collapse when more than COLLAPSE_ROUND_THRESHOLD rounds
+    total_rounds = _count_rounds(run_groups)
+    if total_rounds > COLLAPSE_ROUND_THRESHOLD:
+        # Find how many groups to collapse to keep ~COLLAPSE_KEEP_ROUNDS rounds visible
+        # Work backwards to find the split point
+        rounds_from_end = 0
+        split_idx = len(run_groups)
+        seen_coder = False
 
-        # Create a summary node
-        summary_node = GNode(
-            key="rounds-collapsed",
-            title=f"rounds 1-{collapsed_count} (collapsed)",
-            status="completed",  # Assume earlier rounds completed
-            sub=f"{len(collapsed_runs)} runs",
-            run_id=None,
-        )
-        layers.append(GLayer(nodes=[summary_node], edge_to_next=GEdge()))
+        for i in range(len(run_groups) - 1, -1, -1):
+            group = run_groups[i]
+            roles_in_group = {run.role for run in group}
 
-        # Keep only last 3 round groups
-        run_groups = run_groups[-3:]
+            if "coder" in roles_in_group:
+                if seen_coder or "auditor" not in roles_in_group:
+                    # This coder starts a new round (going backwards)
+                    rounds_from_end += 1
+                    if rounds_from_end >= COLLAPSE_KEEP_ROUNDS:
+                        split_idx = i
+                        break
+                seen_coder = True
+            if "auditor" in roles_in_group and seen_coder:
+                rounds_from_end += 1
+                seen_coder = False
+                if rounds_from_end >= COLLAPSE_KEEP_ROUNDS:
+                    split_idx = i
+                    break
+
+        if split_idx > 0:
+            collapsed_groups = run_groups[:split_idx]
+            collapsed_runs = [r for group in collapsed_groups for r in group]
+            collapsed_round_count = _count_rounds(collapsed_groups)
+
+            # Derive status from collapsed runs
+            collapsed_status = _derive_collapsed_status(collapsed_runs)
+
+            # Create a summary node with accurate round count
+            summary_node = GNode(
+                key="rounds-collapsed",
+                title=f"rounds 1-{collapsed_round_count} (collapsed)",
+                status=collapsed_status,
+                sub=f"{len(collapsed_runs)} runs",
+                run_id=None,
+            )
+            layers.append(GLayer(nodes=[summary_node], edge_to_next=GEdge()))
+
+            # Keep only the later groups
+            run_groups = run_groups[split_idx:]
 
     # Process each group of runs
     for group_idx, group in enumerate(run_groups):
@@ -512,68 +600,47 @@ def mission_layers(
 def _group_parallel_runs(runs: list[Any], events: list[Any]) -> list[list[Any]]:
     """Group runs by when they were spawned to detect parallel execution.
 
-    Returns a list of groups where each group contains runs spawned together.
+    Returns a list of groups where each group contains runs spawned together
+    (i.e., in the same orchestrator turn).
+
+    Signal for "same turn": runs with created_at timestamps within
+    PARALLEL_SPAWN_WINDOW_SECONDS of the first run in a group.
+
+    This works because the orchestrator processes multiple spawn_role tool calls
+    sequentially in a for loop (_execute_calls), so parallel spawns happen
+    within milliseconds of each other. Sequential rounds (coder -> audit ->
+    revision) have gaps of at least several seconds due to model call latency.
+
+    We do NOT use event sequence numbers because:
+    1. Sequential runs can have adjacent seq numbers (e.g. seqs 1,2,3 for
+       coder→auditor→coder - a pure revision chain with no parallelism)
+    2. The seq gap between parallel vs sequential spawns is not guaranteed
     """
     if not runs:
         return []
 
-    # Build a map of run_id -> event sequence when it was spawned
-    spawn_seq: dict[str, int] = {}
-    for ev in events:
-        if str(getattr(ev.type, "value", ev.type)) == "role_spawned" and ev.run_id:
-            spawn_seq[ev.run_id] = ev.seq or 0
+    # Sort runs by created_at timestamp
+    sorted_runs = sorted(runs, key=lambda r: r.created_at)
 
-    # If we have spawn events, use them to group runs
-    if spawn_seq:
-        # Sort runs by their spawn sequence
-        runs_with_seq = [(run, spawn_seq.get(run.id, run.created_at)) for run in runs]
-        runs_with_seq.sort(key=lambda x: x[1])
+    groups: list[list[Any]] = []
+    current_group: list[Any] = []
+    group_start_time: float = 0.0
 
-        # Group consecutive runs spawned close together (within 5 sequence numbers = same batch)
-        groups: list[list[Any]] = []
-        current_group: list[Any] = []
-        prev_seq = -1000
-
-        for run, seq in runs_with_seq:
-            if not current_group or (seq - prev_seq) <= 5:
-                # Same group
-                current_group.append(run)
-                prev_seq = seq
-            else:
-                # New group
-                if current_group:
-                    groups.append(current_group)
-                current_group = [run]
-                prev_seq = seq
-
-        if current_group:
-            groups.append(current_group)
-
-        return groups
-
-    # Fallback: group by overlapping timestamps
-    # For simplicity, assume runs are in chronological order and group consecutive runs
-    # that have overlapping time windows
-    fallback_groups: list[list[Any]] = []
-    fallback_current_group: list[Any] = []
-    fallback_current_end = 0.0
-
-    for run in runs:
-        start = run.created_at
-        end = run.updated_at if hasattr(run, "updated_at") else start + 1.0
-
-        if not fallback_current_group or start < fallback_current_end:
-            # Overlapping or first run - add to current group
-            fallback_current_group.append(run)
-            fallback_current_end = max(fallback_current_end, end)
+    for run in sorted_runs:
+        if not current_group:
+            # First run in a new group
+            current_group = [run]
+            group_start_time = run.created_at
+        elif run.created_at - group_start_time <= PARALLEL_SPAWN_WINDOW_SECONDS:
+            # Within window of the first run in this group - same parallel batch
+            current_group.append(run)
         else:
-            # No overlap - start new group
-            if fallback_current_group:
-                fallback_groups.append(fallback_current_group)
-            fallback_current_group = [run]
-            fallback_current_end = end
+            # Beyond window - start a new group
+            groups.append(current_group)
+            current_group = [run]
+            group_start_time = run.created_at
 
-    if fallback_current_group:
-        fallback_groups.append(fallback_current_group)
+    if current_group:
+        groups.append(current_group)
 
-    return fallback_groups
+    return groups
