@@ -106,7 +106,10 @@ class CoderSpec(RoleSpec):
             " brief. Read the code and use the existing tests; do not write"
             " throwaway probe scripts or experiments unless the brief asks for a"
             " measurement. Run the relevant tests after your change, and again"
-            " only if you changed something."
+            " only if you changed something.\n\n"
+            "Never write under ~/.rework or any path outside your worktree."
+            " Use temporary directories for any probes or tests that touch"
+            " rework's own config or state."
         )
 
         async def ensure_attached() -> None:

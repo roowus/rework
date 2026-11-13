@@ -251,11 +251,32 @@ def role_env(workdir: Path | None = None) -> dict[str, str]:
     command inherited VIRTUAL_ENV and that venv's bin first on PATH, so a bare
     `python`/`pytest` in a rework worktree imported the MAIN checkout's source
     and audits tested the wrong code. A plain repo (no pyproject, e.g. a toy
-    repo whose tests run with `python3 -m pytest`) keeps the daemon's tools."""
+    repo whose tests run with `python3 -m pytest`) keeps the daemon's tools.
+
+    Also redirects any rework-state paths that rework reads/writes under
+    ~/.rework (targets, env file, TUI settings, logs) to a per-run scratch
+    directory inside the role's own workdir, so a role command cannot silently
+    touch or redirect from the real ~/.rework on a dev machine."""
     import os
     import sys
 
     env = dict(os.environ)
+
+    # Always redirect rework-state paths to a per-run scratch dir under the
+    # role's workdir (if one was given), regardless of whether the worktree has
+    # a pyproject.toml.  This prevents role commands from reading/writing the
+    # real ~/.rework (targets.toml, rework.env, tui.json, logs) and
+    # accidentally redirecting which target/db rework talks to.
+    if workdir is not None:
+        scratch = workdir / ".rework-scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        # Only set if not already overridden by the caller's environment.
+        env.setdefault("REWORK_TARGETS", str(scratch / "targets.toml"))
+        env.setdefault("REWORK_ENV_FILE", str(scratch / "rework.env"))
+        env.setdefault("REWORK_TUI_SETTINGS", str(scratch / "tui.json"))
+        env.setdefault("REWORK_LOG_DIR", str(scratch / "logs"))
+        env.setdefault("REWORK_RUN_DIR", str(scratch / "run"))
+
     if workdir is not None and not (workdir / "pyproject.toml").exists():
         return env
     venvs = {v for v in (env.pop("VIRTUAL_ENV", None),) if v}
