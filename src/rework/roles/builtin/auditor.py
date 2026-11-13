@@ -114,7 +114,9 @@ class AuditorSpec(RoleSpec):
         # worktree_path (the coder's branch checkout) wins; else the mission's
         # staged repo; else the empty per-run dir (degenerate: no repo access)
         workspace = run_ctx.get("worktree_path")
-        executor = LocalExecutor(Path(workspace) if workspace else ctx.read_root)
+        executor = LocalExecutor(
+            Path(workspace) if workspace else ctx.read_root, mission_id=ctx.mission.id
+        )
 
         strictness = str(run_ctx.get("strictness") or "standard").strip().lower()
         mode = STRICTNESS_PROMPTS.get(strictness, STRICTNESS_PROMPTS["standard"])

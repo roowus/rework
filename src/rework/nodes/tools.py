@@ -93,12 +93,17 @@ class LazyExecutor:
     worktree is created by its prepare node, but the loop node is wired at
     build_graph time; this wrapper forwards to a LocalExecutor once attached."""
 
-    def __init__(self, fallback_specs: list[ToolSpec] | None = None) -> None:
+    def __init__(
+        self,
+        fallback_specs: list[ToolSpec] | None = None,
+        mission_id: str | None = None,
+    ) -> None:
         self._inner: LocalExecutor | None = None
         self._fallback = fallback_specs or list(BUILTIN_TOOLS)
+        self._mission_id = mission_id
 
     def attach(self, workdir: Path) -> None:
-        self._inner = LocalExecutor(workdir)
+        self._inner = LocalExecutor(workdir, mission_id=self._mission_id)
 
     @property
     def attached(self) -> bool:
@@ -141,9 +146,15 @@ class LocalExecutor:
     exist — we refuse it and say where it actually is, instead of handing back
     an opaque exit 2 the model misreads as success."""
 
-    def __init__(self, workdir: Path, extra_specs: list[ToolSpec] | None = None) -> None:
+    def __init__(
+        self,
+        workdir: Path,
+        extra_specs: list[ToolSpec] | None = None,
+        mission_id: str | None = None,
+    ) -> None:
         self._workdir = workdir.resolve()
         self._extra = extra_specs or []
+        self._mission_id = mission_id  # names the scratch dir; gc reclaims it
         reap_orphaned_commands()
 
     def _jail(self, path_str: str) -> Path:
@@ -211,7 +222,7 @@ class LocalExecutor:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     start_new_session=True,
-                    env=role_env(self._workdir),
+                    env=role_env(self._workdir, self._mission_id),
                 )
                 mark = _register_command(proc.pid, command)
                 try:
@@ -248,7 +259,7 @@ class LocalExecutor:
 # Per-workdir scratch dirs, keyed by the resolved workdir. role_env runs once
 # per jailed command, and every command of a run must see the SAME state dirs,
 # so the dir is derived once and cached.
-_scratch_dirs: dict[Path, Path] = {}
+_scratch_dirs: dict[tuple[Path, str | None], Path] = {}
 
 
 def _is_git_checkout(path: Path) -> bool:
@@ -261,7 +272,7 @@ def _is_git_checkout(path: Path) -> bool:
         return False
 
 
-def scratch_dir(workdir: Path) -> Path:
+def scratch_dir(workdir: Path, mission_id: str | None = None) -> Path:
     """The per-run scratch dir for rework state (targets, env file, TUI
     settings, logs, run registry), kept OUTSIDE any git checkout.
 
@@ -274,21 +285,28 @@ def scratch_dir(workdir: Path) -> Path:
     per-run temporary directory.
 
     Stable for the same workdir: role_env is called once per jailed command, so
-    repeated calls must hand back the same dir, not a fresh temp dir each time."""
+    repeated calls must hand back the same dir, not a fresh temp dir each time.
+
+    `mission_id` goes INTO the temp dir's name (`rework-scratch-<id>-<random>`):
+    found live (follow-up to PR #24), ~140 of these piled up in /tmp with no way
+    to tell whose they were, so `rework gc` could not reclaim them. Legacy dirs
+    without an id are unattributable and left alone by gc."""
     root = Path(workdir).resolve()
-    cached = _scratch_dirs.get(root)
+    key = (root, mission_id)
+    cached = _scratch_dirs.get(key)
     if cached is not None:
         return cached
     if _is_git_checkout(root):
         scratch = root.parent / ".rework-scratch"
     else:
-        scratch = Path(tempfile.mkdtemp(prefix="rework-scratch-"))
+        tag = f"{mission_id}-" if mission_id else ""
+        scratch = Path(tempfile.mkdtemp(prefix=f"rework-scratch-{tag}"))
     scratch.mkdir(parents=True, exist_ok=True)
-    _scratch_dirs[root] = scratch
+    _scratch_dirs[key] = scratch
     return scratch
 
 
-def role_env(workdir: Path | None = None) -> dict[str, str]:
+def role_env(workdir: Path | None = None, mission_id: str | None = None) -> dict[str, str]:
     """The daemon's environment, minus its own Python environment when the
     worktree is a Python project of its own (pyproject.toml). Found live: the
     daemon runs from the main checkout's venv (`uv run rework serve`), every role
@@ -314,7 +332,7 @@ def role_env(workdir: Path | None = None) -> dict[str, str]:
     # which target/db rework talks to.  The dir lives outside the git checkout,
     # so the coder handoff's `git add -A` never sees it.
     if workdir is not None:
-        scratch = scratch_dir(workdir)
+        scratch = scratch_dir(workdir, mission_id)
         # Only set if not already overridden by the caller's environment.
         env.setdefault("REWORK_TARGETS", str(scratch / "targets.toml"))
         env.setdefault("REWORK_ENV_FILE", str(scratch / "rework.env"))
