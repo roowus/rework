@@ -1276,12 +1276,23 @@ class MissionRunner:
         return gates[-1] if gates else None
 
     def escalation_entry(self, current_id: str) -> Any:
-        """The model a role is escalated TO: the configured escalation model
-        (REWORK_ESCALATION_MODEL, default 'claude-sonnet-5-5') when it is in the
-        catalog, usable here and not already the current model. Otherwise the
-        next tier up within the provider (config-gated cross-provider, ADR
-        0001). Nothing is ever excluded: switching the escalation target is
-        env-only."""
+        """The model a role is escalated TO. Resolution order:
+
+        1. the configured escalation model (REWORK_ESCALATION_MODEL, default
+           'claude-sonnet-5-5') when it is in the catalog, usable here and not
+           already the current model: the mission spec's ONE escalation target,
+           the one the prompt tells the orchestrator to escalate to;
+        2. otherwise the STRONGEST USABLE entry, the documented fallback (what
+           `escalation_model_id` itself resolves to when the configured id is
+           missing or keyless on this machine);
+        3. only when that yields nothing or is already the current model, the
+           next tier up within the provider (config-gated cross-provider, ADR
+           0001) as a last resort.
+
+        The mechanical path never invents a target the policy text does not
+        name: a same-provider tier step is the fallback of last resort, not the
+        first answer. Nothing is ever excluded: switching the escalation target
+        is env-only."""
         from rework.config import escalation_model_id
 
         try:
@@ -1291,6 +1302,9 @@ class MissionRunner:
         entry = next((e for e in self._catalog.all() if e.id == wanted), None)
         if entry is not None and entry.has_credentials() and entry.id != current_id:
             return entry
+        strongest = self._catalog.strongest_usable()
+        if strongest is not None and strongest.id != current_id:
+            return strongest
         return self._catalog.promote(current_id) if current_id else None
 
     async def _promote_and_resume(self, run: Run) -> bool:

@@ -176,7 +176,9 @@ How you work:
 
 
 def orchestrator_tools() -> list[ToolSpec]:
-    """The orchestrator's tools; text renders the configured model policy."""
+    """The orchestrator's tools. UNRENDERED templates: the descriptions and the
+    spawn_role `model` schema still carry the $DEFAULT_MODEL / $ESCALATION_MODEL
+    placeholders, so every caller must pass them through render_tool()."""
     return _TOOLS
 
 

@@ -140,6 +140,67 @@ async def test_needs_model_promotes_and_resumes(
     assert mission is not None and mission.status == MissionStatus.DONE
 
 
+async def test_needs_model_escalates_to_the_configured_model(
+    world: dict[str, Any], registry: RoleRegistry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mechanical path escalates to the ONE configured model, not to the
+    next tier up within the provider. The prompt tells the orchestrator to
+    escalate ONLY to the escalation model, so the engine must not invent a
+    target the policy text never names (here: `pro`, the same-provider step)."""
+    from rework.config import ESCALATION_MODEL_ENV, ESCALATION_MODEL_ID
+    from rework.kernel.llm.catalog import ModelCatalog, ModelEntry
+
+    monkeypatch.delenv(ESCALATION_MODEL_ENV, raising=False)
+    catalog = ModelCatalog(
+        [
+            ModelEntry(id="flash", provider="fake", model="fake-flash", tier=1),
+            ModelEntry(id="pro", provider="fake", model="fake-pro", tier=2),
+            ModelEntry(id=ESCALATION_MODEL_ID, provider="fake", model="fake-escal", tier=3),
+        ]
+    )
+    assert catalog.promote("flash").id == "pro"  # what the tier step would pick
+
+    store: SqliteStore = world["store"]
+    await store.create_mission(
+        Mission(
+            id="mp3",
+            objective="needs a bigger model",
+            plan={
+                "steps": [
+                    {
+                        "step": "do",
+                        "role": "escalating",
+                        "context": {"kind": "needs_model", "detail": "flash is too small"},
+                    }
+                ]
+            },
+        )
+    )
+    runner = MissionRunner(
+        "mp3",
+        store,
+        world["bus"],
+        registry,
+        catalog,
+        sqlite_checkpointer_factory(str(world["tmp"] / "ck4.sqlite3")),
+        world["tmp"] / "w4",
+        poll_interval_s=0.05,
+    )
+    task = asyncio.create_task(runner.run())
+    await _await_predicate(lambda: _latest_attempt_done(store, "mp3", "do"))
+    await asyncio.wait_for(task, timeout=5)
+    await runner._supervisor.aclose()
+
+    promoted = await store.get_run(run_id("mp3", "do", "escalating", 1))
+    assert promoted is not None
+    assert promoted.model_ref.get("id") == ESCALATION_MODEL_ID
+    events = await store.events_since(0, mission_id="mp3")
+    hops = [e.payload for e in events if e.type == EventType.MODEL_PROMOTED]
+    assert hops and hops[-1]["to"] == ESCALATION_MODEL_ID
+    assert hops[-1]["from"] == "flash"
+    assert not await store.list_open_gates("mp3")  # handled mechanically
+
+
 async def _latest_attempt_done(store: SqliteStore, mission_id: str, step: str) -> bool:  # type: ignore[no-untyped-def]
     runs = [r for r in await store.list_runs(mission_id) if r.step == step]
     return bool(runs) and runs[-1].status in {

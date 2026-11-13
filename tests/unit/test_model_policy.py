@@ -8,6 +8,7 @@ assert both what resolves today and that changing the env vars changes it.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -253,7 +254,107 @@ def test_playbook_text_names_the_configured_ids_and_the_policy(
     assert "flash" not in changed.split("MODEL POLICY")[1].split("\n")[0]
 
 
-# 6. the TUI knob and the orchestrator's own model use the configured default ---
+# 6. the MECHANICAL escalation path (needs_model) honours the configured model ---
+
+
+def _escalation_entry(catalog: ModelCatalog, current_id: str) -> str | None:
+    """`MissionRunner.escalation_entry` without a live engine: it reads only the
+    catalog and config, so Nones for the rest are honest."""
+    from rework.orchestrator.engine import MissionRunner
+
+    runner = MissionRunner(
+        "m",
+        None,
+        None,
+        None,
+        catalog,
+        None,
+        Path("."),  # type: ignore[arg-type]
+    )
+    entry = runner.escalation_entry(current_id)
+    return entry.id if entry is not None else None
+
+
+def test_mechanical_escalation_uses_the_configured_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cat = ModelCatalog(
+        [
+            _entry("flash", tier=1),
+            _entry("pro", tier=2),
+            _entry(ESCALATION_MODEL_ID, tier=3),
+        ]
+    )
+    # what the old fallback gave: the next tier up within the same provider
+    assert cat.promote("flash").id == "pro"
+    # the mechanical path escalates to the ONE configured target instead
+    assert _escalation_entry(cat, "flash") == ESCALATION_MODEL_ID
+    # and it follows the env var, still with no code change
+    monkeypatch.setenv(ESCALATION_MODEL_ENV, "pro")
+    assert _escalation_entry(cat, "flash") == "pro"
+
+
+def test_mechanical_escalation_never_names_a_model_the_policy_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The policy text tells the orchestrator to escalate ONLY to the escalation
+    model, so while that model is usable the mechanical path must pick it and
+    not a same-provider tier step."""
+    cat = ModelCatalog(
+        [
+            _entry("flash", tier=1),
+            _entry("mid", tier=2),
+            _entry(ESCALATION_MODEL_ID, tier=3),
+        ]
+    )
+    for current in ("flash", "mid"):
+        assert _escalation_entry(cat, current) == ESCALATION_MODEL_ID, current
+    # the tier step for 'flash' would have been 'mid': the mechanical path must
+    # NOT take it while the configured target is usable
+    assert cat.promote("flash").id == "mid" != _escalation_entry(cat, "flash")
+
+
+def test_mechanical_escalation_falls_back_to_the_strongest_usable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing from the catalog, or keyless on THIS machine: the documented
+    fallback is the strongest usable entry, never a bare tier step."""
+    monkeypatch.setenv(ESCALATION_MODEL_ENV, "not-in-this-catalog")
+    cat = ModelCatalog([_entry("flash", tier=1), _entry("pro", tier=2)])
+    assert cat.strongest_usable().id == "pro"
+    assert _escalation_entry(cat, "flash") == "pro"
+
+    keyless = ModelCatalog(
+        [
+            _entry("flash", tier=1),
+            _entry("pro", tier=2),
+            _entry(ESCALATION_MODEL_ID, tier=3, api_key_env="MISSING_KEY"),
+        ]
+    )
+    monkeypatch.delenv("MISSING_KEY", raising=False)
+    monkeypatch.delenv(ESCALATION_MODEL_ENV, raising=False)
+    assert keyless.strongest_usable().id == "pro"  # the configured one has no key
+    assert _escalation_entry(keyless, "flash") == "pro"
+
+
+def test_mechanical_escalation_keeps_promote_as_the_last_resort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only when the configured target IS the current model and no other usable
+    entry is left does the same-provider tier step still apply."""
+    cat = ModelCatalog(
+        [
+            _entry("flash", tier=1),
+            _entry(ESCALATION_MODEL_ID, tier=3),
+            _entry("huge", tier=5, api_key_env="MISSING_KEY"),
+        ]
+    )
+    monkeypatch.delenv("MISSING_KEY", raising=False)
+    assert cat.strongest_usable().id == ESCALATION_MODEL_ID
+    assert _escalation_entry(cat, ESCALATION_MODEL_ID) == "huge"
+
+
+# 7. the TUI knob and the orchestrator's own model use the configured default ---
 
 
 def test_tui_knob_defaults_to_the_configured_default(monkeypatch: pytest.MonkeyPatch) -> None:
