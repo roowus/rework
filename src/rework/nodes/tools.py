@@ -275,6 +275,7 @@ def role_env(workdir: Path | None = None) -> dict[str, str]:
         env.setdefault("REWORK_ENV_FILE", str(scratch / "rework.env"))
         env.setdefault("REWORK_TUI_SETTINGS", str(scratch / "tui.json"))
         env.setdefault("REWORK_LOG_DIR", str(scratch / "logs"))
+        env.setdefault("REWORK_RUN_DIR", str(scratch / "run"))
 
     if workdir is not None and not (workdir / "pyproject.toml").exists():
         return env

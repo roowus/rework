@@ -528,29 +528,26 @@ async def test_a_streamed_completion_is_assembled() -> None:
 # -- role_env scratch dir isolation -------------------------------------------
 
 
-def test_role_env_redirects_rework_state_dirs_to_scratch(tmp_path: Path) -> None:
+def test_role_env_redirects_rework_state_dirs_to_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """FIX 2 (PR #21): role_env must not let role commands touch the real
     ~/.rework.  REWORK_TARGETS (and other state paths) must point inside the
     per-run scratch dir under the workdir, so a rework command run by a role
     never reads/writes the dev machine's targets.toml or env file."""
-    import os
-
     from rework.nodes.tools import role_env
 
-    # Monkeypatch to ensure REWORK_TARGETS/etc are not already set
-    env_backup = {
-        k: os.environ.pop(k, None)
-        for k in ("REWORK_TARGETS", "REWORK_ENV_FILE", "REWORK_TUI_SETTINGS", "REWORK_LOG_DIR")
-    }
-    try:
-        result = role_env(tmp_path)
-    finally:
-        for k, v in env_backup.items():
-            if v is not None:
-                os.environ[k] = v
-            else:
-                os.environ.pop(k, None)
+    # Ensure none of the redirected vars are pre-set in the environment.
+    for var in (
+        "REWORK_TARGETS",
+        "REWORK_ENV_FILE",
+        "REWORK_TUI_SETTINGS",
+        "REWORK_LOG_DIR",
+        "REWORK_RUN_DIR",
+    ):
+        monkeypatch.delenv(var, raising=False)
 
+    result = role_env(tmp_path)
     scratch = tmp_path / ".rework-scratch"
 
     # REWORK_TARGETS must NOT point at the real ~/.rework
@@ -575,6 +572,10 @@ def test_role_env_redirects_rework_state_dirs_to_scratch(tmp_path: Path) -> None
     # Same for REWORK_LOG_DIR
     log_dir = result.get("REWORK_LOG_DIR", "")
     assert log_dir.startswith(str(scratch)), f"REWORK_LOG_DIR {log_dir!r} should be under {scratch}"
+
+    # Same for REWORK_RUN_DIR
+    run_dir = result.get("REWORK_RUN_DIR", "")
+    assert run_dir.startswith(str(scratch)), f"REWORK_RUN_DIR {run_dir!r} should be under {scratch}"
 
     # Scratch dir was created
     assert scratch.is_dir(), "scratch dir should be created by role_env"
