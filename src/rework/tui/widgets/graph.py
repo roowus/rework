@@ -4,7 +4,16 @@ Each node is a step (or a gate / the end); its border carries the status
 colour, the active node is accent. Clicking a node selects that step's run.
 Inside a node, when the role published its own graph topology (ROLE_SPAWNED
 payload["graph"], M7 P3) the role's inner nodes are
-drawn as a strip with the current one highlighted."""
+drawn as a strip with the current one highlighted.
+
+Orchestrated missions are drawn as ordered review ROUNDS: a round is every
+coder run between two audits, plus the audit that reviewed them. A coder that
+continues the previous coder (context["continue_branch"], e.g. after the
+previous one exhausted its turns) belongs to the SAME round; a revision starts
+a new one. Parallel spawns stay side by side inside their round. When a
+mission has many rounds the older ones fold into one summary node that
+expands on click (and folds again), keeping the latest two rounds expanded.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +25,17 @@ from textual.containers import Horizontal, VerticalScroll
 from textual.message import Message
 from textual.widgets import Static
 
+from rework.nodes.report_sections import mechanical_verdict
 from rework.tui.theme import ACCENT, FAINT, MUTED, esc, glyph, status_value
+from rework.tui.widgets.trajectory import role_of
+
+# Collapse policy (bug (a)-(c): grouping was a 2s spawn window and the
+# walk-back split mid-round; rounds are now first-class, so the collapse is
+# "fold every round before the last COLLAPSE_KEEP_ROUNDS, only when the
+# mission is long enough to need it").
+COLLAPSE_ROUND_THRESHOLD = 5  # only fold when there are more rounds than this
+COLLAPSE_KEEP_ROUNDS = 2  # the latest rounds stay expanded (the loop under review)
+PARALLEL_SPAWN_WINDOW_SECONDS = 2.0  # spawns this close are a parallel fan-out
 
 
 @dataclass
@@ -31,6 +50,8 @@ class GNode:
     inner_at: str = ""  # current inner node
     findings: str = ""  # audit findings summary: "2 high · 4 medium"
     strictness: str = ""  # audit strictness level
+    expandable: bool = False  # a collapsed-round summary: click toggles it
+    expanded: bool = False
 
 
 @dataclass
@@ -46,6 +67,25 @@ class GLayer:
 
     nodes: list[GNode] = field(default_factory=list)
     edge_to_next: GEdge | None = None
+
+
+@dataclass
+class ReviewRound:
+    """One review round: the coder runs it is made of, then the audit(s) that
+    reviewed them. Runs before the first coder (the investigator, the
+    orchestrator's own spawns) form a round with no audit."""
+
+    coders: list[Any] = field(default_factory=list)
+    audits: list[Any] = field(default_factory=list)
+    others: list[Any] = field(default_factory=list)  # e.g. the investigator
+
+    def runs(self) -> list[Any]:
+        return self.others + self.coders + self.audits
+
+    @property
+    def is_review(self) -> bool:
+        """A round counts as a review round once an audit reviewed its coders."""
+        return bool(self.audits)
 
 
 class _Node(Static):
@@ -72,6 +112,9 @@ class _Node(Static):
             lines.append(f" [{FAINT}]─[/] ".join(strip))
         if node.loop_note:
             lines.append(f"[{FAINT}]↺ {esc(node.loop_note)}[/]")
+        if node.expandable:
+            hint = "collapse rounds" if node.expanded else "expand rounds"
+            lines.append(f"[{ACCENT}]{hint}[/]")
         self.update("\n".join(lines))
         for cls in list(self.classes):
             if cls.startswith("-s-"):
@@ -80,6 +123,13 @@ class _Node(Static):
         self.set_class(selected, "-selected")
 
     def on_click(self, event: events.Click) -> None:
+        event.stop()
+        view = self.parent
+        while view is not None and not isinstance(view, GraphView):
+            view = view.parent
+        if isinstance(view, GraphView):
+            view.post_message(GraphView.NodeClicked(view, self.node))
+
         event.stop()
         view = self.parent
         while view is not None and not isinstance(view, GraphView):
@@ -98,6 +148,12 @@ class GraphView(VerticalScroll):
     def __init__(self, *, id: str | None = None) -> None:
         super().__init__(id=id, classes="graphview")
         self._keys: list[str] = []
+        self.expanded_rounds = False  # the collapsed-round summary starts folded
+
+    def toggle_collapsed_rounds(self) -> bool:
+        """Expand / fold the collapsed-round summary node. Returns the new state."""
+        self.expanded_rounds = not self.expanded_rounds
+        return self.expanded_rounds
 
     def set_nodes(self, nodes: list[GNode], selected: str | None = None) -> None:
         keys = [n.key for n in nodes]
@@ -310,32 +366,17 @@ def _mission_nodes_per_run(
     )
 
     # Add one node per run, in chronological order (runs are already sorted by created_at)
-    coder_runs: list[Any] = []
+    prev_audit_run: Any = None
     for run in runs:
         status = status_value(run.status)
-        role = run.role
-        title = f"{role}"
-
-        # Check if this is a revision (coder following an audit)
-        if role == "coder" and coder_runs:
-            title = f"{role} (revision)"
-
-        if role == "coder":
-            coder_runs.append(run)
-
-        sub = run_meta.get(run.id, role)
-        if run.attempt > 1:
-            sub = f"{sub} · attempt {run.attempt}"
-
+        title = role_of(run.id) or str(run.role)
+        if run.role == "coder" and prev_audit_run is not None:
+            title = f"{title} (revision)"
+        if run.role == "auditor":
+            prev_audit_run = run
+        sub = run_meta.get(run.id, str(run.role))
         inner_nodes, inner_at = inner.get(run.id, ([], ""))
-
-        # Extract audit findings and strictness
-        findings = ""
-        strictness = ""
-        if role == "auditor":
-            findings = _findings_summary(run)
-            strictness = (run.context or {}).get("strictness", "")
-
+        findings = _findings_summary(run) if run.role == "auditor" else ""
         nodes.append(
             GNode(
                 key=run.id,  # Use run ID as key for per-run nodes
@@ -346,7 +387,9 @@ def _mission_nodes_per_run(
                 inner=inner_nodes,
                 inner_at=inner_at if status == "running" else "",
                 findings=findings,
-                strictness=strictness,
+                strictness=str((run.context or {}).get("strictness", ""))
+                if run.role == "auditor"
+                else "",
             )
         )
 
@@ -369,63 +412,163 @@ def _mission_nodes_per_run(
     return nodes
 
 
-# Constants for parallel detection and collapse thresholds
-PARALLEL_SPAWN_WINDOW_SECONDS = 2.0  # Spawns within this window are considered parallel
-COLLAPSE_ROUND_THRESHOLD = 5  # Collapse when more than this many rounds
-COLLAPSE_KEEP_ROUNDS = 4  # Keep the last N rounds visible after collapse
+# -- review rounds ---------------------------------------------------------------------------
 
 
-def _count_rounds(run_groups: list[list[Any]]) -> int:
-    """Count the number of distinct rounds (coder+audit pairs) in run groups.
+def _continues_previous(run: Any, prev: Any) -> bool:
+    """True when `run` continues `prev`'s work (the same round, more legs):
+    a fresh coder after one that exhausted its turns carries the previous
+    branch in its context and is spawned before any audit ran."""
+    if run.role != "coder" or prev is None or prev.role != "coder":
+        return False
+    return bool((run.context or {}).get("continue_branch"))
 
-    A round is a coder run followed by its audit. Parallel auditors count as
-    one round. A coder without a following audit is a partial round.
+
+def _review_rounds(runs: list[Any]) -> list[ReviewRound]:
+    """Split a mission's runs into ordered review rounds.
+
+    A round is every coder run between two audits plus the audit that reviewed
+    them; a coder continuing the previous coder (context["continue_branch"],
+    e.g. spawned after it exhausted its turns) belongs to the SAME round, so
+    'coders 5-6' is one round. Auditors fanned out in parallel all review the
+    same round. Any role before the first coder (the investigator) is its own
+    non-review round.
     """
-    round_count = 0
-    seen_coder = False
+    ordered = sorted(runs, key=lambda r: (r.created_at, r.id))
+    rounds: list[ReviewRound] = []
+    current = ReviewRound()
 
-    for group in run_groups:
-        roles_in_group = {run.role for run in group}
-        if "coder" in roles_in_group:
-            if seen_coder:
-                # Previous coder had no audit - count it as a round
-                round_count += 1
-            seen_coder = True
-        if "auditor" in roles_in_group and seen_coder:
-            # Coder + auditor = one round
-            round_count += 1
-            seen_coder = False
+    def close_round() -> None:
+        nonlocal current
+        if current.others or current.coders or current.audits:
+            rounds.append(current)
+        current = ReviewRound()
 
-    # Final coder without audit
-    if seen_coder:
-        round_count += 1
+    prev_coder: Any = None
+    for run in ordered:
+        role = str(run.role)
+        if role == "coder":
+            if current.audits and not _continues_previous(run, prev_coder):
+                # the previous round was already reviewed: this is a revision
+                close_round()
+            current.coders.append(run)
+            prev_coder = run
+        elif role == "auditor":
+            current.audits.append(run)  # reviews the round's coders
+        else:
+            # the investigator and other pre-code roles: one round each
+            close_round()
+            current.others.append(run)
+            close_round()
+    close_round()
+    return rounds
 
-    return max(round_count, 1) if run_groups else 0
+
+def _review_edge_label(audits: list[Any]) -> str:
+    """The review outcome of a round, from its audit findings/verdicts:
+    'changes requested: 2 high', 'approve', ..."""
+    if not audits:
+        return ""
+    verdicts = {mechanical_verdict(a.artifact) for a in audits}
+    if len(verdicts) > 1:
+        return " / ".join(sorted(verdicts))
+    verdict = verdicts.pop()
+    if verdict in ("request changes", "approve with fixes"):
+        parts = []
+        for sev in ("critical", "high", "medium", "low"):
+            n = sum(
+                1
+                for a in audits
+                for f in (a.artifact or {}).get("findings") or []
+                if isinstance(f, dict) and str(f.get("severity", "")).lower() == sev
+            )
+            if n:
+                parts.append(f"{n} {sev}")
+        return f"{verdict}: " + " · ".join(parts) if parts else verdict
+    return verdict
 
 
 def _derive_collapsed_status(runs: list[Any]) -> str:
-    """Derive a summary status for collapsed runs.
-
-    Returns:
-    - "completed" if all runs completed successfully
-    - "failed" if any run failed
-    - "mixed" if there's a mix of outcomes
-    """
+    """Derive a summary status for collapsed runs."""
     if not runs:
         return "completed"
-
     statuses = {status_value(r.status) for r in runs}
-
-    if statuses == {"completed"}:
-        return "completed"
     if "failed" in statuses:
         return "failed"
     if "cancelled" in statuses:
         return "cancelled"
     if statuses - {"completed", "running", "pending", "intent"}:
-        # Has some non-success terminal states
         return "mixed"
     return "completed"
+
+
+def _node_for(run: Any, run_meta: dict[str, str], inner: dict[str, tuple[list[str], str]]) -> GNode:
+    """One run, one node - titled from its run id ('coder #2'), never 'coder 4'."""
+    st = status_value(run.status)
+    inner_nodes, inner_at = inner.get(run.id, ([], ""))
+    return GNode(
+        key=run.id,
+        title=role_of(run.id) or str(run.role),
+        status=st,
+        sub=run_meta.get(run.id, str(run.role)),
+        run_id=run.id,
+        inner=inner_nodes,
+        inner_at=inner_at if st == "running" else "",
+        findings=_findings_summary(run) if run.role == "auditor" else "",
+        strictness=str((run.context or {}).get("strictness", "")) if run.role == "auditor" else "",
+    )
+
+
+def _round_layers(
+    round_: ReviewRound,
+    index: int,
+    run_meta: dict[str, str],
+    inner: dict[str, tuple[list[str], str]],
+    is_revision: bool,
+) -> list[GLayer]:
+    """The layers of one round: its leading roles, its coders, then its audits.
+
+    Every run stays its own node (clicking it selects that run), titled from
+    its run id: 'coder #5', never 'coder 4'. A coder that continues the
+    previous coder's branch keeps the round's label ('coders 5-6') in its
+    subtitle; a coder opening a round after an audit is a revision.
+    """
+    layers: list[GLayer] = []
+    if round_.others:
+        layers.append(GLayer(nodes=[_node_for(r, run_meta, inner) for r in round_.others]))
+    coder_nodes: list[GNode] = []
+    chain: list[Any] = []  # the continuation chain inside this round, if any
+    for pos, run in enumerate(round_.coders):
+        node = _node_for(run, run_meta, inner)
+        title = role_of(run.id) or str(run.role)
+        sub = node.sub
+        if is_revision and pos == 0:
+            title = f"{title} (revision)"
+        if pos > 0 and _continues_previous(run, round_.coders[pos - 1]):
+            chain.append(run)
+        else:
+            chain = [run]
+        if len(chain) > 1:
+            lo = _run_ordinal(chain[0])
+            hi = _run_ordinal(run)
+            sub = f"coders {lo}-{hi} · continues {role_of(chain[0].id) or chain[0].role}"
+        node.title = title
+        node.sub = sub
+        coder_nodes.append(node)
+    if coder_nodes:
+        layers.append(GLayer(nodes=coder_nodes))
+    audit_nodes = [_node_for(r, run_meta, inner) for r in round_.audits]
+    if audit_nodes:
+        layers.append(GLayer(nodes=audit_nodes))
+    return layers
+
+
+def _run_ordinal(run: Any) -> int:
+    """'m-abc:code:coder:6' -> 6 (0 when the id is not the mission:step:role:n shape)."""
+    try:
+        return int(str(run.id).rsplit(":", 1)[-1])
+    except ValueError:
+        return 0
 
 
 def mission_layers(
@@ -435,11 +578,15 @@ def mission_layers(
     run_meta: dict[str, str],
     inner: dict[str, tuple[list[str], str]],
     events: list[Any],
+    expanded_rounds: bool = False,
 ) -> list[GLayer]:
-    """Build layered graph structure for orchestrated missions with parallel runs and labeled edges.
+    """Build layered graph structure for orchestrated missions.
 
-    Returns a list of layers where each layer contains one or more nodes (parallel runs).
-    Edges between layers can carry labels (e.g. for revision loops).
+    Layers follow the review rounds: coders of a round (side by side when they
+    were spawned in parallel), then the audit(s) that reviewed them, with the
+    review outcome on the edge between them. Rounds older than the last
+    COLLAPSE_KEEP_ROUNDS fold into one expandable summary node - unless
+    `expanded_rounds` is True, which lays every round out.
     """
     plan = mission.plan or {}
     is_orchestrated = bool(plan.get("orchestrator") or {})
@@ -449,7 +596,6 @@ def mission_layers(
         nodes = _mission_nodes_step_grouped(mission, runs, gates, run_meta, inner)
         return [GLayer(nodes=[n], edge_to_next=GEdge()) for n in nodes]
 
-    # Build layers for orchestrated mission
     layers: list[GLayer] = []
 
     # Orchestrator layer
@@ -465,182 +611,100 @@ def mission_layers(
     )
     layers.append(GLayer(nodes=[orch_node], edge_to_next=GEdge()))
 
-    # Group runs by spawn timing to detect parallel execution
-    run_groups = _group_parallel_runs(runs, events)
-
-    # Track revision loops: when an audit's findings trigger another coder run
-    prev_audit_run: Any = None
-
-    # Collapse when more than COLLAPSE_ROUND_THRESHOLD rounds
-    total_rounds = _count_rounds(run_groups)
-    if total_rounds > COLLAPSE_ROUND_THRESHOLD:
-        # Find how many groups to collapse to keep ~COLLAPSE_KEEP_ROUNDS rounds visible
-        # Work backwards to find the split point
-        rounds_from_end = 0
-        split_idx = len(run_groups)
-        seen_coder = False
-
-        for i in range(len(run_groups) - 1, -1, -1):
-            group = run_groups[i]
-            roles_in_group = {run.role for run in group}
-
-            if "coder" in roles_in_group:
-                if seen_coder or "auditor" not in roles_in_group:
-                    # This coder starts a new round (going backwards)
-                    rounds_from_end += 1
-                    if rounds_from_end >= COLLAPSE_KEEP_ROUNDS:
-                        split_idx = i
-                        break
-                seen_coder = True
-            if "auditor" in roles_in_group and seen_coder:
-                rounds_from_end += 1
-                seen_coder = False
-                if rounds_from_end >= COLLAPSE_KEEP_ROUNDS:
-                    split_idx = i
-                    break
-
-        if split_idx > 0:
-            collapsed_groups = run_groups[:split_idx]
-            collapsed_runs = [r for group in collapsed_groups for r in group]
-            collapsed_round_count = _count_rounds(collapsed_groups)
-
-            # Derive status from collapsed runs
-            collapsed_status = _derive_collapsed_status(collapsed_runs)
-
-            # Create a summary node with accurate round count
-            summary_node = GNode(
-                key="rounds-collapsed",
-                title=f"rounds 1-{collapsed_round_count} (collapsed)",
-                status=collapsed_status,
-                sub=f"{len(collapsed_runs)} runs",
-                run_id=None,
+    rounds = _review_rounds(runs)
+    review_rounds = [r for r in rounds if r.is_review]
+    many_rounds = len(review_rounds) > COLLAPSE_ROUND_THRESHOLD
+    head: list[ReviewRound] = []
+    if many_rounds:
+        # fold at a ROUND boundary, never mid-round: the latest rounds stay
+        # visible so the loop currently under review is not hidden
+        split = len(review_rounds) - COLLAPSE_KEEP_ROUNDS
+        head = review_rounds[:split]
+        head_runs = [r for rd in head for r in rd.runs()]
+        layers.append(
+            GLayer(
+                nodes=[
+                    GNode(
+                        key="rounds-collapsed",
+                        title=(
+                            f"rounds 1-{split} (collapsed)"
+                            if not expanded_rounds
+                            else f"rounds 1-{split} (expanded)"
+                        ),
+                        status=_derive_collapsed_status(head_runs),
+                        sub=(
+                            f"{len(head_runs)} runs · click to expand"
+                            if not expanded_rounds
+                            else f"{len(head_runs)} runs · click to collapse"
+                        ),
+                        expandable=True,
+                        expanded=expanded_rounds,
+                    )
+                ]
             )
-            layers.append(GLayer(nodes=[summary_node], edge_to_next=GEdge()))
+        )
+        if not expanded_rounds:
+            rounds = [r for r in rounds if r not in head]
 
-            # Keep only the later groups
-            run_groups = run_groups[split_idx:]
+    seen_review = False
+    for i, round_ in enumerate(rounds):
+        index = (len(head) + i) if (many_rounds and expanded_rounds) else i
+        round_layers = _round_layers(round_, index, run_meta, inner, seen_review)
+        # label the edge into the audits with the round's review outcome
+        if round_.audits and round_.coders and len(round_layers) >= 2:
+            round_layers[-2].edge_to_next = GEdge(label=_review_edge_label(round_.audits))
+        layers.extend(round_layers)
+        if round_.is_review:
+            seen_review = True
 
-    # Process each group of runs
-    for group_idx, group in enumerate(run_groups):
-        layer_nodes: list[GNode] = []
-
-        for run in group:
-            status = status_value(run.status)
-            role = run.role
-            title = f"{role}"
-
-            # Check if this is a revision (coder following an audit)
-            if role == "coder" and prev_audit_run and prev_audit_run.role == "auditor":
-                title = f"{role} (revision)"
-
-            sub = run_meta.get(run.id, role)
-            if run.attempt > 1:
-                sub = f"{sub} · attempt {run.attempt}"
-
-            inner_nodes, inner_at = inner.get(run.id, ([], ""))
-
-            # Extract audit findings and strictness
-            findings = ""
-            strictness = ""
-            if role == "auditor":
-                findings = _findings_summary(run)
-                strictness = (run.context or {}).get("strictness", "")
-
-            layer_nodes.append(
-                GNode(
-                    key=run.id,
-                    title=title,
-                    status=status,
-                    sub=sub,
-                    run_id=run.id,
-                    inner=inner_nodes,
-                    inner_at=inner_at if status == "running" else "",
-                    findings=findings,
-                    strictness=strictness,
-                )
-            )
-
-            # Track audit runs for detecting revision loops
-            if role == "auditor":
-                prev_audit_run = run
-
-        # Determine edge label for the NEXT edge (from this layer to the next)
-        edge_label = ""
-        if prev_audit_run and prev_audit_run.role == "auditor":
-            # Check if there's a next group and if it starts with a coder (revision loop)
-            if group_idx < len(run_groups) - 1:
-                next_group = run_groups[group_idx + 1]
-                if next_group and next_group[0].role == "coder":
-                    # This is a revision loop - label the edge
-                    findings = _findings_summary(prev_audit_run)
-                    if findings:
-                        edge_label = f"changes requested: {findings}"
-
-        layers.append(GLayer(nodes=layer_nodes, edge_to_next=GEdge(label=edge_label)))
-
-    # Add gates
+    # Gates + end
     for kind in plan.get("gates") or []:
         matching = [g for g in gates if g.kind.value == kind]
         status = status_value(matching[-1].status) if matching else "pending"
-        gate_node = GNode(key=f"gate:{kind}", title=f"{kind} gate", status=status, sub="you decide")
-        layers.append(GLayer(nodes=[gate_node], edge_to_next=GEdge()))
-
-    # Add end node
+        layers.append(
+            GLayer(
+                nodes=[
+                    GNode(
+                        key=f"gate:{kind}",
+                        title=f"{kind} gate",
+                        status=status,
+                        sub="you decide",
+                    )
+                ],
+                edge_to_next=GEdge(),
+            )
+        )
     end_status = {
         "done": "done",
         "failed": "failed",
         "cancelled": "cancelled",
     }.get(status_value(mission.status), "pending")
-    end_node = GNode(key="end", title="end", status=end_status, sub="")
-    layers.append(GLayer(nodes=[end_node], edge_to_next=None))
-
+    layers.append(GLayer(nodes=[GNode(key="end", title="end", status=end_status, sub="")]))
     return layers
 
 
-def _group_parallel_runs(runs: list[Any], events: list[Any]) -> list[list[Any]]:
-    """Group runs by when they were spawned to detect parallel execution.
+def mission_flow_summary(mission: Any, runs: list[Any], gates: list[Any]) -> list[str]:
+    """The header flow line above the tabs: one token per phase, derived from
+    the same run-derived rounds as the graph so the two cannot drift.
 
-    Returns a list of groups where each group contains runs spawned together
-    (i.e., in the same orchestrator turn).
-
-    Signal for "same turn": runs with created_at timestamps within
-    PARALLEL_SPAWN_WINDOW_SECONDS of the first run in a group.
-
-    This works because the orchestrator processes multiple spawn_role tool calls
-    sequentially in a for loop (_execute_calls), so parallel spawns happen
-    within milliseconds of each other. Sequential rounds (coder -> audit ->
-    revision) have gaps of at least several seconds due to model call latency.
-
-    We do NOT use event sequence numbers because:
-    1. Sequential runs can have adjacent seq numbers (e.g. seqs 1,2,3 for
-       coder→auditor→coder - a pure revision chain with no parallelism)
-    2. The seq gap between parallel vs sequential spawns is not guaranteed
+    e.g. ['investigator', '3 rounds (6 coders, 3 audits)', 'PR gate', 'end']
     """
-    if not runs:
-        return []
-
-    # Sort runs by created_at timestamp
-    sorted_runs = sorted(runs, key=lambda r: r.created_at)
-
-    groups: list[list[Any]] = []
-    current_group: list[Any] = []
-    group_start_time: float = 0.0
-
-    for run in sorted_runs:
-        if not current_group:
-            # First run in a new group
-            current_group = [run]
-            group_start_time = run.created_at
-        elif run.created_at - group_start_time <= PARALLEL_SPAWN_WINDOW_SECONDS:
-            # Within window of the first run in this group - same parallel batch
-            current_group.append(run)
-        else:
-            # Beyond window - start a new group
-            groups.append(current_group)
-            current_group = [run]
-            group_start_time = run.created_at
-
-    if current_group:
-        groups.append(current_group)
-
-    return groups
+    plan = mission.plan or {}
+    if not (plan.get("orchestrator") or {}):
+        return [n.title for n in _mission_nodes_step_grouped(mission, runs, gates, {}, {})]
+    rounds = _review_rounds(runs)
+    review_rounds = [r for r in rounds if r.is_review]
+    tokens: list[str] = []
+    for round_ in rounds:
+        if not round_.is_review:
+            tokens.extend(role_of(r.id) or str(r.role) for r in round_.runs())
+    if review_rounds:
+        coders = sum(len(r.coders) for r in rounds)
+        audits = sum(len(r.audits) for r in rounds)
+        n = len(review_rounds)
+        plural = "s" if n > 1 else ""
+        tokens.append(f"{n} round{plural} ({coders} coders, {audits} audits)")
+    for kind in plan.get("gates") or []:
+        tokens.append(f"{kind} gate")
+    tokens.append("end")
+    return tokens

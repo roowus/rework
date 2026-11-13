@@ -50,7 +50,12 @@ from rework.tui.widgets.base import (
     RowList,
     Stat,
 )
-from rework.tui.widgets.graph import GraphView, mission_layers, mission_nodes
+from rework.tui.widgets.graph import (
+    GraphView,
+    mission_flow_summary,
+    mission_layers,
+    mission_nodes,
+)
 from rework.tui.widgets.trajectory import Trajectory, role_of
 
 ALL = "*"
@@ -542,8 +547,10 @@ class DashboardView(View):
             + esc("  ·  ".join(bits))
             + "[/]"
         )
-        nodes = mission_nodes(mission, self.runs, self.mission_gates, {}, {}, compact=True)
-        strip = f" [{FAINT}]──[/] ".join(f"{esc(n.title)} {glyph(n.status)}" for n in nodes)
+        # same run-derived round structure as the graph tab, so the two
+        # cannot drift (the strip is compact, the graph is the full flow)
+        phases = mission_flow_summary(mission, self.runs, self.mission_gates)
+        strip = f" [{FAINT}]──[/] ".join(f"{esc(p)} {glyph(st)}" for p in phases)
         self.query_one("#m-flow", Static).update(strip)
 
     def _run_sub(self, run: Any) -> str:
@@ -625,10 +632,17 @@ class DashboardView(View):
             # Use layered graph for orchestrated missions
             plan = mission.plan or {}
             if plan.get("orchestrator") or {}:
+                graph = self.query_one("#m-graph", GraphView)
                 layers = mission_layers(
-                    mission, self.runs, self.mission_gates, meta, inner, self.events
+                    mission,
+                    self.runs,
+                    self.mission_gates,
+                    meta,
+                    inner,
+                    self.events,
+                    expanded_rounds=graph.expanded_rounds,
                 )
-                self.query_one("#m-graph", GraphView).set_layers(layers, self.run_id)
+                graph.set_layers(layers, self.run_id)
             else:
                 # Fixed-plan missions use the simple node view
                 self.query_one("#m-graph", GraphView).set_nodes(
@@ -794,6 +808,12 @@ class DashboardView(View):
 
     def on_graph_view_node_clicked(self, event: GraphView.NodeClicked) -> None:
         event.stop()
+        if event.node.expandable:
+            # the collapsed-round summary: expand it, or fold it again
+            graph = self.query_one("#m-graph", GraphView)
+            graph.toggle_collapsed_rounds()
+            self._paint_detail_tabs()
+            return
         if event.node.run_id:
             self.run_id = event.node.run_id
             self._paint_head()
