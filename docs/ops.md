@@ -22,6 +22,67 @@ to the same database (the owner's shell exports `REWORK_DB` and
 - The Mac runs no daemon. The last local mission (m-899f95a66990) was merged
   in a second pass; the local SQLite is a sandbox from here on.
 
+### Targets (`~/.rework/targets.toml`)
+
+Which database and daemon a command talks to is now a NAMED TARGET, so the
+shell profile no longer needs to export `REWORK_DB`. The file is read-only to
+rework (stdlib `tomllib`; it is never written) and holds secrets, so keep it
+private: `chmod 600 ~/.rework/targets.toml`.
+
+```toml
+default = "rewvis"
+
+[targets.rewvis]
+db_env = "REWORK_REWVIS_DB"        # the env var holding the URL (secrets stay
+                                   # in ~/.rework/rework.env, not in this file);
+                                   # or a literal db = "postgresql://..."
+daemon_url = "http://100.107.125.118:8941"
+ssh = "ubuntu@100.107.125.118"     # optional, for `rework sync-config`
+library_dir = "/home/ubuntu/.rework/library"  # optional
+
+[targets.sandbox]
+db = "/Users/you/.rework/sandbox.db"       # a plain filesystem path: what
+                                           # REWORK_DB actually carries for
+                                           # sqlite (a `sqlite:////` URL is
+                                           # accepted but normalized to this)
+daemon_url = "http://127.0.0.1:8941"
+```
+
+Selection and precedence (highest wins):
+
+1. `REWORK_DB` / `REWORK_DAEMON_URL` / `REWORK_LIBRARY_DIR` already in the
+   environment always win — target application is setdefault-only, so preview
+   workspaces/TUIs (`REWORK_TARGET_NAME='PREVIEW #<n>'`) and the rewvis
+   systemd unit are never hijacked.
+2. `rework --target NAME ...` (the whole command, and the TUI too:
+   `rework --target sandbox` alone).
+3. `REWORK_TARGET` in the environment.
+4. the file's `default = "..."`.
+5. nothing configured at all: today's behavior, unchanged.
+
+The TUI status bar shows the resolved target's name (it reads
+`REWORK_TARGET_NAME`, which target application also sets — unless the
+environment already set it).
+
+```bash
+rework targets            # list targets: default marked *, per-target
+                          # db reachable? daemon /healthz answers? (unreachable
+                          # targets are reported, never crash the command)
+rework sync-config TARGET # copy ~/.rework/models.json to TARGET's ssh host and
+                          # merge ONLY the REWORK_*_KEY=... lines of local
+                          # ~/.rework/rework.env into the remote
+                          # ~/.rework/rework.env (mode 600 kept; REWORK_DB,
+                          # REWORK_DAEMON_URL and every other remote line are
+                          # left completely untouched). Prints key NAMES and
+                          # value LENGTHS only, never values.
+rework sync-config TARGET --dry-run   # show what would change; the remote host
+                                      # is never written
+```
+
+`sync-config` requires the target to have an `ssh` host (clear error if not).
+`scripts/rework-local` is now just `rework --target sandbox`: a thin wrapper
+around the sandbox target; the real values live in `targets.toml`.
+
 ## Local (the Mac): the dogfood loop, step one
 
 Everything runs on your machine against a local SQLite state file

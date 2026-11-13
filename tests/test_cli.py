@@ -13,6 +13,9 @@ real ~/.rework/state.sqlite3.
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -380,3 +383,367 @@ def test_library_backfill_bodies_command(
     again = runner.invoke(app, ["library", "backfill-bodies"])
     assert again.exit_code == 0, again.output
     assert "backfilled 0 item body/bodies" in again.output
+
+
+# --- named connection targets (rework targets / sync-config) -----------------
+
+
+TARGETS_TOML = """\
+default = "rewvis"
+
+[targets.rewvis]
+db_env = "REWORK_TEST_REWVIS_DB"
+daemon_url = "http://100.107.125.118:8941"
+ssh = "ubuntu@100.107.125.118"
+
+[targets.sandbox]
+db = "sqlite:////tmp/rework-sandbox.db"
+daemon_url = "http://127.0.0.1:8941"
+ssh = "ubuntu@100.107.125.118"
+"""
+
+
+@pytest.fixture()
+def targets_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """targets.toml with a real sandbox sqlite db; monkeypatched into place."""
+    from rework import targets as targets_mod
+
+    db = tmp_path / "sandbox.db"
+    db.write_bytes(b"")  # an empty file is a valid sqlite database
+    path = tmp_path / "targets.toml"
+    path.write_text(TARGETS_TOML.replace("sqlite:////tmp/rework-sandbox.db", f"sqlite:///{db}"))
+    monkeypatch.setattr(targets_mod, "TARGETS_PATH", path)
+    monkeypatch.setenv("REWORK_TEST_REWVIS_DB", "postgresql://nobody:nobody@127.0.0.1:1/nope")
+    for name in ("REWORK_TARGET", "REWORK_TARGET_NAME", "REWORK_DAEMON_URL"):
+        monkeypatch.delenv(name, raising=False)
+    return path
+
+
+def test_targets_lists_each_target_and_survives_unreachable(
+    targets_file: Path, rework_db: Path
+) -> None:
+    result = runner.invoke(app, ["targets"])
+    if result.exit_code != 0:
+        print(result.output)
+    # unreachable hosts must be REPORTED, not raised: both rows printed
+    assert "rewvis" in result.output and "sandbox" in result.output
+    assert "UNREACHABLE" in result.output
+    assert result.exit_code == 0
+
+
+def test_targets_without_any_targets_file_exits_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rework import targets as targets_mod
+
+    monkeypatch.setattr(targets_mod, "TARGETS_PATH", tmp_path / "nope.toml")
+    result = runner.invoke(app, ["targets"])
+    assert result.exit_code == 1
+    assert "no targets configured" in result.output
+
+
+def test_sync_config_merges_only_key_lines_and_never_prints_values(
+    targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+
+    envdir = tmp_path / "state"
+    envdir.mkdir()
+    (envdir / "rework.env").write_text(
+        "# local keys\nREWORK_FIREWORKS_KEY=supersecretvalue123\nOTHER=stay\n"
+    )
+    (envdir / "models.json").write_text("{}")  # a local catalog exists to copy
+    import rework.config as config_mod
+
+    monkeypatch.setattr(config_mod, "DEFAULT_STATE_DIR", envdir)
+
+    # (argv, stdin): the merged env travels over the ssh process's stdin, not
+    # the command line (a command line is visible in `ps` on the remote host)
+    calls: list[tuple[list[str], object]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> object:
+        calls.append((list(cmd), kwargs.get("input")))
+        if cmd[:1] == ["ssh"] and len(cmd) > 2 and cmd[2].startswith("cat"):
+            stdout = "REWORK_FIREWORKS_KEY=old\nREWORK_DB=keepme\n"
+            return type("P", (), {"stdout": stdout, "returncode": 0})()
+        return type("P", (), {"stdout": "", "returncode": 0})()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    result = runner.invoke(app, ["sync-config", "sandbox"])
+    if result.exit_code != 0:
+        print(result.output)
+    assert result.exit_code == 0
+    out = result.output
+    # key NAMES and lengths only, never values
+    assert "REWORK_FIREWORKS_KEY: 19 chars" in out
+    assert "supersecretvalue123" not in out
+    # what was sent over ssh: keys replaced, REWORK_DB untouched, mode 600 kept
+    ssh_writes = [
+        (argv, stdin) for argv, stdin in calls if argv[:1] == ["ssh"] and "cat >" in argv[2]
+    ]
+    assert ssh_writes, "the merged rework.env was never written"
+    write_cmd, stdin = ssh_writes[-1]
+    assert stdin is not None and "REWORK_FIREWORKS_KEY=supersecretvalue123" in str(stdin)
+    assert "REWORK_DB=keepme" in str(stdin)  # remote non-KEY line preserved verbatim
+    assert any("chmod 600" in part for part in write_cmd)
+    assert any(argv[0] == "scp" for argv, _ in calls), "models.json was not copied"
+
+
+def test_sync_config_dry_run_touches_nothing(
+    targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+
+    envdir = tmp_path / "state"
+    envdir.mkdir()
+    (envdir / "rework.env").write_text("REWORK_FIREWORKS_KEY=supersecretvalue123\n")
+    import rework.config as config_mod
+
+    monkeypatch.setattr(config_mod, "DEFAULT_STATE_DIR", envdir)
+
+    called: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> object:
+        called.append(list(cmd))
+        return type("P", (), {"stdout": "", "returncode": 0})()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+    result = runner.invoke(app, ["sync-config", "rewvis", "--dry-run"])
+    if result.exit_code != 0:
+        print(result.output)
+    assert result.exit_code == 0
+    assert "would copy" in result.output
+    assert "dry run: nothing was sent" in result.output
+    assert "REWORK_FIREWORKS_KEY: 19 chars" in result.output
+    assert "supersecretvalue123" not in result.output
+    # dry-run may READ the remote env (the read-only cat, to know add vs
+    # replace) but must never WRITE anything: no heredoc/cat>, no chmod, no scp
+    writes = [
+        argv
+        for argv in called
+        if argv[0] == "scp" or (argv[0] == "ssh" and ("cat >" in argv[2] or "chmod" in argv[2]))
+    ]
+    assert not writes, f"dry run wrote to the remote host: {writes}"
+
+
+def test_sync_config_requires_an_ssh_host(targets_file: Path) -> None:
+    path = targets_file
+    path.write_text('[targets.localonly]\ndb = "sqlite:///x.db"\ndaemon_url = "http://h:1"\n')
+    result = runner.invoke(app, ["sync-config", "localonly"])
+    assert result.exit_code == 1
+    assert "no `ssh` host" in result.output
+
+
+def test_sync_config_unknown_target_errors(targets_file: Path) -> None:
+    result = runner.invoke(app, ["sync-config", "ghost"])
+    assert result.exit_code == 1
+    assert "no target named" in result.output
+
+
+# --- main()'s own dispatch, END TO END --------------------------------------
+# The audit's root cause: CliRunner tests bypass main() entirely, so
+# REWORK_TARGET / default selection and the --target argv handling there were
+# never exercised. These run the real console entrypoint (rework.cli:main) in
+# a subprocess with a temp HOME + REWORK_TARGETS, and cover exactly the cases
+# the audit probed live.
+
+MAIN_TARGETS_TOML = """\
+default = "sandbox"
+
+[targets.sandbox]
+db = "sqlite:////tmp/probe/sandbox.db"
+daemon_url = "http://127.0.0.1:8941"
+
+[targets.rewvis]
+db = "postgresql://nobody:nobody@127.0.0.1:1/nope"
+daemon_url = "http://100.107.125.118:8941"
+"""
+
+
+def _run_main(
+    argv: list[str], home: Path, env_extra: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    # `python -m rework ...`: the same main() the console entrypoint runs
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "REWORK_TARGETS": str(home / "targets.toml"),
+        "PYTHONPATH": "src",
+        "REWORK_LOG_DIR": str(home / "logs"),
+        "REWORK_DB": "",  # never inherited: selection must come from the target
+    }
+    env = {k: v for k, v in env.items() if v != "" or k == "REWORK_DB"}
+    env.update(env_extra or {})
+    return subprocess.run(
+        [sys.executable, str(Path(sys.executable).parent / "rework"), *argv],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        check=False,
+    )
+
+
+@pytest.fixture()
+def main_home(tmp_path: Path) -> Path:
+    home = tmp_path / "home"
+    (home / ".rework").mkdir(parents=True)
+    (home / "targets.toml").write_text(
+        MAIN_TARGETS_TOML.replace("/tmp/probe/sandbox.db", str(tmp_path / "sandbox.db"))
+    )
+    (tmp_path / "sandbox.db").write_bytes(b"")  # a valid empty sqlite database
+    return home
+
+
+def _probe_env_in_child(home: Path, env_extra: dict[str, str]) -> str:
+    """Print the child process's resolved REWORK_* env (one per line) after a
+    real main() dispatch. Resolution lives in main() itself, so the probe has
+    to RUN main() (sys.argv = ['rework', 'version']) -- a bare `python -c`
+    would print the raw inherited env and prove nothing. `version`'s own
+    output is swallowed (redirect_stdout) so only the two probe lines reach
+    stdout. `version` never READS REWORK_DB, so exit codes alone cannot catch
+    a regression where resolution stops applying env -- this probe can."""
+    script = (
+        "import contextlib, io, os, sys\n"
+        "from rework.cli import main\n"
+        "sys.argv = ['rework', 'version']\n"
+        "with contextlib.redirect_stdout(io.StringIO()):\n"
+        "    try:\n"
+        "        main()\n"
+        "    except SystemExit as exc:\n"
+        "        if exc.code not in (0, None):\n"
+        "            raise\n"
+        "print(os.environ.get('REWORK_DB'))\n"
+        "print(os.environ.get('REWORK_TARGET_NAME'))\n"
+    )
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "REWORK_TARGETS": str(home / "targets.toml"),
+        "PYTHONPATH": "src",
+        "REWORK_LOG_DIR": str(home / "logs"),
+    }
+    # never inherited: selection must come from the target (env_extra).
+    # REWORK_TARGETS (the file PATH) is kept -- only the resolved values are
+    # stripped, and only by exact name (a startswith would also drop
+    # REWORK_TARGETS and the probe would silently read the wrong file).
+    for name in ("REWORK_DB", "REWORK_TARGET", "REWORK_TARGET_NAME"):
+        env.pop(name, None)
+    env.update(env_extra)
+    out = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        check=False,
+    )
+    assert out.returncode == 0, out.stderr
+    return out.stdout
+
+
+def test_main_rework_target_env_selects_end_to_end(main_home: Path) -> None:
+    # BLOCKER 1: bare `rework` with only REWORK_TARGET set must still resolve
+    # (the pre-fix bug: main() resolved targets only when "--target" was in argv)
+    result = _run_main(["version"], main_home, {"REWORK_TARGET": "rewvis"})
+    # rewvis IS defined (postgres, unreachable — but selection is not reachability):
+    # resolution must succeed and the command must run
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("rework ")
+    # not just exit 0: the resolution must actually APPLY env (a command like
+    # `version` never reads REWORK_DB, so only a probe proves this end to end)
+    db, name = _probe_env_in_child(main_home, {"REWORK_TARGET": "rewvis"}).splitlines()
+    assert db == "postgresql://nobody:nobody@127.0.0.1:1/nope"  # rewvis's db_env value
+    assert name == "rewvis"
+    ok = _run_main(["targets"], main_home, {"REWORK_TARGET": "sandbox"})
+    assert ok.returncode == 0
+    assert "sandbox" in ok.stdout
+    # the sandbox target's sqlite:// URL form is normalized to the plain path
+    db, name = _probe_env_in_child(main_home, {"REWORK_TARGET": "sandbox"}).splitlines()
+    assert db == str(main_home.parent / "sandbox.db"), db
+    assert name == "sandbox"
+    # an unknown REWORK_TARGET is the error case: exit 2, on stderr
+    bad = _run_main(["version"], main_home, {"REWORK_TARGET": "ghost"})
+    assert bad.returncode == 2
+    assert "no target named 'ghost'" in bad.stderr
+
+
+def test_main_default_only_selection_reaches_subcommands(main_home: Path) -> None:
+    # BLOCKER 1: no flag, no REWORK_TARGET: the file's `default = "sandbox"`
+    # applies to any subcommand, and an unknown DEFAULT never kills the CLI
+    result = _run_main(["version"], main_home, {})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("rework ")
+    # the default target must actually APPLY env, not just exit 0 (`version`
+    # never reads REWORK_DB; the probe proves resolution happened)
+    db, name = _probe_env_in_child(main_home, {}).splitlines()
+    assert db == str(main_home.parent / "sandbox.db")  # plain path, URL normalized
+    assert name == "sandbox"
+    # and `rework --target ghost` IS an error (explicit names are checked)
+    bad = _run_main(["--target", "ghost", "version"], main_home, {})
+    assert bad.returncode == 2
+    assert "no target named 'ghost'" in bad.stderr
+
+
+def test_main_target_equals_form_and_missing_name(main_home: Path) -> None:
+    # BLOCKER 2a: `--target=NAME` works end to end; 2c: a NAME that looks like
+    # a flag or is a subcommand is a usage error, not a target name
+    ok = _run_main(["--target=sandbox", "version"], main_home, {})
+    assert ok.returncode == 0, ok.stderr
+    for argv in (["--target", "--help"], ["--target=", "version"], ["--target"]):
+        bad = _run_main(argv, main_home, {})
+        assert bad.returncode == 2, (argv, bad.stderr)
+        assert "needs a name" in bad.stderr
+
+
+def test_main_target_after_subcommand_is_rejected_before_applying(
+    main_home: Path,
+) -> None:
+    # BLOCKER 2b: after the subcommand --target is not a global option: a
+    # usage error, exit 2, and (checked in test_main_flag_never_mutates_env)
+    # no env mutation before the rejection
+    for argv in (["ls", "--target", "sandbox"], ["ls", "--target=sandbox"]):
+        bad = _run_main(argv, main_home, {"REWORK_TEST_MARK": "1"})
+        assert bad.returncode == 2, (argv, bad.stdout, bad.stderr)
+        assert "must come before the subcommand" in bad.stderr
+
+
+def test_main_flag_never_mutates_env_on_error(main_home: Path) -> None:
+    # the wrong-target guard: a rejected invocation writes NOTHING to the env.
+    # Prove it by re-running `version` as a child with a snapshot comparison:
+    # `python -m rework --version` prints the version WITHOUT resolution side
+    # effects, so instead compare against a direct python -c run of main().
+    probe = (
+        "import os, sys; sys.argv=['rework','ls','--target','sandbox'];"
+        "from rework.cli import main;\n"
+        "try:\n    main()\nexcept SystemExit:\n    pass\n"
+        "print('REWORK_DB' in os.environ, 'REWORK_TARGET_NAME' in os.environ)"
+    )
+    env = {
+        **os.environ,
+        "HOME": str(main_home),
+        "REWORK_TARGETS": str(main_home / "targets.toml"),
+        "PYTHONPATH": "src",
+        "REWORK_LOG_DIR": str(main_home / "logs"),
+    }
+    env = {k: v for k, v in env.items() if not k.startswith("REWORK_DB")}
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=60, env=env
+    )
+    assert result.stdout.strip() == "False False", result.stdout + result.stderr
+
+
+def test_main_stderr_and_exit_code_are_consistent(main_home: Path) -> None:
+    # BLOCKER 2d: one error shape — all --target errors on stderr, exit 2
+    for argv, needle in (
+        (["--target", "ghost", "version"], "no target named 'ghost'"),
+        (["--target", "rewvis", "version"], None),  # postgres target is fine to SELECT
+    ):
+        result = _run_main(argv, main_home, {})
+        if needle is None:
+            assert result.returncode == 0, result.stderr
+            assert result.stdout.startswith("rework ")
+            continue
+        assert result.returncode == 2
+        assert needle in result.stderr
+        assert needle not in result.stdout
