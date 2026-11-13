@@ -64,7 +64,7 @@ def new(
     plan: str = typer.Option("echo", help="Playbook: echo | fix | fix-pr"),
     orchestrator: str | None = typer.Option(
         None,
-        help="Catalog id for the mission's orchestrator (default: the strongest tier).",
+        help="Catalog id for the mission's orchestrator (default: REWORK_DEFAULT_MODEL).",
     ),
     effort: str | None = typer.Option(None, help="Orchestrator effort: low | medium | high"),
     budget: float | None = typer.Option(
@@ -106,13 +106,12 @@ def new(
 
 
 def default_orchestrator_model() -> str:
-    """The strongest real tier in the catalog (the orchestrator decides for a
-    whole mission; it is the last place to save tokens)."""
-    from rework.config import load_catalog
+    """The configured default model (REWORK_DEFAULT_MODEL, default 'flash'):
+    the same cheap strong model every role runs on, resolved against the
+    catalog. Cost control starts here."""
+    from rework.config import default_model_id
 
-    entries = load_catalog().all()
-    real = [e for e in entries if e.provider != "fake" and e.has_credentials()] or entries
-    return max(real, key=lambda e: (e.tier, -e.cost_in_per_mtok)).id
+    return default_model_id()
 
 
 project_app = typer.Typer(no_args_is_help=True, add_completion=False, help="Projects (ADR 0005).")

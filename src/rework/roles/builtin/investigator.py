@@ -47,11 +47,13 @@ class InvestigatorSpec(RoleSpec):
         "Investigate any brief: issues, feasibility, unknowns. Find as much"
         " relevant information as possible and report it honestly."
     )
-    default_model = "flash"
+    # empty = the configured default (REWORK_DEFAULT_MODEL); no literal id in
+    # a default path, so switching models is env-only
+    default_model = ""
     context_manifest: ClassVar[set[str]] = {"brief", "depth", "requested_sections"}
 
     def build_graph(self, ctx: RoleBuildCtx) -> CompiledStateGraph:
-        catalog_id = str(ctx.run.model_ref.get("id") or self.default_model)
+        catalog_id = self.resolve_model(ctx)
         run_ctx = ctx.run.context or {}
         sections = resolve_sections(run_ctx.get("requested_sections"))
         depth = str(run_ctx.get("depth") or "quick")

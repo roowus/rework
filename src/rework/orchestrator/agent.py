@@ -56,6 +56,21 @@ PROVIDER_FAILURE_LIMIT = 2  # failed runs on one model before spawn_role refuses
 STRICTNESS_LEVELS = ("light", "standard", "strict")
 DEFAULT_STRICTNESS = "standard"
 
+def model_policy() -> tuple[str, str]:
+    """(default model id, escalation model id) from config, read at RUNTIME so
+    changing REWORK_DEFAULT_MODEL / REWORK_ESCALATION_MODEL changes the prompt
+    text (and every role default) with no code change."""
+    from rework.config import default_model_id, escalation_model_id
+
+    return default_model_id(), escalation_model_id()
+
+
+def render(text: str) -> str:
+    """Fill the model-policy placeholders in prompt/tool text from config."""
+    default, escalation = model_policy()
+    return text.replace("$DEFAULT_MODEL", default).replace("$ESCALATION_MODEL", escalation)
+
+
 PLAYBOOKS: dict[str, str] = {
     "echo": (
         "Plumbing check: spawn the `echo` role once with the objective as its brief, "
@@ -99,10 +114,15 @@ How you work:
   work is hard or failure-prone; for easy work just wait for the handoff.
 - You may run roles in parallel (several spawn_role calls in one turn), but be
   conservative: parallelism costs money and most missions are sequential.
-- Pick each role's model from the catalog: cheap tiers for exploration and
-  straightforward coding, stronger tiers for audits and hard problems. If a role
-  failed on provider errors (timeouts, 5xx, rate limits), the model's endpoint is
-  struggling: respawn it on a different model rather than the same one.
+- MODEL POLICY: run every role on the default model ($DEFAULT_MODEL). Escalate a
+  role ONLY to the escalation model ($ESCALATION_MODEL), and only when (i) a run
+  on the default model failed on the WORK (the change itself was wrong or
+  incomplete), or (ii) it is a strict audit of a high-risk change (auth, money,
+  migrations, core control flow). When you escalate, say WHY in the brief.
+- Provider errors (timeouts, 5xx, rate limits) are NOT an escalation reason: they
+  mean the endpoint is struggling, not that the model is too weak. Retry, or move
+  that role to another provider/model AT THE SAME LEVEL; never escalate just to
+  retry. Do not pick a stronger tier for any other reason.
 - Write every brief so the role can act without asking: what to do, why, what
   done looks like, and anything earlier roles found that it needs.
 - Scope briefs to the objective. Pass findings along as context, but do not turn
@@ -128,7 +148,12 @@ How you work:
   new branch, so a "push" coder only adds noise).
 - Respond with tool calls. Text without a tool call wastes a turn."""
 
-TOOLS: list[ToolSpec] = [
+def orchestrator_tools() -> list[ToolSpec]:
+    """The orchestrator's tools; text renders the configured model policy."""
+    return _TOOLS
+
+
+_TOOLS: list[ToolSpec] = [
     ToolSpec(
         name="spawn_role",
         description=(
@@ -151,7 +176,15 @@ TOOLS: list[ToolSpec] = [
                     "to a run id or step name, optionally with .field (e.g. "
                     '{"diff": "code.diff"}). Usual wiring is automatic.',
                 },
-                "model": {"type": "string", "description": "Catalog id (default: role's)."},
+                "model": {
+                    "type": "string",
+                    "description": "Catalog id. Leave it OUT to run the role on the"
+                    " default model ($DEFAULT_MODEL). The only other value you may"
+                    " pass is the escalation model ($ESCALATION_MODEL), and only for"
+                    " a run that already failed on the WORK or for a strict audit of"
+                    " a high-risk change; provider errors (timeouts, 5xx, rate"
+                    " limits) are never a reason to escalate.",
+                },
                 "effort": {"type": "string", "enum": ["low", "medium", "high"]},
                 "max_turns": {
                     "type": "integer",
@@ -409,9 +442,9 @@ class MissionOrchestrator:
         catalog = runner._catalog
         wanted = str(orch.get("model") or "")
         try:
-            self.entry = catalog.resolve(wanted) if wanted else self._strongest()
+            self.entry = catalog.resolve(wanted) if wanted else self._default_entry()
         except Exception:
-            self.entry = self._strongest()
+            self.entry = self._default_entry()
         self.effort = orch.get("effort") or None
         self.history: list[dict[str, Any]] = []
         self.seen: dict[str, str] = {}  # run id -> status already reported
@@ -429,16 +462,28 @@ class MissionOrchestrator:
         # _enforce_findings_accepted), and they lead the mission report/PR body
         self.accepted_findings: list[dict[str, str]] = []
         self._providers: dict[str, Any] = {}
+        # built once per orchestrator: the model-policy text is rendered from
+        # config and the system prompt stays byte-stable for prompt caching
+        self.tools = [t.model_copy(update={"description": render(t.description)})
+                      if t.name == "spawn_role" else t
+                      for t in orchestrator_tools()]
 
     def _usable(self) -> list[Any]:
         """Catalog entries this daemon can actually call (real ones first)."""
-        entries = self.r._catalog.all()
-        real = [e for e in entries if e.provider != "fake" and e.has_credentials()]
-        return real or [e for e in entries if e.has_credentials()] or entries
+        return self.r._catalog.usable()
 
-    def _strongest(self) -> Any:
-        entries = self._usable()
-        return max(entries, key=lambda e: (e.tier, -e.cost_in_per_mtok))
+    def _default_entry(self) -> Any:
+        """The orchestrator's OWN model when the plan names none: the configured
+        default (REWORK_DEFAULT_MODEL), resolved against this catalog. Cost
+        control starts with the orchestrator; a stronger tier is never an
+        automatic choice."""
+        from rework.config import default_model_id
+
+        catalog = self.r._catalog
+        try:
+            return catalog.resolve(default_model_id(catalog))
+        except Exception:
+            return catalog.strongest_usable() or catalog.all()[0]
 
     # -- provider ------------------------------------------------------------
 
@@ -621,7 +666,7 @@ class MissionOrchestrator:
                 model=entry.model,
                 system=system,
                 messages=messages,
-                tools=TOOLS,
+                tools=self.tools,
                 max_tokens=min(int(entry.max_output or 4096), 4096),
                 effort=self.effort,
                 session_id=self.run_id,
@@ -1444,8 +1489,10 @@ class MissionOrchestrator:
             inputs = sorted(getattr(spec, "context_manifest", set()) or [])
             roles.append(
                 f"- {name}: {spec.description} Goal: {spec.goal or '-'} "
-                f"Default model: {spec.default_model}. INPUTS: {', '.join(inputs) or 'brief'}"
+                f"Default model: {spec.default_model or default}. "
+                f"INPUTS: {', '.join(inputs) or 'brief'}"
             )
+        default, escalation = model_policy()
         catalog = [
             f"- {e.id}: tier {e.tier}, ${e.cost_in_per_mtok}/${e.cost_out_per_mtok} per Mtok"
             + (f", {', '.join(sorted(e.capabilities))}" if e.capabilities else "")
@@ -1459,8 +1506,9 @@ class MissionOrchestrator:
             [
                 f"{MARKER} for rework, a multi-agent workflow engine. You run one "
                 "mission by delegating work to roles.",
-                RULES,
-                f"PLAYBOOK ({self.playbook}): {PLAYBOOKS.get(self.playbook, PLAYBOOKS['fix'])}",
+                render(RULES),
+                f"PLAYBOOK ({self.playbook}): "
+                f"{render(PLAYBOOKS.get(self.playbook, PLAYBOOKS['fix']))}",
                 "ROLES:\n" + "\n".join(roles),
                 "Automatic wiring: a coder receives the latest investigator handoff; an "
                 "auditor receives the latest coder's diff and worktree plus the latest "
