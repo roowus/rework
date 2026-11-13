@@ -140,6 +140,9 @@ class AuditorSpec(RoleSpec):
             " HIGH finding; re-run what the repo's CI runs (.github/workflows:"
             " tests and lint/format/type checks), and a check that would fail CI"
             " is a HIGH finding."
+            "\n\nNever write under ~/.rework or any path outside your worktree."
+            " Use temporary directories for any probes or tests that touch"
+            " rework's own config or state."
         )
 
         async def prepare(state: AuditorState) -> dict[str, Any]:

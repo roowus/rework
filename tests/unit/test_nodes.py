@@ -523,3 +523,72 @@ async def test_a_streamed_completion_is_assembled() -> None:
         7,
         90,
     )
+
+
+# -- role_env scratch dir isolation -------------------------------------------
+
+
+def test_role_env_redirects_rework_state_dirs_to_scratch(tmp_path: Path) -> None:
+    """FIX 2 (PR #21): role_env must not let role commands touch the real
+    ~/.rework.  REWORK_TARGETS (and other state paths) must point inside the
+    per-run scratch dir under the workdir, so a rework command run by a role
+    never reads/writes the dev machine's targets.toml or env file."""
+    import os
+
+    from rework.nodes.tools import role_env
+
+    # Monkeypatch to ensure REWORK_TARGETS/etc are not already set
+    env_backup = {k: os.environ.pop(k, None) for k in
+                  ("REWORK_TARGETS", "REWORK_ENV_FILE", "REWORK_TUI_SETTINGS", "REWORK_LOG_DIR")}
+    try:
+        result = role_env(tmp_path)
+    finally:
+        for k, v in env_backup.items():
+            if v is not None:
+                os.environ[k] = v
+            else:
+                os.environ.pop(k, None)
+
+    scratch = tmp_path / ".rework-scratch"
+
+    # REWORK_TARGETS must NOT point at the real ~/.rework
+    targets = result.get("REWORK_TARGETS", "")
+    home_rework = str(Path.home() / ".rework")
+    assert not targets.startswith(home_rework), (
+        f"REWORK_TARGETS {targets!r} points inside the real ~/.rework"
+    )
+    # Must point inside the per-run scratch dir under workdir
+    assert targets.startswith(str(scratch)), (
+        f"REWORK_TARGETS {targets!r} should be under {scratch}"
+    )
+
+    # Same for REWORK_ENV_FILE
+    env_file = result.get("REWORK_ENV_FILE", "")
+    assert env_file.startswith(str(scratch)), (
+        f"REWORK_ENV_FILE {env_file!r} should be under {scratch}"
+    )
+
+    # Same for REWORK_TUI_SETTINGS
+    tui = result.get("REWORK_TUI_SETTINGS", "")
+    assert tui.startswith(str(scratch)), (
+        f"REWORK_TUI_SETTINGS {tui!r} should be under {scratch}"
+    )
+
+    # Same for REWORK_LOG_DIR
+    log_dir = result.get("REWORK_LOG_DIR", "")
+    assert log_dir.startswith(str(scratch)), (
+        f"REWORK_LOG_DIR {log_dir!r} should be under {scratch}"
+    )
+
+    # Scratch dir was created
+    assert scratch.is_dir(), "scratch dir should be created by role_env"
+
+
+def test_role_env_no_workdir_does_not_set_scratch_vars(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When workdir is None (no jail), no scratch overrides are injected."""
+    from rework.nodes.tools import role_env
+
+    monkeypatch.delenv("REWORK_TARGETS", raising=False)
+    result = role_env(None)
+    # Without workdir, we do not inject any scratch paths
+    assert "REWORK_TARGETS" not in result

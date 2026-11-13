@@ -530,6 +530,18 @@ class MissionOrchestrator:
         audit = results.get("audit")
         ship, pr_url = (None, None)
         if outcome == "done":
+            # Persist the orchestrator's finish summary and accepted_findings
+            # into mission.result BEFORE _final_gates runs, so _create_pr /
+            # _pr_body reads the real summary instead of falling back to the
+            # coder's handoff text. (Fix: PR #21 — _synthesize was called after
+            # _final_gates, so result["summary"] was empty when _pr_body ran.)
+            _current = await self.r._store.get_mission(self.mid)
+            _pre = dict((_current.result if _current else None) or {})
+            if summary:
+                _pre["summary"] = summary
+            if self.accepted_findings:
+                _pre["accepted_findings"] = self.accepted_findings
+            await self.r._store.update_mission(self.mid, result=_pre)
             ship, pr_url = await self.r._final_gates(
                 self.mission, results, audit.artifact if audit else None
             )
