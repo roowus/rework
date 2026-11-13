@@ -50,7 +50,7 @@ from rework.tui.widgets.base import (
     RowList,
     Stat,
 )
-from rework.tui.widgets.graph import GraphView, mission_nodes
+from rework.tui.widgets.graph import GraphView, mission_layers, mission_nodes
 from rework.tui.widgets.trajectory import Trajectory, role_of
 
 ALL = "*"
@@ -622,9 +622,16 @@ class DashboardView(View):
         if tab == "graph":
             meta = {r.id: f"{role_of(r.id)} · {self._run_sub(r)}" for r in self.runs}
             inner = self._inner_graphs()
-            self.query_one("#m-graph", GraphView).set_nodes(
-                mission_nodes(mission, self.runs, self.mission_gates, meta, inner), self.run_id
-            )
+            # Use layered graph for orchestrated missions
+            plan = mission.plan or {}
+            if (plan.get("orchestrator") or {}):
+                layers = mission_layers(mission, self.runs, self.mission_gates, meta, inner, self.events)
+                self.query_one("#m-graph", GraphView).set_layers(layers, self.run_id)
+            else:
+                # Fixed-plan missions use the simple node view
+                self.query_one("#m-graph", GraphView).set_nodes(
+                    mission_nodes(mission, self.runs, self.mission_gates, meta, inner), self.run_id
+                )
         elif tab == "output":
             if self.run_id is not None and self.run_id == self._orchestrator_id():
                 body = self._orchestrator_output(mission)
