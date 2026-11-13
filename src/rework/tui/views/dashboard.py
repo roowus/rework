@@ -737,7 +737,10 @@ class DashboardView(View):
         if self.mission_id != mission_id:
             return
         self.report_loaded_for = key
-        await self.query_one("#m-report-body", Markdown).update(md or "_no report yet_")
+        # the app can close while this worker awaits: teardown drops the body
+        # first, so the paint is guarded and the data await above is not
+        with self.painting():
+            await self.query_one("#m-report-body", Markdown).update(md or "_no report yet_")
 
     def _paint_gates(self) -> None:
         body = self.query_one("#m-gates-body", Vertical)

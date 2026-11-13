@@ -192,7 +192,8 @@ class WorkView(View):
         own.difference_update(i for i in list(own) if i <= self._chat_cursor)
         items = items_from_messages(fresh)
         if items:
-            self._render_items(items)
+            with self.painting():  # the app can close during the awaits above
+                self._render_items(items)
 
     def _paint_chat_list(self) -> None:
         mission_status = {m.id: m.status for m in self.snap.missions}
@@ -322,16 +323,18 @@ class WorkView(View):
         self.project_id = chat.project_id
         self.model_id = chat.model_id or self.model_id
         self.effort = chat.effort or ""
-        log = self.query_one("#chat-log", Trajectory)
-        log.clear()
-        self._show_chat(True)
-        self._render_items(items, replay=True)
-        self._paint_head()
-        self._paint_knobs()
-        self._paint_chat_list()
-        self._refresh_cards()
-        self.call_after_refresh(log.scroll_end, animate=False)
-        self.focus_prompt()
+        # the app can close during the awaits above: guard the paint only
+        with self.painting():
+            log = self.query_one("#chat-log", Trajectory)
+            log.clear()
+            self._show_chat(True)
+            self._render_items(items, replay=True)
+            self._paint_head()
+            self._paint_knobs()
+            self._paint_chat_list()
+            self._refresh_cards()
+            self.call_after_refresh(log.scroll_end, animate=False)
+            self.focus_prompt()
 
     def new_chat(self) -> None:
         self.convo = None
@@ -608,7 +611,8 @@ class WorkView(View):
                     partial(self.hub.data.get_mission, card.mission_id), None
                 )
                 if mission is not None:
-                    card.update_from(mission, self.snap.gates_for(card.mission_id))
+                    with self.painting():  # the app can close during the await above
+                        card.update_from(mission, self.snap.gates_for(card.mission_id))
             if card.status not in actions.ACTIVE:
                 # Finished (done/failed/cancelled): nothing more will arrive,
                 # so the card is never polled again. Whatever lines it had
@@ -625,24 +629,28 @@ class WorkView(View):
                         partial(self.hub.data.mission_events_newest, card.mission_id, 5000), None
                     )
                     if evs is not None:
-                        card.rebuild_tail(evs)
+                        with self.painting():
+                            card.rebuild_tail(evs)
                         card.tail_filled = True
                     # its cost too, once: the finished path skips the live
                     # poll below (found live: a done card lost its $7.07)
                     card.spend = await self.hub.guard(
                         partial(self.hub.data.mission_spend, card.mission_id), card.spend
                     )
-                    card.paint()
+                    with self.painting():
+                        card.paint()
                 continue
             evs = await self.hub.guard(
                 partial(self.hub.data.events_tail, card.mission_id, card.last_seq), []
             )
             if evs:
-                card.add_events(evs)
+                with self.painting():
+                    card.add_events(evs)
             card.spend = await self.hub.guard(
                 partial(self.hub.data.mission_spend, card.mission_id), card.spend
             )
-            card.paint()
+            with self.painting():
+                card.paint()
 
     def on_mission_card_act(self, event: MissionCard.Act) -> None:
         event.stop()

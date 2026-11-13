@@ -167,7 +167,8 @@ class LibraryView(View):
         self.items = self._filter(items)
         self._fingerprint = tuple(self._item_fingerprint(i) for i in self.items)
         self._body_fingerprint = None
-        self._paint_list()
+        with self.painting():  # the app can close during the await above
+            self._paint_list()
 
     async def _fetch_items(self) -> list[Any]:
         data = self.hub.data
@@ -264,15 +265,16 @@ class LibraryView(View):
         items = self._filter(items)
         self.items = items
         fingerprint = tuple(self._item_fingerprint(i) for i in items)
-        if fingerprint != self._fingerprint:
-            self._fingerprint = fingerprint
-            self._paint_list()
-        if self.selected is not None:
-            # the index row is authoritative for the reader's metadata
-            fresh = next((i for i in items if i.id == self.selected.id), None)
-            if fresh is not None and fresh is not self.selected:
-                self.selected = fresh
-                self._paint_reader()
+        with self.painting():  # the app can close during the await above
+            if fingerprint != self._fingerprint:
+                self._fingerprint = fingerprint
+                self._paint_list()
+            if self.selected is not None:
+                # the index row is authoritative for the reader's metadata
+                fresh = next((i for i in items if i.id == self.selected.id), None)
+                if fresh is not None and fresh is not self.selected:
+                    self.selected = fresh
+                    self._paint_reader()
         await self._recheck_body()
 
     async def _recheck_body(self) -> None:
@@ -290,9 +292,10 @@ class LibraryView(View):
             return
         self._body_fingerprint = fingerprint
         self.selected = fresh
-        self._paint_reader()
-        if body is not None:
-            await self.query_one("#lib-md", Markdown).update(body)
+        with self.painting():  # the app can close during the awaits above
+            self._paint_reader()
+            if body is not None:
+                await self.query_one("#lib-md", Markdown).update(body)
 
     def on_row_list_activated(self, event: RowList.Activated) -> None:
         event.stop()
@@ -363,7 +366,10 @@ class LibraryView(View):
                 "the index and its file is not on this machine. Run `rework library "
                 "backfill-bodies` where the body file lives."
             )
-        await md.update(body)
+        with self.painting():  # the app can close during the await above
+            # `md` was fetched before the await; re-query so a torn-down reader
+            # is a NoMatches the guard can drop
+            await self.query_one("#lib-md", Markdown).update(body)
 
     def on_btn_pressed(self, event: Btn.Pressed) -> None:
         event.stop()
@@ -390,7 +396,8 @@ class LibraryView(View):
             self.toast("Retired" if retire else "Activated")
             index, _ = await self.hub.data.library()
             self.selected = await index.get_item(item_id)
-            self._paint_reader()
+            with self.painting():  # the app can close during the awaits above
+                self._paint_reader()
             self._search()
 
     def new_item(self) -> None:

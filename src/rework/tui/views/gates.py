@@ -213,7 +213,8 @@ class GatesView(View):
             return  # nothing new: repainting would only flicker (RowList.set_rows)
         self.history = fresh
         if self.mode == "decided":
-            self._paint_list(self.history)
+            with self.painting():  # the app can close during the awaits above
+                self._paint_list(self.history)
 
     def select_gate(self, gate_id: str) -> None:
         """Called from elsewhere (a chat card's Answer…)."""
@@ -359,7 +360,8 @@ class GatesView(View):
         self._steps_seq = max((int(e.seq) for e in events), default=0)
         self._steps_lines = self._step_lines(gate, events)[-12:]
         self._steps_ready_for = gate.id
-        self._paint_steps()
+        with self.painting():  # the app can close during the awaits above
+            self._paint_steps()
 
     def _step_lines(self, gate: Any, events: list[Any]) -> list[str]:
         lines = []
@@ -390,7 +392,8 @@ class GatesView(View):
         if not fresh:
             return
         self._steps_lines = (self._steps_lines + fresh)[-12:]
-        self._paint_steps()
+        with self.painting():  # the app can close during the await above
+            self._paint_steps()
 
     def _paint_choices(self, gate: Any) -> None:
         box = self.query_one("#gate-choices", Horizontal)
@@ -457,12 +460,13 @@ class GatesView(View):
         ok = await actions.decide(self.rw, gate.id, approved, note=note, decision=decision)
         if not ok:
             return
-        self.query_one("#gate-text", TextArea).text = ""
-        # move to the next waiting gate (the inbox empties itself)
-        lst = self.query_one("#gate-list", RowList)
-        remaining = [k for k in lst.keys if k != gate.id]
-        self.selected = None
-        if remaining:
-            lst.activate(remaining[0])
-        else:
-            self._paint_detail()
+        with self.painting():  # the app can close during the await above
+            self.query_one("#gate-text", TextArea).text = ""
+            # move to the next waiting gate (the inbox empties itself)
+            lst = self.query_one("#gate-list", RowList)
+            remaining = [k for k in lst.keys if k != gate.id]
+            self.selected = None
+            if remaining:
+                lst.activate(remaining[0])
+            else:
+                self._paint_detail()
