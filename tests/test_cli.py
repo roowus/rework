@@ -13,6 +13,7 @@ real ~/.rework/state.sqlite3.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -451,7 +452,9 @@ def test_sync_config_merges_only_key_lines_and_never_prints_values(
     (envdir / "rework.env").write_text(
         "# local keys\nREWORK_FIREWORKS_KEY=supersecretvalue123\nOTHER=stay\n"
     )
-    (envdir / "models.json").write_text("{}")  # a local catalog exists to copy
+    (envdir / "models.json").write_text(
+        json.dumps([{"id": "flash", "provider": "fake", "model": "f", "tier": 1}])
+    )
     import rework.config as config_mod
 
     monkeypatch.setattr(config_mod, "DEFAULT_STATE_DIR", envdir)
@@ -482,48 +485,209 @@ def test_sync_config_merges_only_key_lines_and_never_prints_values(
         (argv, stdin) for argv, stdin in calls if argv[:1] == ["ssh"] and "cat >" in argv[2]
     ]
     assert ssh_writes, "the merged rework.env was never written"
-    write_cmd, stdin = ssh_writes[-1]
+    env_writes = [(argv, stdin) for argv, stdin in ssh_writes if "rework.env" in argv[2]]
+    assert env_writes, "the merged rework.env was never written"
+    write_cmd, stdin = env_writes[-1]
     assert stdin is not None and "REWORK_FIREWORKS_KEY=supersecretvalue123" in str(stdin)
     assert "REWORK_DB=keepme" in str(stdin)  # remote non-KEY line preserved verbatim
     assert any("chmod 600" in part for part in write_cmd)
-    assert any(argv[0] == "scp" for argv, _ in calls), "models.json was not copied"
+    # models.json is MERGED, not scp'd over: the merged JSON travels to
+    # ~/.rework/models.json over ssh, and no scp of a local file happens at all
+    assert not any(argv[0] == "scp" for argv, _ in calls), "models.json was still scp'd"
+    models_writes = [(argv, stdin) for argv, stdin in ssh_writes if "models.json" in argv[2]]
+    assert models_writes, "the merged models.json was never written"
+    _, models_stdin = models_writes[-1]
+    assert json.loads(str(models_stdin))[0]["id"] == "flash"
 
 
-def test_sync_config_dry_run_touches_nothing(
-    targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+# A local catalog with one callable-from-anywhere entry, one loopback-only
+# entry (the Mac-only 9router case) and one that SHARES the loopback entry's
+# key. The remote catalog has one entry only the target knows.
+LOCAL_MODELS = [
+    {
+        "id": "flash",
+        "provider": "openai-compatible",
+        "model": "glm-4.5-flash",
+        "tier": 1,
+        "base_url": "https://api.z.ai/api/coding/paas/v4",
+        "api_key_env": "REWORK_FIREWORKS_KEY",
+    },
+    {
+        "id": "router",
+        "provider": "openai-compatible",
+        "model": "router-model",
+        "tier": 1,
+        "base_url": "http://localhost:20128/v1",
+        "api_key_env": "REWORK_ROUTER_KEY",
+    },
+    {
+        "id": "router-sibling",
+        "provider": "openai-compatible",
+        "model": "router-sibling",
+        "tier": 1,
+        "base_url": "https://api.example.com/v1",
+        "api_key_env": "REWORK_ROUTER_KEY",  # shared with a skipped entry: keep
+    },
+]
 
+REMOTE_MODELS = [
+    {"id": "flash", "provider": "fake", "model": "old-flash", "tier": 0},
+    {"id": "rewvis-only", "provider": "fake", "model": "rewvis-1", "tier": 2},
+]
+
+
+def _sync_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, remote_models: object = None
+) -> tuple[list[tuple[list[str], object]], Path]:
+    """Fake the whole remote side: local state dir + a fake `subprocess.run`
+    that answers the read-only `cat` calls with canned remote files and records
+    every (argv, stdin) pair. Hermetic: no ssh, no network, no real HOME."""
     envdir = tmp_path / "state"
     envdir.mkdir()
-    (envdir / "rework.env").write_text("REWORK_FIREWORKS_KEY=supersecretvalue123\n")
+    (envdir / "rework.env").write_text(
+        "REWORK_FIREWORKS_KEY=supersecretvalue123\n"
+        "REWORK_ROUTER_KEY=routersecret\n"
+        "REWORK_STALE_KEY=stale\n"
+    )
+    (envdir / "models.json").write_text(json.dumps(LOCAL_MODELS))
     import rework.config as config_mod
 
     monkeypatch.setattr(config_mod, "DEFAULT_STATE_DIR", envdir)
 
-    called: list[list[str]] = []
+    calls: list[tuple[list[str], object]] = []
 
     def fake_run(cmd: list[str], **kwargs: object) -> object:
-        called.append(list(cmd))
-        return type("P", (), {"stdout": "", "returncode": 0})()
+        calls.append((list(cmd), kwargs.get("input")))
+        stdout = ""
+        if cmd[:1] == ["ssh"] and len(cmd) > 2:
+            if "models.json" in cmd[2]:
+                stdout = "" if remote_models is None else json.dumps(remote_models)
+            elif "rework.env" in cmd[2]:
+                stdout = "REWORK_FIREWORKS_KEY=old\nREWORK_DB=keepme\n"
+        return type("P", (), {"stdout": stdout, "returncode": 0})()
 
     monkeypatch.setattr("subprocess.run", fake_run)
+    return calls, envdir
 
-    result = runner.invoke(app, ["sync-config", "rewvis", "--dry-run"])
-    if result.exit_code != 0:
-        print(result.output)
-    assert result.exit_code == 0
-    assert "would copy" in result.output
-    assert "dry run: nothing was sent" in result.output
-    assert "REWORK_FIREWORKS_KEY: 19 chars" in result.output
-    assert "supersecretvalue123" not in result.output
-    # dry-run may READ the remote env (the read-only cat, to know add vs
+
+def _ssh_write(calls: list[tuple[list[str], object]], needle: str) -> str:
+    writes = [
+        stdin
+        for argv, stdin in calls
+        if argv[:1] == ["ssh"] and "cat >" in argv[2] and needle in argv[2]
+    ]
+    assert writes, f"nothing was written to {needle} over ssh"
+    return str(writes[-1])
+
+
+def test_sync_config_skips_loopback_entries_and_their_keys(
+    targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls, _ = _sync_env(tmp_path, monkeypatch, remote_models=REMOTE_MODELS)
+
+    result = runner.invoke(app, ["sync-config", "sandbox"])
+    assert result.exit_code == 0, result.output
+    out = result.output
+    # the loopback entry is skipped, with its reason
+    assert "skip router: loopback base_url http://localhost:20128/v1" in out
+    # a key ONLY the skipped entry uses is skipped, with its reason...
+    assert "skip REWORK_ROUTER_KEY: used only by skipped entries" in out
+    # ...but that same key is kept when a kept entry also uses it
+    assert "REWORK_ROUTER_KEY=routersecret" in _ssh_write(calls, "rework.env")
+    assert "REWORK_FIREWORKS_KEY=supersecretvalue123" in _ssh_write(calls, "rework.env")
+    assert "REWORK_DB=keepme" in _ssh_write(calls, "rework.env")  # remote line survives
+    # no secret value is ever printed
+    assert "supersecretvalue123" not in out and "routersecret" not in out
+    # the merged catalog: loopback entry gone, target-only entry kept, and the
+    # local entry replaced the target's same-id one
+    merged = json.loads(_ssh_write(calls, "models.json"))
+    ids = [e["id"] for e in merged]
+    assert "router" not in ids
+    assert ids == ["flash", "router-sibling", "rewvis-only"]
+    assert merged[0]["model"] == "glm-4.5-flash"  # local wins on id
+    assert "  keep    rewvis-only: only on the target" in out
+    assert "  replace flash:" in out and "  add     router-sibling:" in out
+    assert not any(argv[0] == "scp" for argv, _ in calls)
+
+
+def test_sync_config_skips_a_key_used_only_by_skipped_entries(
+    targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls, envdir = _sync_env(tmp_path, monkeypatch, remote_models=None)
+    # the loopback entry's key is now used by NOTHING kept
+    (envdir / "models.json").write_text(
+        json.dumps([e for e in LOCAL_MODELS if e["id"] != "router-sibling"])
+    )
+
+    result = runner.invoke(app, ["sync-config", "sandbox"])
+    assert result.exit_code == 0, result.output
+    assert "skip REWORK_ROUTER_KEY: used only by skipped entries" in result.output
+    env_written = _ssh_write(calls, "rework.env")
+    assert "REWORK_ROUTER_KEY" not in env_written, "a key only skipped entries use was sent"
+    assert "REWORK_FIREWORKS_KEY=supersecretvalue123" in env_written
+
+
+def test_sync_config_merges_into_a_target_models_json_of_either_shape(
+    targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # an object-shaped remote document ({"entries": [...]}) keeps its shape and
+    # its other keys; a malformed one is reported and replaced by a valid merge
+    calls, _ = _sync_env(
+        tmp_path, monkeypatch, remote_models={"version": 2, "entries": REMOTE_MODELS}
+    )
+    result = runner.invoke(app, ["sync-config", "sandbox"])
+    assert result.exit_code == 0, result.output
+    merged = json.loads(_ssh_write(calls, "models.json"))
+    assert merged["version"] == 2  # the target's own document keys survive
+    assert [e["id"] for e in merged["entries"]] == ["flash", "router-sibling", "rewvis-only"]
+
+    calls2, _ = _sync_env(tmp_path, monkeypatch, remote_models=None)
+
+    def bad_run(cmd: list[str], **kwargs: object) -> object:
+        calls2.append((list(cmd), kwargs.get("input")))
+        stdout = "{not json" if cmd[:1] == ["ssh"] and "models.json" in cmd[2] else ""
+        return type("P", (), {"stdout": stdout, "returncode": 0})()
+
+    monkeypatch.setattr("subprocess.run", bad_run)
+    result = runner.invoke(app, ["sync-config", "sandbox"])
+    assert result.exit_code == 0, result.output  # a warning, never a crash
+    assert "not valid JSON" in result.output
+    merged2 = json.loads(_ssh_write(calls2, "models.json"))
+    assert [e["id"] for e in merged2] == ["flash", "router-sibling"]
+
+
+def test_sync_config_dry_run_prints_the_same_plan_and_writes_nothing(
+    targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls, _ = _sync_env(tmp_path, monkeypatch, remote_models=REMOTE_MODELS)
+
+    result = runner.invoke(app, ["sync-config", "sandbox", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "merge models.json" in out
+    assert "skip router: loopback base_url http://localhost:20128/v1" in out
+    assert "skip REWORK_ROUTER_KEY: used only by skipped entries" in out
+    assert "dry run: nothing was sent" in out
+    assert "supersecretvalue123" not in out
+    # dry-run may READ the remote files (the read-only cat, to know add vs
     # replace) but must never WRITE anything: no heredoc/cat>, no chmod, no scp
     writes = [
         argv
-        for argv in called
+        for argv in [a for a, _ in calls]
         if argv[0] == "scp" or (argv[0] == "ssh" and ("cat >" in argv[2] or "chmod" in argv[2]))
     ]
     assert not writes, f"dry run wrote to the remote host: {writes}"
+
+    # the plan is byte-identical to the real run's plan lines
+    real, _ = _sync_env(tmp_path, monkeypatch, remote_models=REMOTE_MODELS)
+    real_out = runner.invoke(app, ["sync-config", "sandbox"]).output
+    plan = lambda text: [  # noqa: E731
+        line
+        for line in text.splitlines()
+        if line.startswith(("merge ", "  add", "  replace", "  keep", "  skip"))
+    ]
+    assert plan(out) == plan(real_out), "dry run and real run printed different plans"
+    assert real, "the real run must write"
 
 
 def test_sync_config_requires_an_ssh_host(targets_file: Path) -> None:

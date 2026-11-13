@@ -1481,6 +1481,7 @@ class MissionOrchestrator:
         mission = await self.store.get_mission(self.mid) or self.mission
         plan = mission.plan or {}
         registry = self.r._registry
+        default, _ = model_policy()
         roles = []
         for name in registry.sorted_by_name():
             spec = registry.get(name)
@@ -1492,7 +1493,6 @@ class MissionOrchestrator:
                 f"Default model: {spec.default_model or default}. "
                 f"INPUTS: {', '.join(inputs) or 'brief'}"
             )
-        default, escalation = model_policy()
         catalog = [
             f"- {e.id}: tier {e.tier}, ${e.cost_in_per_mtok}/${e.cost_out_per_mtok} per Mtok"
             + (f", {', '.join(sorted(e.capabilities))}" if e.capabilities else "")
