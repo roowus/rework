@@ -69,18 +69,35 @@ def is_loopback_url(base_url: str | None) -> bool:
 
 _VERSION_RE = re.compile(r"\d+")
 
+# Version keys are a FIXED-WIDTH tuple: every id's numeric segments, zero-padded
+# (or truncated to the most significant ones) to exactly this many slots.
+# Fixed width is what makes them safe to NEGATE for a cheapest-first ranking:
+# variable-length tuples do not compare the way negation needs (`(-5, -5)`
+# sorts GREATER than `(-5,)`, so min() would prefer the older model). With one
+# width, `(-5, -5, 0, ...)` < `(-5, 0, 0, ...)`, so `_rank_cheap`'s min() picks
+# the newer model and `_rank_strong`'s max() picks it too. Real catalog ids
+# carry two or three segments; six leaves room for a dated snapshot.
+_VERSION_WIDTH = 6
+
 
 def version_key(catalog_id: str) -> tuple[int, ...]:
-    """The numeric version segments of a catalog id, as a comparable tuple.
+    """The numeric version segments of a catalog id, as a FIXED-WIDTH tuple.
 
-    `claude-sonnet-5-5` -> (5, 5), which sorts above `claude-sonnet-5` -> (5,);
-    a dated id extends its undated sibling's tuple (`...-20250929` -> (5, 20250929)
-    > (5,)), so a dated snapshot reads as newer. An id with no digits (`flash`,
-    `pro`) gives () and never raises, so ranking is always total."""
-    return tuple(int(part) for part in _VERSION_RE.findall(catalog_id))
+    `claude-sonnet-5-5` -> (5, 5, 0, 0, 0, 0), which sorts above
+    `claude-sonnet-5` -> (5, 0, 0, 0, 0, 0); a dated id is newer than its
+    undated sibling (`...-20250929` -> (5, 20250929, 0, ...) > (5, 0, ...)).
+    An id with no digits (`flash`, `pro`) gives all zeros and never raises, so
+    ranking is always total and two such ids fall through to the id tie-break.
+    No model name is special-cased: the id is parsed, never matched."""
+    parts = tuple(int(part) for part in _VERSION_RE.findall(catalog_id))
+    if len(parts) >= _VERSION_WIDTH:
+        return parts[:_VERSION_WIDTH]
+    return parts + (0,) * (_VERSION_WIDTH - len(parts))
 
 
 def _negated_version(catalog_id: str) -> tuple[int, ...]:
+    """The version key negated element-wise, for a cheapest-first (min) rank.
+    Only correct because `version_key` is fixed-width; see _VERSION_WIDTH."""
     return tuple(-part for part in version_key(catalog_id))
 
 

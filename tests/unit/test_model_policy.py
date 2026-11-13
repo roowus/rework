@@ -7,6 +7,7 @@ assert both what resolves today and that changing the env vars changes it.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -87,9 +88,19 @@ def test_default_env_naming_a_missing_id_falls_back_not_raises(
 
 
 def test_escalation_honours_the_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
-    cat = ModelCatalog([_entry("flash", tier=1), _entry("opus", tier=3)])
+    cat = ModelCatalog(
+        [
+            _entry("flash", tier=1),
+            _entry(ESCALATION_MODEL_ID, tier=3),
+            _entry("opus", tier=4),
+        ]
+    )
     assert escalation_model_id(cat) == ESCALATION_MODEL_ID == "claude-sonnet-5-5"
     monkeypatch.setenv(ESCALATION_MODEL_ENV, "opus")
+    assert escalation_model_id(cat) == "opus"
+    # the env var is the ONLY knob: no id is banned, and an id the catalog does
+    # not hold falls back to the strongest usable rather than raising
+    monkeypatch.setenv(ESCALATION_MODEL_ENV, "not-in-the-catalog")
     assert escalation_model_id(cat) == "opus"
 
 
@@ -139,10 +150,18 @@ def test_a_dated_id_reads_as_newer_than_its_undated_sibling() -> None:
 
 
 def test_ids_without_digits_do_not_crash_the_ranking() -> None:
-    assert version_key("flash") == () and version_key("pro") == ()
-    cat = ModelCatalog([_entry("pro", tier=2), _entry("flash", tier=2)])
-    assert cat.strongest_usable().id in {"pro", "flash"}  # total order, no raise
-    assert cat.cheapest_usable().id in {"pro", "flash"}
+    # no digits -> an all-zero key of the SAME width as a parsed one, so the
+    # tuple comparison against `claude-sonnet-5` stays well-defined
+    assert version_key("flash") == version_key("pro") == (0,) * len(version_key("x-1"))
+    assert isinstance(version_key("flash"), tuple)
+    # the ranking is still TOTAL (no raise) and deterministic: with nothing else
+    # to separate them the final tie-break is the id, so the catalog ORDER
+    # cannot change the answer (cheap rank ascends the id, strong rank descends)
+    picks = []
+    for order in (["pro", "flash"], ["flash", "pro"]):
+        cat = ModelCatalog([_entry(name, tier=2) for name in order])
+        picks.append((cat.cheapest_usable().id, cat.strongest_usable().id))
+    assert picks == [("flash", "pro"), ("flash", "pro")]
 
 
 # 4. no default path yields 'pro' (or any hardcoded id) --------------------------
@@ -185,11 +204,21 @@ def test_every_role_resolves_to_the_configured_default(monkeypatch: pytest.Monke
 # 5. the prompt/policy text names the CONFIGURED ids and states the policy -------
 
 
+def _pin_catalog(monkeypatch: pytest.MonkeyPatch, ids: list[str]) -> None:
+    """Point the process-wide catalog at exactly these ids (fake provider: no
+    key needed), so the policy tests do not read a real ~/.rework/models.json."""
+    monkeypatch.setenv(
+        "REWORK_MODELS",
+        json.dumps([{"id": i, "provider": "fake", "model": i, "tier": 1} for i in ids]),
+    )
+
+
 def test_playbook_text_names_the_configured_ids_and_the_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from rework.orchestrator.agent import RULES, model_policy, orchestrator_tools, render
 
+    _pin_catalog(monkeypatch, ["flash", ESCALATION_MODEL_ID])
     rendered = render(RULES)
     assert "$DEFAULT_MODEL" not in rendered and "$ESCALATION_MODEL" not in rendered
     assert "flash" in rendered and "claude-sonnet-5-5" in rendered
@@ -197,18 +226,31 @@ def test_playbook_text_names_the_configured_ids_and_the_policy(
     assert "escalat" in lowered
     assert "provider error" in lowered and "never" in lowered
     assert "high-risk" in lowered or "high risk" in lowered
-    # the spawn_role model description names the same ids
+    # the spawn_role `model` field's description is the other place the policy
+    # lives, and it carries the placeholders until the orchestrator renders it
     spawn = next(t for t in orchestrator_tools() if t.name == "spawn_role")
-    assert "$DEFAULT_MODEL" in spawn.description  # the placeholder is the knob
-    described = render(spawn.description)
-    assert "flash" in described and "claude-sonnet-5-5" in described
+    field = spawn.input_schema["properties"]["model"]["description"]
+    assert "$DEFAULT_MODEL" in field and "$ESCALATION_MODEL" in field
+    rendered_field = render(field)
+    assert "flash" in rendered_field and "claude-sonnet-5-5" in rendered_field
+    assert "$" not in rendered_field  # nothing left unrendered
+    # MissionOrchestrator renders the whole tool (description AND schema)
+    from rework.orchestrator.agent import render_tool
 
+    tool = render_tool(spawn)
+    rendered_field = tool.input_schema["properties"]["model"]["description"]
+    assert "flash" in rendered_field and "claude-sonnet-5-5" in rendered_field
+    assert "$DEFAULT_MODEL" not in rendered_field
+
+    # changing the env vars changes the rendered text (no code change needed)
+    _pin_catalog(monkeypatch, ["cheap-thing", "big-thing"])
     monkeypatch.setenv(DEFAULT_MODEL_ENV, "cheap-thing")
     monkeypatch.setenv(ESCALATION_MODEL_ENV, "big-thing")
     assert model_policy() == ("cheap-thing", "big-thing")
     changed = render(RULES)
     assert "cheap-thing" in changed and "big-thing" in changed
     assert changed != rendered
+    assert "flash" not in changed.split("MODEL POLICY")[1].split("\n")[0]
 
 
 # 6. the TUI knob and the orchestrator's own model use the configured default ---
@@ -252,7 +294,13 @@ def test_is_loopback_url_covers_the_shapes_a_catalog_uses() -> None:
 
 
 def test_api_key_env_name_matches_the_adapter_lookup() -> None:
-    assert api_key_env_name(_entry("a", provider="anthropic")) == "ANTHROPIC_API_KEY"
-    assert api_key_env_name(_entry("a", provider="openai")) == "OPENAI_API_KEY"
+    # provider default: no explicit api_key_env, so the provider's env var wins
+    assert (
+        api_key_env_name(_entry("a", provider="anthropic", api_key_env="")) == "ANTHROPIC_API_KEY"
+    )
+    assert api_key_env_name(_entry("a", provider="openai", api_key_env="")) == "OPENAI_API_KEY"
+    # an explicit api_key_env always wins over the provider default
     assert api_key_env_name(_entry("a", api_key_env="REWORK_ROUTER_KEY")) == "REWORK_ROUTER_KEY"
+    # a provider that needs no key, and a provider with no known default
     assert api_key_env_name(ModelEntry(id="f", provider="fake", model="f")) == ""
+    assert api_key_env_name(_entry("a", provider="mystery", api_key_env="")) == ""

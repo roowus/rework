@@ -105,13 +105,15 @@ def new(
         raise typer.BadParameter(str(exc)) from exc
 
 
-def default_orchestrator_model() -> str:
+def default_orchestrator_model(catalog: Any = None) -> str:
     """The configured default model (REWORK_DEFAULT_MODEL, default 'flash'):
     the same cheap strong model every role runs on, resolved against the
-    catalog. Cost control starts here."""
+    catalog. Cost control starts here. `catalog` is optional so a caller that
+    already loaded one (or a test) can pass it instead of re-reading
+    ~/.rework/models.json."""
     from rework.config import default_model_id
 
-    return default_model_id()
+    return default_model_id(catalog)
 
 
 project_app = typer.Typer(no_args_is_help=True, add_completion=False, help="Projects (ADR 0005).")
@@ -1748,7 +1750,12 @@ def sync_config_cmd(
     merged_entries = list(kept_entries) + [
         entry for entry in target_entries if str(entry.get("id")) not in set(local_ids)
     ]
-    merged_doc = _models_doc_with(local_doc, merged_entries)
+    # the TARGET owns the shape of its own file: an object-shaped remote
+    # document keeps its other keys and its `entries` key only changes. With no
+    # usable remote document, the local document's shape is the fallback.
+    merged_doc = _models_doc_with(
+        target_doc if target_doc is not None else local_doc, merged_entries
+    )
 
     if local_doc is None:
         typer.echo(f"no local {models}: models.json not merged")

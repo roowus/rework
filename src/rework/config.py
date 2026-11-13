@@ -169,9 +169,7 @@ def default_model_id(catalog: ModelCatalog | None = None) -> str:
     against the catalog. Every role, plan step, the TUI knob and the
     orchestrator's own model use this one function, so switching the default
     is env-only."""
-    return _configured_model(
-        DEFAULT_MODEL_ENV, DEFAULT_MODEL_ID, catalog=catalog, cheapest=True
-    )
+    return _configured_model(DEFAULT_MODEL_ENV, DEFAULT_MODEL_ID, catalog=catalog, cheapest=True)
 
 
 def escalation_model_id(catalog: ModelCatalog | None = None) -> str:

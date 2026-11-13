@@ -448,7 +448,7 @@ def test_sync_config_merges_only_key_lines_and_never_prints_values(
 ) -> None:
 
     envdir = tmp_path / "state"
-    envdir.mkdir()
+    envdir.mkdir(exist_ok=True)  # a test may fake two remote shapes in a row
     (envdir / "rework.env").write_text(
         "# local keys\nREWORK_FIREWORKS_KEY=supersecretvalue123\nOTHER=stay\n"
     )
@@ -526,7 +526,7 @@ LOCAL_MODELS = [
         "model": "router-sibling",
         "tier": 1,
         "base_url": "https://api.example.com/v1",
-        "api_key_env": "REWORK_ROUTER_KEY",  # shared with a skipped entry: keep
+        "api_key_env": "REWORK_SIBLING_KEY",  # its own key: the router's is droppable
     },
 ]
 
@@ -543,10 +543,11 @@ def _sync_env(
     that answers the read-only `cat` calls with canned remote files and records
     every (argv, stdin) pair. Hermetic: no ssh, no network, no real HOME."""
     envdir = tmp_path / "state"
-    envdir.mkdir()
+    envdir.mkdir(exist_ok=True)  # a test may fake two remote shapes in a row
     (envdir / "rework.env").write_text(
         "REWORK_FIREWORKS_KEY=supersecretvalue123\n"
         "REWORK_ROUTER_KEY=routersecret\n"
+        "REWORK_SIBLING_KEY=siblingsecret\n"
         "REWORK_STALE_KEY=stale\n"
     )
     (envdir / "models.json").write_text(json.dumps(LOCAL_MODELS))
@@ -590,12 +591,12 @@ def test_sync_config_skips_loopback_entries_and_their_keys(
     out = result.output
     # the loopback entry is skipped, with its reason
     assert "skip router: loopback base_url http://localhost:20128/v1" in out
-    # a key ONLY the skipped entry uses is skipped, with its reason...
+    # ...and so is the key ONLY that skipped entry uses, with its reason
     assert "skip REWORK_ROUTER_KEY: used only by skipped entries" in out
-    # ...but that same key is kept when a kept entry also uses it
-    assert "REWORK_ROUTER_KEY=routersecret" in _ssh_write(calls, "rework.env")
-    assert "REWORK_FIREWORKS_KEY=supersecretvalue123" in _ssh_write(calls, "rework.env")
-    assert "REWORK_DB=keepme" in _ssh_write(calls, "rework.env")  # remote line survives
+    env_written = _ssh_write(calls, "rework.env")
+    assert "REWORK_ROUTER_KEY" not in env_written, "a key only skipped entries use was sent"
+    assert "REWORK_FIREWORKS_KEY=supersecretvalue123" in env_written
+    assert "REWORK_DB=keepme" in env_written  # remote line survives
     # no secret value is ever printed
     assert "supersecretvalue123" not in out and "routersecret" not in out
     # the merged catalog: loopback entry gone, target-only entry kept, and the
@@ -610,21 +611,25 @@ def test_sync_config_skips_loopback_entries_and_their_keys(
     assert not any(argv[0] == "scp" for argv, _ in calls)
 
 
-def test_sync_config_skips_a_key_used_only_by_skipped_entries(
+def test_sync_config_keeps_a_key_a_kept_entry_also_uses(
     targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The other half of the key rule: a key the skipped loopback entry uses is
+    still needed on the target when a KEPT entry needs it too, so it must be
+    sent and must NOT be reported as skipped."""
     calls, envdir = _sync_env(tmp_path, monkeypatch, remote_models=None)
-    # the loopback entry's key is now used by NOTHING kept
-    (envdir / "models.json").write_text(
-        json.dumps([e for e in LOCAL_MODELS if e["id"] != "router-sibling"])
-    )
+    shared = [
+        {**e, "api_key_env": "REWORK_ROUTER_KEY"} if e["id"] == "router-sibling" else e
+        for e in LOCAL_MODELS
+    ]
+    (envdir / "models.json").write_text(json.dumps(shared))
 
     result = runner.invoke(app, ["sync-config", "sandbox"])
     assert result.exit_code == 0, result.output
-    assert "skip REWORK_ROUTER_KEY: used only by skipped entries" in result.output
+    assert "skip router: loopback base_url http://localhost:20128/v1" in result.output
+    assert "REWORK_ROUTER_KEY: used only by skipped entries" not in result.output
     env_written = _ssh_write(calls, "rework.env")
-    assert "REWORK_ROUTER_KEY" not in env_written, "a key only skipped entries use was sent"
-    assert "REWORK_FIREWORKS_KEY=supersecretvalue123" in env_written
+    assert "REWORK_ROUTER_KEY=routersecret" in env_written
 
 
 def test_sync_config_merges_into_a_target_models_json_of_either_shape(

@@ -56,6 +56,7 @@ PROVIDER_FAILURE_LIMIT = 2  # failed runs on one model before spawn_role refuses
 STRICTNESS_LEVELS = ("light", "standard", "strict")
 DEFAULT_STRICTNESS = "standard"
 
+
 def model_policy() -> tuple[str, str]:
     """(default model id, escalation model id) from config, read at RUNTIME so
     changing REWORK_DEFAULT_MODEL / REWORK_ESCALATION_MODEL changes the prompt
@@ -69,6 +70,31 @@ def render(text: str) -> str:
     """Fill the model-policy placeholders in prompt/tool text from config."""
     default, escalation = model_policy()
     return text.replace("$DEFAULT_MODEL", default).replace("$ESCALATION_MODEL", escalation)
+
+
+def _render_schema(node: Any) -> Any:
+    """Every string inside a tool's JSON schema, placeholders filled. The
+    policy text lives in the spawn_role `model` field's description, so
+    rendering only the tool's top-level description would ship a literal
+    `$DEFAULT_MODEL` to the model."""
+    if isinstance(node, str):
+        return render(node)
+    if isinstance(node, dict):
+        return {key: _render_schema(value) for key, value in node.items()}
+    if isinstance(node, list):
+        return [_render_schema(item) for item in node]
+    return node
+
+
+def render_tool(tool: ToolSpec) -> ToolSpec:
+    """One tool with the configured model policy rendered into its description
+    AND its input_schema (spawn_role's `model` field carries the policy)."""
+    return tool.model_copy(
+        update={
+            "description": render(tool.description),
+            "input_schema": _render_schema(tool.input_schema),
+        }
+    )
 
 
 PLAYBOOKS: dict[str, str] = {
@@ -147,6 +173,7 @@ How you work:
   never spawn a role to push, commit, or open PRs (each coder run also creates a
   new branch, so a "push" coder only adds noise).
 - Respond with tool calls. Text without a tool call wastes a turn."""
+
 
 def orchestrator_tools() -> list[ToolSpec]:
     """The orchestrator's tools; text renders the configured model policy."""
@@ -464,9 +491,7 @@ class MissionOrchestrator:
         self._providers: dict[str, Any] = {}
         # built once per orchestrator: the model-policy text is rendered from
         # config and the system prompt stays byte-stable for prompt caching
-        self.tools = [t.model_copy(update={"description": render(t.description)})
-                      if t.name == "spawn_role" else t
-                      for t in orchestrator_tools()]
+        self.tools = [render_tool(t) for t in orchestrator_tools()]
 
     def _usable(self) -> list[Any]:
         """Catalog entries this daemon can actually call (real ones first)."""
