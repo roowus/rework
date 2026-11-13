@@ -528,57 +528,108 @@ async def test_a_streamed_completion_is_assembled() -> None:
 # -- role_env scratch dir isolation -------------------------------------------
 
 
-def test_role_env_redirects_rework_state_dirs_to_scratch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """FIX 2 (PR #21): role_env must not let role commands touch the real
-    ~/.rework.  REWORK_TARGETS (and other state paths) must point inside the
-    per-run scratch dir under the workdir, so a rework command run by a role
-    never reads/writes the dev machine's targets.toml or env file."""
-    from rework.nodes.tools import role_env
+STATE_VARS = (
+    "REWORK_TARGETS",
+    "REWORK_ENV_FILE",
+    "REWORK_TUI_SETTINGS",
+    "REWORK_LOG_DIR",
+    "REWORK_RUN_DIR",
+)
 
-    # Ensure none of the redirected vars are pre-set in the environment.
-    for var in (
-        "REWORK_TARGETS",
-        "REWORK_ENV_FILE",
-        "REWORK_TUI_SETTINGS",
-        "REWORK_LOG_DIR",
-        "REWORK_RUN_DIR",
-    ):
+
+def _clear_state_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for var in STATE_VARS:
         monkeypatch.delenv(var, raising=False)
 
-    result = role_env(tmp_path)
-    scratch = tmp_path / ".rework-scratch"
 
-    # REWORK_TARGETS must NOT point at the real ~/.rework
-    targets = result.get("REWORK_TARGETS", "")
+def _assert_state_dirs_point_into(result: dict[str, str], scratch: Path) -> None:
+    """Every redirected state path sits in the scratch dir, and nowhere near
+    the real ~/.rework. REWORK_RUN_DIR is the scratch dir's `run` subdir."""
     home_rework = str(Path.home() / ".rework")
-    assert not targets.startswith(home_rework), (
-        f"REWORK_TARGETS {targets!r} points inside the real ~/.rework"
+    for var in STATE_VARS:
+        value = result.get(var, "")
+        assert value.startswith(str(scratch) + "/"), f"{var} {value!r} should be under {scratch}"
+        assert not value.startswith(home_rework), f"{var} {value!r} points inside ~/.rework"
+    assert result["REWORK_RUN_DIR"] == str(scratch / "run")
+
+
+def test_role_env_puts_the_scratch_dir_outside_a_worktree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Follow-up to PR #22: a coder's workdir IS its git worktree, so the old
+    `<workdir>/.rework-scratch` was staged by the handoff's `git add -A` and
+    landed in the PR. The scratch dir must sit NEXT TO the worktree, in the run
+    dir (where loop.json lives), and the five state vars must follow it."""
+    import subprocess
+
+    from rework.nodes.tools import role_env
+
+    _clear_state_env(monkeypatch)
+    run_dir = tmp_path / "m-abc123_code_coder_1"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
+    (repo / "a.py").write_text("x = 1\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
     )
-    # Must point inside the per-run scratch dir under workdir
-    assert targets.startswith(str(scratch)), f"REWORK_TARGETS {targets!r} should be under {scratch}"
-
-    # Same for REWORK_ENV_FILE
-    env_file = result.get("REWORK_ENV_FILE", "")
-    assert env_file.startswith(str(scratch)), (
-        f"REWORK_ENV_FILE {env_file!r} should be under {scratch}"
+    worktree = run_dir / "worktree"  # exactly coder.py's <run_dir>/worktree
+    run_dir.mkdir()
+    subprocess.run(
+        ["git", "worktree", "add", "-q", "-b", "rework/x", str(worktree)],
+        cwd=repo,
+        check=True,
+        capture_output=True,
     )
 
-    # Same for REWORK_TUI_SETTINGS
-    tui = result.get("REWORK_TUI_SETTINGS", "")
-    assert tui.startswith(str(scratch)), f"REWORK_TUI_SETTINGS {tui!r} should be under {scratch}"
+    result = role_env(worktree)
+    scratch = run_dir / ".rework-scratch"
+    assert scratch.is_dir(), "the run-dir scratch dir is created"
+    assert scratch == worktree.parent / ".rework-scratch"
+    assert not scratch.is_relative_to(worktree), "scratch must not be inside the worktree"
+    _assert_state_dirs_point_into(result, scratch)
 
-    # Same for REWORK_LOG_DIR
-    log_dir = result.get("REWORK_LOG_DIR", "")
-    assert log_dir.startswith(str(scratch)), f"REWORK_LOG_DIR {log_dir!r} should be under {scratch}"
 
-    # Same for REWORK_RUN_DIR
-    run_dir = result.get("REWORK_RUN_DIR", "")
-    assert run_dir.startswith(str(scratch)), f"REWORK_RUN_DIR {run_dir!r} should be under {scratch}"
+def test_role_env_keeps_a_non_git_workdir_scratch_out_of_any_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-coder role's workdir IS the run dir (an empty, non-git dir), so it
+    gets a per-run temp dir instead of a sibling of the workroot."""
+    from rework.nodes.tools import role_env
 
-    # Scratch dir was created
-    assert scratch.is_dir(), "scratch dir should be created by role_env"
+    _clear_state_env(monkeypatch)
+    workdir = tmp_path / "m-abc123_look_investigator_1"
+    workdir.mkdir()
+
+    result = role_env(workdir)
+    scratch = Path(result["REWORK_RUN_DIR"]).parent
+    assert scratch.is_dir()
+    assert not scratch.is_relative_to(workdir), "scratch must not be inside the workdir"
+    assert not scratch.is_relative_to(tmp_path), "scratch must not be beside the workroot"
+    assert not (scratch / ".git").exists(), "scratch must not be a git checkout"
+    _assert_state_dirs_point_into(result, scratch)
+
+
+def test_role_env_scratch_dir_is_stable_for_the_same_workdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """role_env runs once per jailed command: every command of a run must see
+    the same state dirs, not a fresh temp dir each call."""
+    from rework.nodes.tools import role_env
+
+    _clear_state_env(monkeypatch)
+    workdir = tmp_path / "plain"
+    workdir.mkdir()
+    first = role_env(workdir)
+    second = role_env(workdir)
+    assert first["REWORK_RUN_DIR"] == second["REWORK_RUN_DIR"]
+    assert first["REWORK_TARGETS"] == second["REWORK_TARGETS"]
+    # an equivalent, non-normalized spelling of the same workdir is the same run
+    assert role_env(workdir / ".." / workdir.name)["REWORK_RUN_DIR"] == first["REWORK_RUN_DIR"]
 
 
 def test_role_env_no_workdir_does_not_set_scratch_vars(monkeypatch: pytest.MonkeyPatch) -> None:

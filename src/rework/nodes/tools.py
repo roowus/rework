@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import tempfile
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -244,6 +245,49 @@ class LocalExecutor:
         return [s for s in all_specs if s.name in allowed]
 
 
+# Per-workdir scratch dirs, keyed by the resolved workdir. role_env runs once
+# per jailed command, and every command of a run must see the SAME state dirs,
+# so the dir is derived once and cached.
+_scratch_dirs: dict[Path, Path] = {}
+
+
+def _is_git_checkout(path: Path) -> bool:
+    """True when `path` is the root of a git checkout: `.git` is a directory in
+    a main checkout and a file (`gitdir: ...`) in a linked worktree. A missing
+    or unreadable path is not a checkout."""
+    try:
+        return (path / ".git").exists()
+    except OSError:
+        return False
+
+
+def scratch_dir(workdir: Path) -> Path:
+    """The per-run scratch dir for rework state (targets, env file, TUI
+    settings, logs, run registry), kept OUTSIDE any git checkout.
+
+    Found live (follow-up to PR #22): this used to be `<workdir>/.rework-scratch`
+    and a coder's workdir IS its git worktree, so the handoff's `git add -A`
+    staged everything the role's own rework invocation wrote there into the PR.
+    A checkout workdir is therefore treated as the coder's `<run_dir>/worktree`:
+    the scratch dir goes NEXT TO it, in the run dir (`<run_dir>/.rework-scratch`,
+    where loop.json lives), which no checkout covers. Any other workdir gets a
+    per-run temporary directory.
+
+    Stable for the same workdir: role_env is called once per jailed command, so
+    repeated calls must hand back the same dir, not a fresh temp dir each time."""
+    root = Path(workdir).resolve()
+    cached = _scratch_dirs.get(root)
+    if cached is not None:
+        return cached
+    if _is_git_checkout(root):
+        scratch = root.parent / ".rework-scratch"
+    else:
+        scratch = Path(tempfile.mkdtemp(prefix="rework-scratch-"))
+    scratch.mkdir(parents=True, exist_ok=True)
+    _scratch_dirs[root] = scratch
+    return scratch
+
+
 def role_env(workdir: Path | None = None) -> dict[str, str]:
     """The daemon's environment, minus its own Python environment when the
     worktree is a Python project of its own (pyproject.toml). Found live: the
@@ -255,21 +299,22 @@ def role_env(workdir: Path | None = None) -> dict[str, str]:
 
     Also redirects any rework-state paths that rework reads/writes under
     ~/.rework (targets, env file, TUI settings, logs) to a per-run scratch
-    directory inside the role's own workdir, so a role command cannot silently
-    touch or redirect from the real ~/.rework on a dev machine."""
+    directory OUTSIDE the role's git worktree (see scratch_dir), so a role
+    command cannot silently touch or redirect from the real ~/.rework on a dev
+    machine, and nothing it writes there can be staged by the handoff."""
     import os
     import sys
 
     env = dict(os.environ)
 
-    # Always redirect rework-state paths to a per-run scratch dir under the
-    # role's workdir (if one was given), regardless of whether the worktree has
-    # a pyproject.toml.  This prevents role commands from reading/writing the
-    # real ~/.rework (targets.toml, rework.env, tui.json, logs) and
-    # accidentally redirecting which target/db rework talks to.
+    # Always redirect rework-state paths to the run's scratch dir (if a workdir
+    # was given), regardless of whether the worktree has a pyproject.toml.  This
+    # prevents role commands from reading/writing the real ~/.rework
+    # (targets.toml, rework.env, tui.json, logs) and accidentally redirecting
+    # which target/db rework talks to.  The dir lives outside the git checkout,
+    # so the coder handoff's `git add -A` never sees it.
     if workdir is not None:
-        scratch = workdir / ".rework-scratch"
-        scratch.mkdir(parents=True, exist_ok=True)
+        scratch = scratch_dir(workdir)
         # Only set if not already overridden by the caller's environment.
         env.setdefault("REWORK_TARGETS", str(scratch / "targets.toml"))
         env.setdefault("REWORK_ENV_FILE", str(scratch / "rework.env"))
