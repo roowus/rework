@@ -1911,18 +1911,18 @@ async def test_dashboard_report_body_follows_a_run_that_changes_without_a_new_ru
         assert not app.swallowed
 
 
-
 async def test_dashboard_graph_orchestrated_missions(env: Path) -> None:
     """Orchestrated missions show one node per run, not collapsed by step."""
-    from rework.kernel.state.records import Mission, MissionStatus, Run, RunStatus
-    from rework.kernel.state.sqlite import open_sqlite
-    
     # env fixture returns tmp_path, the DB is at tmp_path / "tui.sqlite3"
     # but open_sqlite needs the DB path directly from REWORK_DB env
     # Let's just use the env var that was set
     import os
+
+    from rework.kernel.state.records import Mission, MissionStatus, Run, RunStatus
+    from rework.kernel.state.sqlite import open_sqlite
+
     db_path = os.environ["REWORK_DB"]
-    
+
     # Create an orchestrated mission with multiple runs
     store = await open_sqlite(db_path)
     try:
@@ -1939,9 +1939,9 @@ async def test_dashboard_graph_orchestrated_missions(env: Path) -> None:
                 },
             )
         )
-        
+
         # Create runs: 1 investigator, 3 coders, 3 auditors
-        inv_run = await store.create_run(
+        await store.create_run(
             Run(
                 id=f"{mission.id}:investigate:investigator:1",
                 mission_id=mission.id,
@@ -1952,9 +1952,9 @@ async def test_dashboard_graph_orchestrated_missions(env: Path) -> None:
                 artifact={"summary": "Found issues in auth.py"},
             )
         )
-        
+
         # Round 1: coder + auditor (changes requested)
-        coder1 = await store.create_run(
+        await store.create_run(
             Run(
                 id=f"{mission.id}:code:coder:1",
                 mission_id=mission.id,
@@ -1965,7 +1965,7 @@ async def test_dashboard_graph_orchestrated_missions(env: Path) -> None:
                 artifact={"branch": "rework/m-orch00000001"},
             )
         )
-        audit1 = await store.create_run(
+        await store.create_run(
             Run(
                 id=f"{mission.id}:audit:auditor:1",
                 mission_id=mission.id,
@@ -1976,16 +1976,37 @@ async def test_dashboard_graph_orchestrated_missions(env: Path) -> None:
                 context={"strictness": "standard"},
                 artifact={
                     "findings": [
-                        {"title": "Missing test", "severity": "high", "detail": "...", "evidence": ["test.py:1"], "verdict": "CONFIRMED", "confidence": 0.9},
-                        {"title": "Poor naming", "severity": "medium", "detail": "...", "evidence": ["auth.py:10"], "verdict": "CONFIRMED", "confidence": 0.8},
-                        {"title": "Typo in comment", "severity": "medium", "detail": "...", "evidence": ["auth.py:20"], "verdict": "PLAUSIBLE", "confidence": 0.6},
+                        {
+                            "title": "Missing test",
+                            "severity": "high",
+                            "detail": "...",
+                            "evidence": ["test.py:1"],
+                            "verdict": "CONFIRMED",
+                            "confidence": 0.9,
+                        },
+                        {
+                            "title": "Poor naming",
+                            "severity": "medium",
+                            "detail": "...",
+                            "evidence": ["auth.py:10"],
+                            "verdict": "CONFIRMED",
+                            "confidence": 0.8,
+                        },
+                        {
+                            "title": "Typo in comment",
+                            "severity": "medium",
+                            "detail": "...",
+                            "evidence": ["auth.py:20"],
+                            "verdict": "PLAUSIBLE",
+                            "confidence": 0.6,
+                        },
                     ]
                 },
             )
         )
-        
+
         # Round 2: coder revision + auditor (more changes)
-        coder2 = await store.create_run(
+        await store.create_run(
             Run(
                 id=f"{mission.id}:code:coder:2",
                 mission_id=mission.id,
@@ -1996,7 +2017,7 @@ async def test_dashboard_graph_orchestrated_missions(env: Path) -> None:
                 artifact={"branch": "rework/m-orch00000001"},
             )
         )
-        audit2 = await store.create_run(
+        await store.create_run(
             Run(
                 id=f"{mission.id}:audit:auditor:2",
                 mission_id=mission.id,
@@ -2007,14 +2028,21 @@ async def test_dashboard_graph_orchestrated_missions(env: Path) -> None:
                 context={"strictness": "strict"},
                 artifact={
                     "findings": [
-                        {"title": "Still missing edge case", "severity": "critical", "detail": "...", "evidence": ["test.py:5"], "verdict": "CONFIRMED", "confidence": 0.95},
+                        {
+                            "title": "Still missing edge case",
+                            "severity": "critical",
+                            "detail": "...",
+                            "evidence": ["test.py:5"],
+                            "verdict": "CONFIRMED",
+                            "confidence": 0.95,
+                        },
                     ]
                 },
             )
         )
-        
+
         # Round 3: coder revision + auditor (approved)
-        coder3 = await store.create_run(
+        await store.create_run(
             Run(
                 id=f"{mission.id}:code:coder:3",
                 mission_id=mission.id,
@@ -2025,7 +2053,7 @@ async def test_dashboard_graph_orchestrated_missions(env: Path) -> None:
                 artifact={"branch": "rework/m-orch00000001"},
             )
         )
-        audit3 = await store.create_run(
+        await store.create_run(
             Run(
                 id=f"{mission.id}:audit:auditor:3",
                 mission_id=mission.id,
@@ -2037,66 +2065,79 @@ async def test_dashboard_graph_orchestrated_missions(env: Path) -> None:
                 artifact={"findings": []},
             )
         )
-        
+
     finally:
         await store.aclose()
-    
+
     # Now test the graph view
     app = _app()
     async with app.run_test(size=SIZE) as pilot:
         await _settle(pilot)
         app.open_mission("m-orch00000001")
         await _settle(pilot, 1.0)
-        
+
         # Click the graph tab to make nodes visible
         from rework.tui.widgets.base import ChipGroup
+
         tabs = app.query_one("#m-tabs", ChipGroup)
         graph_chip = next(c for c in tabs.query(".chip") if c.value == "graph")
         await pilot.click(graph_chip)
         await _settle(pilot, 0.6)
-        
+
         # Check nodes are per-run
         nodes = [n.node for n in app.query(".gnode")]
         node_keys = [n.key for n in nodes]
-        
+
         # Should have: orchestrator + 7 runs + ship gate + end = 10 nodes
         assert len(nodes) >= 9, f"Expected at least 9 nodes, got {len(nodes)}: {node_keys}"
-        
+
         # Check that run IDs are used as keys (not step names)
         run_nodes = [n for n in nodes if n.run_id and n.run_id.startswith("m-orch")]
         assert len(run_nodes) >= 7, f"Expected 7 run nodes, got {len(run_nodes)}"
-        
+
         # Check audit nodes have findings
         audit_nodes = [n for n in nodes if "auditor" in (n.run_id or "")]
         assert len(audit_nodes) == 3, f"Expected 3 audit nodes, got {len(audit_nodes)}"
-        
+
         # First audit should show findings summary
-        audit1_id = f"m-orch00000001:audit:auditor:1"
+        audit1_id = "m-orch00000001:audit:auditor:1"
         if audit1_id in node_keys:
             idx = node_keys.index(audit1_id)
             audit1_node = nodes[idx]
             # Should have "1 high · 2 medium" in findings
             assert audit1_node.findings, f"Audit node should have findings summary: {audit1_node}"
-            assert "high" in audit1_node.findings.lower(), f"Expected 'high' in findings: {audit1_node.findings}"
-        
+            assert "high" in audit1_node.findings.lower(), (
+                f"Expected 'high' in findings: {audit1_node.findings}"
+            )
+
         # Check coder revisions are marked
         coder_nodes = [n for n in nodes if "coder" in (n.run_id or "")]
         assert len(coder_nodes) >= 3, f"Expected 3 coder nodes, got {len(coder_nodes)}"
-        
+
         # Second and third coders should be marked as revisions
         revision_titles = [n.title for n in coder_nodes[1:]]
         # At least one should be marked as revision
-        assert any("revision" in t.lower() for t in revision_titles), f"Expected revision markers in {revision_titles}"
-        
+        assert any("revision" in t.lower() for t in revision_titles), (
+            f"Expected revision markers in {revision_titles}"
+        )
+
         assert not app.swallowed
 
 
 async def test_dashboard_graph_parallel_auditors(env: Path) -> None:
     """Test parallel runs (two auditors spawned together after one coder)."""
     import os
-    from rework.kernel.state.records import EventRecord, EventType, Mission, MissionStatus, Run, RunStatus
+
+    from rework.kernel.state.records import (
+        EventRecord,
+        EventType,
+        Mission,
+        MissionStatus,
+        Run,
+        RunStatus,
+    )
     from rework.kernel.state.sqlite import open_sqlite
-    
+
     store = await open_sqlite(os.environ["REWORK_DB"])
     try:
         # Create orchestrated mission
@@ -2112,9 +2153,9 @@ async def test_dashboard_graph_parallel_auditors(env: Path) -> None:
                 },
             )
         )
-        
+
         # Round 1: one coder
-        coder1 = await store.create_run(
+        await store.create_run(
             Run(
                 id=f"{mission.id}:code:coder:1",
                 mission_id=mission.id,
@@ -2125,7 +2166,7 @@ async def test_dashboard_graph_parallel_auditors(env: Path) -> None:
                 artifact={"branch": "rework/m-parallel00001"},
             )
         )
-        
+
         # Create role_spawned events for the two auditors (spawned in same turn)
         seq_base = 100
         await store.append_event(
@@ -2146,11 +2187,12 @@ async def test_dashboard_graph_parallel_auditors(env: Path) -> None:
                 payload={"role": "auditor"},
             )
         )
-        
+
         # Two auditors spawned together (same created_at timestamp)
         import time
+
         spawn_time = time.time()
-        audit1 = await store.create_run(
+        await store.create_run(
             Run(
                 id=f"{mission.id}:audit:auditor:1",
                 mission_id=mission.id,
@@ -2163,7 +2205,7 @@ async def test_dashboard_graph_parallel_auditors(env: Path) -> None:
                 artifact={"findings": []},
             )
         )
-        audit2 = await store.create_run(
+        await store.create_run(
             Run(
                 id=f"{mission.id}:audit:auditor:2",
                 mission_id=mission.id,
@@ -2176,52 +2218,53 @@ async def test_dashboard_graph_parallel_auditors(env: Path) -> None:
                 artifact={"findings": []},
             )
         )
-        
+
     finally:
         await store.aclose()
-    
+
     # Test the graph view
     app = _app()
     async with app.run_test(size=SIZE) as pilot:
         await _settle(pilot)
         app.open_mission("m-parallel00001")
         await _settle(pilot, 1.0)
-        
+
         # Click the graph tab
         from rework.tui.widgets.base import ChipGroup
+
         tabs = app.query_one("#m-tabs", ChipGroup)
         graph_chip = next(c for c in tabs.query(".chip") if c.value == "graph")
         await pilot.click(graph_chip)
         await _settle(pilot, 0.6)
-        
+
         # Check for parallel layout
         # We should have a Horizontal container for the parallel auditors
-        from textual.containers import Horizontal
         parallel_layers = app.query(".glayer")
-        
+
         # Should have at least one parallel layer (the two auditors)
         assert len(parallel_layers) >= 1, f"Expected parallel layer, got {len(parallel_layers)}"
-        
+
         # Check nodes
         nodes = [n.node for n in app.query(".gnode")]
         node_keys = [n.key for n in nodes]
-        
+
         # Should have: orchestrator + coder + 2 auditors + gate + end = 6 nodes
         assert len(nodes) >= 5, f"Expected at least 5 nodes, got {len(nodes)}: {node_keys}"
-        
+
         # Check for both auditor run IDs
         auditor_nodes = [n for n in nodes if "auditor" in (n.run_id or "")]
         assert len(auditor_nodes) == 2, f"Expected 2 auditor nodes, got {len(auditor_nodes)}"
-        
+
         assert not app.swallowed
 
 
 async def test_dashboard_graph_revision_edges(env: Path) -> None:
     """Test revision loop edges with labels."""
     import os
+
     from rework.kernel.state.records import Mission, MissionStatus, Run, RunStatus
     from rework.kernel.state.sqlite import open_sqlite
-    
+
     store = await open_sqlite(os.environ["REWORK_DB"])
     try:
         # Create orchestrated mission with revision loops
@@ -2237,9 +2280,9 @@ async def test_dashboard_graph_revision_edges(env: Path) -> None:
                 },
             )
         )
-        
+
         # Round 1: coder + audit with findings
-        coder1 = await store.create_run(
+        await store.create_run(
             Run(
                 id=f"{mission.id}:code:coder:1",
                 mission_id=mission.id,
@@ -2250,7 +2293,7 @@ async def test_dashboard_graph_revision_edges(env: Path) -> None:
                 artifact={"branch": "rework/m-revisions001"},
             )
         )
-        audit1 = await store.create_run(
+        await store.create_run(
             Run(
                 id=f"{mission.id}:audit:auditor:1",
                 mission_id=mission.id,
@@ -2261,15 +2304,29 @@ async def test_dashboard_graph_revision_edges(env: Path) -> None:
                 context={"strictness": "standard"},
                 artifact={
                     "findings": [
-                        {"title": "Bug 1", "severity": "high", "detail": "...", "evidence": [], "verdict": "CONFIRMED", "confidence": 0.9},
-                        {"title": "Bug 2", "severity": "medium", "detail": "...", "evidence": [], "verdict": "CONFIRMED", "confidence": 0.8},
+                        {
+                            "title": "Bug 1",
+                            "severity": "high",
+                            "detail": "...",
+                            "evidence": [],
+                            "verdict": "CONFIRMED",
+                            "confidence": 0.9,
+                        },
+                        {
+                            "title": "Bug 2",
+                            "severity": "medium",
+                            "detail": "...",
+                            "evidence": [],
+                            "verdict": "CONFIRMED",
+                            "confidence": 0.8,
+                        },
                     ]
                 },
             )
         )
-        
+
         # Round 2: coder revision + audit with one finding
-        coder2 = await store.create_run(
+        await store.create_run(
             Run(
                 id=f"{mission.id}:code:coder:2",
                 mission_id=mission.id,
@@ -2280,7 +2337,7 @@ async def test_dashboard_graph_revision_edges(env: Path) -> None:
                 artifact={"branch": "rework/m-revisions001"},
             )
         )
-        audit2 = await store.create_run(
+        await store.create_run(
             Run(
                 id=f"{mission.id}:audit:auditor:2",
                 mission_id=mission.id,
@@ -2291,14 +2348,21 @@ async def test_dashboard_graph_revision_edges(env: Path) -> None:
                 context={"strictness": "strict"},
                 artifact={
                     "findings": [
-                        {"title": "Still an issue", "severity": "critical", "detail": "...", "evidence": [], "verdict": "CONFIRMED", "confidence": 0.95},
+                        {
+                            "title": "Still an issue",
+                            "severity": "critical",
+                            "detail": "...",
+                            "evidence": [],
+                            "verdict": "CONFIRMED",
+                            "confidence": 0.95,
+                        },
                     ]
                 },
             )
         )
-        
+
         # Round 3: coder revision + audit approved
-        coder3 = await store.create_run(
+        await store.create_run(
             Run(
                 id=f"{mission.id}:code:coder:3",
                 mission_id=mission.id,
@@ -2309,7 +2373,7 @@ async def test_dashboard_graph_revision_edges(env: Path) -> None:
                 artifact={"branch": "rework/m-revisions001"},
             )
         )
-        audit3 = await store.create_run(
+        await store.create_run(
             Run(
                 id=f"{mission.id}:audit:auditor:3",
                 mission_id=mission.id,
@@ -2321,50 +2385,55 @@ async def test_dashboard_graph_revision_edges(env: Path) -> None:
                 artifact={"findings": []},
             )
         )
-        
+
     finally:
         await store.aclose()
-    
+
     # Test the graph view
     app = _app()
     async with app.run_test(size=SIZE) as pilot:
         await _settle(pilot)
         app.open_mission("m-revisions001")
         await _settle(pilot, 1.0)
-        
+
         # Click the graph tab
         from rework.tui.widgets.base import ChipGroup
+
         tabs = app.query_one("#m-tabs", ChipGroup)
         graph_chip = next(c for c in tabs.query(".chip") if c.value == "graph")
         await pilot.click(graph_chip)
         await _settle(pilot, 0.6)
-        
+
         # Check nodes
         nodes = [n.node for n in app.query(".gnode")]
         node_keys = [n.key for n in nodes]
-        
+
         # Should have all runs visible
         assert len(nodes) >= 8, f"Expected at least 8 nodes, got {len(nodes)}: {node_keys}"
-        
+
         # Check for revision markers
         coder_nodes = [n for n in nodes if "coder" in (n.run_id or "")]
         assert len(coder_nodes) == 3, f"Expected 3 coder nodes, got {len(coder_nodes)}"
-        
+
         # Second and third coders should be marked as revisions
         revision_nodes = [n for n in coder_nodes if "revision" in n.title.lower()]
-        assert len(revision_nodes) >= 2, f"Expected at least 2 revision nodes, got {len(revision_nodes)}"
-        
+        assert len(revision_nodes) >= 2, (
+            f"Expected at least 2 revision nodes, got {len(revision_nodes)}"
+        )
+
         # Check for audit findings
         audit_nodes = [n for n in nodes if "auditor" in (n.run_id or "")]
         assert len(audit_nodes) == 3, f"Expected 3 audit nodes, got {len(audit_nodes)}"
-        
+
         # First audit should have findings summary
         audit1_nodes = [n for n in audit_nodes if n.run_id == "m-revisions001:audit:auditor:1"]
         assert len(audit1_nodes) == 1, "Should find first audit node"
-        assert "high" in audit1_nodes[0].findings.lower(), f"Expected 'high' in findings: {audit1_nodes[0].findings}"
-        
+        assert "high" in audit1_nodes[0].findings.lower(), (
+            f"Expected 'high' in findings: {audit1_nodes[0].findings}"
+        )
+
         # For now, just verify edges exist (labels are rendered but checking their text is complex)
         edges = app.query(".gedge")
         assert len(edges) >= 3, f"Expected at least 3 edges between nodes, got {len(edges)}"
-        
+
         assert not app.swallowed
