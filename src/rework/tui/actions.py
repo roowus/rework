@@ -105,7 +105,7 @@ def is_git_repo(repo_dir: str | Path) -> bool:
     blows up deep inside the CLI, so refuse up front with something readable."""
     try:
         top = subprocess.run(
-            ["git", "-C", str(repo_dir, stderr=subprocess.PIPE), "rev-parse", "--show-toplevel"],
+            ["git", "-C", str(repo_dir), "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
         )
