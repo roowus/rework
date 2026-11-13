@@ -542,7 +542,7 @@ class DashboardView(View):
             + esc("  ·  ".join(bits))
             + "[/]"
         )
-        nodes = mission_nodes(mission, self.runs, self.mission_gates, {}, {})
+        nodes = mission_nodes(mission, self.runs, self.mission_gates, {}, {}, compact=True)
         strip = f" [{FAINT}]──[/] ".join(f"{esc(n.title)} {glyph(n.status)}" for n in nodes)
         self.query_one("#m-flow", Static).update(strip)
 

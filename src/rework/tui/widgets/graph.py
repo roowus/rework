@@ -21,7 +21,7 @@ from rework.tui.theme import ACCENT, FAINT, MUTED, esc, glyph, status_value
 
 @dataclass
 class GNode:
-    key: str  # step name, "gate:<kind>" or "end"
+    key: str  # run id for orchestrated per-run nodes, step name otherwise
     title: str
     status: str = "pending"
     sub: str = ""
@@ -29,6 +29,8 @@ class GNode:
     loop_note: str = ""
     inner: list[str] = field(default_factory=list)  # role graph nodes
     inner_at: str = ""  # current inner node
+    findings: str = ""  # audit findings summary: "2 high · 4 medium"
+    strictness: str = ""  # audit strictness level
 
 
 class _Node(Static):
@@ -41,6 +43,10 @@ class _Node(Static):
         lines = [f"{glyph(node.status)} [b]{esc(node.title)}[/b]"]
         if node.sub:
             lines.append(f"[{MUTED}]{esc(node.sub)}[/]")
+        if node.findings:
+            lines.append(f"[{MUTED}]{esc(node.findings)}[/]")
+        if node.strictness:
+            lines.append(f"[{FAINT}]strictness: {esc(node.strictness)}[/]")
         if node.inner:
             strip = []
             for name in node.inner:
@@ -94,17 +100,59 @@ class GraphView(VerticalScroll):
             widget.paint(fresh, fresh.run_id is not None and fresh.run_id == selected)
 
 
+def _findings_summary(run: Any) -> str:
+    """Format audit findings as '2 high · 4 medium'."""
+    findings = (run.artifact or {}).get("findings", [])
+    if not findings:
+        return ""
+    counts: dict[str, int] = {}
+    for f in findings:
+        sev = f.get("severity", "")
+        if sev:
+            counts[sev] = counts.get(sev, 0) + 1
+    # Order by severity: critical, high, medium, low
+    parts = []
+    for sev in ["critical", "high", "medium", "low"]:
+        if sev in counts:
+            parts.append(f"{counts[sev]} {sev}")
+    return " · ".join(parts)
+
+
 def mission_nodes(
     mission: Any,
     runs: list[Any],
     gates: list[Any],
     run_meta: dict[str, str],
     inner: dict[str, tuple[list[str], str]],
+    compact: bool = False,
 ) -> list[GNode]:
     """Plan steps + gates + end, each with the status of its latest run.
+    
+    For orchestrated missions and compact=False, returns one node per run.
+    For fixed-plan missions or compact=True, returns step-grouped nodes.
 
     run_meta: run_id -> one-line subtitle (model · duration · cost)
-    inner:    run_id -> (role graph nodes, current node)"""
+    inner:    run_id -> (role graph nodes, current node)
+    compact:  True for the flow strip (step-grouped), False for the graph view"""
+    plan = mission.plan or {}
+    is_orchestrated = bool((plan.get("orchestrator") or {}))
+    
+    # For compact mode (flow strip) or fixed-plan missions, use step-grouped view
+    if compact or not is_orchestrated:
+        return _mission_nodes_step_grouped(mission, runs, gates, run_meta, inner)
+    
+    # Orchestrated mission: one node per run, chronologically
+    return _mission_nodes_per_run(mission, runs, gates, run_meta, inner)
+
+
+def _mission_nodes_step_grouped(
+    mission: Any,
+    runs: list[Any],
+    gates: list[Any],
+    run_meta: dict[str, str],
+    inner: dict[str, tuple[list[str], str]],
+) -> list[GNode]:
+    """Original step-grouped view: one node per step name (latest attempt)."""
     plan = mission.plan or {}
     steps = list(plan.get("steps") or [])
     by_step: dict[str, list[Any]] = {}
@@ -168,4 +216,91 @@ def mission_nodes(
         "cancelled": "cancelled",
     }.get(status_value(mission.status), "pending")
     nodes.append(GNode(key="end", title="end", status=end_status, sub=""))
+    return nodes
+
+
+def _mission_nodes_per_run(
+    mission: Any,
+    runs: list[Any],
+    gates: list[Any],
+    run_meta: dict[str, str],
+    inner: dict[str, tuple[list[str], str]],
+) -> list[GNode]:
+    """Orchestrated mission view: one node per run, chronologically."""
+    plan = mission.plan or {}
+    nodes: list[GNode] = []
+    
+    # Add orchestrator node
+    orch = plan.get("orchestrator") or {}
+    live = status_value(mission.status) in {"pending", "running", "awaiting_gate", "on_hold"}
+    st = "running" if live else status_value(mission.status)
+    nodes.append(
+        GNode(
+            key="orchestrator",
+            title="orchestrator",
+            status={"done": "completed"}.get(st, st),
+            sub=f"{orch.get('model') or 'default'} · playbook {plan.get('playbook', '?')}",
+            run_id=f"{mission.id}:orchestrate:orchestrator:1",
+        )
+    )
+    
+    # Add one node per run, in chronological order (runs are already sorted by created_at)
+    coder_runs = []
+    for run in runs:
+        status = status_value(run.status)
+        role = run.role
+        title = f"{role}"
+        
+        # Check if this is a revision (coder following an audit)
+        is_revision = False
+        if role == "coder" and coder_runs:
+            is_revision = True
+            title = f"{role} (revision)"
+        
+        if role == "coder":
+            coder_runs.append(run)
+        
+        sub = run_meta.get(run.id, role)
+        if run.attempt > 1:
+            sub = f"{sub} · attempt {run.attempt}"
+        
+        inner_nodes, inner_at = inner.get(run.id, ([], ""))
+        
+        # Extract audit findings and strictness
+        findings = ""
+        strictness = ""
+        if role == "auditor":
+            findings = _findings_summary(run)
+            strictness = (run.context or {}).get("strictness", "")
+        
+        nodes.append(
+            GNode(
+                key=run.id,  # Use run ID as key for per-run nodes
+                title=title,
+                status=status,
+                sub=sub,
+                run_id=run.id,
+                inner=inner_nodes,
+                inner_at=inner_at if status == "running" else "",
+                findings=findings,
+                strictness=strictness,
+            )
+        )
+    
+    # Add gates
+    for kind in plan.get("gates") or []:
+        matching = [g for g in gates if g.kind.value == kind]
+        status = status_value(matching[-1].status) if matching else "pending"
+        nodes.append(
+            GNode(key=f"gate:{kind}", title=f"{kind} gate", status=status, sub="you decide")
+        )
+    
+    # Add end node
+    end_status = {
+        "done": "done",
+        "failed": "failed",
+        "cancelled": "cancelled",
+    }.get(status_value(mission.status), "pending")
+    nodes.append(GNode(key="end", title="end", status=end_status, sub=""))
+    
     return nodes

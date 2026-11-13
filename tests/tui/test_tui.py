@@ -1909,3 +1909,187 @@ async def test_dashboard_report_body_follows_a_run_that_changes_without_a_new_ru
         assert dash.report_loaded_for == settled, "a quiet tick must not reload"
         assert str(body._markdown) == after
         assert not app.swallowed
+
+
+async def test_dashboard_graph_orchestrated_missions(env: Path) -> None:
+    """Orchestrated missions show one node per run, not collapsed by step."""
+    from rework.kernel.state.records import Mission, MissionStatus, Run, RunStatus
+    from rework.kernel.state.sqlite import open_sqlite
+
+
+async def test_dashboard_graph_orchestrated_missions(env: Path) -> None:
+    """Orchestrated missions show one node per run, not collapsed by step."""
+    from rework.kernel.state.records import Mission, MissionStatus, Run, RunStatus
+    from rework.kernel.state.sqlite import open_sqlite
+
+
+async def test_dashboard_graph_orchestrated_missions(env: Path) -> None:
+    """Orchestrated missions show one node per run, not collapsed by step."""
+    from rework.kernel.state.records import Mission, MissionStatus, Run, RunStatus
+    from rework.kernel.state.sqlite import open_sqlite
+    
+    # env fixture returns tmp_path, the DB is at tmp_path / "tui.sqlite3"
+    # but open_sqlite needs the DB path directly from REWORK_DB env
+    # Let's just use the env var that was set
+    import os
+    db_path = os.environ["REWORK_DB"]
+    
+    # Create an orchestrated mission with multiple runs
+    store = await open_sqlite(db_path)
+    try:
+        mission = await store.create_mission(
+            Mission(
+                id="m-orch00000001",
+                objective="refactor the auth module",
+                status=MissionStatus.RUNNING,
+                plan={
+                    "kind": "fix",
+                    "orchestrator": {"model": "pro"},
+                    "playbook": "standard",
+                    "gates": ["ship"],
+                },
+            )
+        )
+        
+        # Create runs: 1 investigator, 3 coders, 3 auditors
+        inv_run = await store.create_run(
+            Run(
+                id=f"{mission.id}:investigate:investigator:1",
+                mission_id=mission.id,
+                role="investigator",
+                step="investigate",
+                attempt=1,
+                status=RunStatus.COMPLETED,
+                artifact={"summary": "Found issues in auth.py"},
+            )
+        )
+        
+        # Round 1: coder + auditor (changes requested)
+        coder1 = await store.create_run(
+            Run(
+                id=f"{mission.id}:code:coder:1",
+                mission_id=mission.id,
+                role="coder",
+                step="code",
+                attempt=1,
+                status=RunStatus.COMPLETED,
+                artifact={"branch": "rework/m-orch00000001"},
+            )
+        )
+        audit1 = await store.create_run(
+            Run(
+                id=f"{mission.id}:audit:auditor:1",
+                mission_id=mission.id,
+                role="auditor",
+                step="audit",
+                attempt=1,
+                status=RunStatus.COMPLETED,
+                context={"strictness": "standard"},
+                artifact={
+                    "findings": [
+                        {"title": "Missing test", "severity": "high", "detail": "...", "evidence": ["test.py:1"], "verdict": "CONFIRMED", "confidence": 0.9},
+                        {"title": "Poor naming", "severity": "medium", "detail": "...", "evidence": ["auth.py:10"], "verdict": "CONFIRMED", "confidence": 0.8},
+                        {"title": "Typo in comment", "severity": "medium", "detail": "...", "evidence": ["auth.py:20"], "verdict": "PLAUSIBLE", "confidence": 0.6},
+                    ]
+                },
+            )
+        )
+        
+        # Round 2: coder revision + auditor (more changes)
+        coder2 = await store.create_run(
+            Run(
+                id=f"{mission.id}:code:coder:2",
+                mission_id=mission.id,
+                role="coder",
+                step="code",
+                attempt=2,
+                status=RunStatus.COMPLETED,
+                artifact={"branch": "rework/m-orch00000001"},
+            )
+        )
+        audit2 = await store.create_run(
+            Run(
+                id=f"{mission.id}:audit:auditor:2",
+                mission_id=mission.id,
+                role="auditor",
+                step="audit",
+                attempt=2,
+                status=RunStatus.COMPLETED,
+                context={"strictness": "strict"},
+                artifact={
+                    "findings": [
+                        {"title": "Still missing edge case", "severity": "critical", "detail": "...", "evidence": ["test.py:5"], "verdict": "CONFIRMED", "confidence": 0.95},
+                    ]
+                },
+            )
+        )
+        
+        # Round 3: coder revision + auditor (approved)
+        coder3 = await store.create_run(
+            Run(
+                id=f"{mission.id}:code:coder:3",
+                mission_id=mission.id,
+                role="coder",
+                step="code",
+                attempt=3,
+                status=RunStatus.COMPLETED,
+                artifact={"branch": "rework/m-orch00000001"},
+            )
+        )
+        audit3 = await store.create_run(
+            Run(
+                id=f"{mission.id}:audit:auditor:3",
+                mission_id=mission.id,
+                role="auditor",
+                step="audit",
+                attempt=3,
+                status=RunStatus.COMPLETED,
+                context={"strictness": "standard"},
+                artifact={"findings": []},
+            )
+        )
+        
+    finally:
+        await store.aclose()
+    
+    # Now test the graph view
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.open_mission("m-orch00000001")
+        await _settle(pilot, 1.0)
+        
+        # Check nodes are per-run
+        nodes = [n.node for n in app.query(".gnode")]
+        node_keys = [n.key for n in nodes]
+        
+        # Should have: orchestrator + 7 runs + ship gate + end = 10 nodes
+        assert len(nodes) >= 9, f"Expected at least 9 nodes, got {len(nodes)}: {node_keys}"
+        
+        # Check that run IDs are used as keys (not step names)
+        run_nodes = [n for n in nodes if n.run_id and n.run_id.startswith("m-orch")]
+        assert len(run_nodes) >= 7, f"Expected 7 run nodes, got {len(run_nodes)}"
+        
+        # Check audit nodes have findings
+        audit_nodes = [n for n in nodes if "auditor" in (n.run_id or "")]
+        assert len(audit_nodes) == 3, f"Expected 3 audit nodes, got {len(audit_nodes)}"
+        
+        # First audit should show findings summary
+        audit1_id = f"m-orch00000001:audit:auditor:1"
+        if audit1_id in node_keys:
+            idx = node_keys.index(audit1_id)
+            audit1_node = nodes[idx]
+            # Should have "1 high · 2 medium" in findings
+            assert audit1_node.findings, f"Audit node should have findings summary: {audit1_node}"
+            assert "high" in audit1_node.findings.lower(), f"Expected 'high' in findings: {audit1_node.findings}"
+        
+        # Check coder revisions are marked
+        coder_nodes = [n for n in nodes if "coder" in (n.run_id or "")]
+        assert len(coder_nodes) >= 3, f"Expected 3 coder nodes, got {len(coder_nodes)}"
+        
+        # Second and third coders should be marked as revisions
+        revision_titles = [n.title for n in coder_nodes[1:]]
+        # At least one should be marked as revision
+        assert any("revision" in t.lower() for t in revision_titles), f"Expected revision markers in {revision_titles}"
+        
+        assert not app.swallowed
