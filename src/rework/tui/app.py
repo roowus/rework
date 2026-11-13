@@ -19,6 +19,7 @@ from textual.notifications import SeverityLevel
 from textual.screen import ModalScreen
 from textual.widgets import ContentSwitcher
 
+from rework import update as update_mod
 from rework.runtime import CODE_CHANGED, CodeChangeWatcher
 from rework.tui.hub import Hub, Snapshot
 from rework.tui.settings import Settings
@@ -40,6 +41,12 @@ ERROR_STORM_WINDOW = 5.0
 # walk of the package is cheap but not free, and a merge is rare, so this stays
 # off the 2s heartbeat: its own slow interval.
 CODE_CHECK_SECONDS = 60.0
+
+# How often the shell asks origin whether main moved (finding 28: the
+# checkout can be behind the code the owner expects). A `git fetch` is
+# slower than the stat walk above, so it gets its own slow interval and
+# runs off the UI thread; offline is silent.
+UPDATE_CHECK_SECONDS = 900.0
 
 # Found live: alt+N worked under Pilot and NEVER in a real macOS terminal.
 # Option+digit reaches Textual as a character (¡ ™ £ ¢ ∞; Textual even maps
@@ -103,6 +110,8 @@ def _menus() -> dict[str, list[MenuItem]]:
             MenuItem("Preview a PR…", "app.preview_pr"),
         ],
         "Help": [
+            MenuItem("Update rework…", "app.action_update_rework"),
+            SEPARATOR,
             MenuItem("Keyboard shortcuts", "app.help", "f1"),
             MenuItem("About rework", "app.about"),
         ],
@@ -159,6 +168,9 @@ class ReworkApp(App[None]):
         # "the code on disk moved under us": recorded here, said once (see
         # _check_code); None until the shell is mounted and can paint a note
         self._code_watcher: CodeChangeWatcher | None = None
+        self._code_changed = False
+        # commits origin/main is ahead by; None = not known (yet/offline)
+        self._update_commits_behind: int | None = None
 
     # -- layout ------------------------------------------------------------
 
@@ -201,6 +213,7 @@ class ReworkApp(App[None]):
         self.set_interval(self.poll_seconds, self._kick)
         self._code_watcher = CodeChangeWatcher()
         self.set_interval(CODE_CHECK_SECONDS, self._check_code)
+        self.set_interval(UPDATE_CHECK_SECONDS, self._check_update)
 
     def get_theme_variable_defaults(self) -> dict[str, str]:
         # the stylesheet references $bg/$fg/… before any theme switch happens
@@ -375,10 +388,35 @@ class ReworkApp(App[None]):
         if self._code_watcher is None or not self._code_watcher.poll():
             return
         log.warning("%s", CODE_CHANGED)
+        self._code_changed = True
+        self._refresh_note()
+
+    async def _check_update(self) -> None:
+        """Every UPDATE_CHECK_SECONDS: is origin/main ahead of this checkout?
+        Off the UI thread, silent when offline, and it never touches the working
+        tree (fetch only). Records the count and repaints the note."""
         try:
-            self.set_note(f"[{WARN}]{CODE_CHANGED}[/]")
+            check = await asyncio.to_thread(update_mod.check_remote)
+        except Exception:
+            return  # unknown is not news
+        behind = check.ahead if check is not None else None
+        if behind == self._update_commits_behind:
+            return
+        self._update_commits_behind = behind
+        self._refresh_note()
+
+    def _refresh_note(self) -> None:
+        """The ONE place the status-bar note is composed, so two facts (the
+        code on disk moved, origin is ahead) coexist instead of clobbering."""
+        parts = []
+        if self._code_changed:
+            parts.append(f"[{WARN}]{CODE_CHANGED}[/]")
+        if self._update_commits_behind:
+            parts.append(f"[{WARN}]update available: {self._update_commits_behind} commits[/]")
+        try:
+            self.set_note(" | ".join(parts))
         except Exception:  # a missing widget must not kill the tick
-            log.debug("code-change note failed", exc_info=True)
+            log.debug("note update failed", exc_info=True)
 
     # -- chrome helpers --------------------------------------------------------
 
@@ -482,6 +520,33 @@ class ReworkApp(App[None]):
             timeout=5,
             markup=False,
         )
+
+    def action_update_rework(self) -> None:
+        """Pull origin/main into THIS checkout and `uv sync`, then tell the owner
+        to restart: nothing restarts itself (finding 28). Unlike the remote
+        `rework update --target NAME` path, this is local and report-only."""
+        self.run_worker(self._update_rework(), group="update")
+
+    async def _update_rework(self) -> None:
+        repo_root = update_mod.find_repo_root()
+        if repo_root is None:
+            self.notify("cannot find this checkout's git root", severity="error", timeout=6)
+            return
+        self.notify("updating rework…", timeout=3)
+        try:
+            result = await asyncio.to_thread(update_mod.run_update, repo_root)
+        except Exception as exc:
+            self._swallow(exc)
+            return
+        if not result.ok:
+            self.notify(f"update refused: {result.reason}", severity="error", timeout=8)
+            return
+        if not result.changed:
+            self.notify(update_mod.describe_update(result), timeout=5)
+            return
+        self._update_commits_behind = 0
+        self._refresh_note()
+        self.notify(update_mod.describe_update(result), title="rework updated", timeout=10)
 
     def action_mission(self, verb: str) -> None:
         dash = self.view("dashboard")

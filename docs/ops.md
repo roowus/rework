@@ -37,7 +37,8 @@ db_env = "REWORK_REWVIS_DB"        # the env var holding the URL (secrets stay
                                    # in ~/.rework/rework.env, not in this file);
                                    # or a literal db = "postgresql://..."
 daemon_url = "http://100.107.125.118:8941"
-ssh = "ubuntu@100.107.125.118"     # optional, for `rework sync-config`
+ssh = "ubuntu@100.107.125.118"     # optional, for `rework sync-config` and
+                                   # `rework update --target rewvis`
 library_dir = "/home/ubuntu/.rework/library"  # optional
 
 [targets.sandbox]
@@ -265,13 +266,20 @@ The daemon runs as `rework.service` (systemd, User=ubuntu) on rewvis
 (tailnet 100.107.125.118), state in Postgres `rework_state` on the
 `rework-dev-pg` container (:5433), env in `~/.rework/rework.env`.
 
-Deploy:
+Deploy: `rework update --target rewvis` does the whole thing from the Mac —
+fetch, fast-forward, `uv sync`, `sudo systemctl restart rework`, then report
+`systemctl is-active`. It refuses (exit 1, nothing moved) rather than guessing
+when the remote tree is dirty, off `main` or diverged, and `--check` only
+reports whether the remote checkout is behind.
 
 ```bash
-ssh ubuntu@100.107.125.118 'cd ~/projects/rework && git pull --ff-only && uv sync \
-  && sudo systemctl restart rework && sleep 3 && systemctl is-active rework \
-  && curl -s http://100.107.125.118:8941/healthz'
+rework update --target rewvis          # deploy, then the health check below
+rework update --target rewvis --check  # report only; nothing on rewvis changes
 ```
+
+This needs the target's `targets.toml` entry to have an `ssh` host (the
+`rewvis` entry in [Targets](#targets-reworktargetstoml) above has one; without
+it the command says so and exits 1).
 
 A `DaemonLocked` right after a restart is benign: the old heartbeat is still
 fresh; systemd's restart retry wins after one stale window.

@@ -84,6 +84,26 @@ def _git_head(start: Path) -> str | None:
     return None
 
 
+def find_repo_root(start: Path | None = None) -> Path | None:
+    """The checkout the installed package runs from, or None.
+
+    The same upward walk `_git_head` does (`.git` may be a FILE for a worktree
+    or a submodule), but it answers with the working-tree DIRECTORY rather than
+    a sha: `rework update` has to run git IN that directory.
+    """
+    directory = (start if start is not None else Path(__file__).resolve().parent).resolve()
+    for _ in range(_GIT_LEVELS):
+        try:
+            if (directory / ".git").exists():
+                return directory
+        except OSError:
+            return None
+        if directory.parent == directory:
+            return None
+        directory = directory.parent
+    return None
+
+
 def _scan(root: Path) -> tuple[int, int]:
     """(number of *.py files, newest mtime_ns) under root, contents never read.
     Directory mtimes count as well: they move when a module is added or deleted."""

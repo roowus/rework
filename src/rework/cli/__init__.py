@@ -1126,8 +1126,24 @@ def preview(
         raise typer.Exit(2) from exc
 
 
+def _env_truthy(name: str) -> bool:
+    """REWORK_AUTO_UPDATE=1/true/yes (case-insensitive) enables the flag."""
+    import os as _os
+
+    return _os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
 @app.command()
-def serve() -> None:
+def serve(
+    auto_update: bool = typer.Option(
+        False,
+        "--auto-update",
+        help=(
+            "When origin/main is ahead and nothing is in flight, pull + `uv sync` and"
+            " exit so the service restarts on the new code (also REWORK_AUTO_UPDATE=1)."
+        ),
+    ),
+) -> None:
     """Run the headless daemon (one per database; leader-locked)."""
     from rework.logs import setup_logging
 
@@ -1138,6 +1154,7 @@ def serve() -> None:
 
     config = Config.from_env()
     workroot = daemon_workroot(config)
+    updating = auto_update or _env_truthy("REWORK_AUTO_UPDATE")
 
     async def go() -> None:
         from rework.logs import asyncio_exception_handler
@@ -1192,6 +1209,7 @@ def serve() -> None:
             workroot=workroot,
             config=config,
             library=library,
+            auto_update=updating,
         )
         # the workspace API rides the daemon's event loop (ADR 0005); binding
         # is localhost by default, tailnet-only when REWORK_HTTP_HOST points at
@@ -1366,7 +1384,11 @@ def main() -> None:
     _argv = sys.argv[1:]
     _flag, _rest = parse_target_flag(_argv)
     _explicit = any(a == "--target" or a.startswith("--target=") for a in _argv)
-    if _explicit and _flag is None:
+    # `rework update --target NAME` is NOT the global target flag: the update
+    # command owns a --target of its own (a remote host to update over ssh), so
+    # the after-the-subcommand rejection below must not fire for it.
+    _sub = _rest[0] if _rest else ""
+    if _explicit and _flag is None and _sub != "update":
         # --target on the argv line without a consumable NAME: either it was
         # left off entirely (`rework --target --help`, `rework --target=`, the
         # trailing `--target`), or it sits after the subcommand, where it is
@@ -1467,6 +1489,98 @@ def targets_cmd() -> None:
         f"default marked *; REWORK_DB/REWORK_DAEMON_URL/REWORK_LIBRARY_DIR come"
         f" from {DEFAULT_STATE_DIR / 'targets.toml'}"
     )
+
+
+def _update_remote(target_name: str, *, check: bool) -> None:
+    """Update a REMOTE host's checkout over ssh (the deploy path of docs/ops.md)
+    and restart its service. This one DOES restart: the remote daemon is not
+    the process running this command (finding 28 is about self-restarts)."""
+    import subprocess as _sp
+
+    from rework import update as _update
+    from rework.targets import TARGETS_PATH, load_targets_file
+
+    target = load_targets_file().targets.get(target_name)
+    if target is None:
+        typer.secho(
+            f"no target named {target_name!r} in {TARGETS_PATH} (see `rework targets`)",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(1)
+    if not target.ssh:
+        typer.secho(
+            f"target {target_name!r} has no `ssh` host in {TARGETS_PATH}; add one, e.g."
+            f' ssh = "ubuntu@100.107.125.118"',
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(1)
+    try:
+        proc = _sp.run(
+            ["ssh", target.ssh, _update.remote_update_command(check=check)],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        # no `ssh` on PATH at all (or it cannot be exec'd): the deploy cannot
+        # even start, so say that instead of dying with a traceback
+        typer.secho(f"could not run ssh: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from None
+    if proc.stdout:
+        typer.echo(proc.stdout, nl=False)
+    if proc.stderr:
+        typer.secho(proc.stderr, fg=typer.colors.RED, err=True, nl=False)
+    if proc.returncode != 0:
+        raise typer.Exit(proc.returncode)
+
+
+@app.command("update")
+def update_cmd(
+    check: bool = typer.Option(
+        False, "--check", help="Report only: say whether origin/main is ahead; change nothing."
+    ),
+    target_name: str | None = typer.Option(
+        None,
+        "--target",
+        "-t",
+        help="Update the named target's checkout over ssh, then restart its service.",
+    ),
+) -> None:
+    """Update this checkout to origin/main: fetch, fast-forward, `uv sync`.
+
+    Refuses (exit 1) rather than guessing when the working tree is dirty, the
+    branch is not `main`, or the history diverged. With `--target NAME` the same
+    update runs on that target's ssh host and restarts its service."""
+    from rework import update as _update
+
+    if target_name is not None:
+        _update_remote(target_name, check=check)
+        return
+
+    repo_root = _update.find_repo_root() or Path.cwd()
+    if check:
+        found = _update.check_update(repo_root)
+        if found.error:
+            typer.secho(f"cannot check for updates: {found.error}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(1)
+        if found.ahead:
+            typer.echo(f"origin/main is {found.ahead} commits ahead")
+        else:
+            typer.echo("up to date")
+        return
+
+    result = _update.run_update(repo_root)
+    if not result.ok:
+        typer.secho(result.reason, fg=typer.colors.RED, err=True)
+        raise typer.Exit(1)
+    if not result.changed:
+        typer.echo(f"already up to date ({result.new})")
+        return
+    typer.echo(result.old)
+    typer.echo(result.new)
+    for subject in result.subjects:
+        typer.echo(subject)
 
 
 @app.command("sync-config")
