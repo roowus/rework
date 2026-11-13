@@ -51,6 +51,12 @@ PREFERRED_FAILURE_LIMIT = 3  # failed turns in a row before leaving the chosen m
 # waits when EVERY model fails transiently (an outage), about 7.5 minutes in all
 OUTAGE_WAITS_S = (15.0, 30.0, 60.0, 120.0, 240.0)
 MAX_IDLE_NUDGES = 3
+# a reply cut off at max_tokens (typically all thinking) is not idleness: retry the
+# turn once with a bigger budget, then once more at a lower effort
+MAX_CUT_OFFS = 2
+EFFORT_FLOOR_TOKENS = 16_384  # turn budget floor when thinking effort is set
+MAX_TURN_TOKENS = 65_536  # ceiling for the bumped budget
+_LOWER_EFFORT = {"high": "medium", "medium": "low"}
 PROVIDER_FAILURE_LIMIT = 2  # failed runs on one model before spawn_role refuses it
 
 STRICTNESS_LEVELS = ("light", "standard", "strict")
@@ -554,8 +560,17 @@ class MissionOrchestrator:
             accepted_findings=self.accepted_findings,
         )
 
+    def _output_budget(self, entry: Any, effort: str | None) -> int:
+        """Output tokens for one turn: the entry's max_output; thinking shares it,
+        so with an effort set it is never below EFFORT_FLOOR_TOKENS."""
+        budget = int(getattr(entry, "max_output", 0) or 4096)
+        return max(budget, EFFORT_FLOOR_TOKENS) if effort else budget
+
     async def _loop(self) -> None:
         idle = 0
+        cut_offs = 0
+        budget: int | None = None  # per-turn overrides, set only by a cut-off retry
+        effort: str | None = None
         turns = sum(1 for m in self.history if m.get("role") == "assistant")
         while self.finished is None:
             signal = await self._owner_gate()
@@ -572,9 +587,38 @@ class MissionOrchestrator:
                 continue
             turns += 1
             await self._deliver_owner_messages()
-            result = await self._think()
+            result = await self._think(max_tokens=budget, effort=effort)
             if result is None:
                 return
+            if (
+                not result.tool_calls
+                and result.stop_reason == "max_tokens"
+                and cut_offs < MAX_CUT_OFFS
+            ):
+                # cut off mid-thought, not idle: retry with more room, then less effort
+                cut_offs += 1
+                used_effort = effort or self.effort
+                used_budget = budget or self._output_budget(self.entry, used_effort)
+                if cut_offs == 1:
+                    new_budget = min(max(used_budget * 2, used_budget), MAX_TURN_TOKENS)
+                    new_effort = used_effort
+                else:
+                    new_budget = used_budget
+                    new_effort = _LOWER_EFFORT.get(used_effort or "", used_effort and "low")
+                await self._note(
+                    f"orchestrator reply cut off at the output limit (retry {cut_offs}/"
+                    f"{MAX_CUT_OFFS}): effort {used_effort or 'none'} -> {new_effort or 'none'}, "
+                    f"budget {used_budget} -> {new_budget} tokens"
+                )
+                budget, effort = new_budget, new_effort
+                await self._append(
+                    {
+                        "role": "user",
+                        "content": "[Your reply hit the output limit and was cut off before "
+                        "you made a tool call. Think briefly, then respond with a tool call.]",
+                    }
+                )
+                continue
             if not result.tool_calls:
                 idle += 1
                 if idle >= MAX_IDLE_NUDGES:
@@ -590,6 +634,8 @@ class MissionOrchestrator:
                 )
                 continue
             idle = 0
+            cut_offs = 0
+            budget = effort = None
             await self._execute_calls(result.tool_calls)
 
     async def _owner_gate(self) -> str:
@@ -605,7 +651,7 @@ class MissionOrchestrator:
             return "cancelled"
         return "ok"
 
-    async def _think(self) -> Any:
+    async def _think(self, max_tokens: int | None = None, effort: str | None = None) -> Any:
         # the system prompt is STATIC for the whole mission (prompt caching
         # works on exact prefixes); the live state rides in a trailing message
         # that is never persisted
@@ -622,8 +668,8 @@ class MissionOrchestrator:
                 system=system,
                 messages=messages,
                 tools=TOOLS,
-                max_tokens=min(int(entry.max_output or 4096), 4096),
-                effort=self.effort,
+                max_tokens=max_tokens or self._output_budget(entry, effort or self.effort),
+                effort=effort or self.effort,
                 session_id=self.run_id,
             )
             try:
