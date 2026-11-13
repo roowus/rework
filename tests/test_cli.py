@@ -595,6 +595,37 @@ def main_home(tmp_path: Path) -> Path:
     return home
 
 
+def _probe_env_in_child(home: Path, env_extra: dict[str, str]) -> str:
+    """Print the child process's resolved REWORK_* env (one per line) after a
+    real main() dispatch: the same trick test_main_flag_never_mutates_env uses
+    for the negative case, here for the positive one. `version`/`targets`
+    never READ REWORK_DB, so exit codes alone cannot catch a regression where
+    target resolution stops applying env — this probe can."""
+    script = "import os; print(os.environ.get('REWORK_DB')); print(os.environ.get('REWORK_TARGET_NAME'))"
+    # run python -c directly with the same env _run_main builds (the console
+    # script cannot take -c; this is the same probe style
+    # test_main_flag_never_mutates_env uses for the negative case)
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "REWORK_TARGETS": str(home / "targets.toml"),
+        "PYTHONPATH": "src",
+        "REWORK_LOG_DIR": str(home / "logs"),
+    }
+    env = {k: v for k, v in env.items() if not k.startswith("REWORK_DB")}
+    env.update(env_extra)
+    out = _sp.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        check=False,
+    )
+    assert out.returncode == 0, out.stderr
+    return out.stdout
+
+
 def test_main_rework_target_env_selects_end_to_end(main_home: Path) -> None:
     # BLOCKER 1: bare `rework` with only REWORK_TARGET set must still resolve
     # (the pre-fix bug: main() resolved targets only when "--target" was in argv)
@@ -603,9 +634,18 @@ def test_main_rework_target_env_selects_end_to_end(main_home: Path) -> None:
     # resolution must succeed and the command must run
     assert result.returncode == 0, result.stderr
     assert result.stdout.startswith("rework ")
+    # not just exit 0: the resolution must actually APPLY env (a command like
+    # `version` never reads REWORK_DB, so only a probe proves this end to end)
+    db, name = _probe_env_in_child(main_home, {"REWORK_TARGET": "rewvis"}).splitlines()
+    assert db == "postgresql://nobody:nobody@127.0.0.1:1/nope"  # rewvis's db_env value
+    assert name == "rewvis"
     ok = _run_main(["targets"], main_home, {"REWORK_TARGET": "sandbox"})
     assert ok.returncode == 0
     assert "sandbox" in ok.stdout
+    # the sandbox target's sqlite:// URL form is normalized to the plain path
+    db, name = _probe_env_in_child(main_home, {"REWORK_TARGET": "sandbox"}).splitlines()
+    assert db == str(main_home.parent / "sandbox.db"), db
+    assert name == "sandbox"
     # an unknown REWORK_TARGET is the error case: exit 2, on stderr
     bad = _run_main(["version"], main_home, {"REWORK_TARGET": "ghost"})
     assert bad.returncode == 2
@@ -618,6 +658,11 @@ def test_main_default_only_selection_reaches_subcommands(main_home: Path) -> Non
     result = _run_main(["version"], main_home, {})
     assert result.returncode == 0, result.stderr
     assert result.stdout.startswith("rework ")
+    # the default target must actually APPLY env, not just exit 0 (`version`
+    # never reads REWORK_DB; the probe proves resolution happened)
+    db, name = _probe_env_in_child(main_home, {}).splitlines()
+    assert db == str(main_home.parent / "sandbox.db")  # plain path, URL normalized
+    assert name == "sandbox"
     # and `rework --target ghost` IS an error (explicit names are checked)
     bad = _run_main(["--target", "ghost", "version"], main_home, {})
     assert bad.returncode == 2

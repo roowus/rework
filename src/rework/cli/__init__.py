@@ -1363,10 +1363,6 @@ def main() -> None:
     # REWORK_DB / REWORK_DAEMON_URL: apply what the launch asked for (--target
     # NAME, else REWORK_TARGET, else the file's default) with setdefault
     # semantics, so an explicit REWORK_DB still wins (previews, systemd).
-    # Resolution runs on EVERY invocation: REWORK_TARGET and targets.toml's
-    # `default` must reach bare `rework` and every subcommand, not just
-    # launches that spelled out --target (the pre-fix bug: a bare `rework`
-    # with REWORK_TARGET set silently talked to the wrong instance).
     _argv = sys.argv[1:]
     _flag, _rest = parse_target_flag(_argv)
     _explicit = any(a == "--target" or a.startswith("--target=") for a in _argv)

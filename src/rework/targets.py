@@ -23,6 +23,11 @@ each key with setdefault semantics and sets REWORK_TARGET_NAME (again only
 if unset) so the TUI's status bar shows it. No targets file at all = today's
 behavior, unchanged.
 
+A `db = "sqlite:////abs/x.db"` URL in targets.toml is accepted but
+NORMALIZED to the plain filesystem path before it reaches REWORK_DB:
+Config.from_env opens bare paths for sqlite, and the raw URL would be
+mangled into a bogus relative directory named `sqlite:` in the CWD.
+
 Checkpoints: a sqlite target gets REWORK_CHECKPOINTS_DB setdefaulted to
 `checkpoints.sqlite3` next to its db (or to the explicit `checkpoints_db` /
 `checkpoints_db_env` value), so a sandbox target is self-contained the way
@@ -135,7 +140,15 @@ def resolve_target(
     if selected is None or not apply:
         return selected
     target = file.targets[selected]
-    _setdefault("REWORK_DB", target.db)
+    # Normalize a `sqlite:///` URL down to the plain filesystem path REWORK_DB
+    # actually carries (what Config.from_env / open_store_from_config open for
+    # sqlite). Path() on the raw URL mangles `sqlite:////abs/x.db` into a bogus
+    # RELATIVE directory named `sqlite:` in the CWD — the silent wrong-target
+    # failure — so the scheme never reaches the env. Postgres URLs (and a
+    # remote `sqlite://host/x.db` authority) pass through untouched; an
+    # explicitly exported REWORK_DB is never rewritten.
+    db = plain_sqlite_path(target.db) or target.db
+    _setdefault("REWORK_DB", db)
     _setdefault("REWORK_DAEMON_URL", target.daemon_url)
     if target.library_dir:
         _setdefault("REWORK_LIBRARY_DIR", target.library_dir)
@@ -143,18 +156,19 @@ def resolve_target(
     if target.checkpoints_db:
         _setdefault("REWORK_CHECKPOINTS_DB", target.checkpoints_db)
     else:
-        derived = _default_checkpoints_db(target.db)
+        derived = _default_checkpoints_db(db)
         if derived:
             _setdefault("REWORK_CHECKPOINTS_DB", derived)
     return selected
 
 
 def _default_checkpoints_db(db: str | None) -> str | None:
-    """The sandbox-self-contained default: a plain-path sqlite target keeps its
+    """The sandbox-self-contained default: a sqlite target keeps its
     checkpoints next to the state db (the same default Config.from_env picks).
-    Postgres shares the main db for checkpoints (no separate file to point at)
-    and a `sqlite:///` URL has no plain directory to anchor to, so neither
-    derives one."""
+    Postgres shares the main db for checkpoints (no separate file to point at).
+    resolve_target normalizes `sqlite:///` URLs to plain paths before calling
+    this, so a URL target derives checkpoints from its REAL directory too; the
+    `://` guard stays for direct callers."""
     if not db or "://" in db:
         return None
     return str(Path(db).expanduser().parent / "checkpoints.sqlite3")
@@ -165,13 +179,31 @@ def _setdefault(name: str, value: str | None) -> None:
         os.environ[name] = value
 
 
+def plain_sqlite_path(db: str | None) -> str | None:
+    """The plain filesystem path behind a LOCAL sqlite db string: a bare path
+    (`/abs/x.db`), the absolute `sqlite:////abs/x.db` URL or its relative
+    `sqlite:///rel/x.db` sibling all open a file, so all three normalize to
+    the bare path. None when db is not a local file at all (a postgres URL, a
+    remote `sqlite://host/x.db` authority). Config.from_env /
+    open_store_from_config take a bare path for sqlite — Path() on the raw
+    URL form mangles it into a bogus relative directory named `sqlite:` —
+    which is also why the pre-targets scripts/rework-local env export always
+    carried a plain filesystem path, never a URL."""
+    if not db or db.startswith(("postgresql://", "postgres://")):
+        return None
+    path = sqlite_db_path(db)
+    return str(path) if path is not None else None
+
+
 def sqlite_db_path(db: str) -> Path | None:
     """The file behind a db string, or None when db is not a sqlite file
-    reference (a postgres URL, say). Three forms reach a connection in this
-    codebase: a bare path (Config.from_env's default), the `sqlite:////abs`
-    URL docs/ops.md puts in targets.toml, and its `sqlite:///rel` sibling.
-    `Path(db)` alone mangles the URL forms into bogus relative paths, which is
-    exactly how `rework targets` reported healthy sqlite targets unreachable."""
+    reference (a postgres URL, say). Three forms are accepted here: a bare
+    path (Config.from_env's default and the form docs/ops.md documents), the
+    `sqlite:////abs` URL and its `sqlite:///rel` sibling (legacy;
+    resolve_target normalizes both to the bare path before anything reaches
+    REWORK_DB). `Path(db)` alone mangles the URL forms into bogus relative
+    paths, which is exactly how `rework targets` reported healthy sqlite
+    targets unreachable."""
     if db.startswith(("postgresql://", "postgres://")):
         return None
     if db.startswith("sqlite:"):

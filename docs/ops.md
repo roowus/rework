@@ -37,7 +37,10 @@ ssh = "ubuntu@100.107.125.118"     # optional, for `rework sync-config`
 library_dir = "/home/ubuntu/.rework/library"  # optional
 
 [targets.sandbox]
-db = "sqlite:////Users/you/.rework/sandbox.db"
+db = "/Users/you/.rework/sandbox.db"       # a plain filesystem path: what
+                                           # REWORK_DB actually carries for
+                                           # sqlite (a `sqlite:////` URL is
+                                           # accepted but normalized to this)
 daemon_url = "http://127.0.0.1:8941"
 ```
 

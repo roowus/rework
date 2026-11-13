@@ -1,0 +1,3 @@
+[targets.sandbox]
+db = "sqlite:////Users/you/.rework/sandbox.db"
+daemon_url = "http://127.0.0.1:8941"

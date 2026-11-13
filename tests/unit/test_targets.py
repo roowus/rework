@@ -138,7 +138,10 @@ def test_apply_false_only_answers(targets_file: Path) -> None:
 def test_env_var_selection_via_rework_target(targets_file: Path) -> None:
     os.environ["REWORK_TARGET"] = "sandbox"
     assert resolve_target() == "sandbox"
-    assert os.environ["REWORK_DB"] == "sqlite:////tmp/rework-sandbox.db"
+    # the sandbox target's sqlite:// URL is NORMALIZED to the plain path
+    # Config.open_store_from_config actually opens (the raw URL would be
+    # mangled into a bogus relative directory named `sqlite:` in the CWD)
+    assert os.environ["REWORK_DB"] == "/tmp/rework-sandbox.db"
     assert os.environ["REWORK_TARGET_NAME"] == "sandbox"
 
 
@@ -250,3 +253,46 @@ def test_postgres_target_touches_no_checkpoints_var(targets_file: Path) -> None:
     os.environ.pop("REWORK_CHECKPOINTS_DB", None)
     resolve_target(flag="rewvis")  # postgres shares the main db
     assert "REWORK_CHECKPOINTS_DB" not in os.environ
+
+
+# --- the sqlite:// URL normalization (HIGH audit fix) ------------------------
+
+
+def test_sqlite_url_target_is_normalized_to_a_plain_path(tmp_path: Path) -> None:
+    """`db = "sqlite:////abs/x.db"` in targets.toml must reach REWORK_DB as the
+    bare filesystem path: Config.open_store_from_config does Path(db) on it for
+    sqlite, and the raw URL mangles into a bogus relative directory literally
+    named `sqlite:` in the CWD (the silent wrong-target run this feature
+    exists to prevent). docs/ops.md used to document exactly that URL form."""
+    db = tmp_path / "sandbox.db"
+    db.write_bytes(b"")  # a valid empty sqlite database
+    path = tmp_path / "targets.toml"
+    path.write_text(f'[targets.sandbox]\ndb = "sqlite:///{db}"'
+                    '\ndaemon_url = "http://127.0.0.1:8941"\n')
+    resolve_target(flag="sandbox", path=path)
+    assert os.environ["REWORK_DB"] == str(db)  # the bare path, no scheme
+    assert os.environ["REWORK_TARGET_NAME"] == "sandbox"
+    # and the self-contained checkpoints default now derives from the REAL
+    # directory (before the fix a URL target derived a mangled `sqlite:...` path)
+    assert os.environ["REWORK_CHECKPOINTS_DB"] == str(tmp_path / "checkpoints.sqlite3")
+    os.environ.pop("REWORK_CHECKPOINTS_DB")
+
+
+def test_postgres_url_target_is_never_normalized(targets_file: Path) -> None:
+    resolve_target(flag="rewvis")
+    assert os.environ["REWORK_DB"] == "postgresql://db/rewvis"  # passed through untouched
+
+
+def test_plain_sqlite_path_helper() -> None:
+    from rework.targets import plain_sqlite_path
+
+    assert plain_sqlite_path("/abs/state.db") == "/abs/state.db"  # already plain: identity
+    assert plain_sqlite_path("sqlite:////Users/you/.rework/sandbox.db") == (
+        "/Users/you/.rework/sandbox.db"
+    )
+    assert plain_sqlite_path("sqlite:///rel/state.db") == "rel/state.db"
+    assert plain_sqlite_path("postgresql://db/rewvis") is None  # postgres: untouched
+    assert plain_sqlite_path("sqlite://host/x.db") is None  # remote authority: not a local file
+    assert plain_sqlite_path(None) is None
+    assert plain_sqlite_path("") is None
+
