@@ -632,20 +632,39 @@ def test_sync_config_keeps_a_key_a_kept_entry_also_uses(
     assert "REWORK_ROUTER_KEY=routersecret" in env_written
 
 
-def test_sync_config_merges_into_a_target_models_json_of_either_shape(
+def test_sync_config_never_writes_a_models_json_the_loader_cannot_read(
     targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # an object-shaped remote document ({"entries": [...]}) keeps its shape and
-    # its other keys; a malformed one is reported and replaced by a valid merge
+    """The payload actually written must PARSE through the loader.
+
+    An object-shaped remote document ({"version": 2, "entries": [...]}) is not
+    readable by rework at all: ModelCatalog.from_config runs ModelEntry(**item)
+    over the raw document, so preserving that shape would hand the target a
+    catalog that raises TypeError. So the sync writes the flat list, says why,
+    and the target keeps its own entries in the merge. Asserting the payload
+    parses (not merely that it is JSON) is the point: json.loads alone passed
+    while the file was unloadable."""
+    from rework.config import load_catalog
+
     calls, _ = _sync_env(
         tmp_path, monkeypatch, remote_models={"version": 2, "entries": REMOTE_MODELS}
     )
     result = runner.invoke(app, ["sync-config", "sandbox"])
     assert result.exit_code == 0, result.output
-    merged = json.loads(_ssh_write(calls, "models.json"))
-    assert merged["version"] == 2  # the target's own document keys survive
-    assert [e["id"] for e in merged["entries"]] == ["flash", "router-sibling", "rewvis-only"]
+    assert "not an entry list the loader can read" in result.output
 
+    payload = _ssh_write(calls, "models.json")
+    assert isinstance(json.loads(payload), list), "the object shape must not survive"
+
+    # the REAL proof: feed the exact payload to the loader the daemon uses
+    written = tmp_path / "written-models.json"
+    written.write_text(payload)
+    monkeypatch.setenv("REWORK_MODELS", str(written))
+    catalog = load_catalog()
+    assert [e.id for e in catalog.all()] == ["flash", "router-sibling", "rewvis-only"]
+    assert catalog.resolve("flash").model == "glm-4.5-flash"  # local wins on id
+
+    # a malformed remote document: reported, and still written as a loadable list
     calls2, _ = _sync_env(tmp_path, monkeypatch, remote_models=None)
 
     def bad_run(cmd: list[str], **kwargs: object) -> object:
@@ -657,8 +676,11 @@ def test_sync_config_merges_into_a_target_models_json_of_either_shape(
     result = runner.invoke(app, ["sync-config", "sandbox"])
     assert result.exit_code == 0, result.output  # a warning, never a crash
     assert "not valid JSON" in result.output
-    merged2 = json.loads(_ssh_write(calls2, "models.json"))
-    assert [e["id"] for e in merged2] == ["flash", "router-sibling"]
+    payload2 = _ssh_write(calls2, "models.json")
+    assert [e["id"] for e in json.loads(payload2)] == ["flash", "router-sibling"]
+    written.write_text(payload2)
+    monkeypatch.setenv("REWORK_MODELS", str(written))
+    assert [e.id for e in load_catalog().all()] == ["flash", "router-sibling"]
 
 
 def test_sync_config_dry_run_prints_the_same_plan_and_writes_nothing(

@@ -1305,7 +1305,15 @@ class MissionRunner:
         strongest = self._catalog.strongest_usable()
         if strongest is not None and strongest.id != current_id:
             return strongest
-        return self._catalog.promote(current_id) if current_id else None
+        if not current_id:
+            return None
+        try:
+            # promote() -> resolve() raises UnknownModelError for an id the
+            # catalog does not hold (always true for an empty catalog), so the
+            # last resort must never raise: None sends the run to the human gate
+            return self._catalog.promote(current_id)
+        except UnknownModelError:
+            return None
 
     async def _promote_and_resume(self, run: Run) -> bool:
         """needs_model policy: escalate the role to the configured escalation

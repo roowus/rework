@@ -380,6 +380,27 @@ def test_mechanical_escalation_keeps_promote_as_the_last_resort(
     assert _escalation_entry(cat, ESCALATION_MODEL_ID) == "huge"
 
 
+def test_mechanical_escalation_returns_none_on_an_empty_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty catalog must never raise: `_promote_and_resume` reads None as
+    "no model to escalate to" and opens the human gate (audited crash:
+    `promote()` -> `resolve()` raised UnknownModelError from outside the try)."""
+    monkeypatch.delenv(ESCALATION_MODEL_ENV, raising=False)
+    assert _escalation_entry(ModelCatalog([]), "flash") is None
+
+
+def test_mechanical_escalation_returns_none_when_the_current_id_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same guard, non-empty catalog: a current id the catalog does not hold
+    (a role whose default_model is absent here) also gives None, not a raise."""
+    monkeypatch.delenv(ESCALATION_MODEL_ENV, raising=False)
+    cat = ModelCatalog([_entry("flash", tier=1), _entry("pro", tier=2)])
+    assert _escalation_entry(cat, "not-in-this-catalog") is None
+    assert _escalation_entry(cat, "") is None
+
+
 # 7. the TUI knob and the orchestrator's own model use the configured default ---
 
 

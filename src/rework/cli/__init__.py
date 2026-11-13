@@ -1750,12 +1750,17 @@ def sync_config_cmd(
     merged_entries = list(kept_entries) + [
         entry for entry in target_entries if str(entry.get("id")) not in set(local_ids)
     ]
-    # the TARGET owns the shape of its own file: an object-shaped remote
-    # document keeps its other keys and its `entries` key only changes. With no
-    # usable remote document, the local document's shape is the fallback.
-    merged_doc = _models_doc_with(
-        target_doc if target_doc is not None else local_doc, merged_entries
-    )
+    # The ONLY document shape the loader reads is the flat entry list
+    # (load_catalog -> ModelCatalog.from_config -> ModelEntry(**item)). Nothing
+    # in rework writes the object shape and an object-shaped file makes the
+    # target's catalog unreadable, so preserving it could only corrupt the
+    # target: sync-config always writes the list (its entries are merged above).
+    merged_doc = _models_doc_with(merged_entries)
+    if isinstance(target_doc, dict):
+        typer.echo(
+            "note: the target's models.json is not an entry list the loader can "
+            "read; written as a plain entry list"
+        )
 
     if local_doc is None:
         typer.echo(f"no local {models}: models.json not merged")
@@ -1800,11 +1805,12 @@ def _models_doc_entries(doc: Any) -> list[dict[str, Any]]:
     return [item for item in raw if isinstance(item, dict)]
 
 
-def _models_doc_with(doc: Any, entries: list[dict[str, Any]]) -> Any:
-    """`doc`'s own shape carrying `entries`: a list stays a list, an object
-    keeps its other keys and only its `entries` key changes."""
-    if isinstance(doc, dict):
-        return {**doc, "entries": entries}
+def _models_doc_with(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The document to write for `entries`: ALWAYS the flat list, the one shape
+    the loader can read (ModelCatalog.from_config). The object shape
+    `{"version": 2, "entries": [...]}` is deliberately NOT preserved: rework
+    cannot read it, so reproducing it would only corrupt the target's catalog.
+    """
     return entries
 
 

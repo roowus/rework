@@ -201,6 +201,76 @@ async def test_needs_model_escalates_to_the_configured_model(
     assert not await store.list_open_gates("mp3")  # handled mechanically
 
 
+async def test_needs_model_falls_back_to_the_strongest_usable(
+    world: dict[str, Any], registry: RoleRegistry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pins the `strongest_usable()` fallback, which the configured-model test
+    above cannot reach.
+
+    Mutation-tested: delete the strongest_usable branch of `escalation_entry`
+    and this test goes red (the test above stays green, which is why it was
+    needed). Here the role is ALREADY on the configured escalation model, so
+    branch 1 is out; the strongest usable entry sits in a DIFFERENT provider, so
+    `promote()` returns None and only the fallback can answer."""
+    from rework.config import ESCALATION_MODEL_ENV, ESCALATION_MODEL_ID
+    from rework.kernel.llm.adapters.fake import FakeProvider
+    from rework.kernel.llm.catalog import ModelCatalog, ModelEntry
+
+    monkeypatch.delenv(ESCALATION_MODEL_ENV, raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    catalog = ModelCatalog(
+        [
+            ModelEntry(id="flash", provider="fake", model="fake-flash", tier=1),
+            ModelEntry(id=ESCALATION_MODEL_ID, provider="fake", model="fake-escal", tier=3),
+            ModelEntry(id="mid", provider="anthropic", model="claude-mid", tier=4),
+        ]
+    )
+    assert catalog.strongest_usable().id == "mid"
+    assert catalog.promote(ESCALATION_MODEL_ID) is None  # other provider only
+
+    store: SqliteStore = world["store"]
+    await store.create_mission(
+        Mission(
+            id="mp4",
+            objective="already on the escalation model",
+            plan={
+                "steps": [
+                    {
+                        "step": "do",
+                        "role": "escalating",
+                        "model": ESCALATION_MODEL_ID,  # current == configured target
+                        "context": {"kind": "needs_model", "detail": "still too small"},
+                    }
+                ]
+            },
+        )
+    )
+    runner = MissionRunner(
+        "mp4",
+        store,
+        world["bus"],
+        registry,
+        catalog,
+        sqlite_checkpointer_factory(str(world["tmp"] / "ck5.sqlite3")),
+        world["tmp"] / "w5",
+        poll_interval_s=0.05,
+        provider=FakeProvider(),  # the role never calls a model; no network
+    )
+    task = asyncio.create_task(runner.run())
+    await _await_predicate(lambda: _latest_attempt_done(store, "mp4", "do"))
+    await asyncio.wait_for(task, timeout=5)
+    await runner._supervisor.aclose()
+
+    promoted = await store.get_run(run_id("mp4", "do", "escalating", 1))
+    assert promoted is not None
+    assert promoted.model_ref.get("id") == "mid"
+    events = await store.events_since(0, mission_id="mp4")
+    hops = [e.payload for e in events if e.type == EventType.MODEL_PROMOTED]
+    assert hops and hops[-1]["to"] == "mid"
+    assert hops[-1]["from"] == ESCALATION_MODEL_ID
+    assert not await store.list_open_gates("mp4")  # handled mechanically
+
+
 async def _latest_attempt_done(store: SqliteStore, mission_id: str, step: str) -> bool:  # type: ignore[no-untyped-def]
     runs = [r for r in await store.list_runs(mission_id) if r.step == step]
     return bool(runs) and runs[-1].status in {
