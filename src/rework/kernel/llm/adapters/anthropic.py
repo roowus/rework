@@ -72,8 +72,9 @@ def _mark_cache(payload: dict[str, Any]) -> None:
     messages = payload.get("messages") or []
     if not messages:
         return
-    # newest first, so a breakpoint-limit hit keeps the tail marked; the
-    # second-to-last message only exists when the history is long enough
+    # newest first; the count already includes the system block, so at the
+    # 4-breakpoint limit the newest message may go unmarked, never worse than
+    # before. The second-to-last message only exists for long histories
     targets = messages[-2:] if len(messages) >= 2 else messages[-1:]
     marked = _breakpoints(payload)
     for message in reversed(targets):
