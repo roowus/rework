@@ -597,14 +597,25 @@ def main_home(tmp_path: Path) -> Path:
 
 def _probe_env_in_child(home: Path, env_extra: dict[str, str]) -> str:
     """Print the child process's resolved REWORK_* env (one per line) after a
-    real main() dispatch: the same trick test_main_flag_never_mutates_env uses
-    for the negative case, here for the positive one. `version`/`targets`
-    never READ REWORK_DB, so exit codes alone cannot catch a regression where
-    target resolution stops applying env — this probe can."""
-    script = "import os; print(os.environ.get('REWORK_DB')); print(os.environ.get('REWORK_TARGET_NAME'))"
-    # run python -c directly with the same env _run_main builds (the console
-    # script cannot take -c; this is the same probe style
-    # test_main_flag_never_mutates_env uses for the negative case)
+    real main() dispatch. Resolution lives in main() itself, so the probe has
+    to RUN main() (sys.argv = ['rework', 'version']) -- a bare `python -c`
+    would print the raw inherited env and prove nothing. `version`'s own
+    output is swallowed (redirect_stdout) so only the two probe lines reach
+    stdout. `version` never READS REWORK_DB, so exit codes alone cannot catch
+    a regression where resolution stops applying env -- this probe can."""
+    script = (
+        "import contextlib, io, os, sys\n"
+        "from rework.cli import main\n"
+        "sys.argv = ['rework', 'version']\n"
+        "with contextlib.redirect_stdout(io.StringIO()):\n"
+        "    try:\n"
+        "        main()\n"
+        "    except SystemExit as exc:\n"
+        "        if exc.code not in (0, None):\n"
+        "            raise\n"
+        "print(os.environ.get('REWORK_DB'))\n"
+        "print(os.environ.get('REWORK_TARGET_NAME'))\n"
+    )
     env = {
         **os.environ,
         "HOME": str(home),
@@ -612,9 +623,14 @@ def _probe_env_in_child(home: Path, env_extra: dict[str, str]) -> str:
         "PYTHONPATH": "src",
         "REWORK_LOG_DIR": str(home / "logs"),
     }
-    env = {k: v for k, v in env.items() if not k.startswith("REWORK_DB")}
+    # never inherited: selection must come from the target (env_extra).
+    # REWORK_TARGETS (the file PATH) is kept -- only the resolved values are
+    # stripped, and only by exact name (a startswith would also drop
+    # REWORK_TARGETS and the probe would silently read the wrong file).
+    for name in ("REWORK_DB", "REWORK_TARGET", "REWORK_TARGET_NAME"):
+        env.pop(name, None)
     env.update(env_extra)
-    out = _sp.run(
+    out = subprocess.run(
         [sys.executable, "-c", script],
         capture_output=True,
         text=True,

@@ -267,8 +267,9 @@ def test_sqlite_url_target_is_normalized_to_a_plain_path(tmp_path: Path) -> None
     db = tmp_path / "sandbox.db"
     db.write_bytes(b"")  # a valid empty sqlite database
     path = tmp_path / "targets.toml"
-    path.write_text(f'[targets.sandbox]\ndb = "sqlite:///{db}"'
-                    '\ndaemon_url = "http://127.0.0.1:8941"\n')
+    path.write_text(
+        f'[targets.sandbox]\ndb = "sqlite:///{db}"\ndaemon_url = "http://127.0.0.1:8941"\n'
+    )
     resolve_target(flag="sandbox", path=path)
     assert os.environ["REWORK_DB"] == str(db)  # the bare path, no scheme
     assert os.environ["REWORK_TARGET_NAME"] == "sandbox"
@@ -295,4 +296,3 @@ def test_plain_sqlite_path_helper() -> None:
     assert plain_sqlite_path("sqlite://host/x.db") is None  # remote authority: not a local file
     assert plain_sqlite_path(None) is None
     assert plain_sqlite_path("") is None
-
