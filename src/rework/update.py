@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from rework.kernel.state.records import MissionStatus
+from rework.kernel.state.store import StateStore
 from rework.runtime import find_repo_root
 
 BRANCH = "main"
@@ -276,7 +277,7 @@ def should_auto_update(*, ahead: bool, busy: bool) -> bool:
     return bool(ahead and not busy)
 
 
-async def mission_busy(store: object) -> bool:
+async def mission_busy(store: StateStore) -> bool:
     """Is any mission running, queued or waiting on a gate?
 
     Derived from store rows (rule 3: the store is the source of truth), using
@@ -285,10 +286,10 @@ async def mission_busy(store: object) -> bool:
     for status in MissionStatus:
         if status.value not in ACTIVE_STATUSES:
             continue
-        rows = await store.list_missions(status=status, limit=1)  # type: ignore[attr-defined]
+        rows = await store.list_missions(status=status, limit=1)
         if rows:
             return True
-    gates = await store.list_open_gates()  # type: ignore[attr-defined]
+    gates = await store.list_open_gates()
     return bool(gates)
 
 

@@ -1556,9 +1556,7 @@ def update_cmd(
     if check:
         found = _update.check_update(repo_root)
         if found.error:
-            typer.secho(
-                f"cannot check for updates: {found.error}", fg=typer.colors.RED, err=True
-            )
+            typer.secho(f"cannot check for updates: {found.error}", fg=typer.colors.RED, err=True)
             raise typer.Exit(1)
         if found.ahead:
             typer.echo(f"origin/main is {found.ahead} commits ahead")
