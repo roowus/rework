@@ -1516,11 +1516,17 @@ def _update_remote(target_name: str, *, check: bool) -> None:
             err=True,
         )
         raise typer.Exit(1)
-    proc = _sp.run(
-        ["ssh", target.ssh, _update.remote_update_command(check=check)],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        proc = _sp.run(
+            ["ssh", target.ssh, _update.remote_update_command(check=check)],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        # no `ssh` on PATH at all (or it cannot be exec'd): the deploy cannot
+        # even start, so say that instead of dying with a traceback
+        typer.secho(f"could not run ssh: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from None
     if proc.stdout:
         typer.echo(proc.stdout, nl=False)
     if proc.stderr:

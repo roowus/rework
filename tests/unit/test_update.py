@@ -190,6 +190,86 @@ def test_should_auto_update_needs_an_update_and_an_idle_daemon() -> None:
     assert update.should_auto_update(ahead=False, busy=False) is False
 
 
+# --- a hung git / uv is an OUTCOME, not an exception -----------------------
+# The daemon runs check_remote from a background timer (asyncio.to_thread), so
+# a `git fetch` that hits its timeout must come back as the module's usual
+# error/refusal shape: a TimeoutExpired escaping the thread would kill the
+# whole daemon process, which is exactly what "offline is silence" forbids.
+# `subprocess.run` is patched to RAISE, the way a real timeout does — not the
+# module's own helpers, so these tests fail against the pre-fix code.
+
+_REAL_RUN = subprocess.run
+
+
+def _raises_on(monkeypatch: pytest.MonkeyPatch, *, needle: str) -> None:
+    """Make the real `subprocess.run` raise TimeoutExpired when `needle` is in
+    the argv (the hung command); every other call runs for real."""
+
+    def run(argv: list[str], *args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if needle in argv:
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout") or 120.0)
+        return _REAL_RUN(argv, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(subprocess, "run", run)
+
+
+def test_a_timeout_from_subprocess_run_becomes_a_completed_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _raises_on(monkeypatch, needle="fetch")
+
+    proc = update._git(Path("/tmp"), "fetch", "origin", "main")  # must not raise
+
+    assert proc.returncode == update._TIMEOUT_RC
+    assert "timed out" in proc.stderr
+    assert proc.stdout == ""
+
+
+def test_check_update_reports_a_timed_out_fetch_instead_of_raising(
+    repos: Repos, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _raises_on(monkeypatch, needle="fetch")
+
+    check = update.check_update(repos.clone)  # must not raise
+
+    assert check.error is not None
+    assert "timed out" in check.error
+    assert check.available is False
+    # the background-timer flavour: a stall is "unknown", i.e. silence
+    assert update.check_remote(repos.clone) is None
+
+
+def test_run_update_refuses_after_a_timed_out_fetch(
+    repos: Repos, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = repos.head()
+    repos.commit("never fetched")
+    _raises_on(monkeypatch, needle="fetch")
+
+    result = update.run_update(repos.clone, sync=False)  # must not raise
+
+    assert result.ok is False
+    assert "timed out" in (result.reason or "")
+    assert repos.head() == old  # nothing moved
+    assert update.describe_update(result).startswith("update refused")
+
+
+def test_run_update_reports_a_uv_sync_timeout_after_the_fast_forward(
+    repos: Repos, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = repos.head()
+    new = repos.commit("landed, but the env did not sync")
+    _raises_on(monkeypatch, needle="uv")
+
+    result = update.run_update(repos.clone)  # sync=True
+
+    assert result.ok is False
+    assert "uv sync timed out" in (result.reason or "")
+    # the tree DID move: the owner is still told where it landed
+    assert result.old == old
+    assert result.new == new == repos.head()
+
+
 # --- `rework update --target NAME`: the CLI path ---------------------------
 # main() rejects a --target AFTER the subcommand (it is not a global option),
 # but `update` owns a --target of its own. Only a real `python -m rework` run
@@ -314,6 +394,21 @@ def test_a_global_target_after_a_subcommand_is_still_rejected(
 
     assert result.returncode == 2, (result.stdout, result.stderr)
     assert "must come before the subcommand" in result.stderr
+
+
+def test_update_target_survives_a_missing_ssh_binary(
+    cli_env: tuple[Path, dict[str, str]], tmp_path: Path
+) -> None:
+    # no `ssh` anywhere on PATH: the deploy cannot start, but that is a clean
+    # red error + exit 1, not a FileNotFoundError traceback out of the CLI
+    _log, env = cli_env
+    empty = tmp_path / "nobin"
+    empty.mkdir()
+    result = _run_cli(["update", "--target", "rewvis"], {**env, "PATH": str(empty)})
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "could not run ssh" in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 # --- mission_busy: the daemon's gate on auto-update -------------------------

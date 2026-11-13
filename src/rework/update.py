@@ -9,8 +9,9 @@ anything: a running TUI or daemon reports the change and the owner restarts
 exception is `rework update --target NAME`, which restarts the *remote* systemd
 service it just updated: that is the whole point of a deploy.
 
-Everything degrades quietly: a missing checkout, an offline host or a broken
-`uv` is a reason string, never an exception out of a background timer.
+Everything degrades quietly: a missing checkout, an offline host, a hung git
+or a broken `uv` is a reason string, never an exception out of a background
+timer (the timeouts below are outcomes, not raises).
 """
 
 from __future__ import annotations
@@ -29,6 +30,11 @@ REMOTE = "origin"
 # a fetch/merge is seconds; `uv sync` can install a whole environment
 GIT_TIMEOUT_S = 120.0
 UV_TIMEOUT_S = 900.0
+
+# subprocess.run's own "killed for running too long" convention: a timed-out
+# call comes back as a CompletedProcess with this rc (never a TimeoutExpired),
+# so every caller below keeps its plain returncode check
+_TIMEOUT_RC = 124
 
 # the daemon's opt-in auto-update cadence (serve --auto-update / REWORK_AUTO_UPDATE=1)
 AUTO_UPDATE_SECONDS = 900.0
@@ -94,14 +100,34 @@ class UpdateResult:
         return bool(self.ok and self.old and self.new and self.old != self.new)
 
 
+def _run(
+    argv: list[str], *, cwd: Path | None = None, timeout: float
+) -> subprocess.CompletedProcess[str]:
+    """`subprocess.run` with a timeout that is an OUTCOME, never a raise.
+
+    A hung `git fetch` (a dead host, a stalled tunnel) must not leave this
+    module as an exception: the daemon runs `check_remote` from a background
+    timer, and "offline is silence" only holds if a stall looks like any other
+    failure. So a timeout comes back as `_TIMEOUT_RC` with the reason in
+    stderr, exactly like a non-zero exit, and nothing above has to catch it.
+    """
+    try:
+        return subprocess.run(
+            argv,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            argv, _TIMEOUT_RC, stdout="", stderr=f"timed out after {timeout:.0f}s"
+        )
+
+
 def _git(repo_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", str(repo_root), *args],
-        capture_output=True,
-        text=True,
-        timeout=GIT_TIMEOUT_S,
-        check=False,
-    )
+    return _run(["git", "-C", str(repo_root), *args], timeout=GIT_TIMEOUT_S)
 
 
 def _rev(repo_root: Path, rev: str) -> str | None:
@@ -118,14 +144,7 @@ def _count(repo_root: Path, spec: str) -> int | None:
 
 def _uv_sync(root: Path) -> subprocess.CompletedProcess[str]:
     """One seam for `uv sync`, so the update tests never need a real uv."""
-    return subprocess.run(
-        ["uv", "sync"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        timeout=UV_TIMEOUT_S,
-        check=False,
-    )
+    return _run(["uv", "sync"], cwd=root, timeout=UV_TIMEOUT_S)
 
 
 def _short(sha: str | None) -> str:
@@ -143,6 +162,11 @@ def check_update(repo_root: Path | None = None) -> UpdateCheck:
     if root is None:
         return UpdateCheck(error="cannot find the git checkout rework runs from")
     fetch = _git(root, "fetch", REMOTE, BRANCH)
+    if fetch.returncode == _TIMEOUT_RC:
+        return UpdateCheck(
+            repo_root=root,
+            error=f"git fetch {REMOTE} {BRANCH} timed out after {GIT_TIMEOUT_S:.0f}s",
+        )
     if fetch.returncode != 0:
         detail = (fetch.stderr or fetch.stdout).strip().splitlines()
         return UpdateCheck(
@@ -210,6 +234,11 @@ def run_update(repo_root: Path | None = None, *, sync: bool = True) -> UpdateRes
         return UpdateResult(ok=False, reason=f"cannot read HEAD in {root}")
 
     fetch = _git(root, "fetch", REMOTE, BRANCH)
+    if fetch.returncode == _TIMEOUT_RC:
+        return UpdateResult(
+            ok=False,
+            reason=f"git fetch {REMOTE} {BRANCH} timed out after {GIT_TIMEOUT_S:.0f}s",
+        )
     if fetch.returncode != 0:
         detail = (fetch.stderr or fetch.stdout).strip().splitlines()
         return UpdateResult(
@@ -233,6 +262,12 @@ def run_update(repo_root: Path | None = None, *, sync: bool = True) -> UpdateRes
         )
 
     merge = _git(root, "merge", "--ff-only", f"{REMOTE}/{BRANCH}")
+    if merge.returncode == _TIMEOUT_RC:
+        return UpdateResult(
+            ok=False,
+            old=old,
+            reason=f"git merge --ff-only {REMOTE}/{BRANCH} timed out after {GIT_TIMEOUT_S:.0f}s",
+        )
     if merge.returncode != 0:
         detail = (merge.stderr or merge.stdout).strip().splitlines()
         return UpdateResult(
@@ -254,6 +289,14 @@ def run_update(repo_root: Path | None = None, *, sync: bool = True) -> UpdateRes
             return UpdateResult(
                 ok=False,
                 reason=f"uv sync failed to start in {root}: {exc}",
+                old=old,
+                new=new,
+                subjects=subjects,
+            )
+        if proc.returncode == _TIMEOUT_RC:
+            return UpdateResult(
+                ok=False,
+                reason=f"uv sync timed out after {UV_TIMEOUT_S:.0f}s",
                 old=old,
                 new=new,
                 subjects=subjects,
