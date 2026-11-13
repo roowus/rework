@@ -214,7 +214,14 @@ class DashboardView(View):
                     r for r in runs if status_value(r.status) in ("running", "halted_escalated")
                 ]
                 self.mission_role[mission.id] = role_of(live[-1].id) if live else ""
-        self._paint_overview()
+        # the app can close while this worker awaits (the awaits above): the
+        # paint then queries '#st-running' on a view whose children teardown
+        # already removed, and NoMatches killed the worker mid-test. Same guard
+        # as _poll_mission (m7 findings #19): only the paint, never the awaits.
+        try:
+            self._paint_overview()
+        except NoMatches:
+            return
 
     # -- overview -------------------------------------------------------------------
 
