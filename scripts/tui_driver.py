@@ -108,6 +108,7 @@ def serve(command: list[str]) -> None:
         os.unlink(SOCK)
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(SOCK)
+    own_inode = os.stat(SOCK).st_ino
     srv.listen(4)
     print(f"driving pid {pid} on {SOCK}", flush=True)
     while alive["ok"]:
@@ -160,8 +161,13 @@ def serve(command: list[str]) -> None:
     except OSError:
         pass
     srv.close()
-    if os.path.exists(SOCK):
-        os.unlink(SOCK)
+    # only remove the socket if it is still OURS: a stop followed at once by a
+    # new serve raced, and this cleanup deleted the new server's socket
+    try:
+        if os.stat(SOCK).st_ino == own_inode:
+            os.unlink(SOCK)
+    except OSError:
+        pass
 
 
 def call(req: dict) -> dict:
