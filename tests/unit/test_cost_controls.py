@@ -11,6 +11,23 @@ from rework.kernel.llm.types import ChatRequest
 from rework.nodes import toolloop
 
 
+def _breakpoints(payload: dict) -> list[dict]:  # type: ignore[type-arg]
+    """Every cache_control value in a translated Anthropic request, in order:
+    system blocks first, then messages."""
+    found = [
+        b["cache_control"]
+        for b in payload.get("system", [])
+        if isinstance(b, dict) and "cache_control" in b
+    ]
+    for msg in payload["messages"]:
+        content = msg["content"]
+        if isinstance(content, list):
+            found += [
+                b["cache_control"] for b in content if isinstance(b, dict) and "cache_control" in b
+            ]
+    return found
+
+
 def test_session_id_reaches_both_adapters() -> None:
     from rework.kernel.llm.adapters.anthropic import translate_request as to_anthropic
     from rework.kernel.llm.adapters.openai_compat import translate_request as to_openai
@@ -18,15 +35,96 @@ def test_session_id_reaches_both_adapters() -> None:
     req = ChatRequest(
         model="m",
         system="static rules",
-        messages=[{"role": "user", "content": "go"}],
+        messages=[
+            {"role": "user", "content": "go"},
+            {"role": "user", "content": "CURRENT STATE (rebuilt for this turn)"},
+        ],
         session_id="m-1:code:coder:1",
     )
     assert to_openai(req)["user"] == "m-1:code:coder:1", "Fireworks routes by it (cache hits)"
     payload = to_anthropic(req)
     assert payload["system"][0]["cache_control"] == {"type": "ephemeral"}
+    # the newest message is the volatile tail (the orchestrator's per-turn
+    # state message, never persisted): the breakpoint must ALSO sit on the
+    # message before it, or the cached prefix never recurs and the whole
+    # transcript behind the tail re-bills as fresh input every turn
+    assert payload["messages"][-2]["content"][-1]["cache_control"] == {"type": "ephemeral"}
     assert payload["messages"][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
     plain = to_openai(ChatRequest(model="m", messages=[{"role": "user", "content": "x"}]))
     assert "user" not in plain
+
+
+def test_a_volatile_tail_is_cached_behind() -> None:
+    """The orchestrator appends a per-turn state message on top of a persisted
+    transcript: system + second-to-last + last are marked (3 of the API's 4),
+    and the same handling covers both content shapes."""
+    from rework.kernel.llm.adapters.anthropic import translate_request as to_anthropic
+
+    history = [
+        {"role": "user", "content": "Mission objective: fix it. Begin."},
+        {"role": "assistant", "content": "ok"},
+        {"role": "tool", "tool_call_id": "t1", "name": "read_file", "content": "x"},
+    ]
+    req = ChatRequest(
+        model="m",
+        system="static rules",
+        messages=[*history, {"role": "user", "content": "CURRENT STATE (this turn)"}],
+        session_id="m-1",
+    )
+    payload = to_anthropic(req)
+    assert _breakpoints(payload) == [
+        {"type": "ephemeral"},
+        {"type": "ephemeral"},
+        {"type": "ephemeral"},
+    ], "system + messages[-2] + messages[-1], and no more"
+    # the tool result is a list content: the breakpoint lands on its last block
+    tool_result = payload["messages"][2]["content"]
+    assert tool_result[-1]["type"] == "tool_result"
+    assert tool_result[-1]["cache_control"] == {"type": "ephemeral"}
+    # and never on the caller's persisted history
+    assert "cache_control" not in history[2]
+    again = to_anthropic(req)
+    assert len(_breakpoints(again)) == 3, "no accumulation across turns"
+
+
+def test_short_histories_do_not_break_or_over_mark() -> None:
+    from rework.kernel.llm.adapters.anthropic import translate_request as to_anthropic
+
+    empty = ChatRequest(model="m", system="s", messages=[], session_id="chat-1")
+    assert _breakpoints(to_anthropic(empty)) == [{"type": "ephemeral"}]  # the system block
+    one = ChatRequest(
+        model="m", system="s", messages=[{"role": "user", "content": "hi"}], session_id="chat-1"
+    )
+    payload = to_anthropic(one)
+    assert len(payload["messages"]) == 1 and len(_breakpoints(payload)) == 2
+    assert payload["messages"][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_breakpoints_never_exceed_the_api_limit() -> None:
+    from rework.kernel.llm.adapters.anthropic import translate_request as to_anthropic
+
+    # content that already carries a breakpoint (a resumed payload, or a caller
+    # that marked its own block) must not be marked twice or pushed over 4
+    marked = {"type": "text", "text": "x", "cache_control": {"type": "ephemeral"}}
+    req = ChatRequest(
+        model="m",
+        system="s",
+        messages=[
+            {"role": "user", "content": [marked]},
+            {"role": "user", "content": [{"type": "text", "text": "y"}]},
+        ],
+        session_id="m-1",
+    )
+    payload = to_anthropic(req)
+    assert _breakpoints(payload) == [
+        {"type": "ephemeral"},
+        {"type": "ephemeral"},
+        {"type": "ephemeral"},
+    ]
+    assert (
+        req.messages[0]["content"][0] is marked
+        and "cache_control" not in req.messages[1]["content"][0]
+    )
 
 
 def test_cached_tokens_bill_at_the_discount() -> None:

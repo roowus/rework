@@ -16,27 +16,72 @@ _STOP_MAP = {
 }
 
 
+CACHE_BREAKPOINT = {"type": "ephemeral"}
+_CACHE_LIMIT = 4  # the API rejects a request with more than four breakpoints
+
+
+def _breakpoints(payload: dict[str, Any]) -> int:
+    """How many cache breakpoints this payload already carries."""
+    count = 0
+    system = payload.get("system")
+    if isinstance(system, list):
+        count += sum(1 for b in system if isinstance(b, dict) and "cache_control" in b)
+    for msg in payload.get("messages") or []:
+        content = msg.get("content")
+        if isinstance(content, list):
+            count += sum(1 for b in content if isinstance(b, dict) and "cache_control" in b)
+    return count
+
+
+def _mark_message(message: dict[str, Any]) -> bool:
+    """Put one cache breakpoint on a message; True if it was added. A str
+    content is wrapped into a text block, otherwise the breakpoint goes on the
+    last block. The block is COPIED, never mutated in place: a list content
+    can be the caller's own persisted history, where a leftover cache_control
+    would ride along into the next request."""
+    content = message.get("content")
+    if isinstance(content, str):
+        message["content"] = [{"type": "text", "text": content, "cache_control": CACHE_BREAKPOINT}]
+        return True
+    if isinstance(content, list) and content and isinstance(content[-1], dict):
+        if "cache_control" in content[-1]:
+            return False  # already marked: never attach a second one
+        message["content"] = [
+            *content[:-1],
+            {**content[-1], "cache_control": CACHE_BREAKPOINT},
+        ]
+        return True
+    return False
+
+
 def _mark_cache(payload: dict[str, Any]) -> None:
-    """Anthropic caches only up to explicit breakpoints: one after the system
-    prompt (static per run) and one on the newest message, so each turn reads
-    everything before it from cache. Requests with a session_id are the long
-    agent loops where this pays (cache reads bill at a tenth of input)."""
+    """Anthropic caches only up to explicit breakpoints, and only exact
+    prefixes: one after the system prompt (static per run), one on the newest
+    message, and one on the message before it. The second one matters where
+    the newest message does not recur: the orchestrator appends a per-turn
+    "CURRENT STATE" tail that is never persisted, so a breakpoint on it alone
+    caches nothing and the whole transcript behind it is re-billed as fresh
+    input every turn. Role loops (newest message = a persisted tool result)
+    keep their newest-message breakpoint unchanged, and gain nothing but one
+    extra breakpoint on the persisted message before it. Requests with a
+    session_id are the long agent loops where this pays (cache reads bill at a
+    tenth of input)."""
     system = payload.get("system")
     if isinstance(system, str):
-        payload["system"] = [
-            {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
-        ]
+        payload["system"] = [{"type": "text", "text": system, "cache_control": CACHE_BREAKPOINT}]
     messages = payload.get("messages") or []
     if not messages:
         return
-    last = messages[-1]
-    content = last.get("content")
-    if isinstance(content, str):
-        last["content"] = [
-            {"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}
-        ]
-    elif isinstance(content, list) and content and isinstance(content[-1], dict):
-        content[-1] = {**content[-1], "cache_control": {"type": "ephemeral"}}
+    # newest first; the count already includes the system block, so at the
+    # 4-breakpoint limit the newest message may go unmarked, never worse than
+    # before. The second-to-last message only exists for long histories
+    targets = messages[-2:] if len(messages) >= 2 else messages[-1:]
+    marked = _breakpoints(payload)
+    for message in reversed(targets):
+        if marked >= _CACHE_LIMIT:
+            break
+        if _mark_message(message):
+            marked += 1
 
 
 def translate_request(request: ChatRequest) -> dict[str, Any]:

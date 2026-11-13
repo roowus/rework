@@ -217,6 +217,33 @@ Prices for Anthropic come from OpenRouter's list (Anthropic's list prices);
 anything without a known price got a deliberately high estimate so budgets
 stay conservative.
 
+## Cost and prompt-cache hit rates
+
+Exact accounting is the `charges` table, one row per model call:
+`mission_id`, `run_id`, `model`, `input_tokens`, `output_tokens`,
+`cached_tokens`, `cost_usd`, `ts`. `input_tokens` INCLUDES the cached ones
+(the adapters normalize to OpenAI semantics: Anthropic's separate cache-read
+and cache-write counts are folded into it), so the prompt-cache hit rate is
+`SUM(cached_tokens) / SUM(input_tokens)`. Group by model, or by role through
+`runs` (`charges.run_id = runs.id`, `runs.role`), over a `ts` window:
+
+```bash
+# rewvis (Postgres). For a local sqlite DB the same SQL works with
+# sqlite3 <file>, swapping the window for ts >= strftime('%s','now') - 7*86400
+ssh ubuntu@100.107.125.118 "docker exec rework-dev-pg psql -U postgres -d rework_state -c \"
+  SELECT c.model, SUM(c.input_tokens) AS input, SUM(c.cached_tokens) AS cached,
+         round(100.0 * SUM(c.cached_tokens) / NULLIF(SUM(c.input_tokens), 0), 1) AS hit_pct
+    FROM charges c WHERE c.ts >= extract(epoch from now()) - 7 * 86400
+   GROUP BY 1 ORDER BY input DESC\""
+# ... and per role: SELECT r.role, SUM(c.input_tokens), SUM(c.cached_tokens)
+#     FROM charges c JOIN runs r ON r.id = c.run_id WHERE c.ts >= ... GROUP BY 1
+```
+
+A long role loop sits at 85-95%; the orchestrator sat at 37.8% while its
+per-turn "CURRENT STATE" tail carried the only message breakpoint. `rework
+report <mission>` prints `cached` per run, and the TUI's Cost view groups the
+same ledger by model, project, role and mission.
+
 ## Checks before merging (`scripts/ci-local`)
 
 rework never uses GitHub Actions: coders and auditors run the checks
