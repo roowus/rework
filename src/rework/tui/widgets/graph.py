@@ -130,13 +130,6 @@ class _Node(Static):
         if isinstance(view, GraphView):
             view.post_message(GraphView.NodeClicked(view, self.node))
 
-        event.stop()
-        view = self.parent
-        while view is not None and not isinstance(view, GraphView):
-            view = view.parent
-        if isinstance(view, GraphView):
-            view.post_message(GraphView.NodeClicked(view, self.node))
-
 
 class GraphView(VerticalScroll):
     class NodeClicked(Message):

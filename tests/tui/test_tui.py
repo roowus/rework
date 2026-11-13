@@ -2968,3 +2968,292 @@ async def test_dashboard_graph_collapse_many_rounds(env: Path) -> None:
         )
 
         assert not app.swallowed
+
+
+@pytest.mark.asyncio
+async def test_dashboard_graph_owner_sequence_rounds(env: Path) -> None:
+    """The owner's real mission (m-e825d222884d): investigator, then three review
+    rounds of two coders each - the second coder continuing the first after it
+    exhausted its turns - each followed by the audit that reviewed it.
+
+    Every run appears exactly once, in order; the round's verdict labels the edge
+    into its audit; identities come from the run id ('coder #5', never 'coder 4');
+    the header flow line follows the same run-derived rounds.
+    """
+    import os
+    import time
+
+    from rework.kernel.state.records import Mission, MissionStatus, Run, RunStatus
+    from rework.kernel.state.sqlite import open_sqlite
+
+    store = await open_sqlite(os.environ["REWORK_DB"])
+    base = time.time()
+    try:
+        mission = await store.create_mission(
+            Mission(
+                id="m-ownerflow01",
+                objective="Owner sequence: three review rounds",
+                status=MissionStatus.DONE,
+                plan={
+                    "orchestrator": {"model": "pro"},
+                    "playbook": "standard",
+                    "gates": ["open_pr"],
+                },
+            )
+        )
+
+        def coder(n: int, *, continues: bool = False) -> Run:
+            return Run(
+                id=f"{mission.id}:code:coder:{n}",
+                mission_id=mission.id,
+                role="coder",
+                step="code",
+                attempt=n,
+                status=RunStatus.COMPLETED,
+                created_at=base + n + 1 + (n - 1) // 2,
+                context={"continue_branch": True} if continues else {},
+                artifact={"branch": "rework/m-ownerflow01"},
+            )
+
+        def auditor(n: int, findings: list[dict[str, Any]]) -> Run:
+            return Run(
+                id=f"{mission.id}:audit:auditor:{n}",
+                mission_id=mission.id,
+                role="auditor",
+                step="audit",
+                attempt=n,
+                status=RunStatus.COMPLETED,
+                created_at=base + 3 * n + 1,
+                context={"strictness": "standard"},
+                artifact={"findings": findings},
+            )
+
+        def finding(severity: str) -> dict[str, Any]:
+            return {
+                "title": f"{severity} issue",
+                "severity": severity,
+                "detail": "...",
+                "evidence": [],
+                "verdict": "CONFIRMED",
+                "confidence": 0.9,
+            }
+
+        await store.create_run(
+            Run(
+                id=f"{mission.id}:investigate:investigator:1",
+                mission_id=mission.id,
+                role="investigator",
+                step="investigate",
+                attempt=1,
+                status=RunStatus.COMPLETED,
+                created_at=base,
+                artifact={"summary": "scope"},
+            )
+        )
+        # round 1: coders 1-2 (2 continues 1), audited by auditor 1 -> approve with fixes
+        await store.create_run(coder(1))
+        await store.create_run(coder(2, continues=True))
+        await store.create_run(auditor(1, [finding("high"), finding("high")]))
+        # round 2: coders 3-4, audited by auditor 2 -> request changes
+        await store.create_run(coder(3))
+        await store.create_run(coder(4, continues=True))
+        await store.create_run(auditor(2, [finding("critical")]))
+        # round 3: coders 5-6, audited by auditor 3 -> approve
+        await store.create_run(coder(5))
+        await store.create_run(coder(6, continues=True))
+        await store.create_run(auditor(3, []))
+
+        stored_runs = await store.list_runs(mission.id)
+        stored_gates = await store.list_gates(mission.id)
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.open_mission("m-ownerflow01")
+        await _settle(pilot, 1.0)
+
+        from textual.widgets import Static
+
+        # the header flow line is derived from the same runs as the graph
+        flow = str(app.query_one("#m-flow", Static).render())
+
+        from rework.tui.widgets.base import ChipGroup
+        from rework.tui.widgets.graph import mission_flow_summary
+
+        tokens = mission_flow_summary(mission, stored_runs, stored_gates)
+        assert tokens == [
+            "investigator",
+            "3 rounds (6 coders, 3 audits)",
+            "open_pr gate",
+            "end",
+        ], tokens
+        cursor = -1
+        for token in tokens:
+            cursor = flow.find(token, cursor + 1)
+            assert cursor >= 0, f"header flow line missing {token!r}: {flow!r}"
+
+        tabs = app.query_one("#m-tabs", ChipGroup)
+        graph_chip = next(c for c in tabs.query(".chip") if c.value == "graph")
+        await pilot.click(graph_chip)
+        await _settle(pilot, 0.6)
+
+        nodes = [n.node for n in app.query(".gnode")]
+        keys = [n.key for n in nodes]
+
+        # every one of the 10 runs, exactly once, in order - nothing folded away
+        run_keys = [k for k in keys if k.startswith("m-ownerflow01:")]
+        assert run_keys == [r.id for r in stored_runs], run_keys
+        assert len(run_keys) == len(set(run_keys)) == 10, run_keys
+
+        # the round structure: investigator, coder layer, audit layer, x3, gate, end
+        assert keys[0] == "orchestrator", keys
+        assert [k for k in keys if not k.startswith("m-ownerflow01:")] == [
+            "orchestrator",
+            "gate:open_pr",
+            "end",
+        ], keys
+        coder_layers = [
+            [n.node.key for n in layer.query(".gnode")] for layer in app.query(".glayer")
+        ]
+        assert coder_layers == [
+            [f"m-ownerflow01:code:coder:{i}" for i in (1, 2)],
+            [f"m-ownerflow01:code:coder:{i}" for i in (3, 4)],
+            [f"m-ownerflow01:code:coder:{i}" for i in (5, 6)],
+        ], coder_layers
+
+        # identities come from the run id, so the last round is coders 5-6
+        titles = {n.key: n.title for n in nodes}
+        assert titles["m-ownerflow01:code:coder:1"] == "coder", titles
+        assert titles["m-ownerflow01:code:coder:2"] == "coder #2", titles
+        assert titles["m-ownerflow01:audit:auditor:1"] == "auditor", titles
+        assert titles["m-ownerflow01:code:coder:3"] == "coder #3 (revision)", titles
+        assert titles["m-ownerflow01:code:coder:4"] == "coder #4", titles
+        assert titles["m-ownerflow01:audit:auditor:2"] == "auditor #2", titles
+        assert titles["m-ownerflow01:code:coder:5"] == "coder #5 (revision)", titles
+        assert titles["m-ownerflow01:code:coder:6"] == "coder #6", titles
+        assert titles["m-ownerflow01:audit:auditor:3"] == "auditor #3", titles
+        assert "coder 4" not in titles.values(), titles
+
+        # the continuation is called out on the continuing coder
+        coder6 = next(n for n in nodes if n.key == "m-ownerflow01:code:coder:6")
+        assert "coders 5-6" in coder6.sub and "continues coder #5" in coder6.sub, coder6.sub
+
+        # the review verdict labels the edge into each round's audit
+        # an edge renders '│\n▼' plus its label on the last line, when it has one
+        edge_labels = [str(e.render()).splitlines()[-1].strip() for e in app.query(".gedge")]
+        assert len(edge_labels) == 9, edge_labels
+        assert [label for label in edge_labels if label != "▼"] == [
+            "approve with fixes: 2 high",
+            "request changes: 1 critical",
+            "approve",
+        ], edge_labels
+
+        # 3 review rounds is under the collapse threshold: the loop stays visible
+        assert not [n for n in nodes if n.expandable], keys
+
+        assert not app.swallowed
+
+
+@pytest.mark.asyncio
+async def test_dashboard_graph_collapsed_rounds_toggle(env: Path) -> None:
+    """Clicking the collapsed-round summary expands the folded rounds, clicking
+    it again folds them back (the summary node is expandable, run_id-less)."""
+    import os
+    import time
+
+    from rework.kernel.state.records import Mission, MissionStatus, Run, RunStatus
+    from rework.kernel.state.sqlite import open_sqlite
+
+    store = await open_sqlite(os.environ["REWORK_DB"])
+    try:
+        mission = await store.create_mission(
+            Mission(
+                id="m-toggle000001",
+                objective="Toggle collapsed rounds",
+                status=MissionStatus.DONE,
+                plan={"orchestrator": {"model": "pro"}, "playbook": "standard", "gates": []},
+            )
+        )
+        base = time.time()
+        for i in range(1, 8):  # 7 rounds > COLLAPSE_ROUND_THRESHOLD
+            await store.create_run(
+                Run(
+                    id=f"{mission.id}:code:coder:{i}",
+                    mission_id=mission.id,
+                    role="coder",
+                    step="code",
+                    attempt=i,
+                    status=RunStatus.COMPLETED,
+                    created_at=base + i * 100,
+                    artifact={"branch": f"rework/m-toggle000001-{i}"},
+                )
+            )
+            await store.create_run(
+                Run(
+                    id=f"{mission.id}:audit:auditor:{i}",
+                    mission_id=mission.id,
+                    role="auditor",
+                    step="audit",
+                    attempt=i,
+                    status=RunStatus.COMPLETED,
+                    created_at=base + i * 100 + 50,
+                    context={"strictness": "standard"},
+                    artifact={"findings": []},
+                )
+            )
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.open_mission("m-toggle000001")
+        await _settle(pilot, 1.0)
+
+        from rework.tui.widgets.base import ChipGroup
+
+        tabs = app.query_one("#m-tabs", ChipGroup)
+        graph_chip = next(c for c in tabs.query(".chip") if c.value == "graph")
+        await pilot.click(graph_chip)
+        await _settle(pilot, 0.6)
+
+        def keys() -> list[str]:
+            return [n.node.key for n in app.query(".gnode")]
+
+        folded = keys()
+        # 7 rounds, keep the latest 2: rounds 1-5 fold, rounds 6-7 stay visible
+        assert folded == [
+            "orchestrator",
+            "rounds-collapsed",
+            "m-toggle000001:code:coder:6",
+            "m-toggle000001:audit:auditor:6",
+            "m-toggle000001:code:coder:7",
+            "m-toggle000001:audit:auditor:7",
+            "end",
+        ], folded
+
+        summary = next(n for n in app.query(".gnode") if n.node.key == "rounds-collapsed")
+        assert summary.node.expandable and summary.node.run_id is None
+        assert summary.node.title == "rounds 1-5 (collapsed)", summary.node.title
+        assert "10 runs" in summary.node.sub, summary.node.sub
+
+        # click the summary: the folded rounds appear
+        await pilot.click(summary)
+        await _settle(pilot, 0.6)
+        expanded = keys()
+        assert "rounds-collapsed" in expanded, expanded
+        assert all(f"m-toggle000001:code:coder:{i}" in expanded for i in range(1, 6)), expanded
+        assert all(f"m-toggle000001:audit:auditor:{i}" in expanded for i in range(1, 6)), expanded
+        # orchestrator + the summary (still shown, now "(expanded)") + 14 runs + end
+        assert len(expanded) == 17, expanded
+        summary = next(n for n in app.query(".gnode") if n.node.key == "rounds-collapsed")
+        assert summary.node.title == "rounds 1-5 (expanded)", summary.node.title
+
+        # click again: back to the folded default
+        await pilot.click(summary)
+        await _settle(pilot, 0.6)
+        assert keys() == folded, keys()
+
+        assert not app.swallowed
