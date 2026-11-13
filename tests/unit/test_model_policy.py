@@ -390,15 +390,25 @@ def test_mechanical_escalation_returns_none_on_an_empty_catalog(
     assert _escalation_entry(ModelCatalog([]), "flash") is None
 
 
-def test_mechanical_escalation_returns_none_when_the_current_id_is_unknown(
+def test_mechanical_escalation_answers_an_unknown_current_id_from_the_strongest_usable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Same guard, non-empty catalog: a current id the catalog does not hold
-    (a role whose default_model is absent here) also gives None, not a raise."""
+    """The ORDERED policy: branch 2 answers before promote is ever reached.
+
+    A current id the catalog does not hold (a role whose default_model is
+    absent here) is not a special case: the configured escalation id is missing
+    too, so `escalation_model_id()` has already resolved to the strongest
+    usable entry, which is neither the configured id nor the current one, and
+    the engine returns it. promote() - the only step that can raise
+    UnknownModelError - is therefore never consulted while a usable entry
+    exists. The guard in that last resort only matters with no usable entry at
+    all (the empty-catalog regression test above); an unknown or empty current
+    id alone does not produce None."""
     monkeypatch.delenv(ESCALATION_MODEL_ENV, raising=False)
     cat = ModelCatalog([_entry("flash", tier=1), _entry("pro", tier=2)])
-    assert _escalation_entry(cat, "not-in-this-catalog") is None
-    assert _escalation_entry(cat, "") is None
+    assert cat.strongest_usable().id == "pro"
+    assert _escalation_entry(cat, "not-in-this-catalog") == "pro"
+    assert _escalation_entry(cat, "") == "pro"
 
 
 # 7. the TUI knob and the orchestrator's own model use the configured default ---
