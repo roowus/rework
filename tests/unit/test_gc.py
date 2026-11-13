@@ -61,9 +61,15 @@ def test_remove_keeps_the_clone_and_prunes_its_worktrees(tmp_path: Path) -> None
     git("worktree", "add", "-q", "-b", "rework/x", str(wt), cwd=repo)
     assert str(wt) in git("worktree", "list", cwd=repo)
 
+    # the role's rework scratch dir lives next to the worktree, in the run dir
+    scratch = wt.parent / ".rework-scratch"
+    (scratch / "logs").mkdir(parents=True)
+    (scratch / "logs" / "run.log").write_text("x\n")
+
     found = collect(tmp_path, {"m-aaaaaaaaaaaa": ("done", 0.0)}, DAY, now=NOW)
     freed = remove(found, tmp_path)
     assert freed > 0
+    assert not scratch.exists()  # reclaimed with the run dir, not orphaned
     assert not wt.parent.exists()
     assert (repo / "a.py").exists()  # the clone stays (preview needs it)
     assert str(wt) not in git("worktree", "list", cwd=repo)

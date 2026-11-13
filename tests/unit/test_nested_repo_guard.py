@@ -1,5 +1,6 @@
 """The handoff never commits nested git repos (found live: a coder's bare
-`origin.git/` and a clone `work/` landed in the PR-preview branch)."""
+`origin.git/` and a clone `work/` landed in the PR-preview branch), nor the
+role's own rework scratch dir (follow-up to PR #22)."""
 
 import subprocess
 from pathlib import Path
@@ -59,3 +60,49 @@ def test_the_auditor_gets_the_complete_file_list() -> None:
         + "diff --git a/origin.git/HEAD b/origin.git/HEAD\n+ref\n"
     )
     assert changed_files(diff) == ["src/x.py", "origin.git/HEAD"]
+
+
+async def test_the_roles_rework_scratch_dir_never_reaches_the_commit(tmp_path: Path) -> None:
+    """Follow-up to PR #22: role_env used to put rework's per-run state in
+    `<workdir>/.rework-scratch`, and a coder's workdir IS its worktree, so the
+    handoff's `git add -A` committed logs/targets/run registry into the PR.
+    Real worktree + real role_env + a real jailed command writing into it."""
+    from rework.nodes.tools import LocalExecutor, role_env
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    (repo / "a.py").write_text("x = 1\n")
+    git(repo, "add", "a.py")
+    git(repo, "commit", "-qm", "base")
+
+    run_dir = tmp_path / "m-abc123_code_coder_1"  # the run dir; loop.json lives here
+    run_dir.mkdir()
+    wt = run_dir / "worktree"  # coder.py's <run_dir>/worktree
+    git(repo, "worktree", "add", "-q", "-b", "rework/x", str(wt))
+
+    # REWORK_RUN_DIR is pinned by the _isolated_command_registry fixture, so
+    # locate the scratch dir through REWORK_LOG_DIR (same dir).
+    scratch = Path(role_env(wt)["REWORK_LOG_DIR"]).parent
+    assert not scratch.is_relative_to(wt), "scratch dir must be outside the worktree"
+
+    # the role's own rework invocation, run through the real jail
+    out = await LocalExecutor(wt).execute(
+        "run_command",
+        {
+            "command": 'mkdir -p "$REWORK_LOG_DIR" && echo log > "$REWORK_LOG_DIR/run.log"'
+            ' && echo t > "$REWORK_TARGETS"'
+        },
+    )
+    assert out.startswith("(exit 0)"), out
+    assert (scratch / "logs" / "run.log").exists()
+    assert (scratch / "targets.toml").exists()
+
+    # the genuine change the coder made
+    (wt / "a.py").write_text("x = 2\n")
+
+    await stage_all(wt)
+    assert await unstage_nested_repos(wt) == []
+    staged = git(wt, "diff", "--cached", "--name-only").split()
+    assert staged == ["a.py"], f"only the real change is staged, got {staged}"
+    assert not any(".rework-scratch" in p for p in staged)
