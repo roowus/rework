@@ -36,12 +36,14 @@ class GNode:
 @dataclass
 class GEdge:
     """An edge between nodes or layers."""
+
     label: str = ""  # optional label, e.g. "changes requested: 2 high · 1 medium"
 
 
 @dataclass
 class GLayer:
     """A layer of one or more nodes (parallel runs go in the same layer)."""
+
     nodes: list[GNode] = field(default_factory=list)
     edge_to_next: GEdge | None = None
 
@@ -116,22 +118,26 @@ class GraphView(VerticalScroll):
         """Set nodes organized into layers (for parallel runs and labeled edges)."""
         all_nodes = [n for layer in layers for n in layer.nodes]
         keys = [n.key for n in all_nodes]
-        
+
         if keys != self._keys:
             self.remove_children()
             widgets: list[Static | Horizontal] = []
-            
+            # Track which Horizontal widget corresponds to which layer
+            horiz_to_layer: dict[Horizontal, GLayer] = {}
+
             for i, layer in enumerate(layers):
                 if i > 0:
                     # Add edge from previous layer
                     prev_edge = layers[i - 1].edge_to_next
                     if prev_edge and prev_edge.label:
                         # Labeled edge
-                        widgets.append(Static(f"│\n▼\n[{FAINT}]{esc(prev_edge.label)}[/]", classes="gedge"))
+                        widgets.append(
+                            Static(f"│\n▼\n[{FAINT}]{esc(prev_edge.label)}[/]", classes="gedge")
+                        )
                     else:
                         # Standard edge
                         widgets.append(Static("│\n▼", classes="gedge"))
-                
+
                 # Add nodes for this layer
                 if len(layer.nodes) == 1:
                     # Single node - just add it directly
@@ -139,22 +145,17 @@ class GraphView(VerticalScroll):
                 else:
                     # Multiple nodes - horizontal layout
                     horiz = Horizontal(classes="glayer")
+                    horiz_to_layer[horiz] = layer
                     widgets.append(horiz)
-            
+
             self.mount_all(widgets)
-            
-            # Now mount nodes inside horizontal containers
-            for widget in widgets:
-                if isinstance(widget, Horizontal):
-                    # Find which layer this belongs to
-                    for layer in layers:
-                        if len(layer.nodes) > 1:
-                            # This is a parallel layer - mount its nodes
-                            widget.mount_all([_Node(n) for n in layer.nodes])
-                            break
-            
+
+            # Now mount nodes inside horizontal containers using the tracked mapping
+            for horiz, layer in horiz_to_layer.items():
+                horiz.mount_all([_Node(n) for n in layer.nodes])
+
             self._keys = keys
-        
+
         # Update all nodes
         for widget in self.query(_Node):
             fresh = next((n for n in all_nodes if n.key == widget.node.key), None)
@@ -189,7 +190,7 @@ def mission_nodes(
     compact: bool = False,
 ) -> list[GNode]:
     """Plan steps + gates + end, each with the status of its latest run.
-    
+
     For orchestrated missions and compact=False, returns one node per run.
     For fixed-plan missions or compact=True, returns step-grouped nodes.
 
@@ -197,12 +198,12 @@ def mission_nodes(
     inner:    run_id -> (role graph nodes, current node)
     compact:  True for the flow strip (step-grouped), False for the graph view"""
     plan = mission.plan or {}
-    is_orchestrated = bool((plan.get("orchestrator") or {}))
-    
+    is_orchestrated = bool(plan.get("orchestrator") or {})
+
     # For compact mode (flow strip) or fixed-plan missions, use step-grouped view
     if compact or not is_orchestrated:
         return _mission_nodes_step_grouped(mission, runs, gates, run_meta, inner)
-    
+
     # Orchestrated mission: one node per run, chronologically
     return _mission_nodes_per_run(mission, runs, gates, run_meta, inner)
 
@@ -289,11 +290,11 @@ def _mission_nodes_per_run(
     inner: dict[str, tuple[list[str], str]],
 ) -> list[GNode]:
     """Orchestrated mission view: one node per run, chronologically.
-    
+
     This is the simple linear view - use mission_layers for the full flow graph."""
     plan = mission.plan or {}
     nodes: list[GNode] = []
-    
+
     # Add orchestrator node
     orch = plan.get("orchestrator") or {}
     live = status_value(mission.status) in {"pending", "running", "awaiting_gate", "on_hold"}
@@ -307,36 +308,34 @@ def _mission_nodes_per_run(
             run_id=f"{mission.id}:orchestrate:orchestrator:1",
         )
     )
-    
+
     # Add one node per run, in chronological order (runs are already sorted by created_at)
     coder_runs: list[Any] = []
     for run in runs:
         status = status_value(run.status)
         role = run.role
         title = f"{role}"
-        
+
         # Check if this is a revision (coder following an audit)
-        is_revision = False
         if role == "coder" and coder_runs:
-            is_revision = True
             title = f"{role} (revision)"
-        
+
         if role == "coder":
             coder_runs.append(run)
-        
+
         sub = run_meta.get(run.id, role)
         if run.attempt > 1:
             sub = f"{sub} · attempt {run.attempt}"
-        
+
         inner_nodes, inner_at = inner.get(run.id, ([], ""))
-        
+
         # Extract audit findings and strictness
         findings = ""
         strictness = ""
         if role == "auditor":
             findings = _findings_summary(run)
             strictness = (run.context or {}).get("strictness", "")
-        
+
         nodes.append(
             GNode(
                 key=run.id,  # Use run ID as key for per-run nodes
@@ -350,7 +349,7 @@ def _mission_nodes_per_run(
                 strictness=strictness,
             )
         )
-    
+
     # Add gates
     for kind in plan.get("gates") or []:
         matching = [g for g in gates if g.kind.value == kind]
@@ -358,7 +357,7 @@ def _mission_nodes_per_run(
         nodes.append(
             GNode(key=f"gate:{kind}", title=f"{kind} gate", status=status, sub="you decide")
         )
-    
+
     # Add end node
     end_status = {
         "done": "done",
@@ -366,7 +365,7 @@ def _mission_nodes_per_run(
         "cancelled": "cancelled",
     }.get(status_value(mission.status), "pending")
     nodes.append(GNode(key="end", title="end", status=end_status, sub=""))
-    
+
     return nodes
 
 
@@ -379,21 +378,21 @@ def mission_layers(
     events: list[Any],
 ) -> list[GLayer]:
     """Build layered graph structure for orchestrated missions with parallel runs and labeled edges.
-    
+
     Returns a list of layers where each layer contains one or more nodes (parallel runs).
     Edges between layers can carry labels (e.g. for revision loops).
     """
     plan = mission.plan or {}
-    is_orchestrated = bool((plan.get("orchestrator") or {}))
-    
+    is_orchestrated = bool(plan.get("orchestrator") or {})
+
     if not is_orchestrated:
         # For non-orchestrated missions, just convert nodes to single-node layers
         nodes = _mission_nodes_step_grouped(mission, runs, gates, run_meta, inner)
         return [GLayer(nodes=[n], edge_to_next=GEdge()) for n in nodes]
-    
+
     # Build layers for orchestrated mission
     layers: list[GLayer] = []
-    
+
     # Orchestrator layer
     orch = plan.get("orchestrator") or {}
     live = status_value(mission.status) in {"pending", "running", "awaiting_gate", "on_hold"}
@@ -406,20 +405,20 @@ def mission_layers(
         run_id=f"{mission.id}:orchestrate:orchestrator:1",
     )
     layers.append(GLayer(nodes=[orch_node], edge_to_next=GEdge()))
-    
+
     # Group runs by spawn events to detect parallel execution
     run_groups = _group_parallel_runs(runs, events)
-    
+
     # Track revision loops: when an audit's findings trigger another coder run
     prev_audit_run: Any = None
-    
+
     # Collapse >4 rounds if needed (count total rounds, not run groups)
     total_runs = sum(len(group) for group in run_groups)
     if total_runs > 8:  # More than 6 runs (3 rounds of coder+audit pairs)
         # Collapse early rounds, keep last 3 round groups
         collapsed_count = len(run_groups) - 3
         collapsed_runs = [r for group in run_groups[:collapsed_count] for r in group]
-        
+
         # Create a summary node
         summary_node = GNode(
             key="rounds-collapsed",
@@ -429,36 +428,36 @@ def mission_layers(
             run_id=None,
         )
         layers.append(GLayer(nodes=[summary_node], edge_to_next=GEdge()))
-        
+
         # Keep only last 3 round groups
         run_groups = run_groups[-3:]
-    
+
     # Process each group of runs
     for group_idx, group in enumerate(run_groups):
         layer_nodes: list[GNode] = []
-        
+
         for run in group:
             status = status_value(run.status)
             role = run.role
             title = f"{role}"
-            
+
             # Check if this is a revision (coder following an audit)
             if role == "coder" and prev_audit_run and prev_audit_run.role == "auditor":
                 title = f"{role} (revision)"
-            
+
             sub = run_meta.get(run.id, role)
             if run.attempt > 1:
                 sub = f"{sub} · attempt {run.attempt}"
-            
+
             inner_nodes, inner_at = inner.get(run.id, ([], ""))
-            
+
             # Extract audit findings and strictness
             findings = ""
             strictness = ""
             if role == "auditor":
                 findings = _findings_summary(run)
                 strictness = (run.context or {}).get("strictness", "")
-            
+
             layer_nodes.append(
                 GNode(
                     key=run.id,
@@ -472,11 +471,11 @@ def mission_layers(
                     strictness=strictness,
                 )
             )
-            
+
             # Track audit runs for detecting revision loops
             if role == "auditor":
                 prev_audit_run = run
-        
+
         # Determine edge label for the NEXT edge (from this layer to the next)
         edge_label = ""
         if prev_audit_run and prev_audit_run.role == "auditor":
@@ -488,21 +487,16 @@ def mission_layers(
                     findings = _findings_summary(prev_audit_run)
                     if findings:
                         edge_label = f"changes requested: {findings}"
-        
+
         layers.append(GLayer(nodes=layer_nodes, edge_to_next=GEdge(label=edge_label)))
-    
+
     # Add gates
     for kind in plan.get("gates") or []:
         matching = [g for g in gates if g.kind.value == kind]
         status = status_value(matching[-1].status) if matching else "pending"
-        gate_node = GNode(
-            key=f"gate:{kind}",
-            title=f"{kind} gate",
-            status=status,
-            sub="you decide"
-        )
+        gate_node = GNode(key=f"gate:{kind}", title=f"{kind} gate", status=status, sub="you decide")
         layers.append(GLayer(nodes=[gate_node], edge_to_next=GEdge()))
-    
+
     # Add end node
     end_status = {
         "done": "done",
@@ -511,63 +505,63 @@ def mission_layers(
     }.get(status_value(mission.status), "pending")
     end_node = GNode(key="end", title="end", status=end_status, sub="")
     layers.append(GLayer(nodes=[end_node], edge_to_next=None))
-    
+
     return layers
 
 
 def _group_parallel_runs(runs: list[Any], events: list[Any]) -> list[list[Any]]:
     """Group runs by when they were spawned to detect parallel execution.
-    
+
     Returns a list of groups where each group contains runs spawned together.
     """
     if not runs:
         return []
-    
+
     # Build a map of run_id -> event sequence when it was spawned
     spawn_seq: dict[str, int] = {}
     for ev in events:
         if str(getattr(ev.type, "value", ev.type)) == "role_spawned" and ev.run_id:
             spawn_seq[ev.run_id] = ev.seq or 0
-    
+
     # If we have spawn events, use them to group runs
     if spawn_seq:
         # Sort runs by their spawn sequence
         runs_with_seq = [(run, spawn_seq.get(run.id, run.created_at)) for run in runs]
         runs_with_seq.sort(key=lambda x: x[1])
-        
+
         # Group consecutive runs spawned close together (within 5 sequence numbers = same batch)
         groups: list[list[Any]] = []
         current_group: list[Any] = []
         prev_seq = -1000
-        
+
         for run, seq in runs_with_seq:
             if not current_group or (seq - prev_seq) <= 5:
                 # Same group
-                fallback_current_group.append(run)
+                current_group.append(run)
                 prev_seq = seq
             else:
                 # New group
-                if fallback_current_group:
-                    fallback_groups.append(fallback_current_group)
-                fallback_current_group = [run]
+                if current_group:
+                    groups.append(current_group)
+                current_group = [run]
                 prev_seq = seq
-        
-        if fallback_current_group:
-            fallback_groups.append(fallback_current_group)
-        
-        return fallback_groups
-    
+
+        if current_group:
+            groups.append(current_group)
+
+        return groups
+
     # Fallback: group by overlapping timestamps
     # For simplicity, assume runs are in chronological order and group consecutive runs
     # that have overlapping time windows
     fallback_groups: list[list[Any]] = []
     fallback_current_group: list[Any] = []
     fallback_current_end = 0.0
-    
+
     for run in runs:
         start = run.created_at
-        end = run.updated_at if hasattr(run, 'updated_at') else start + 1.0
-        
+        end = run.updated_at if hasattr(run, "updated_at") else start + 1.0
+
         if not fallback_current_group or start < fallback_current_end:
             # Overlapping or first run - add to current group
             fallback_current_group.append(run)
@@ -578,8 +572,8 @@ def _group_parallel_runs(runs: list[Any], events: list[Any]) -> list[list[Any]]:
                 fallback_groups.append(fallback_current_group)
             fallback_current_group = [run]
             fallback_current_end = end
-    
+
     if fallback_current_group:
         fallback_groups.append(fallback_current_group)
-    
+
     return fallback_groups

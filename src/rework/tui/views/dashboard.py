@@ -624,8 +624,10 @@ class DashboardView(View):
             inner = self._inner_graphs()
             # Use layered graph for orchestrated missions
             plan = mission.plan or {}
-            if (plan.get("orchestrator") or {}):
-                layers = mission_layers(mission, self.runs, self.mission_gates, meta, inner, self.events)
+            if plan.get("orchestrator") or {}:
+                layers = mission_layers(
+                    mission, self.runs, self.mission_gates, meta, inner, self.events
+                )
                 self.query_one("#m-graph", GraphView).set_layers(layers, self.run_id)
             else:
                 # Fixed-plan missions use the simple node view

@@ -1911,17 +1911,6 @@ async def test_dashboard_report_body_follows_a_run_that_changes_without_a_new_ru
         assert not app.swallowed
 
 
-async def test_dashboard_graph_orchestrated_missions(env: Path) -> None:
-    """Orchestrated missions show one node per run, not collapsed by step."""
-    from rework.kernel.state.records import Mission, MissionStatus, Run, RunStatus
-    from rework.kernel.state.sqlite import open_sqlite
-
-
-async def test_dashboard_graph_orchestrated_missions(env: Path) -> None:
-    """Orchestrated missions show one node per run, not collapsed by step."""
-    from rework.kernel.state.records import Mission, MissionStatus, Run, RunStatus
-    from rework.kernel.state.sqlite import open_sqlite
-
 
 async def test_dashboard_graph_orchestrated_missions(env: Path) -> None:
     """Orchestrated missions show one node per run, not collapsed by step."""
