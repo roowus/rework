@@ -2973,8 +2973,12 @@ async def test_dashboard_graph_collapse_many_rounds(env: Path) -> None:
 @pytest.mark.asyncio
 async def test_dashboard_graph_owner_sequence_rounds(env: Path) -> None:
     """The owner's real mission (m-e825d222884d): investigator, then three review
-    rounds of two coders each - the second coder continuing the first after it
-    exhausted its turns - each followed by the audit that reviewed it.
+    rounds of two coders each - each followed by the audit that reviewed it.
+
+    The seed reproduces the real flag pattern: EVERY coder 2-6 carries
+    context["continue_branch"], including coder 3, the revision spawned after
+    auditor 1. A round is the coders between two audits plus that audit, so the
+    flag joins coders inside a round but never bridges across an audit.
 
     Every run appears exactly once, in order; the round's verdict labels the edge
     into its audit; identities come from the run id ('coder #5', never 'coder 4');
@@ -3054,12 +3058,14 @@ async def test_dashboard_graph_owner_sequence_rounds(env: Path) -> None:
         await store.create_run(coder(1))
         await store.create_run(coder(2, continues=True))
         await store.create_run(auditor(1, [finding("high"), finding("high")]))
-        # round 2: coders 3-4, audited by auditor 2 -> request changes
-        await store.create_run(coder(3))
+        # round 2: coders 3-4, audited by auditor 2 -> request changes.
+        # coder 3 is the REAL post-audit revision: it carries continue_branch
+        # too, and must still open a new round instead of bridging the audit.
+        await store.create_run(coder(3, continues=True))
         await store.create_run(coder(4, continues=True))
         await store.create_run(auditor(2, [finding("critical")]))
         # round 3: coders 5-6, audited by auditor 3 -> approve
-        await store.create_run(coder(5))
+        await store.create_run(coder(5, continues=True))
         await store.create_run(coder(6, continues=True))
         await store.create_run(auditor(3, []))
 

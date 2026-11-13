@@ -421,8 +421,10 @@ def _review_rounds(runs: list[Any]) -> list[ReviewRound]:
     """Split a mission's runs into ordered review rounds.
 
     A round is every coder run between two audits plus the audit that reviewed
-    them; a coder continuing the previous coder (context["continue_branch"],
-    e.g. spawned after it exhausted its turns) belongs to the SAME round, so
+    them: an audit CLOSES its round, so any coder arriving after an audit opens
+    a NEW round even when it carries context["continue_branch"] (a revision also
+    continues the branch - the flag must never bridge across an audit). Inside a
+    round a coder continuing the previous coder belongs to the SAME round, so
     'coders 5-6' is one round. Auditors fanned out in parallel all review the
     same round. Any role before the first coder (the investigator) is its own
     non-review round.
@@ -437,15 +439,15 @@ def _review_rounds(runs: list[Any]) -> list[ReviewRound]:
             rounds.append(current)
         current = ReviewRound()
 
-    prev_coder: Any = None
     for run in ordered:
         role = str(run.role)
         if role == "coder":
-            if current.audits and not _continues_previous(run, prev_coder):
-                # the previous round was already reviewed: this is a revision
+            if current.audits:
+                # the round was already reviewed by its audit: this coder opens
+                # a new round (a revision continues the branch, but never
+                # bridges across an audit)
                 close_round()
             current.coders.append(run)
-            prev_coder = run
         elif role == "auditor":
             current.audits.append(run)  # reviews the round's coders
         else:
