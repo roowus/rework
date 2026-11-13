@@ -78,6 +78,86 @@ async def test_logged_provider_records_latency_tokens_and_failures(log_env: Path
     assert ok["model"] == "deepseek" and ok["tokens_in"] == 120 and "ms" in ok
     bad = next(r for r in records if "model call failed" in r["msg"])
     assert bad["level"] == "warning" and "503" in bad["msg"]
+    assert "cause" not in bad, "a failure with no cause logs no chain"
+
+
+async def test_logged_provider_logs_the_cause_chain(log_env: Path) -> None:
+    """Found live (m-b928ea6d51bc): the Anthropic SDK raises APITimeoutError
+    `from err`, where err is the underlying httpx exception, and only the
+    top-level type reached the log, so an idle timeout could not be told from a
+    dropped connection or an overload. The chain gets its own `cause` field."""
+    import httpx
+
+    from rework.kernel.llm.adapters.logged import LoggedProvider
+    from rework.kernel.llm.types import ChatRequest, ChatResult
+
+    path = logs.setup_logging("test")
+
+    class TimedOut:
+        async def complete(self, request: ChatRequest) -> ChatResult:
+            raise TimeoutError("Request timed out or interrupted") from httpx.ReadTimeout(
+                "read timed out"
+            )
+
+    request = ChatRequest(model="haiku", messages=[{"role": "user", "content": "x"}])
+    with pytest.raises(TimeoutError):
+        await LoggedProvider(TimedOut()).complete(request)
+
+    bad = next(
+        json.loads(x)
+        for x in path.read_text().splitlines()
+        if "model call failed" in json.loads(x)["msg"]
+    )
+    assert "TimeoutError" in bad["msg"], "the top-level warning is unchanged"
+    assert "ReadTimeout" in bad["cause"] and "read timed out" in bad["cause"]
+    assert bad["cause"] not in bad["msg"], "the chain is a separate field, not the message"
+
+
+def test_cause_chain_walks_causes_contexts_cycles_and_bad_str() -> None:
+    """Pure logic of the chain walk: __cause__ first, then __context__, bounded
+    per link and in depth, cycle-safe, and never raising on a hostile cause."""
+    from rework.kernel.llm.adapters.logged import cause_chain
+
+    top = RuntimeError("top")
+    assert cause_chain(top) == "", "no cause, no chain"
+
+    outer = RuntimeError("outer")
+    outer.__cause__ = ValueError("boom")
+    assert cause_chain(outer) == "ValueError: boom"
+
+    # __cause__ wins when both are set, and __context__ is walked after it
+    both = RuntimeError("both")
+    inner = ValueError("inner")
+    inner.__cause__ = LookupError("deep")
+    both.__cause__ = inner
+    both.__context__ = OSError("stale context")
+    assert cause_chain(both) == "ValueError: inner <- LookupError: deep"
+
+    loop = RuntimeError("a")
+    loop.__cause__ = RuntimeError("b")
+    loop.__cause__.__cause__ = loop
+    assert cause_chain(loop) == "RuntimeError: b", "a cycle stops the walk"
+
+    deep = RuntimeError("d0")
+    node = deep
+    for i in range(1, 8):
+        node.__cause__ = RuntimeError(f"d{i}")
+        node = node.__cause__
+    assert cause_chain(deep).count("<-") == 3, "capped at 4 links"
+
+    class Hostile(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError("no str for you")
+
+    class Blank(Exception):
+        pass
+
+    hostile = RuntimeError("x")
+    hostile.__cause__ = Hostile()
+    assert cause_chain(hostile) == "Hostile: <unprintable>"
+    blank = RuntimeError("x")
+    blank.__cause__ = Blank()
+    assert cause_chain(blank) == "Blank", "an empty message still names the type"
 
 
 def test_reader_filters_and_formats(log_env: Path) -> None:
