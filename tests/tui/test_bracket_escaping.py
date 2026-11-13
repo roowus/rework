@@ -58,14 +58,12 @@ async def _store(db: Path) -> Any:
     return await open_sqlite(str(db))
 
 
-async def test_owner_chat_message_with_brackets_renders(
-    ids: dict[str, str], env: Path
-) -> None:
+async def test_owner_chat_message_with_brackets_renders(ids: dict[str, str], env: Path) -> None:
     """Owner requirement (a): sending a chat message with square brackets must
     render without raising MarkupError, and the displayed text must match the
     original message exactly."""
     test_message = 'I need to run ["git", "-c", "user.name=rework", "commit", "-m", "init"]'
-    
+
     app = _app()
     async with app.run_test(size=SIZE) as pilot:
         await _settle(pilot)
@@ -89,32 +87,30 @@ async def test_owner_chat_message_with_brackets_renders(
                 await pilot.press(ch)
         await pilot.press("enter")
         await _settle(pilot, 0.8)
-        
+
         # The message should render in the trajectory without raising
         traj = app.query_one("#chat-log", Trajectory)
         assert traj is not None
-        
+
         # Verify the message is in the chat history with exact text
         chat_id = app.view("work").convo.id
-    
+
     store = await _store(env)
     try:
         msgs = await store.chat_messages(chat_id)
         user_msgs = [m for m in msgs if m.role == "user"]
         assert user_msgs, "the owner's message must be saved"
-        assert user_msgs[-1].content == test_message, "content must match exactly"
+        assert user_msgs[-1].display == test_message, "content must match exactly"
     finally:
         await store.aclose()
 
 
-async def test_tool_call_with_git_command_renders_on_chat_and_card(
-    ids: dict[str, str]
-) -> None:
+async def test_tool_call_with_git_command_renders_on_chat_and_card(ids: dict[str, str]) -> None:
     """Owner requirement (b): tool calls containing git command arrays must
     render on both the chat trajectory and mission card activity without
     raising MarkupError."""
     git_cmd = '["git", "-c", "user.name=rework", "commit", "-m", "init"]'
-    
+
     # Test event_step directly (used by both chat and cards)
     ev = EventRecord(
         id="e-test00000001",
@@ -128,27 +124,27 @@ async def test_tool_call_with_git_command_renders_on_chat_and_card(
             "arguments": git_cmd,
         },
     )
-    
+
     # Must not raise MarkupError
     step = event_step(ev, show_role=True)
     assert step is not None, "tool_call event must produce a Step"
-    
+
     # The step should render without errors
     rendered = str(step.render())
     assert rendered, "step must render to non-empty string"
-    
+
     # The plain text should contain the git command
     plain = str(step._head)
     assert "git" in plain.lower(), "rendered step must mention git"
     assert "run_command" in plain, "tool name must be visible"
-    
+
     # Now test it renders in a real Trajectory widget
     from textual.app import App, ComposeResult
-    
+
     class TrajectoryApp(App[None]):
         def compose(self) -> ComposeResult:
             yield Trajectory(id="test-traj")
-    
+
     app = TrajectoryApp()
     async with app.run_test() as pilot:
         traj = app.query_one("#test-traj", Trajectory)
@@ -162,7 +158,7 @@ async def test_mission_card_activity_with_brackets(ids: dict[str, str]) -> None:
     """Owner requirement (b continued): mission card tail showing tool calls
     with brackets must render without MarkupError."""
     git_cmd = '["git", "-c", "user.name=rework", "commit", "-m", "init"]'
-    
+
     ev = EventRecord(
         id="e-test00000002",
         mission_id="m-test00000002",
@@ -175,13 +171,13 @@ async def test_mission_card_activity_with_brackets(ids: dict[str, str]) -> None:
             "arguments": git_cmd,
         },
     )
-    
+
     from textual.app import App, ComposeResult
-    
+
     class CardApp(App[None]):
         def compose(self) -> ComposeResult:
             yield MissionCard("m-test00000002")
-    
+
     app = CardApp()
     async with app.run_test() as pilot:
         card = app.query_one(MissionCard)

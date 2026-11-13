@@ -130,7 +130,7 @@ async def run_preview(app: ReworkApp, pr_number: str, repo_dir: str) -> bool:
         app.notify(f"Starting preview of PR {pr_number}…", timeout=3)
         with app.suspend():
             # blocking on purpose: suspend() handed the terminal to the child
-            subprocess.run(cmd)  # preview suspend: terminal handed to child: ASYNC221
+            subprocess.run(cmd)  # noqa: ASYNC221  preview suspend: terminal handed to child
     except Exception as exc:
         app.notify(str(exc), severity="error", timeout=8)
         return False

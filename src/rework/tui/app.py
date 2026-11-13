@@ -18,6 +18,7 @@ from textual.binding import Binding, BindingType
 from textual.notifications import SeverityLevel
 from textual.screen import ModalScreen
 from textual.widgets import ContentSwitcher
+from textual.worker import WorkerFailed
 
 from rework.runtime import CODE_CHANGED, CodeChangeWatcher
 from rework.tui.hub import Hub, Snapshot
@@ -633,7 +634,12 @@ class ReworkApp(App[None]):
         toast is plain text, and an identical error repeating inside
         ERROR_STORM_WINDOW is counted, not re-toasted."""
         self.swallowed.append(exc)
-        log.exception("swallowed UI error", exc_info=exc)
+        # WorkerFailed wraps the real exception; log the inner one with its traceback
+        if isinstance(exc, WorkerFailed):
+            inner = exc.error
+            log.error("worker failed: %s", inner, exc_info=inner)
+        else:
+            log.exception("swallowed UI error", exc_info=exc)
         key = (type(exc).__name__, str(exc))
         now = time.monotonic()
         if key == self._last_error and now - self._last_error_at < ERROR_STORM_WINDOW:
