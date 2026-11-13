@@ -11,11 +11,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+from rework import update
 from rework.config import Config
 from rework.kernel.events.bus import EventBus
 from rework.kernel.llm.catalog import ModelCatalog
@@ -23,7 +25,7 @@ from rework.kernel.state.records import EventRecord, EventType, MissionStatus
 from rework.kernel.state.store import StateStore
 from rework.orchestrator.engine import CheckpointerFactory, MissionRunner
 from rework.roles.registry import RoleRegistry
-from rework.runtime import CODE_CHANGED, CodeChangeWatcher
+from rework.runtime import CODE_CHANGED, CodeChangeWatcher, find_repo_root
 
 log = logging.getLogger("rework.daemon")
 
@@ -107,6 +109,7 @@ class Daemon:
         workroot: Path,
         config: Config,
         library: Any | None = None,
+        auto_update: bool = False,
     ) -> None:
         self._store = store
         self._bus = bus
@@ -116,6 +119,10 @@ class Daemon:
         self._workroot = workroot
         self._config = config
         self._library = library  # LibraryHandle | None (M5)
+        # serve --auto-update / REWORK_AUTO_UPDATE: opt-in, default off
+        self._auto_update = auto_update
+        self._repo_root: Path | None = None
+        self._last_update_check = 0.0
         self._sem = asyncio.Semaphore(config.concurrency)
         self._runners: dict[str, asyncio.Task[None]] = {}
         self._bg: set[asyncio.Task[None]] = set()
@@ -134,11 +141,16 @@ class Daemon:
         try:
             await self._recover()
             self._code = CodeChangeWatcher()
+            # resolved once: the checkout this daemon runs from (may be None
+            # for a pip install with no git tree, which disables auto-update)
+            self._repo_root = find_repo_root()
+            self._last_update_check = time.monotonic()
             while True:
                 await self._store.heartbeat_lock(self._owner)
                 await self._pickup_pending()
                 self._reap()
                 self._check_code()
+                await self._maybe_auto_update()
                 await asyncio.sleep(self._config.poll_interval_s)
         finally:
             await self._store.release_lock(self._owner)
@@ -150,6 +162,36 @@ class Daemon:
         is the owner's call (docs/plans/m7-findings.md, finding 28)."""
         if self._code is not None and self._code.poll():
             log.warning("%s", CODE_CHANGED)
+
+    async def _maybe_auto_update(self) -> None:
+        """Opt-in auto-update (`serve --auto-update`, `REWORK_AUTO_UPDATE=1`).
+
+        Every `update.AUTO_UPDATE_SECONDS`: if origin/main is ahead AND no
+        mission is in flight, pull it in, `uv sync`, and exit so systemd's
+        `Restart=always` brings the daemon back on the new code. A mission
+        mid-run is never dropped for a deploy, offline is silence, and a
+        refusal is a log line, never a crash (docs/plans/m7-findings.md 28)."""
+        if not self._auto_update or self._repo_root is None:
+            return
+        now = time.monotonic()
+        if now - self._last_update_check < update.AUTO_UPDATE_SECONDS:
+            return
+        self._last_update_check = now
+        check = await asyncio.to_thread(update.check_remote, self._repo_root)
+        if check is None or not check.available:
+            return  # unknown (offline) or up to date: nothing to say
+        busy = await update.mission_busy(self._store)
+        if not update.should_auto_update(ahead=check.available, busy=busy):
+            log.debug("auto-update deferred: a mission is in flight")
+            return
+        result = await asyncio.to_thread(update.run_update, self._repo_root)
+        if not result.ok:
+            log.warning("auto-update refused: %s", result.reason)
+            return
+        if not result.changed:
+            return
+        log.warning("rework updated: %s -> %s, exiting for restart", result.old, result.new)
+        raise SystemExit(0)
 
     async def _recover(self) -> None:
         for status in (
