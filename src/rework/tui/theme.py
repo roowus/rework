@@ -186,13 +186,13 @@ def clip(text: str, width: int) -> str:
         return flat
     return flat[: max(0, width - 1)] + "…"
 
-
 def esc(text: object) -> str:
-    """Escape markup in user/agent text (Textual content markup)."""
-    from textual.markup import escape
-
-    return escape(str(text if text is not None else ""))
-
+    """Escape markup in user/agent text (Textual content markup).
+    
+    Escapes EVERY '[' as '\\[' to prevent MarkupError crashes.
+    """
+    s = str(text if text is not None else "")
+    return s.replace("[", "\\[")
 
 def m(colour: str, text: object) -> str:
     """Markup helper: escaped text in a palette colour."""

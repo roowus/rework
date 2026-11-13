@@ -105,7 +105,7 @@ def is_git_repo(repo_dir: str | Path) -> bool:
     blows up deep inside the CLI, so refuse up front with something readable."""
     try:
         top = subprocess.run(
-            ["git", "-C", str(repo_dir), "rev-parse", "--show-toplevel"],
+            ["git", "-C", str(repo_dir, stderr=subprocess.PIPE), "rev-parse", "--show-toplevel"],
             capture_output=True,
             text=True,
         )
@@ -130,7 +130,7 @@ async def run_preview(app: ReworkApp, pr_number: str, repo_dir: str) -> bool:
         app.notify(f"Starting preview of PR {pr_number}…", timeout=3)
         with app.suspend():
             # blocking on purpose: suspend() handed the terminal to the child
-            subprocess.run(cmd)  # noqa: ASYNC221
+            subprocess.run(cmd)  # preview suspend: terminal handed to child: ASYNC221
     except Exception as exc:
         app.notify(str(exc), severity="error", timeout=8)
         return False
