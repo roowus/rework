@@ -730,3 +730,76 @@ async def test_a_queued_pending_mission_is_logged_once(
         assert sum("picking up pending mission mq" in r.message for r in caplog.records) == 1
     finally:
         d._runners["mq"].cancel()
+
+
+def _pickup_daemon(world: dict[str, Any], spawned: list[str]) -> Daemon:
+    """A Daemon that records what pickup chose; _spawn_runner is the only fake."""
+    d = Daemon(
+        store=world["store"],
+        bus=world["bus"],
+        registry=world["registry"],
+        catalog=world["catalog"],
+        make_checkpointer=sqlite_checkpointer_factory(world["ck_path"]),
+        workroot=world["workroot"],
+        config=world["config"],
+    )
+
+    async def fake_spawn(mid: str) -> None:
+        spawned.append(mid)
+        d._runners[mid] = asyncio.create_task(asyncio.sleep(60))  # queued on the semaphore
+
+    d._spawn_runner = fake_spawn  # type: ignore[method-assign]
+    return d
+
+
+def _cancel_runners(d: Daemon) -> None:
+    for task in d._runners.values():
+        task.cancel()
+
+
+async def test_pickup_takes_the_oldest_pending_mission_first(world: dict[str, Any]) -> None:
+    """Newest-first listing let fresh missions jump the queue: pickup is
+    oldest-first so an old pending mission runs before newer ones."""
+    from rework.kernel.state.records import Mission
+
+    store: SqliteStore = world["store"]
+    await store.create_mission(Mission(id="m-old", objective="old", created_at=1_000.0))
+    for i in range(3):
+        await store.create_mission(
+            Mission(id=f"m-new-{i}", objective="new", created_at=5_000.0 + i)
+        )
+
+    spawned: list[str] = []
+    d = _pickup_daemon(world, spawned)
+    try:
+        await d._pickup_pending()
+        assert spawned[0] == "m-old"
+        # every pending mission eventually runs, oldest first
+        assert spawned == ["m-old", "m-new-0", "m-new-1", "m-new-2"]
+    finally:
+        _cancel_runners(d)
+
+
+async def test_pickup_oldest_still_picked_with_more_than_ten_pending(
+    world: dict[str, Any],
+) -> None:
+    """Starvation regression: with 13 pending missions the newest-first window
+    of 10 never contained the oldest, so it never ran."""
+    from rework.kernel.state.records import Mission
+
+    store: SqliteStore = world["store"]
+    await store.create_mission(Mission(id="m-old", objective="starved", created_at=1_000.0))
+    for i in range(12):
+        await store.create_mission(
+            Mission(id=f"m-newer-{i:02d}", objective="newer", created_at=5_000.0 + i)
+        )
+    assert len(await store.list_missions(status=MissionStatus.PENDING, limit=100)) == 13
+
+    spawned: list[str] = []
+    d = _pickup_daemon(world, spawned)
+    try:
+        await d._pickup_pending()
+        # the oldest is inside the window and is chosen first
+        assert spawned[0] == "m-old"
+    finally:
+        _cancel_runners(d)

@@ -15,6 +15,7 @@ from typing import Any, ClassVar
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
+from textual.css.query import NoMatches
 from textual.notifications import SeverityLevel
 from textual.screen import ModalScreen
 from textual.widgets import ContentSwitcher
@@ -258,24 +259,19 @@ class ReworkApp(App[None]):
             log.warning("tick failed: %s", exc)
 
     def _on_snapshot(self, snap: Snapshot) -> None:
-        if not self.is_running:
-            # Textual's shutdown removes the children (App._close_all) before
-            # it dispatches Unmount -> hub.aclose(), so a poll resuming in that
-            # window still reaches this listener with MenuBar already gone: the
-            # query raised NoMatches, the Hub logged it as a live bug, and
-            # tui.log grew an error the owner never saw (tests/tui/
-            # test_toast_log.py::test_a_swallowed_error_is_logged_exactly_once).
-            # `_running` is False from the first line of _shutdown, so this is
-            # the one point that is reliably teardown: a snapshot arriving now
-            # has nothing left to paint.
+        try:
+            self.query_one(MenuBar).set_status(
+                online=snap.online,
+                gates=len(snap.gates),
+                spend_today=snap.spend_today,
+                error=snap.error,
+            )
+            self.query_one(TabBar).set_badge("gates", len(snap.gates))
+        except NoMatches:
+            # the DOM is gone: this app instance is shutting down, so there is
+            # nothing to paint and nothing to report. Any OTHER listener error
+            # still reaches Hub._broadcast, which logs it with a traceback.
             return
-        self.query_one(MenuBar).set_status(
-            online=snap.online,
-            gates=len(snap.gates),
-            spend_today=snap.spend_today,
-            error=snap.error,
-        )
-        self.query_one(TabBar).set_badge("gates", len(snap.gates))
         self._notify_new_gates(snap)
         for view in self.views():
             try:

@@ -9,13 +9,16 @@ fix/fix-pr plans are the canned investigate -> code -> audit pipelines.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
 from rework.kernel.state.records import (
+    PRIORITIES,
     EventRecord,
     EventType,
     Mission,
+    check_priority,
     new_id,
 )
 from rework.kernel.state.store import StateStore
@@ -58,11 +61,57 @@ PLAN_FIX: dict = {
     "gates": ["ship"],
 }
 
-PLAN_FIX_PR: dict = {"steps": PLAN_FIX["steps"], "gates": ["open_pr"]}
+# `publish` marks the plans that end by pushing the coder branch and opening
+# a PR. It is separate from `gates`: publishing is mechanical, gating it is
+# the optional exception (ask_before_pr / project setting), so a fix-pr plan
+# has no gate by default but still publishes.
+PLAN_FIX_PR: dict = {"steps": PLAN_FIX["steps"], "gates": [], "publish": "pr"}
 
 PLANS = ("echo", "fix", "fix-pr")
 
-PLAYBOOK_GATES: dict[str, list[str]] = {"echo": [], "fix": ["ship"], "fix-pr": ["open_pr"]}
+# a derived mission title is a few words for lists (PR titles, `rework ls`,
+# commit subjects): the whole objective is not one (found live: PR #24 was
+# titled "rework: Follow-up to #22 (just merged, NOT deployed to rewvis...")
+TITLE_WORDS = 8
+TITLE_CHARS = 60
+_ENUMERATOR = re.compile(r"^(?:[-*•\u2013\u2014]|\(?\d+[.)])\s+")
+_SENTENCE_END = re.compile(r"(?<=[.!?])(?:\s|$)")
+_QUOTES = "\"'\u201c\u201d\u2018\u2019"
+
+
+def derive_title(objective: str) -> str | None:
+    """A short, deterministic mission title from the objective; None when there
+    is nothing usable. No model call: `rework new` must not spend money (or
+    wait on a provider) just to name a mission.
+
+    Rule: the first non-empty line, minus leading list/enumerator noise
+    ("(1) ", "1. ", "- ", "bullet") and surrounding quotes/markdown; then the
+    first sentence if there is more; capped at ~8 words and ~60 chars; trailing
+    punctuation/ellipsis trimmed so a title never ends in "..." or an ellipsis.
+    """
+    line = next((ln.strip() for ln in (objective or "").splitlines() if ln.strip()), "")
+    if not line:
+        return None
+    line = _ENUMERATOR.sub("", line)
+    line = _SENTENCE_END.split(line, maxsplit=1)[0]
+    line = line.replace("`", "").replace("**", "")  # markdown decoration, anywhere
+    line = " ".join(line.split()).strip("#~ ")
+    if line[:1] and line[0] in _QUOTES:  # a quote the objective wrapped the line in
+        opener, line = line[0], line[1:].lstrip()
+        if opener in line:
+            line = line.replace(opener, "", 1)
+    line = line.rstrip(_QUOTES + "`*_#~ ")
+    words = line.split()
+    if len(words) > TITLE_WORDS:
+        line = " ".join(words[:TITLE_WORDS])
+    line = line[:TITLE_CHARS].rstrip(" .,;:!?-\u2013\u2014\u2026")
+    if line.count("(") > line.count(")"):
+        line = line[: line.index("(")].rstrip(" .,;:!?-\u2013\u2014\u2026")  # cut group
+    return line or None
+
+
+PLAYBOOK_GATES: dict[str, list[str]] = {"echo": [], "fix": ["ship"], "fix-pr": []}
+PLAYBOOK_PUBLISH: dict[str, str] = {"echo": "", "fix": "", "fix-pr": "pr"}
 
 
 def default_budget() -> tuple[float, float]:
@@ -95,6 +144,7 @@ def orchestrated_plan(
         "playbook": playbook,
         "orchestrator": {"model": orchestrator_model, "effort": orchestrator_effort},
         "gates": list(PLAYBOOK_GATES.get(playbook, [])),
+        "publish": PLAYBOOK_PUBLISH.get(playbook, ""),
         "budget": {
             "max_usd": cap if budget_usd is None else budget_usd,
             "ask_every_usd": step if budget_step_usd is None else budget_step_usd,
@@ -280,6 +330,16 @@ async def _project_repo(project_id: str, name: str | None) -> tuple[str | None, 
     return None, url
 
 
+__all__ = ["PRIORITIES"]
+
+
+def _priority(value: str | None) -> str:
+    """Validate a mission priority: normal (default) or high, the two pickup
+    levels. Anything else is a caller bug, not something to store."""
+    level = (value or "normal").strip().lower()
+    return check_priority(level)
+
+
 async def create_mission(
     objective: str,
     *,
@@ -296,6 +356,7 @@ async def create_mission(
     budget_usd: float | None = None,
     budget_step_usd: float | None = None,
     title: str | None = None,
+    priority: str = "normal",
 ) -> Mission:
     """Create a mission row (+ created event) and return it. When `store` is
     given it is used and NOT closed (the TUI holds one open); otherwise a
@@ -354,7 +415,11 @@ async def create_mission(
                 repo_origin=resolved["repo_origin"],
                 project_id=project_id,
                 chat_id=chat_id,
-                title=(title or "").strip()[:80] or None,
+                # an explicit title (the TUI's LLM proposal, `new --title`)
+                # always wins; otherwise derive one so every mission has a
+                # short name for lists, PR titles and commit subjects
+                title=(title or "").strip()[:80] or derive_title(objective),
+                priority=_priority(priority),
                 plan=plan_spec,
             )
         )

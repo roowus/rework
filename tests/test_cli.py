@@ -42,12 +42,17 @@ def rework_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return db
 
 
-def _seed_mission(db: Path, *, mission_id: str, objective: str) -> None:
+def _seed_mission(db: Path, *, mission_id: str, objective: str, title: str | None = None) -> None:
     async def go() -> None:
         store = await open_sqlite(str(db))
         try:
             await store.create_mission(
-                Mission(id=mission_id, objective=objective, status=MissionStatus.PENDING)
+                Mission(
+                    id=mission_id,
+                    objective=objective,
+                    title=title,
+                    status=MissionStatus.PENDING,
+                )
             )
         finally:
             await store.aclose()
@@ -119,14 +124,82 @@ def test_new_accepts_git_url_without_plan(rework_db: Path) -> None:
 
 
 def test_ls_output_format(rework_db: Path) -> None:
-    """`ls` prints `{id}  {status:<14}  {objective}` (two spaces, status
-    left-justified to width 14)."""
+    """`ls` prints `{id}  {status:<14}  {name}` (two spaces, status
+    left-justified to width 14), where `name` is the title when the mission has
+    one and the flattened objective otherwise."""
     _seed_mission(rework_db, mission_id="m-abc123", objective="fix the planted bug")
 
     result = runner.invoke(app, ["ls"])
 
     assert result.exit_code == 0, result.output
     assert result.output == "m-abc123  pending         fix the planted bug\n"
+
+
+def test_ls_prints_one_row_per_mission_with_a_multiline_objective(rework_db: Path) -> None:
+    """Objectives are free text and are often numbered briefs; `ls` must render
+    one line per mission, never spill the objective across terminal rows."""
+    objective = (
+        "(1) 'rework update' must not print the whole objective\n"
+        "(2) derive a short title when none is given\n"
+        "   (6) gc must reclaim role scratch dirs\n"
+    )
+    _seed_mission(rework_db, mission_id="m-multi", objective=objective)
+
+    result = runner.invoke(app, ["ls"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert len(lines) == 1, result.output
+    assert "\n" not in result.output.rstrip("\n")
+    assert lines[0].startswith("m-multi  pending         (1) 'rework update'")
+    assert lines[0].endswith("\u2026")  # flattened and clipped, not cut mid-nowhere
+
+
+def test_ls_prefers_the_title_and_clips_a_long_one(rework_db: Path) -> None:
+    """A title (item 2) is what `ls` shows; it is clipped too, so a stray long
+    title cannot break the one-row-per-mission rule."""
+    _seed_mission(rework_db, mission_id="m-titled", objective="raw\nobjective", title="short name")
+    _seed_mission(rework_db, mission_id="m-long", objective="x", title="word " * 40)
+
+    result = runner.invoke(app, ["ls"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert len(lines) == 2, result.output
+    assert "short name" in lines[1]
+    assert "raw" not in result.output
+    assert all(len(line) <= 6 + 2 + 14 + 2 + 72 for line in lines)
+    assert lines[0].endswith("\u2026")
+
+
+def test_new_without_a_title_stores_a_derived_short_title(rework_db: Path) -> None:
+    """CLI-created missions used to store title=None, so the PR title fell back
+    to the objective's first line (found live: PR #24)."""
+    url = "https://github.com/example/repo.git"
+    objective = (
+        "Follow-up to #22 (just merged, NOT deployed to rewvis until this lands):"
+        " role_env scratch dirs pile up. Make gc reclaim them."
+    )
+    result = runner.invoke(app, ["new", objective, "--repo", url])
+
+    assert result.exit_code == 0, result.output
+    mission = _get_mission(rework_db, result.output.strip())
+    assert mission is not None
+    assert mission.title
+    assert "\n" not in mission.title
+    assert len(mission.title.split()) <= 8
+
+
+def test_new_title_option_wins(rework_db: Path) -> None:
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(
+        app, ["new", "a long objective. more words", "--repo", url, "--title", "My Title"]
+    )
+
+    assert result.exit_code == 0, result.output
+    mission = _get_mission(rework_db, result.output.strip())
+    assert mission is not None
+    assert mission.title == "My Title"
 
 
 def test_ls_on_empty_db_prints_nothing(rework_db: Path) -> None:
@@ -293,7 +366,7 @@ def test_new_creates_an_orchestrated_mission_by_default(rework_db: Path) -> None
     assert mission is not None
     plan = mission.plan or {}
     assert plan["kind"] == "auto" and plan["playbook"] == "fix-pr"
-    assert plan["gates"] == ["open_pr"]
+    assert plan["gates"] == []
     assert plan["orchestrator"]["model"]
     assert plan["budget"]["max_usd"] == 3.0
 
@@ -1037,3 +1110,52 @@ def test_main_stderr_and_exit_code_are_consistent(main_home: Path) -> None:
         assert result.returncode == 2
         assert needle in result.stderr
         assert needle not in result.stdout
+
+
+def test_new_with_priority_high_and_prioritize_command(rework_db: Path) -> None:
+    """(d) `new --priority high` and `prioritize` both flip the stored level."""
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(app, ["new", "urgent fix", "--repo", url, "--priority", "high"])
+    assert result.exit_code == 0, result.output
+    mission = _get_mission(rework_db, result.output.strip())
+    assert mission is not None and mission.priority == "high"
+
+    plain = runner.invoke(app, ["new", "a later fix", "--repo", url])
+    assert plain.exit_code == 0, plain.output
+    other = _get_mission(rework_db, plain.output.strip())
+    assert other is not None and other.priority == "normal"
+
+    # focusing a mission is a flag: default high, --priority normal goes back
+    focused = runner.invoke(app, ["prioritize", other.id])
+    assert focused.exit_code == 0, focused.output
+    assert focused.output.strip() == f"{other.id}: priority high"
+    assert (_get_mission(rework_db, other.id) or other).priority == "high"
+
+    back = runner.invoke(app, ["prioritize", other.id, "--priority", "normal"])
+    assert back.exit_code == 0, back.output
+    assert (_get_mission(rework_db, other.id) or other).priority == "normal"
+
+    bad = runner.invoke(app, ["prioritize", other.id, "--priority", "urgent"])
+    assert bad.exit_code != 0
+
+
+def test_new_with_unknown_priority_is_a_clean_cli_error(rework_db: Path) -> None:
+    """BLOCKER: `new --priority urgent` exits non-zero with a clear message, not
+    an unhandled ValueError traceback out of typer."""
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(app, ["new", "urgent fix", "--repo", url, "--priority", "urgent"])
+    assert result.exit_code != 0
+    output = result.output + (result.stderr if result.stderr else "")
+    assert "unknown priority 'urgent'; priorities: normal, high" in output
+    assert "Traceback" not in output
+    assert "ValueError" not in output
+
+    # and nothing was stored
+    async def all_missions() -> list[Mission]:
+        store = await open_sqlite(str(rework_db))
+        try:
+            return await store.list_missions()
+        finally:
+            await store.aclose()
+
+    assert asyncio.run(all_missions()) == []

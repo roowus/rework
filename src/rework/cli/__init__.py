@@ -61,6 +61,10 @@ def new(
         " to the daemon (ADR 0005 upload transport).",
     ),
     project: str | None = typer.Option(None, help="Project id (p-...) to attach."),
+    title: str | None = typer.Option(
+        None,
+        help="A few words naming the mission (default: derived from the objective).",
+    ),
     plan: str = typer.Option("echo", help="Playbook: echo | fix | fix-pr"),
     orchestrator: str | None = typer.Option(
         None,
@@ -75,10 +79,17 @@ def new(
         "--mechanical",
         help="Legacy: run the canned step pipeline instead of an LLM orchestrator.",
     ),
+    priority: str = typer.Option(
+        "normal",
+        "--priority",
+        help="Pickup priority: normal | high. High missions are picked up before"
+        " normal ones; the oldest first within a level.",
+    ),
 ) -> None:
     """Create a mission; the daemon picks it up. An LLM orchestrator runs it
     (ADR 0007), following the plan as a playbook: `fix` = investigate, code,
-    audit, then a ship gate; `fix-pr` ends at an open-PR gate instead."""
+    audit, then a ship gate; `fix-pr` opens a PR instead (no gate by default,
+    unless the project's `pr_gate` setting or the orchestrator asks for one)."""
 
     async def go() -> str:
         from rework.missions import create_mission, resolve_project
@@ -92,7 +103,9 @@ def new(
             repo=repo,
             repo_dir=repo_dir,
             project_id=project_id,
+            title=title,
             plan=plan,
+            priority=priority,
             orchestrator_model=orch_model,
             orchestrator_effort=effort,
             budget_usd=budget,
@@ -769,9 +782,18 @@ def report(
     asyncio.run(go())
 
 
+def _one_line(text: str | None, width: int = 72) -> str:
+    """Flatten `text` to ONE line for a table column, clipped with an ellipsis.
+    Objectives are free text (often multi-line, e.g. a numbered brief), and `ls`
+    prints one row per mission. The TUI has the same helper (tui/theme.clip),
+    which the CLI must not import."""
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= width else flat[: width - 1].rstrip() + "\u2026"
+
+
 @app.command()
 def ls(limit: int = 20) -> None:
-    """List missions, newest first."""
+    """List missions, newest first, one line each."""
 
     async def go() -> list[tuple[str, str, str]]:
         from rework.config import Config, open_store_from_config
@@ -779,12 +801,12 @@ def ls(limit: int = 20) -> None:
         store = await open_store_from_config(Config.from_env())
         try:
             missions = await store.list_missions(limit=limit)
-            return [(m.id, m.status.value, m.objective) for m in missions]
+            return [(m.id, m.status.value, _one_line(m.title or m.objective)) for m in missions]
         finally:
             await store.aclose()
 
-    for mid, status, objective in asyncio.run(go()):
-        typer.echo(f"{mid}  {status:<14}  {objective}")
+    for mid, status, name in asyncio.run(go()):
+        typer.echo(f"{mid}  {status:<14}  {name}")
 
 
 @app.command()
@@ -829,6 +851,40 @@ def pause(mission_id: str) -> None:
 def resume(mission_id: str) -> None:
     """Resume a paused mission (or un-cancel one that never got far)."""
     _set_mission_status(mission_id, "running")
+
+
+@app.command()
+def prioritize(
+    mission_id: str,
+    priority: str = typer.Option(
+        "high",
+        "--priority",
+        help="normal | high. Defaults to high: prioritizing is the common case,"
+        " and --priority normal puts a mission back in the normal queue.",
+    ),
+) -> None:
+    """Set a mission's pickup priority (high missions are picked up first,
+    oldest first within a level). Does not touch a running mission."""
+    from rework.missions import PRIORITIES
+
+    level = (priority or "high").strip().lower()
+    if level not in PRIORITIES:
+        raise typer.BadParameter(f"unknown priority {priority!r}; priorities: normal, high")
+
+    async def go() -> str:
+        from rework.config import Config, open_store_from_config
+
+        store = await open_store_from_config(Config.from_env())
+        try:
+            updated = await store.update_mission(mission_id, priority=level)
+            if updated is None:
+                typer.echo(f"unknown mission {mission_id}", err=True)
+                raise typer.Exit(1)
+            return updated.priority
+        finally:
+            await store.aclose()
+
+    typer.echo(f"{mission_id}: priority {asyncio.run(go())}")
 
 
 def _set_mission_status(mission_id: str, status: str) -> None:
@@ -1031,12 +1087,16 @@ def gc(
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="List what would be removed."),
 ) -> None:
-    """Remove role worktrees of finished missions (mission clones are kept)."""
+    """Remove role worktrees and role scratch dirs of finished missions (mission
+    clones are kept)."""
+    import tempfile
+
     from rework import gc as gc_mod
     from rework.config import Config, open_store_from_config
 
     config = Config.from_env()
     workroot = daemon_workroot(config)
+    scratch_root = Path(tempfile.gettempdir())
 
     async def go() -> dict[str, tuple[str, float]]:
         store = await open_store_from_config(config)
@@ -1047,16 +1107,25 @@ def gc(
 
     missions = asyncio.run(go())
     found = gc_mod.collect(workroot, missions, older_than_days * 86400)
-    total = sum(c.bytes for c in found)
-    for c in found:
+    finished = {mid for mid, (status, _) in missions.items() if status in gc_mod.FINISHED}
+    # scratch dirs have no idle window: they are dead the moment the mission is
+    scratch = gc_mod.collect_scratch(scratch_root, finished)
+    total = sum(c.bytes for c in found) + sum(c.bytes for c in scratch)
+    for c in [*found, *scratch]:
         typer.echo(
             f"{'would remove' if dry_run else 'remove'} {c.path.name}  {gc_mod.human(c.bytes)}"
         )
     if dry_run:
-        typer.echo(f"{len(found)} run dirs, {gc_mod.human(total)} (dry run; nothing removed)")
+        typer.echo(
+            f"{len(found)} run dirs, {len(scratch)} scratch dirs,"
+            f" {gc_mod.human(total)} (dry run; nothing removed)"
+        )
         return
-    freed = gc_mod.remove(found, workroot)
-    typer.echo(f"removed {len(found)} run dirs, freed {gc_mod.human(freed)} from {workroot}")
+    freed = gc_mod.remove(found, workroot) + gc_mod.remove_scratch(scratch)
+    typer.echo(
+        f"removed {len(found)} run dirs and {len(scratch)} scratch dirs,"
+        f" freed {gc_mod.human(freed)}"
+    )
 
 
 @app.command()

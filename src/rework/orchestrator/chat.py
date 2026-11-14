@@ -42,7 +42,7 @@ Ground rules:
 Plans you can choose:
 - echo    — no roles, just prove the plumbing works
 - fix     — investigate, code, audit, then a ship gate
-- fix-pr  — same, but finishes by opening a pull request
+- fix-pr  — same, then the engine opens a pull request (no gate by default)
 
 Every mission starts from the repo's default branch: you cannot hand it an
 earlier mission's branch, results or worktree, so never promise that. Describe
@@ -57,8 +57,8 @@ asking the owner what it meant). Only lessons about doing the work itself
 belong in the objective.
 
 For a project backed by a git repo, prefer fix-pr: the owner reviews the change
-as a pull request, and the PR gate still lets them stop first. Use fix when they
-only want the result held for inspection.
+as a pull request, which the engine opens after a clean audited finish. Use fix
+when they only want the result held for inspection.
 
 Available context is provided in the conversation as system notes. Use it.
 
