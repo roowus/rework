@@ -81,6 +81,52 @@ def _get_mission(db: Path, mission_id: str) -> Mission | None:
     return asyncio.run(go())
 
 
+def _get_project(db: Path, project_id: str):  # type: ignore[no-untyped-def]
+    async def go():  # type: ignore[no-untyped-def]
+        store = await open_sqlite(str(db))
+        try:
+            return await store.get_project(project_id)
+        finally:
+            await store.aclose()
+
+    return asyncio.run(go())
+
+
+def test_project_create_defaults_to_the_upload_transport(rework_db: Path) -> None:
+    """A project with no --repo has no origin to push to (ADR 0005): creation
+    must store transport=upload / results=fetch, never git/push_branch."""
+    result = runner.invoke(app, ["project", "create", "NAME"])
+
+    assert result.exit_code == 0, result.output
+    project = _get_project(rework_db, result.output.strip())
+    assert project is not None
+    assert project.settings["transport"] == "upload"
+    assert project.settings["results"] == "fetch"
+    assert project.settings["repos"] == []
+
+
+def test_project_create_with_a_repo_defaults_to_git(rework_db: Path) -> None:
+    result = runner.invoke(app, ["project", "create", "N2", "--repo", "r=https://github.com/a/b"])
+
+    assert result.exit_code == 0, result.output
+    project = _get_project(rework_db, result.output.strip())
+    assert project is not None
+    assert project.settings["transport"] == "git"
+    assert project.settings["results"] == "push_branch"
+    assert project.settings["repos"] == [
+        {"name": "r", "kind": "github", "url": "https://github.com/a/b"}
+    ]
+
+
+def test_project_create_rejects_git_transport_without_a_repo(rework_db: Path) -> None:
+    """--transport git with nothing to clone would create a project every fix
+    mission then fails on; refuse it at creation."""
+    result = runner.invoke(app, ["project", "create", "N3", "--transport", "git"])
+
+    assert result.exit_code != 0, result.output
+    assert "needs at least one --repo" in result.output
+
+
 def test_help_exits_zero() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0

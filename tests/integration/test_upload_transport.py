@@ -1,0 +1,140 @@
+"""Upload transport (ADR 0005), end to end: a repo-less project's files area is
+the mission's workspace, and what the mission produces goes back into it.
+
+The harness mirrors tests/integration/test_vertical_slice.py (ScriptedProvider,
+a real MissionRunner over a real sqlite store, a real per-run git worktree) but
+the plan is a single coder step with no human gates: nothing here is mocked —
+the seeding, the worktree, the handoff commit and the save-back all run.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from conftest import ScriptedProvider, role_catalog
+from rework.kernel.events.bus import InProcessEventBus
+from rework.kernel.llm.types import ChatResult, ToolCall, Usage
+from rework.kernel.state.records import Mission, MissionStatus, Project
+from rework.kernel.state.sqlite import SqliteStore, open_sqlite
+from rework.orchestrator.daemon import sqlite_checkpointer_factory
+from rework.orchestrator.engine import MissionRunner
+from rework.orchestrator.workspace import ensure_files_area, git_init_commit
+from rework.roles.registry import autodiscover
+
+OBJECTIVE = "add a notes file next to the seeded one"
+# no gates: the mission must reach synthesis without a human in the loop
+PLAN_CODE_ONLY: dict[str, Any] = {
+    "steps": [
+        {"step": "code", "role": "coder", "model": "flash", "context": {"brief": "$OBJECTIVE"}},
+    ],
+}
+
+
+def _coder_writes_and_edits() -> list[ChatResult]:
+    write_b = "cat > b.md << 'REWORK_EOF'\n# b\n\nwritten by the coder\nREWORK_EOF"
+    edit_a = "cat > a.md << 'REWORK_EOF'\n# a\n\nseeded, then edited\nREWORK_EOF"
+    return [
+        ChatResult(
+            text="reading the seeded file first",
+            tool_calls=[ToolCall(id="c0", name="read_file", arguments={"path": "a.md"})],
+            usage=Usage(input_tokens=10, output_tokens=5),
+            stop_reason="tool_calls",
+        ),
+        ChatResult(
+            text="writing",
+            tool_calls=[
+                ToolCall(id="c1", name="run_command", arguments={"command": write_b}),
+                ToolCall(id="c2", name="run_command", arguments={"command": edit_a}),
+            ],
+            usage=Usage(input_tokens=10, output_tokens=5),
+            stop_reason="tool_calls",
+        ),
+        ChatResult(text="all done", usage=Usage(input_tokens=10, output_tokens=8)),
+    ]
+
+
+@pytest.fixture
+async def upload_world(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncIterator[dict[str, Any]]:
+    monkeypatch.setenv("REWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    store: SqliteStore = await open_sqlite(str(tmp_path / "upload.sqlite3"))
+    try:
+        project = await store.create_project(Project(name="p", settings={"repos": []}))
+        area = ensure_files_area(project.id)
+        (area / "a.md").write_text("# a\n\nseeded\n")
+        git_init_commit(area, "seed")  # the run must start from this
+        mission = await store.create_mission(
+            Mission(
+                id="m-upload",
+                objective=OBJECTIVE,
+                project_id=project.id,
+                plan=PLAN_CODE_ONLY,
+            )
+        )
+        provider = ScriptedProvider()
+        yield {
+            "store": store,
+            "project": project,
+            "area": area,
+            "mission": mission,
+            "provider": provider,
+            "ck": str(tmp_path / "ck.sqlite3"),
+            "workroot": tmp_path / "work",
+        }
+    finally:
+        await store.aclose()
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    return root.resolve() in path.resolve().parents
+
+
+async def test_upload_project_seeds_the_mission_and_saves_back(
+    upload_world: dict[str, Any],
+) -> None:
+    store: SqliteStore = upload_world["store"]
+    provider: ScriptedProvider = upload_world["provider"]
+    workroot: Path = upload_world["workroot"]
+    area: Path = upload_world["area"]
+    provider.route("Fulfill the task", _coder_writes_and_edits())
+
+    runner = MissionRunner(
+        upload_world["mission"].id,
+        store,
+        InProcessEventBus(store),
+        autodiscover(),
+        role_catalog(),
+        sqlite_checkpointer_factory(upload_world["ck"]),
+        workroot,
+        poll_interval_s=0.05,
+        provider=provider,
+    )
+    await asyncio.wait_for(runner.run(), timeout=60)
+
+    mission = await store.get_mission(upload_world["mission"].id)
+    assert mission is not None and mission.status == MissionStatus.DONE
+
+    # the seeded files area became the mission's workspace, inside the workroot
+    assert mission.repo_path, "upload transport must adopt a seeded repo_path"
+    seeded = Path(mission.repo_path)
+    assert _is_under(seeded, workroot)
+    # the run started from the seeded a.md: the workspace carries it untouched
+    # and the coder saw it as a MODIFICATION of an existing file, not a new one
+    assert (seeded / "a.md").read_text() == "# a\n\nseeded\n"
+
+    # ... and the files area came back with what the mission produced
+    assert (area / "b.md").read_text() == "# b\n\nwritten by the coder\n"
+    assert (area / "a.md").read_text() == "# a\n\nseeded, then edited\n"
+
+    # the report names them
+    note = mission.result["project_files"]
+    assert "b.md (new)" in note
+    assert "a.md (changed)" in note
+    assert "Project files updated:" in mission.result["summary"]
+    assert note in mission.result["summary"]

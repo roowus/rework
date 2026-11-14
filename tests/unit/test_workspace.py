@@ -9,12 +9,13 @@ from pathlib import Path
 
 from aiohttp.test_utils import TestClient, TestServer
 
-from rework.kernel.state.records import Mission, Run, RunStatus, new_id, run_id
+from rework.kernel.state.records import Mission, Project, Run, RunStatus, new_id, run_id
 from rework.kernel.state.store import StateStore
 from rework.orchestrator.workspace import (
     EXCLUDE_DIRS,
     build_workspace_app,
     pack_directory,
+    pack_paths,
     stage_bundle,
 )
 
@@ -121,3 +122,66 @@ async def test_token_auth(tmp_path: Path, store: StateStore, monkeypatch) -> Non
         )
         assert ok.status == 200  # past auth with the right token
         monkeypatch.delenv("REWORK_TOKEN")
+
+
+async def _upload_project(store: StateStore) -> Project:
+    """A repo-less project: the one that travels by the upload transport."""
+    return await store.create_project(Project(name="p", settings={"repos": []}))
+
+
+async def test_project_files_routes_roundtrip(
+    tmp_path: Path, store: StateStore, monkeypatch
+) -> None:
+    """POST /projects/<id>/files lands files in the area; GET .../archive gives
+    them back. This is the whole `rework project add-files` / `pull` surface."""
+    monkeypatch.setenv("REWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    project = await _upload_project(store)
+    local = tmp_path / "local"
+    local.mkdir()
+    (local / "a.md").write_text("# a\n")
+    app = build_workspace_app(store, tmp_path / "workroot")
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(f"/projects/{project.id}/files", data=pack_paths([local / "a.md"]))
+        assert resp.status == 200
+        payload = await resp.json()
+        assert payload["changed"], "the upload must report what it wrote"
+        assert any("a.md" in line for line in payload["changed"])
+
+        resp = await client.get(f"/projects/{project.id}/files/archive")
+        assert resp.status == 200
+        pulled = tmp_path / "pulled"
+        pulled.mkdir()
+        with tarfile.open(fileobj=io.BytesIO(await resp.read()), mode="r:gz") as tar:
+            tar.extractall(pulled, filter="data")
+        assert (pulled / "a.md").read_text() == "# a\n"
+
+
+async def test_project_files_routes_check_the_token(
+    tmp_path: Path, store: StateStore, monkeypatch
+) -> None:
+    monkeypatch.setenv("REWORK_TOKEN", "sekrit")
+    monkeypatch.setenv("REWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    project = await _upload_project(store)
+    local = tmp_path / "local"
+    local.mkdir()
+    (local / "a.md").write_text("# a\n")
+    app = build_workspace_app(store, tmp_path / "workroot")
+    async with TestClient(TestServer(app)) as client:
+        body = pack_paths([local / "a.md"])
+        assert (await client.post(f"/projects/{project.id}/files", data=body)).status == 401
+        assert (await client.get(f"/projects/{project.id}/files/archive")).status == 401
+    monkeypatch.delenv("REWORK_TOKEN")
+
+
+async def test_project_files_routes_404_for_unknown_project(
+    tmp_path: Path, store: StateStore, monkeypatch
+) -> None:
+    monkeypatch.setenv("REWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    local = tmp_path / "local"
+    local.mkdir()
+    (local / "a.md").write_text("# a\n")
+    app = build_workspace_app(store, tmp_path / "workroot")
+    async with TestClient(TestServer(app)) as client:
+        body = pack_paths([local / "a.md"])
+        assert (await client.post("/projects/p-nope/files", data=body)).status == 404
+        assert (await client.get("/projects/p-nope/files/archive")).status == 404
