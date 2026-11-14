@@ -239,11 +239,12 @@ class CoderSpec(RoleSpec):
                 library_executor(
                     ctx,
                     ComplaintAwareExecutor(
-                    EscalationAwareExecutor(executor, ctx),
-                    ctx.store,
-                    ctx.mission.id,
-                    ctx.run.id,
-                    self.name,
+                        EscalationAwareExecutor(executor, ctx),
+                        ctx.store,
+                        ctx.mission.id,
+                        ctx.run.id,
+                        self.name,
+                    ),
                 ),
             ),
             system_prompt=with_library_menu(ctx, system_prompt),

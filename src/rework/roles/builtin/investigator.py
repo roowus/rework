@@ -110,13 +110,14 @@ class InvestigatorSpec(RoleSpec):
                 library_executor(
                     ctx,
                     ComplaintAwareExecutor(
-                    EscalationAwareExecutor(
-                        LocalExecutor(ctx.read_root, mission_id=ctx.mission.id), ctx
+                        EscalationAwareExecutor(
+                            LocalExecutor(ctx.read_root, mission_id=ctx.mission.id), ctx
+                        ),
+                        ctx.store,
+                        ctx.mission.id,
+                        ctx.run.id,
+                        self.name,
                     ),
-                    ctx.store,
-                    ctx.mission.id,
-                    ctx.run.id,
-                    self.name,
                 ),
             ),
             system_prompt=with_library_menu(ctx, system_prompt),

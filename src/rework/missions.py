@@ -64,7 +64,7 @@ PLAN_FIX: dict = {
 
 PLAN_FIX_PR: dict = {"steps": PLAN_FIX["steps"], "gates": ["open_pr"]}
 
-PLANS = ("echo", "fix", "fix-pr")
+PLANS = ("echo", "fix", "fix-pr", "draft")
 
 # a derived mission title is a few words for lists (PR titles, `rework ls`,
 # commit subjects): the whole objective is not one (found live: PR #24 was
@@ -107,7 +107,14 @@ def derive_title(objective: str) -> str | None:
     return line or None
 
 
-PLAYBOOK_GATES: dict[str, list[str]] = {"echo": [], "fix": ["ship"], "fix-pr": ["open_pr"]}
+# a playbook's FINAL gates. `draft` deliberately has none: its results are
+# the project's files, so there is nothing to push and no PR to open.
+PLAYBOOK_GATES: dict[str, list[str]] = {
+    "echo": [],
+    "fix": ["ship"],
+    "fix-pr": ["open_pr"],
+    "draft": [],
+}
 
 
 def default_budget() -> tuple[float, float]:
@@ -361,7 +368,12 @@ async def create_mission(
         project_id = await project_for_repo(resolved["repo_origin"] or repo or "")
     if plan not in PLANS:
         raise ValueError(f"unknown plan {plan!r}; plans: {', '.join(PLANS)}")
-    if plan in ("fix", "fix-pr") and not resolved["repo_path"] and not resolved["repo_origin"]:
+    # draft needs one too: the deliverables are files written into the project
+    if (
+        plan in ("fix", "fix-pr", "draft")
+        and not resolved["repo_path"]
+        and not resolved["repo_origin"]
+    ):
         raise ValueError(f"--plan {plan} requires a repo (URL, path, folder, or project ref)")
     plan_spec: dict | None = None
     if orchestrator_model:

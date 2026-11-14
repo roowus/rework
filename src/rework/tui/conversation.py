@@ -139,7 +139,10 @@ def context_note(snap: Snapshot, project_id: str | None) -> str:
         lines.append("Missions in flight:")
         for mission in active[:10]:
             lines.append(f"- {mission.id} [{mission.status.value}] {mission.objective[:80]}")
-    lines.append("Plans: echo (no repo), fix and fix-pr (need a repo).")
+    lines.append(
+        "Plans: echo (no repo), fix and fix-pr (need a repo), draft (document"
+        " work: research with the web tools, write files in the project, no PR)."
+    )
     return "\n".join(lines)
 
 

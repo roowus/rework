@@ -2,6 +2,6 @@
 
 Both are ordinary role tools, registered compositionally the same way the
 library tools are (see web/tools.py), and both stay behind the guard in
-web/safety.py: a role may read the public web, never the deployment's own
+web/guard.py: a role may read the public web, never the deployment's own
 network.
 """

@@ -65,7 +65,7 @@ def new(
         None,
         help="A few words naming the mission (default: derived from the objective).",
     ),
-    plan: str = typer.Option("echo", help="Playbook: echo | fix | fix-pr"),
+    plan: str = typer.Option("echo", help="Playbook: echo | fix | fix-pr | draft"),
     orchestrator: str | None = typer.Option(
         None,
         help="Catalog id for the mission's orchestrator (default: the strongest tier).",
@@ -82,7 +82,9 @@ def new(
 ) -> None:
     """Create a mission; the daemon picks it up. An LLM orchestrator runs it
     (ADR 0007), following the plan as a playbook: `fix` = investigate, code,
-    audit, then a ship gate; `fix-pr` ends at an open-PR gate instead."""
+    audit, then a ship gate; `fix-pr` ends at an open-PR gate instead; `draft`
+    is document work (research with the web tools, write files, audit the
+    claims) and has no gate: no branch push and no PR."""
 
     async def go() -> str:
         from rework.missions import create_mission, resolve_project
