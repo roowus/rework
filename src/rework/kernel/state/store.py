@@ -64,6 +64,14 @@ class StateStore(Protocol):
         """Pending missions in PICKUP order: priority high first, then oldest
         first within a level. Not the browse order of list_missions (created_at
         DESC): an old pending mission must not starve behind newer ones."""
+
+    async def list_missions_for_pickup(self, status: MissionStatus, limit: int) -> list[Mission]:
+        """Missions the daemon should start now: OLDEST created first.
+
+        list_missions is newest-first for humans; pickup must never hide an old
+        mission behind newer ones, so this seam orders ASC with an id tiebreak
+        (created_at is not unique). A limit therefore only trims the newest.
+        """
         ...
 
     # -- projects (ADR 0005) ------------------------------------------------

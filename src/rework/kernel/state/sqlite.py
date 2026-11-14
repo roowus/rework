@@ -336,9 +336,21 @@ class SqliteStore:
         not starve behind newer ones."""
         rows = await self._fetch_all(
             "SELECT * FROM missions WHERE status = ?"
-            " ORDER BY CASE priority WHEN 'high' THEN 0 ELSE 1 END, created_at ASC"
+            " ORDER BY CASE priority WHEN 'high' THEN 0 ELSE 1 END, created_at ASC, id ASC"
             " LIMIT ?",
             (MissionStatus.PENDING.value, limit),
+        )
+        return [self._mission(r) for r in rows]
+
+    async def list_missions_for_pickup(self, status: MissionStatus, limit: int) -> list[Mission]:
+        """Daemon pickup: OLDEST first, id as tiebreak (created_at is not unique).
+
+        An old pending mission must never be hidden behind newer ones, so the
+        limit only ever trims the newest end of the queue.
+        """
+        rows = await self._fetch_all(
+            "SELECT * FROM missions WHERE status = ? ORDER BY created_at ASC, id ASC LIMIT ?",
+            (status.value, limit),
         )
         return [self._mission(r) for r in rows]
 
