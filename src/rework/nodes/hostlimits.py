@@ -8,8 +8,11 @@ to be hard-rebooted. Two guards live here:
 - sizing defaults derived from the host (CPU count, total RAM from
   /proc/meminfo) so a deployment needs no tuning to be safe (:func:`default_max_roles`,
   :func:`default_concurrency`, :func:`default_role_memory_max`);
-- :func:`command_prefix`, which wraps a role's shell command in `nice` /
-  `ionice` / a systemd transient scope with `MemoryMax=`. Pure functions over
+- :func:`command_prefix`, which wraps a role's shell command in the first
+  memory limit that works here — a systemd user scope, then a systemd system
+  scope (what `rework.service` has: no user bus), then a `ulimit -v` in the
+  wrapper shell — always deprioritized with `nice -n 10` / idle-class
+  `ionice`. Pure functions over
   injectable probes so they are testable without touching the real host
   (tests/unit/test_hostlimits.py).
 """
@@ -17,6 +20,8 @@ to be hard-rebooted. Two guards live here:
 from __future__ import annotations
 
 import logging
+import os
+import shlex
 import shutil
 import subprocess
 from collections.abc import Callable
@@ -32,8 +37,6 @@ ROLE_MEMORY_SHARE = 0.6
 
 def cpu_count() -> int:
     """Host CPU count, never below 1."""
-    import os
-
     try:
         count = os.cpu_count()
     except (NotImplementedError, OSError):  # pragma: no cover - exotic platforms
@@ -120,23 +123,61 @@ def default_role_memory_max() -> str:
     return str(int(total * ROLE_MEMORY_SHARE))
 
 
-@lru_cache(maxsize=1)
-def systemd_scope_available() -> bool:
-    """Probe (once, cached) whether `systemd-run --user --scope` works here.
-    A box without a user manager, without systemd, or with a transient-scope
-    policy that refuses returns False and rework falls back to nice/ionice."""
-    exe = shutil.which("systemd-run")
-    if not exe:
-        return False
+# systemd probes run once per process (lru_cache) with a short timeout: a
+# hanging bus must never stall the first role command of a mission.
+SCOPE_PROBE_TIMEOUT = 3.0
+# the system bus socket: present when `systemd-run --system` can work even
+# though this process (rework.service) has no user bus
+SYSTEM_BUS = Path("/run/systemd/private")
+
+
+def _run_probe(argv: list[str]) -> bool:
     try:
-        proc = subprocess.run(
-            [exe, "--user", "--scope", "-q", "true"],
-            capture_output=True,
-            timeout=5,
-        )
+        proc = subprocess.run(argv, capture_output=True, timeout=SCOPE_PROBE_TIMEOUT)
     except (OSError, subprocess.SubprocessError):
         return False
     return proc.returncode == 0
+
+
+@lru_cache(maxsize=1)
+def systemd_scope_available() -> bool:
+    """Probe (once, cached) whether `systemd-run --user --scope` works here.
+
+    The cheap case: an interactive/user-managed install has a user manager.
+    A box without a user bus, without systemd, or with a transient-scope policy
+    that refuses returns False. Found live on rewvis: `rework.service` is a
+    SYSTEM service, so `--user` fails with "Failed to connect to bus: No medium
+    found" (XDG_RUNTIME_DIR unset) even though lingering is enabled for ubuntu —
+    which is why the system scope below exists."""
+    exe = shutil.which("systemd-run")
+    if not exe:
+        return False
+    return _run_probe([exe, "--user", "--scope", "-q", "true"])
+
+
+def system_bus_present() -> bool:
+    """True when there is a system bus for `systemd-run --system` to talk to."""
+    try:
+        return SYSTEM_BUS.exists()
+    except OSError:  # pragma: no cover - exotic platforms
+        return False
+
+
+@lru_cache(maxsize=1)
+def system_scope_available() -> bool:
+    """Probe (once, cached) whether a SYSTEM transient scope works here.
+
+    This is the path that works from a service like `rework.service`: it talks
+    to the system bus, needs no user manager, and `--uid=<uid>` runs the command
+    as the owner instead of root. Soft: no system bus (e.g. a container), no
+    `systemd-run`, or a scope policy that refuses/prompts for auth -> False, and
+    rework falls back to `ulimit -v`."""
+    if not system_bus_present():
+        return False  # no system bus to talk to
+    exe = shutil.which("systemd-run")
+    if not exe:
+        return False
+    return _run_probe([exe, "--system", "--scope", "-q", f"--uid={os.getuid()}", "true"])
 
 
 _reported = False
@@ -144,37 +185,82 @@ _reported = False
 
 def configured_memory_max() -> str:
     """REWORK_ROLE_MEMORY_MAX, or the ~60%-of-RAM default when unset."""
-    import os
-
     raw = os.environ.get("REWORK_ROLE_MEMORY_MAX")
     return default_role_memory_max() if raw is None else raw
 
 
-def report_once(prefix: list[str], memory_max: str) -> None:
-    """Say once per process how role commands are wrapped (and which part of the
-    wrapper could not be applied), so an operator can tell from the daemon log
-    whether the memory cap is actually in force."""
-    import shlex
+def ulimit_kb(memory_max: str) -> str:
+    """REWORK_ROLE_MEMORY_MAX as the whole kB `ulimit -v` wants, or ''."""
+    size = systemd_memory_max(memory_max)
+    if not size:
+        return ""
+    kb = int(size) // 1024
+    return str(kb) if kb > 0 else ""
 
+
+def ulimit_wrapped(command: str, kb: str) -> str:
+    """`command` behind a hard RLIMIT_AS of `kb` kB, as one /bin/sh program.
+
+    `ulimit -v` is the memory limit that needs no systemd, no cgroup and no
+    privileges, so it is the fallback that still holds where the 2026-11-13 OOM
+    happened: a runaway pytest/mypy gets ENOMEM and dies instead of
+    swap-thrashing the box. It only affects the wrapper's own children (the
+    daemon never calls it), the command is shlex-quoted so quotes, `$`, `|`,
+    `>` and spaces in it survive as ONE word (a pipeline cannot be `exec`ed
+    directly, hence `exec /bin/sh -c`), and `exec` keeps the pid — so
+    `start_new_session` + the process-group kill and the timeout still cover
+    the whole tree. 2>/dev/null: a /bin/sh whose `ulimit` lacks `-v` must not
+    print a warning on every command."""
+    if not kb:
+        return command
+    return f"ulimit -v {kb} 2>/dev/null; exec /bin/sh -c {shlex.quote(command)}"
+
+
+def human_size(size: str) -> str:
+    """A byte count as the shortest exact rendering ('5G', '512M', '1234')."""
+    if not size.isdigit():
+        return size
+    value = int(size)
+    for unit, mult in (("T", 1024**4), ("G", 1024**3), ("M", 1024**2), ("K", 1024)):
+        if value >= mult and value % mult == 0:
+            return f"{value // mult}{unit}"
+    return str(value)
+
+
+def report_once(prefix: list[str], memory_max: str) -> None:
+    """Say once per process, in ONE log record, what is actually in force for
+    role commands — which memory limit and how they are deprioritized — so an
+    operator can tell from the daemon log whether the cap really applies
+    (`rework logs daemon -g 'role commands run'`)."""
     global _reported
     if _reported:
         return
     _reported = True
     shown = shlex.join(prefix)
+    mem = systemd_memory_max(memory_max)
     exe = Path(prefix[0]).name if prefix else ""
     if exe == "systemd-run":
-        cap = next((p for p in prefix if p.startswith("--property=MemoryMax=")), "")
-        log.info("role commands run in a systemd scope (%s): %s", cap or "no MemoryMax", shown)
-    elif exe in {"nice", "ionice"}:
-        wanted = systemd_memory_max(memory_max)
+        kind = "user" if "--user" in prefix else "system"
         log.info(
-            "role commands run deprioritized; no usable systemd --user scope so "
-            "MemoryMax%s was not applied: %s",
-            f"={wanted}" if wanted else "",
+            "role commands run in a systemd %s scope with MemoryMax=%s: %s",
+            kind,
+            human_size(mem),
+            shown,
+        )
+    elif any("ulimit -v" in part for part in prefix):
+        log.info(
+            "role commands run with MemoryMax=%s (no systemd scope available: "
+            "applying ulimit -v instead; sshd/tailscaled keep priority via "
+            "nice/ionice): %s",
+            human_size(mem),
             shown,
         )
     else:
-        log.info("role commands run with no nice/ionice/systemd wrapper: %s", shown)
+        log.info(
+            "role commands run deprioritized with NO memory limit "
+            "(REWORK_ROLE_MEMORY_MAX unset/unparseable): %s",
+            shown,
+        )
 
 
 def reset_report_flag() -> None:
@@ -189,42 +275,54 @@ def command_prefix(
     memory_max: str = "",
     which: Callable[[str], str | None] = shutil.which,
     scope_available: Callable[[], bool] = systemd_scope_available,
+    system_scope: Callable[[], bool] = system_scope_available,
 ) -> list[str]:
-    """argv prefix that runs `command` (a shell string, quoted with shlex) under
-    nice/ionice and, where possible, inside a transient systemd scope with a
-    memory cap.
+    """argv prefix that runs `command` (a shell string) under a resource chain:
 
-    Falls back cleanly: each wrapper is added only when its binary exists (and
-    the scope only when the probe succeeds AND there is a memory cap to enforce,
-    since that is the reason the scope exists), so the returned prefix is always
-    runnable. `["/bin/sh", "-c", command]` is the last two elements, i.e. the
-    prefix ends with the shell invocation itself.
+    1. a systemd USER transient scope with `MemoryMax=` (interactive installs);
+    2. a systemd SYSTEM transient scope with `MemoryMax=` (works from
+       `rework.service`, which has no user bus);
+    3. `nice -n 10` + `ionice -c3 -n7` in front of a `/bin/sh` that applies a
+       hard `ulimit -v` before `exec`-ing the command — no systemd, no cgroup;
+    4. nothing at all (bare `/bin/sh -c`, and report_once says so).
+
+    A scope is only worth its extra process when there is a memory cap to
+    enforce; without one the nice/ionice path is used. Every path uses the idle
+    IO class. The returned prefix always ends with the shell invocation itself,
+    so `["/bin/sh", "-c", command]` is its last two/three elements.
     """
-    shell = ["/bin/sh", "-c", command]
     nice = which("nice")
     ionice = which("ionice")
-    prefix: list[str] = []
+    srun = which("systemd-run")
     mem = systemd_memory_max(memory_max) if memory_max else ""
-    if mem and scope_available():
-        srun = which("systemd-run")
-        if srun:
-            prefix = [str(srun), "--user", "--scope", "--quiet", "--collect"]
-            if mem:
-                prefix += [f"--property=MemoryMax={mem}"]
-            if nice:
-                prefix += ["--nice=10"]
-            if ionice:
-                # best-effort IO class, lowest priority: a role's mypy must not
-                # starve the box's own logging/DB writes
-                prefix += ["--property=IOSchedulingClass=best-effort"]
-                prefix += ["--property=IOSchedulingPriority=7"]
-            return [*prefix, *shell]
+    shell = ["/bin/sh", "-c", command]
+    if mem and srun:
+        props = [f"--property=MemoryMax={mem}", "--property=MemoryAccounting=yes", "--collect"]
+        if nice:
+            props += ["--nice=10"]
+        if ionice:
+            # idle IO class, same as the fallback below: a role's mypy must not
+            # starve the box's own DB writes/journald
+            props += ["--property=IOSchedulingClass=idle"]
+        if scope_available():
+            return [str(srun), "--user", "--scope", "--quiet", *props, *shell]
+        if system_scope():
+            return [
+                str(srun),
+                "--system",
+                "--scope",
+                "--quiet",
+                f"--uid={os.getuid()}",
+                *props,
+                *shell,
+            ]
+    shell = ["/bin/sh", "-c", ulimit_wrapped(command, ulimit_kb(memory_max))]
+    prefix: list[str] = []
     if nice:
         prefix = [str(nice), "-n", "10"]
         if ionice:
             prefix += [str(ionice), "-c3", "-n7"]
-        return [*prefix, *shell]
-    if ionice:
+    elif ionice:
         # ionice alone still needs a shell to run the command
-        return [str(ionice), "-c3", "-n7", *shell]
-    return shell
+        prefix = [str(ionice), "-c3", "-n7"]
+    return [*prefix, *shell]

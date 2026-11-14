@@ -330,16 +330,36 @@ stays `intent` and the orchestrator sees `queued (waiting for a free role
 slot, cap N)` in `wait` / `check_in`, so a queue never looks like a hung role.
 
 `REWORK_ROLE_MEMORY_MAX` accepts `4G`, `512M`, `60%` or raw bytes (a percentage
-is that share of total RAM, resolved once at startup). rework applies it as
-`MemoryMax=` on a systemd transient user scope around each role command, so a
-single runaway `pytest`/`mypy` is OOM-killed on its own instead of taking the
-box (or the daemon) down. Role commands also run under `nice -n 10` and
-`ionice -c3 -n7`, so the work rework does stays behind sshd, tailscaled and
-Postgres. Where `systemd-run --user --scope` is unusable (no user manager, no
-user bus) or `ionice` is missing, rework falls back to whatever wrapper is
-available — down to a bare `/bin/sh -c` — and says so once in the daemon log at
-the first command, naming the `MemoryMax` that was not applied. Check it with
-`rework logs daemon -g 'role commands run'`.
+is that share of total RAM, resolved once at startup). rework applies it through
+a chain of mechanisms and uses the FIRST one that works on the box, so a single
+runaway `pytest`/`mypy` dies on its own instead of taking the box (or the
+daemon) down:
+
+1. a systemd transient USER scope with `MemoryMax=` (`systemd-run --user
+   --scope`) — interactive, user-managed installs;
+2. a systemd transient SYSTEM scope with `MemoryMax=` (`systemd-run --system
+   --scope --uid=<uid>`, plus `MemoryAccounting=yes` and `--collect`) — this is
+   the one in force on rewvis: a transient user scope needs a user bus, and
+   `rework.service` has none (`systemd-run --user` there fails with "Failed to
+   connect to bus: No medium found" even though lingering is enabled for
+   ubuntu), whereas the system bus is there and `--uid` runs the command as the
+   owner, not root. It is only attempted when `/run/systemd/private` exists and
+   it fails soft (3 s probe, cached once per process);
+3. a hard `ulimit -v` in the wrapper shell (`/bin/sh -c 'ulimit -v <kB>
+   2>/dev/null; exec <command>'`) — no systemd, no cgroup, no privileges
+   needed, and it still turns swap-thrashing into an allocation failure. It
+   only affects the wrapper's children, never the daemon;
+4. no memory limit at all, if `REWORK_ROLE_MEMORY_MAX` is unset or unparseable
+   and no RAM could be read.
+
+Role commands are deprioritized on every path so the work rework does stays
+behind sshd, tailscaled and Postgres: `nice -n 10`, and the IO IDLE class —
+`ionice -c3` in the fallback and `IOSchedulingClass=idle` in a scope. rework
+says which mechanism is actually in force in ONE daemon log record at the first
+command (`role commands run in a systemd system scope with MemoryMax=5G: …`, or
+`… with MemoryMax=5G (no systemd scope available: applying ulimit -v instead;
+…)`, or `… with NO memory limit`). Check it with `rework logs daemon -g 'role
+commands run'`.
 
 `REWORK_CONCURRENCY` caps WORKING missions only. A mission that is waiting — at
 a gate, for the owner, or on hold — gives its slot back and takes a new one at
