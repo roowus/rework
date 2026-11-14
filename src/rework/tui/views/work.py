@@ -477,6 +477,11 @@ class WorkView(View):
                 prompt.text = text  # never lose input
                 return
             self._clear_thinking()
+            if result.reply.startswith("⚠ "):
+                # the turn failed inside the engine (provider down, etc.): the
+                # error line is in the chat; give the owner their text back
+                prompt.text = text  # never lose input
+                return
             if engine.launched and engine.proposal is not None:
                 await self._launch(engine.proposal)
                 return

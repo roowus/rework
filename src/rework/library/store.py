@@ -9,7 +9,9 @@ Both impls must pass tests/library/test_library_store.py.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import logging
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -19,6 +21,8 @@ from rework.library.model import (
     LibraryItem,
     Provenance,
 )
+
+logger = logging.getLogger("rework.library")
 
 _DDL = [
     """
@@ -252,22 +256,93 @@ class SqliteLibraryStore:
         await self._conn.commit()
 
 
-class PostgresLibraryStore:
-    """Deployment-grade library index; same contract as the sqlite impl."""
+def _is_connection_error(exc: BaseException) -> bool:
+    """Whether this looks like the CONNECTION died rather than the query being
+    wrong (the idiom the TUI state reads already use, tui/data.py)."""
+    try:
+        import psycopg
+    except ImportError:  # pragma: no cover - psycopg is a hard dep
+        return isinstance(exc, OSError | TimeoutError | ConnectionError)
+    return isinstance(
+        exc,
+        OSError
+        | TimeoutError
+        | ConnectionError
+        | psycopg.OperationalError
+        | psycopg.InterfaceError,
+    )
 
-    def __init__(self, conn: Any) -> None:
+
+async def _connect(dsn: str) -> Any:
+    """One connection, DDL and migrations applied — the single connect path,
+    shared by open_library_store and PostgresLibraryStore's reconnect."""
+    import psycopg
+    from psycopg.rows import dict_row
+
+    conn = await psycopg.AsyncConnection.connect(
+        dsn, autocommit=False, row_factory=dict_row, prepare_threshold=None, connect_timeout=10
+    )
+    for ddl in _DDL:
+        await conn.execute(ddl)
+    await apply_library_migrations(conn)
+    await conn.commit()
+    return conn
+
+
+class PostgresLibraryStore:
+    """Deployment-grade library index; same contract as the sqlite impl.
+
+    The connection is replaceable: a recreated DB container kills the socket
+    and every later call would raise 'the connection is closed' forever (found
+    live). Every operation runs through _run(), which reconnects once on a
+    connection error and retries, so the TUI, the daemon and the MCP server all
+    self-heal without their own retry layers."""
+
+    def __init__(self, conn: Any, dsn: str = "") -> None:
         self._conn = conn
+        self._dsn = dsn
         self._op_lock = _LibLock(conn)
 
     async def aclose(self) -> None:
         await self._conn.close()
 
+    async def _reconnect(self) -> None:
+        """Drop the dead handle and connect again. Called with the op lock
+        released, so a concurrently failing operation can retry on the fresh
+        connection instead of piling onto the dead one."""
+        with contextlib.suppress(Exception):
+            await self._conn.close()
+        conn = await _connect(self._dsn)
+        self._conn = conn
+        self._op_lock = _LibLock(conn)
+
+    async def _run(self, op: Any) -> Any:
+        """Run one operation under the op lock; on a dead connection reconnect
+        once and retry exactly once, then surface a clear error. Reconnecting
+        closes the old connection first, which discards any half-applied
+        write — no retried statement runs inside a poisoned transaction."""
+        try:
+            async with self._op_lock:
+                return await op(self._conn)
+        except Exception as first:
+            if not self._dsn or not _is_connection_error(first):
+                raise
+            logger.warning("library store connection lost (%s); reconnecting", first)
+        try:
+            await self._reconnect()
+            async with self._op_lock:
+                return await op(self._conn)
+        except Exception as second:
+            raise RuntimeError(
+                f"library store unavailable after reconnect: {type(second).__name__}: {second}"
+            ) from second
+
     async def upsert_item(self, item: LibraryItem) -> LibraryItem:
-        async with self._op_lock:
+        async def _op(conn: Any) -> LibraryItem:
             from rework.library.model import item_to_row
 
             r = item_to_row(item)
-            await self._conn.execute(
+            await conn.execute(
                 "INSERT INTO library_items (id, type, name, description, body_path,"
                 " body, tags, provenance, status, version, uses, created_at, updated_at,"
                 " vectors)"
@@ -295,15 +370,19 @@ class PostgresLibraryStore:
                     _j(item.vectors) or "{}",
                 ),
             )
-            await self._conn.commit()
-        return item
+            await conn.commit()
+            return item
+
+        return await self._run(_op)
 
     async def get_item(self, item_id: str) -> LibraryItem | None:
-        async with self._op_lock:
-            async with self._conn.cursor() as cur:
+        async def _op(conn: Any) -> LibraryItem | None:
+            async with conn.cursor() as cur:
                 await cur.execute("SELECT * FROM library_items WHERE id = %s", (item_id,))
                 row = await cur.fetchone()
-        return _row_to_item(row) if row else None
+            return _row_to_item(row) if row else None
+
+        return await self._run(_op)
 
     async def list_items(
         self,
@@ -311,7 +390,7 @@ class PostgresLibraryStore:
         status: ItemStatus | None = None,
         limit: int = 100,
     ) -> list[LibraryItem]:
-        async with self._op_lock:
+        async def _op(conn: Any) -> list[LibraryItem]:
             sql = "SELECT * FROM library_items"
             clauses: list[str] = []
             params: list[Any] = []
@@ -325,10 +404,12 @@ class PostgresLibraryStore:
                 sql += " WHERE " + " AND ".join(clauses)
             sql += " ORDER BY created_at DESC LIMIT %s"
             params.append(limit)
-            async with self._conn.cursor() as cur:
+            async with conn.cursor() as cur:
                 await cur.execute(sql, tuple(params))
                 rows = list(await cur.fetchall())
-        return [_row_to_item(r) for r in rows]
+            return [_row_to_item(r) for r in rows]
+
+        return await self._run(_op)
 
     async def search(
         self, query: str, type_: ItemType | None = None, limit: int = 20
@@ -342,11 +423,11 @@ class PostgresLibraryStore:
         return [i for _, i in hits[:limit]]
 
     async def record_use(self, item_id: str) -> None:
-        async with self._op_lock:
-            await self._conn.execute(
-                "UPDATE library_items SET uses = uses + 1 WHERE id = %s", (item_id,)
-            )
-            await self._conn.commit()
+        async def _op(conn: Any) -> None:
+            await conn.execute("UPDATE library_items SET uses = uses + 1 WHERE id = %s", (item_id,))
+            await conn.commit()
+
+        await self._run(_op)
 
 
 class _LibLock:
@@ -413,17 +494,7 @@ async def open_library_store(db: str) -> LibraryStore:
     """Open the library index on the same database substrate as the state
     store (sqlite path or postgresql:// URL)."""
     if db.startswith(("postgresql://", "postgres://")):
-        import psycopg
-        from psycopg.rows import dict_row
-
-        conn = await psycopg.AsyncConnection.connect(
-            db, autocommit=False, row_factory=dict_row, prepare_threshold=None, connect_timeout=10
-        )
-        for ddl in _DDL:
-            await conn.execute(ddl)
-        await apply_library_migrations(conn)
-        await conn.commit()
-        return PostgresLibraryStore(conn)
+        return PostgresLibraryStore(await _connect(db), dsn=db)
     import aiosqlite
 
     def _prepare() -> str:
