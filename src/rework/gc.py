@@ -6,17 +6,26 @@ role runs `uv run`; found 2026-11-10: 160 of them held 8.1 GB on the Mac and
 nothing ever removed them. A run directory is removable when its mission is
 finished (done, failed or cancelled) and has not changed for a while.
 
+`role_env` also gives every non-checkout workdir a scratch dir under the system
+temp dir (`rework-scratch-<mission>-<random>`, nodes/tools.py); found 2026-11-12:
+~140 of those had piled up in /tmp with no mission in the name, so nothing could
+reclaim them (the prefix sweep was unsafe: a legacy `rework-scratch-<random>` is
+unattributable). gc now removes the ones that name a finished mission.
+
 Kept on purpose:
 - `missions/<id>/repo`, the mission's clone: the Preview button and
   `rework preview` fetch PRs through it;
 - anything of an ACTIVE mission (a revision coder continues the previous
   coder's worktree);
 - directories that do not name a mission this database knows (another
-  database's work, or not ours to delete).
+  database's work, or not ours to delete);
+- legacy `rework-scratch-<random>` dirs with no mission id: nobody can say
+  whose they are, so they are left alone.
 """
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import time
@@ -25,6 +34,11 @@ from pathlib import Path
 from typing import Any
 
 FINISHED = {"done", "failed", "cancelled"}
+
+# role_env's scratch dirs: `rework-scratch-<mission id>-<random>`; tempfile's
+# random part never contains a hyphen, so the two hyphens are ours
+SCRATCH_PREFIX = "rework-scratch-"
+_SCRATCH = re.compile(rf"^{SCRATCH_PREFIX}(?P<mission>m-[A-Za-z0-9]+)-[^-]+$")
 
 
 @dataclass
@@ -83,6 +97,52 @@ def collect(
             continue
         out.append(Candidate(run_dir, mid, _size(run_dir) if measure else 0))
     return out
+
+
+def scratch_mission(name: str) -> str | None:
+    """`rework-scratch-m-58d05d4101c7-ab12cd34` -> `m-58d05d4101c7`. None for
+    anything else, including the legacy `rework-scratch-<8 random chars>` dirs
+    created before the mission id was in the name: unattributable, never ours
+    to delete."""
+    match = _SCRATCH.match(name)
+    return match.group("mission") if match else None
+
+
+def collect_scratch(temp: Path, finished: set[str], measure: bool = True) -> list[Candidate]:
+    """Scratch dirs in `temp` that belong to a FINISHED mission. `finished` is
+    the set of mission ids whose status is terminal: a dir naming a running,
+    queued, unknown or unnamed mission is not collected. A missing or
+    unreadable `temp`, and a dir that vanishes mid-scan, are not errors."""
+    out: list[Candidate] = []
+    try:
+        entries = sorted(temp.iterdir())
+    except OSError:
+        return out
+    for path in entries:
+        mid = scratch_mission(path.name)
+        if mid is None or mid not in finished:
+            continue
+        try:
+            if not path.is_dir():
+                continue
+        except OSError:
+            continue
+        try:
+            size = _size(path) if measure else 0
+        except OSError:
+            continue
+        out.append(Candidate(path, mid, size))
+    return out
+
+
+def remove_scratch(candidates: list[Candidate]) -> int:
+    """Delete the scratch dirs; returns bytes actually freed."""
+    freed = 0
+    for c in candidates:
+        shutil.rmtree(c.path, ignore_errors=True)
+        if not c.path.exists():
+            freed += c.bytes
+    return freed
 
 
 def remove(candidates: list[Candidate], workroot: Path) -> int:

@@ -113,6 +113,7 @@ class DashboardView(View):
                 yield Btn("Pause", "pause", variant="ghost")
                 yield Btn("Resume", "resume", variant="ghost")
                 yield Btn("Cancel", "cancel", variant="ghost")
+                yield Btn("Priority", "priority", variant="ghost")
                 yield Btn("Fetch result", "fetch", variant="ghost")
                 yield Btn("Copy id", "copy-id", variant="ghost")
         with ContentSwitcher(initial="dash-overview", id="dash-pages"):
@@ -219,7 +220,14 @@ class DashboardView(View):
                     r for r in runs if status_value(r.status) in ("running", "halted_escalated")
                 ]
                 self.mission_role[mission.id] = role_of(live[-1].id) if live else ""
-        self._paint_overview()
+        # the app can close while this worker awaits (the awaits above): the
+        # paint then queries '#st-running' on a view whose children teardown
+        # already removed, and NoMatches killed the worker mid-test. Same guard
+        # as _poll_mission (m7 findings #19): only the paint, never the awaits.
+        try:
+            self._paint_overview()
+        except NoMatches:
+            return
 
     # -- overview -------------------------------------------------------------------
 
@@ -382,6 +390,9 @@ class DashboardView(View):
             for btn in controls.query(Btn):
                 if btn.action in ("pause", "resume", "cancel", "fetch"):
                     btn.display = actions.can(btn.action, st)
+                elif btn.action == "priority":
+                    level = getattr(mission, "priority", "normal") if mission else "normal"
+                    btn.set_label(f"Priority: {level}")
 
     def on_breadcrumb_navigate(self, event: Breadcrumb.Navigate) -> None:
         event.stop()
@@ -420,6 +431,11 @@ class DashboardView(View):
             return
         if verb == "cancel":
             self._disarm(event.btn)
+        if verb == "priority":
+            mission = self.snap.mission(self.mission_id)
+            current = getattr(mission, "priority", "normal")
+            self.run_worker(actions.prioritize(self.rw, self.mission_id, current), group="control")
+            return
         self.run_worker(actions.control(self.rw, self.mission_id, verb), group="control")
 
     def _disarm(self, btn: Btn) -> None:
@@ -753,7 +769,10 @@ class DashboardView(View):
         if self.mission_id != mission_id:
             return
         self.report_loaded_for = key
-        await self.query_one("#m-report-body", Markdown).update(md or "_no report yet_")
+        # the app can close while this worker awaits: teardown drops the body
+        # first, so the paint is guarded and the data await above is not
+        with self.painting():
+            await self.query_one("#m-report-body", Markdown).update(md or "_no report yet_")
 
     def _paint_gates(self) -> None:
         body = self.query_one("#m-gates-body", Vertical)

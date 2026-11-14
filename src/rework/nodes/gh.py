@@ -1,8 +1,10 @@
-"""GitHub operations via the gh CLI (thin, mechanical, behind gates).
+"""GitHub operations via the gh CLI (thin, mechanical, no gate by default).
 
-PR creation only happens when an open_pr gate is approved; the human reviews
-and merges. REWORK_GH_BIN overrides the binary (tests use a fake that records
-the call and prints a URL).
+After a clean audited `done` the engine pushes the branch and opens the PR with
+no gate; the orchestrator may request one (`ask_before_pr` + reason) and a
+project `settings.pr_gate` of `always`/`never` overrides. Merging is always the
+owner's. REWORK_GH_BIN overrides the binary (tests use a fake that records the
+call and prints a URL).
 """
 
 from __future__ import annotations
