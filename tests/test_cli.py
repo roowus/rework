@@ -23,7 +23,7 @@ import pytest
 from typer.testing import CliRunner
 
 from rework import __version__
-from rework.cli import app
+from rework.cli import _models_doc_entries, app
 from rework.kernel.state.records import Gate, GateKind, GateStatus, Mission, MissionStatus
 from rework.kernel.state.sqlite import open_sqlite
 
@@ -615,6 +615,48 @@ def test_sync_config_skips_loopback_entries_and_their_keys(
     assert "  keep    rewvis-only: only on the target" in out
     assert "  replace flash:" in out and "  add     router-sibling:" in out
     assert not any(argv[0] == "scp" for argv, _ in calls)
+
+
+def test_sync_config_keeps_a_target_entry_containing_the_marker_token(
+    targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The marker is appended LAST by the remote shell, so it must be stripped
+    from the TAIL. A target entry whose text happens to contain the token
+    (here a "note") is legitimate: a head-anchored split truncates the document
+    there, the remainder fails json.loads, the merge then treats the target as
+    empty and `cat >` drops every target-only entry."""
+    remote = [
+        *REMOTE_MODELS,
+        {
+            "id": "tokens-holder",
+            "provider": "fake",
+            "model": "t",
+            "tier": 1,
+            "note": "echo __REWORK_MODELS_EOF__ appears in a string",
+        },
+    ]
+    calls, _ = _sync_env(tmp_path, monkeypatch, remote_models=remote)
+
+    result = runner.invoke(app, ["sync-config", "sandbox"])
+    assert result.exit_code == 0, result.output
+    # the target's catalog parsed, so no "treating it as empty" warning
+    assert "not valid JSON" not in result.output
+    assert "keep    tokens-holder: only on the target" in result.output
+
+    payload = _ssh_write(calls, "models.json")
+    merged = json.loads(payload)
+    ids = [entry["id"] for entry in merged]
+    assert ids == ["flash", "router-sibling", "rewvis-only", "tokens-holder"]
+    holder = next(entry for entry in merged if entry["id"] == "tokens-holder")
+    assert holder["note"] == "echo __REWORK_MODELS_EOF__ appears in a string"
+    # the same payload round-trips through the loader's entry parser
+    assert [entry["id"] for entry in _models_doc_entries(merged)] == ids
+    written = tmp_path / "token-models.json"
+    written.write_text(payload)
+    monkeypatch.setenv("REWORK_MODELS", str(written))
+    from rework.config import load_catalog
+
+    assert [e.id for e in load_catalog().all()] == ids
 
 
 def test_sync_config_writes_nothing_when_the_remote_read_fails(

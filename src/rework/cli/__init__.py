@@ -1752,7 +1752,10 @@ def sync_config_cmd(
             err=True,
         )
         raise typer.Exit(1)
-    remote_models = remote_models.split(models_sentinel, 1)[0]
+    # The marker is echoed LAST (`cat ...; echo <marker>`), so the split is
+    # tail-anchored on purpose: a document may legitimately contain the token
+    # inside a string, and a head-anchored split would truncate it there.
+    remote_models = remote_models.rsplit(models_sentinel, 1)[0]
     if remote_models.endswith("\n"):
         remote_models = remote_models[:-1]
     if remote_models.strip():
