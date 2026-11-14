@@ -42,9 +42,22 @@ def _blank(text: Any) -> bool:
     return not isinstance(text, str) or not text.strip()
 
 
+def _empty_result(content: Any) -> bool:
+    """A tool_result with nothing in it: a blank str, or a list with no
+    non-blank text part and no other kind of part (an image counts)."""
+    if isinstance(content, list):
+        return all(
+            isinstance(b, dict) and b.get("type") == "text" and _blank(b.get("text"))
+            for b in content
+        )
+    return _blank(content)
+
+
 def _cacheable(block: Any) -> bool:
     if not isinstance(block, dict) or block.get("type") not in _CACHEABLE:
         return False
+    if block["type"] == "tool_result":
+        return not _empty_result(block.get("content"))
     return block["type"] != "text" or not _blank(block.get("text"))
 
 
@@ -124,7 +137,10 @@ def _clean(content: Any) -> Any:
 
 
 def _blocks(content: Any) -> list[Any]:
-    return [{"type": "text", "text": content}] if isinstance(content, str) else list(content)
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    # copy each block: the payload must never alias the caller's history
+    return [dict(b) if isinstance(b, dict) else b for b in content]
 
 
 def _signed(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:

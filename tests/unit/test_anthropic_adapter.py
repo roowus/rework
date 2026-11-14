@@ -89,6 +89,7 @@ def _check_valid(payload: dict) -> None:
             marked += 1
             assert b["type"] not in ("thinking", "redacted_thinking"), b
             assert b["type"] != "text" or b["text"].strip(), b
+            assert b["type"] != "tool_result" or not A._empty_result(b["content"]), b
     for b in payload.get("system") or []:
         marked += "cache_control" in b
     assert marked <= 4
@@ -228,3 +229,55 @@ def test_legacy_stored_history_is_repaired_on_retranslation() -> None:
     # re-translating the same history does not accumulate breakpoints
     assert _translate(msgs) == _translate(msgs)
     assert all("cache_control" not in str(m) for m in msgs)
+
+
+def _tool_history(output: object) -> list[dict]:
+    call = {"id": "t1", "name": "bash", "arguments": {}}
+    return [
+        {"role": "user", "content": "run it"},
+        {"role": "assistant", "content": "", "tool_calls": [call], "thinking_blocks": [THINK]},
+        {"role": "tool", "tool_call_id": "t1", "content": output},
+    ]
+
+
+def test_no_cache_control_on_an_empty_tool_result() -> None:
+    for output in ("", "  \n", [{"type": "text", "text": ""}], []):
+        for tail in ([], [{"role": "assistant", "content": "ok"}]):
+            payload = _translate([*_tool_history(output), *tail])
+            _check_valid(payload)
+            results = [b for b in _all_blocks(payload) if b["type"] == "tool_result"]
+            assert len(results) == 1
+            assert results[0]["content"] == ""  # still sent, just never marked
+            assert "cache_control" not in results[0]
+    # a tool_result with output is still marked, and the budget holds
+    payload = _translate(_tool_history("done"))
+    _check_valid(payload)
+    assert "cache_control" in payload["messages"][-1]["content"][-1]
+
+
+def test_empty_tool_result_is_skipped_by_mark_message() -> None:
+    empty = {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "t", "content": ""}],
+    }
+    assert A._mark_message(empty) is False
+    assert "cache_control" not in empty["content"][0]
+    full = {
+        "role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "t", "content": "x"}],
+    }
+    assert A._mark_message(full) is True
+
+
+def test_merged_blocks_do_not_alias_the_callers_history() -> None:
+    caller_block = {"type": "text", "text": "q"}
+    msgs = [
+        {"role": "user", "content": [caller_block]},
+        {"role": "assistant", "content": ""},
+        {"role": "user", "content": [{"type": "text", "text": "again"}]},
+    ]
+    payload = _translate(msgs)
+    merged = payload["messages"][0]["content"]
+    assert merged[0] == caller_block and merged[0] is not caller_block
+    merged[0]["cache_control"] = "x"
+    assert "cache_control" not in caller_block

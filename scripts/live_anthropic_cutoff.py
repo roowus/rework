@@ -13,7 +13,12 @@ thousand tokens on claude-sonnet-5-5:
    cannot be set for empty text blocks" and every later turn failed too;
 3. a follow-up turn on top of the reply.
 
-Exits 1 when any step is rejected.
+4. a tool_use whose TOOL OUTPUT IS AN EMPTY STRING (persisted as role=tool with
+   content ""): first with cache_control forced onto that tool_result (raw
+   payload, to learn whether the API rejects it; informational), then through
+   the adapter, which must not mark it.
+
+Exits 1 when any step the adapter sends is rejected.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ import os
 import sys
 
 from rework.kernel.llm.adapters.anthropic import AnthropicProvider, translate_request
-from rework.kernel.llm.types import ChatRequest
+from rework.kernel.llm.types import ChatRequest, ToolSpec
 
 MODEL = "claude-sonnet-5-5"
 PROMPT = (
@@ -42,6 +47,52 @@ def check(request: ChatRequest) -> None:
                 assert b["text"].strip(), f"empty text block in {msg['role']} turn"
             marked += isinstance(b, dict) and "cache_control" in b
     print(f"  payload ok: no empty text block, {marked} breakpoint(s) in messages")
+
+
+async def empty_tool_result(llm: AnthropicProvider) -> bool:
+    """Step 4. True when the adapter's request is accepted."""
+    call = {"id": "toolu_empty_1", "name": "run", "arguments": {"cmd": "true"}}
+    history = [
+        {"role": "user", "content": "Run the command `true` with the run tool, then say done."},
+        {"role": "assistant", "content": "", "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": call["id"], "content": ""},  # empty tool output
+    ]
+    tool = ToolSpec(
+        name="run",
+        description="Run a shell command and return its output.",
+        input_schema={
+            "type": "object",
+            "properties": {"cmd": {"type": "string"}},
+            "required": ["cmd"],
+        },
+    )
+    request = ChatRequest(
+        model=MODEL, messages=history, max_tokens=64, tools=[tool], session_id="live"
+    )
+
+    print("4a. empty tool output with cache_control FORCED onto the tool_result (raw payload)")
+    forced = translate_request(request)
+    result = forced["messages"][-1]["content"][-1]
+    assert result["type"] == "tool_result" and result["content"] == ""
+    assert "cache_control" not in result, "the adapter must not mark an empty tool_result"
+    result["cache_control"] = {"type": "ephemeral"}
+    try:
+        reply = await llm._stream(forced)
+        print(f"  ACCEPTED by the API: stop_reason={reply.stop_reason} text={reply.text[:60]!r}")
+    except Exception as exc:  # informational: this is the question being asked
+        print(f"  REJECTED by the API: {type(exc).__name__}: {str(exc)[:300]}")
+
+    print("4b. the same history through the fixed adapter")
+    check(request)
+    sent = translate_request(request)["messages"][-1]["content"][-1]
+    print(f"  tool_result content={sent['content']!r} cache_control={'cache_control' in sent}")
+    try:
+        reply = await llm.complete(request)
+    except Exception as exc:
+        print(f"  FAIL: {type(exc).__name__}: {str(exc)[:300]}")
+        return False
+    print(f"  OK stop_reason={reply.stop_reason} text={reply.text[:60]!r}")
+    return True
 
 
 async def main() -> int:
@@ -90,6 +141,8 @@ async def main() -> int:
     check(request)
     again = await llm.complete(request)
     print(f"  OK stop_reason={again.stop_reason} text={again.text[:80]!r}")
+    if not await empty_tool_result(llm):
+        return 1
     print("PASS")
     return 0
 
