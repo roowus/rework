@@ -68,7 +68,8 @@ class CoderSpec(RoleSpec):
     name = "coder"
     description = (
         "Implements a change in an isolated worktree + branch, self-checks"
-        " with real test runs, hands off a mechanical diff."
+        " with real test runs, hands off a mechanical diff. Can search the public"
+        " web (`web_search`) and read pages (`fetch_url`)."
     )
     goal = (
         "Fulfill the task completely and make the code work reliably and well:"
@@ -235,7 +236,6 @@ class CoderSpec(RoleSpec):
             catalog=ctx.catalog,
             catalog_id=catalog_id,
             executor=web_executor(
-                ctx,
                 library_executor(
                     ctx,
                     ComplaintAwareExecutor(
@@ -245,7 +245,7 @@ class CoderSpec(RoleSpec):
                         ctx.run.id,
                         self.name,
                     ),
-                ),
+                )
             ),
             system_prompt=with_library_menu(ctx, system_prompt),
             store=ctx.store,

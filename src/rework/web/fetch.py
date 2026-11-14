@@ -3,8 +3,13 @@
 Design notes:
 - Redirects are NOT followed automatically: each hop is re-validated, so a
   public URL cannot bounce the agent into the tailnet or the metadata service.
-- The host is resolved and every resolved address is checked, which is what
-  defends against DNS rebinding (a name that resolves to 127.0.0.1).
+- The host is resolved and every resolved address is checked, so a name that
+  resolves into a blocked range (127.0.0.1, the metadata service, the tailnet)
+  is refused, as is a name whose answers mix public and blocked addresses.
+  The validated address is NOT pinned: httpx resolves again on connect, so a
+  resolver that answers public at validation time and private a moment later
+  keeps a narrow TOCTOU window. Accepted limitation; closing it needs a
+  connection to the checked IP with the original Host header.
 - httpx is constructed with trust_env=False: a proxy from the environment would
   resolve the destination itself and put the guard out of the loop.
 - Errors are RETURNED as `error: ...` strings. The tool loop classifies failure

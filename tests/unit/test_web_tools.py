@@ -8,6 +8,9 @@ the real DNS.
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import httpx
 import pytest
 
@@ -87,6 +90,43 @@ def test_html_to_text_survives_malformed_markup() -> None:
 async def test_check_url_refuses_non_public_targets(url: str) -> None:
     with pytest.raises(BlockedURL):
         check_url(url)
+
+
+@pytest.mark.parametrize(
+    ("url", "embedded"),
+    [
+        # NAT64 (RFC 6052): a 64:ff9b::/96 address carries an IPv4 in its low
+        # 32 bits, and ipaddress reports the whole block as is_global, so the
+        # block used to let 127.0.0.1 and the metadata service straight through
+        ("http://[64:ff9b::7f00:1]/", "127.0.0.1"),
+        ("http://[64:ff9b::a9fe:a9fe]/", "169.254.169.254"),
+        ("http://[64:ff9b::a00:1]/", "10.0.0.1"),
+    ],
+)
+async def test_nat64_addresses_embedding_a_blocked_ipv4_are_blocked(
+    url: str, embedded: str
+) -> None:
+    with pytest.raises(BlockedURL, match="NAT64-embedded") as exc:
+        check_url(url)
+    assert embedded in str(exc.value), "the error must name the embedded address"
+
+
+async def test_a_nat64_address_with_a_public_embedded_ipv4_is_allowed() -> None:
+    """The negative control: the NAT64 rule unwraps, it does not blanket-ban."""
+    check_url("http://[64:ff9b::5db8:d822]/")  # 93.184.216.34, example.com
+    await ensure_public("http://[64:ff9b::5db8:d822]/", resolver=public_resolver)
+
+
+async def test_site_local_ipv6_is_blocked() -> None:
+    """fec0::/10 is deprecated but still routable on some networks."""
+    with pytest.raises(BlockedURL, match="site-local"):
+        check_url("http://[fec0::1]/")
+
+
+async def test_ipv4_mapped_ipv6_is_still_blocked() -> None:
+    """Regression guard for the pre-existing ::ffff: path."""
+    with pytest.raises(BlockedURL, match="loopback"):
+        check_url("http://[::ffff:127.0.0.1]/")
 
 
 async def test_ensure_public_blocks_a_name_that_resolves_to_loopback() -> None:
@@ -425,7 +465,7 @@ def test_web_executor_factory_wraps_the_inner_executor() -> None:
             return []
 
     inner = Inner()
-    wrapped = web_executor(object(), inner)
+    wrapped = web_executor(inner)
     assert isinstance(wrapped, WebAwareExecutor)
     assert {s.name for s in wrapped.specs()} == {"web_search", "fetch_url"}
     assert wrapped._inner is inner, "the wrapper must not drop the role's own tools"
@@ -433,9 +473,31 @@ def test_web_executor_factory_wraps_the_inner_executor() -> None:
 
 def test_investigator_and_coder_are_wired_but_the_auditor_is_not() -> None:
     """The brief names investigators and coders only: the auditor reads the diff
-    and must not gain outbound network access."""
+    and must not gain outbound network access.
+
+    Checked on `auditor.py`'s own source, not on its namespace: `hasattr` only
+    proves the module does not import the factory under that name, while any of
+    the aliasing routes below would still put the tools in front of the model.
+    The behavioural half (the auditor's assembled executor offers no web tool)
+    is asserted against a real graph in
+    tests/unit/test_auditor.py::test_auditor_reads_context_and_reports.
+    """
     from rework.roles.builtin import auditor, coder, investigator
 
     assert investigator.web_executor is web_executor
     assert coder.web_executor is web_executor
-    assert not hasattr(auditor, "web_executor")
+
+    tree = ast.parse(Path(auditor.__file__).read_text(encoding="utf-8"))
+    constructed = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    } | {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert constructed.isdisjoint({"web_executor", "WebAwareExecutor"}), (
+        f"auditor.py constructs a web executor: {constructed}"
+    )
+    assert "rework.web" not in Path(auditor.__file__).read_text(encoding="utf-8")

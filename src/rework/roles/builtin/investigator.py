@@ -42,7 +42,8 @@ class InvestigatorSpec(RoleSpec):
     name = "investigator"
     description = (
         "Investigates a brief against a workspace and reports structured"
-        " findings with evidence: issues, feasibility, unknowns."
+        " findings with evidence: issues, feasibility, unknowns. Can search the"
+        " public web (`web_search`) and read pages (`fetch_url`)."
     )
     goal = (
         "Investigate any brief: issues, feasibility, unknowns. Find as much"
@@ -106,7 +107,6 @@ class InvestigatorSpec(RoleSpec):
             catalog=ctx.catalog,
             catalog_id=catalog_id,
             executor=web_executor(
-                ctx,
                 library_executor(
                     ctx,
                     ComplaintAwareExecutor(
@@ -118,7 +118,7 @@ class InvestigatorSpec(RoleSpec):
                         ctx.run.id,
                         self.name,
                     ),
-                ),
+                )
             ),
             system_prompt=with_library_menu(ctx, system_prompt),
             store=ctx.store,

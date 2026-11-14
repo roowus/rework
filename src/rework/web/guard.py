@@ -45,6 +45,14 @@ BLOCKED_HOSTS = frozenset(
 )
 
 
+# NAT64 (RFC 6052) embeds an IPv4 address in the low 32 bits of a
+# 64:ff9b::/96 address. ipaddress calls the whole block is_global, so without
+# this a NAT64 host reaches 127.0.0.1 or the metadata service.
+NAT64_NETWORK = ipaddress.ip_network("64:ff9b::/96")
+# site-local, deprecated by RFC 3879 but still routable on some networks
+SITE_LOCAL_NETWORK = ipaddress.ip_network("fec0::/10")
+
+
 class BlockedURL(ValueError):
     """The URL is not fetchable: bad scheme, no host, or a private destination."""
 
@@ -54,6 +62,13 @@ def _blocked_ip_reason(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> s
     mapped = getattr(addr, "ipv4_mapped", None)
     if mapped is not None:  # ::ffff:127.0.0.1 reaches loopback
         return _blocked_ip_reason(mapped)
+    if isinstance(addr, ipaddress.IPv6Address) and addr in NAT64_NETWORK:
+        # 64:ff9b::7f00:1 is 127.0.0.1 in translation form
+        embedded = ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)
+        inner = _blocked_ip_reason(embedded)
+        if inner:
+            return f"NAT64-embedded {embedded} ({inner})"
+        return None
     if addr.is_loopback:
         return "loopback"
     if addr.is_link_local:
@@ -70,6 +85,8 @@ def _blocked_ip_reason(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> s
         return "CGNAT/tailnet"
     if isinstance(addr, ipaddress.IPv6Address) and addr in ipaddress.ip_network("fc00::/7"):
         return "unique-local"
+    if isinstance(addr, ipaddress.IPv6Address) and addr in SITE_LOCAL_NETWORK:
+        return "site-local (fec0::/10, deprecated)"
     return None
 
 
@@ -94,10 +111,9 @@ def check_url(url: str, *, allow_private: bool = False) -> tuple[str, str, int]:
     """Validate scheme/host and return (scheme, host, port).
 
     Raises BlockedURL for anything that is not a plain public http(s) URL.
-    Only textual checks here: resolution happens in `ensure_public`, which is
-    what defends against DNS rebinding. `allow_private` is for the SEARCH
-    backend, whose address is deployment config (a SearXNG on 127.0.0.1), not
-    model input.
+    Only textual checks here: the resolved addresses are checked in
+    `ensure_public`. `allow_private` is for the SEARCH backend, whose address
+    is deployment config (a SearXNG on 127.0.0.1), not model input.
     """
     raw = (url or "").strip()
     if not raw:
@@ -145,7 +161,12 @@ async def ensure_public(
     allow_private: bool = False,
     resolver: Callable[[str, int], Awaitable[list[str]]] | None = None,
 ) -> None:
-    """check_url + resolve + check every resolved IP (defeats DNS rebinding).
+    """check_url + resolve + check every resolved IP.
+
+    This rejects names that resolve into a blocked range and names whose
+    answers mix public and blocked addresses. It does NOT pin the address the
+    HTTP client then connects to, so a public->private flip between this check
+    and the connection is a narrow accepted race, not a guarantee.
 
     `resolver` is injectable so tests never touch real DNS.
     """

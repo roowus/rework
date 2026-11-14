@@ -8,7 +8,7 @@ REWORK_SEARCH_URL, never model input). fetch_url is the one that must not.
 from __future__ import annotations
 
 import os
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -78,7 +78,7 @@ async def search_text(
         return "error: web_search needs a query"
     limit = max(1, min(results, MAX_RESULTS))
     base = (base_url or search_base_url()).rstrip("/")
-    endpoint = f"{base}/search"
+    endpoint = search_endpoint(base)
     timeout = timeout_s or float(os.environ.get("REWORK_SEARCH_TIMEOUT_S", DEFAULT_TIMEOUT_S))
     try:
         # allow_private: a self-hosted SearXNG on 127.0.0.1 is the normal case
@@ -118,8 +118,3 @@ async def search_text(
 
 
 _HEADERS = {"user-agent": "rework-search/0.1", "accept": "application/json"}
-
-
-def query_of(url: str) -> str:
-    """The q= of a search URL (used by tests to prove the request was formed)."""
-    return (parse_qs(urlsplit(url).query).get("q") or [""])[0]

@@ -388,10 +388,16 @@ async def create_mission(
             budget_usd=budget_usd,
             budget_step_usd=budget_step_usd,
         )
-    elif plan in ("fix", "fix-pr"):
+    elif plan in ("fix", "fix-pr", "draft"):
+        # `draft` needs the template as much as fix/fix-pr do: without it
+        # plan_spec stays None, the engine's DEFAULT_PLAN (echo) takes over, and
+        # a programmatic caller silently gets a mission that does nothing.
         template = PLAN_FIX_PR if plan == "fix-pr" else PLAN_FIX
         plan_spec = json.loads(json.dumps(template).replace("$OBJECTIVE", objective))
         plan_spec["kind"] = plan
+        if plan == "draft":
+            # writing in the project's own files: nothing to ship, no PR
+            plan_spec["gates"] = list(PLAYBOOK_GATES["draft"])
         if model:
             # a mission-wide model choice replaces the template's per-step pins
             for step in plan_spec["steps"]:

@@ -94,8 +94,7 @@ class WebAwareExecutor:
         return getattr(self._inner, item)
 
 
-def web_executor(ctx: Any, executor: Any) -> Any:
+def web_executor(executor: Any) -> Any:
     """Wrap a role's executor with the web tools. Roles that should not reach
     the web (the auditor) simply do not call this."""
-    _ = ctx
     return WebAwareExecutor(executor)
