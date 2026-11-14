@@ -585,7 +585,12 @@ class MissionRunner:
         # ship gate: the plan's final human decision before synthesis. An
         # existing row (open or decided) is REUSED: a restart after the owner
         # already decided must not open a duplicate gate (chaos-test finding)
-        gates_spec = (mission.plan or {}).get("gates") or []
+        plan = mission.plan or {}
+        gates_spec = plan.get("gates") or []
+        # A plan publishes a PR when it says so (`publish`) or when it still
+        # carries the legacy open_pr gate marker. A mission with no publish
+        # intent (echo, fix, an eval fixture) never pushes or opens anything.
+        publishes = bool(plan.get("publish")) or "open_pr" in gates_spec
         ship_decision: bool | None = None
         if "ship" in gates_spec:
             gate = await self._latest_gate_of_kind(GateKind.SHIP)
@@ -622,7 +627,9 @@ class MissionRunner:
             ).lower()
             setting = raw if raw in ("auto", "always", "never") else "auto"
         want_gate = "open_pr" in gates_spec
-        if setting == "always":
+        if not publishes:
+            want_gate = False
+        elif setting == "always":
             want_gate = True
         elif setting == "never":
             want_gate = False
@@ -662,7 +669,7 @@ class MissionRunner:
             pr_approved = await self._gate_decision(mission.id, gate.id)
             if pr_approved:
                 pr_url = await self._create_pr(mission, results)
-        else:
+        elif publishes:
             pr_url = await self._create_pr(mission, results)
 
         return ship_decision, pr_url

@@ -104,6 +104,10 @@ audit rail already guarantees the change was reviewed. The orchestrator can ask
 for one (`finish(ask_before_pr=true, reason=...)`) when the change is risky or
 unusual, and a project setting controls it globally:
 
+Only a plan that publishes (`"publish": "pr"` — the `fix-pr` playbook; older
+plans carrying `"gates": ["open_pr"]` count too) pushes a branch or opens a PR
+at all. `echo` and `fix` missions deliver their result and stop.
+
 | project `settings.pr_gate` | effect |
 | --- | --- |
 | `auto` (default) | gate only when the orchestrator asks (or the plan lists `open_pr`) |
