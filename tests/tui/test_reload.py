@@ -297,9 +297,7 @@ async def test_a_running_chat_turn_blocks_the_reload_until_it_finishes(
     assert execs == []
 
 
-async def test_a_modal_screen_blocks_the_reload(
-    env: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+async def test_a_modal_screen_blocks_the_reload(env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The owner is picking a model / reading the help: not idle."""
     app = _app()
     monkeypatch.setattr(reload_mod, "IDLE_SECONDS", 0.0)
@@ -384,9 +382,7 @@ async def test_the_ui_state_is_saved_and_restored_on_the_next_start(
     assert not rl.state_path().exists(), "the state file applies exactly once"
 
 
-async def test_a_stale_state_file_is_ignored_field_by_field(
-    env: Path, ids: dict[str, str]
-) -> None:
+async def test_a_stale_state_file_is_ignored_field_by_field(env: Path, ids: dict[str, str]) -> None:
     """Ids that are gone (a deleted chat / mission / gate) must be skipped and
     the rest of the restore must still land: no crash, no toast about it."""
     from rework.tui import reload as rl
