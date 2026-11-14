@@ -22,6 +22,7 @@ from rework.nodes.report_writer import make_report_writer_node
 from rework.nodes.toolloop import make_toolloop_node
 from rework.nodes.tools import ComplaintAwareExecutor, LocalExecutor
 from rework.roles.base import RoleBuildCtx, RoleSpec
+from rework.web.tools import web_executor
 
 if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
@@ -104,9 +105,11 @@ class InvestigatorSpec(RoleSpec):
             provider=ctx.provider,
             catalog=ctx.catalog,
             catalog_id=catalog_id,
-            executor=library_executor(
+            executor=web_executor(
                 ctx,
-                ComplaintAwareExecutor(
+                library_executor(
+                    ctx,
+                    ComplaintAwareExecutor(
                     EscalationAwareExecutor(
                         LocalExecutor(ctx.read_root, mission_id=ctx.mission.id), ctx
                     ),
