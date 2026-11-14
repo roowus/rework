@@ -85,8 +85,9 @@ PLAYBOOKS: dict[str, str] = {
         "medium-or-higher findings you are not willing to ship (ask_owner after three "
         "rounds). Pick each audit's `strictness` from risk (size, blast radius, prior "
         "findings) and re-decide it every round from the latest report, never once for "
-        "the whole mission. After you finish, the ENGINE pushes the last coder's branch "
-        "and opens the pull request when the owner approves the gate; agents never merge."
+        "the whole mission. After a clean audited done, the ENGINE pushes the last coder's "
+        "branch and opens the pull request itself, with no gate; pass ask_before_pr=true "
+        "with a reason to put the owner in front of it first. Agents never merge."
     ),
 }
 
@@ -124,10 +125,14 @@ How you work:
   a needed revision or audit to save budget. The budget gate asks the owner before
   the cap is passed.
 - Call `finish` when the mission's goal is met, or when it cannot be met (say why).
-  Final gates (ship / open a PR) happen after you finish; you do not open them.
-  The engine pushes the last coder's branch and opens the PR itself on approval:
-  never spawn a role to push, commit, or open PRs (each coder run also creates a
-  new branch, so a "push" coder only adds noise).
+  You never open PRs and never merge. After a clean audited `done` the engine
+  pushes the last coder's branch and opens the PR itself, with no gate. Pass
+  `ask_before_pr=true` plus a short `reason` when the change is risky, unusual,
+  or you are unsure the owner wants it shipped unreviewed: that puts a human
+  decision in front of the PR. A project setting can force that gate always or
+  never. Merging is always the owner's decision. Never spawn a role to push,
+  commit, or open PRs (each coder run also creates a new branch, so a "push"
+  coder only adds noise).
 - Respond with tool calls. Text without a tool call wastes a turn."""
 
 TOOLS: list[ToolSpec] = [
@@ -316,6 +321,16 @@ TOOLS: list[ToolSpec] = [
                     "description": "What happened, for the owner: what changed, why, and what "
                     "the audit found. This leads the PR body, so write it for a reviewer.",
                 },
+                "ask_before_pr": {
+                    "type": "boolean",
+                    "description": "Ask the owner to review before the PR opens. Default false: "
+                    "after a clean audited `done` the engine opens the PR itself.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why the owner should look before the PR opens (risky, "
+                    "unusual, unsure it should ship). Ignored unless ask_before_pr is true.",
+                },
                 "accepted_findings": {
                     "type": "array",
                     "description": "Judgment, not a bypass: for every open medium-or-higher "
@@ -450,6 +465,10 @@ class MissionOrchestrator:
         # one mechanical rail that blocks finish(done) requires them (see
         # _enforce_findings_accepted), and they lead the mission report/PR body
         self.accepted_findings: list[dict[str, str]] = []
+        # the orchestrator's optional request for a human look before the PR
+        # opens (engine opens the PR directly after a clean audited `done`)
+        self.ask_before_pr = False
+        self.pr_reason = ""
         self._providers: dict[str, Any] = {}
 
     def _usable(self) -> list[Any]:
@@ -565,7 +584,11 @@ class MissionOrchestrator:
                 _pre["accepted_findings"] = self.accepted_findings
             await self.r._store.update_mission(self.mid, result=_pre)
             ship, pr_url = await self.r._final_gates(
-                self.mission, results, audit.artifact if audit else None
+                self.mission,
+                results,
+                audit.artifact if audit else None,
+                ask_before_pr=self.ask_before_pr,
+                reason=self.pr_reason,
             )
         self.r._pr_url = pr_url
         await self.r._synthesize(
@@ -786,6 +809,8 @@ class MissionOrchestrator:
                 if call.get("name") == "finish" and answered.get(call.get("id")) == "finished":
                     args = call.get("arguments") or {}
                     self.accepted_findings = _accepted_findings(args.get("accepted_findings"))
+                    self.ask_before_pr = bool(args.get("ask_before_pr"))
+                    self.pr_reason = str(args.get("reason") or "")
                     return (str(args.get("outcome") or "done"), str(args.get("summary") or ""))
         return None
 
@@ -852,6 +877,8 @@ class MissionOrchestrator:
                 await self._enforce_findings_accepted(accepted)
             self.finished = (outcome, str(args.get("summary") or ""))
             self.accepted_findings = accepted
+            self.ask_before_pr = bool(args.get("ask_before_pr"))
+            self.pr_reason = str(args.get("reason") or "")
             await self._note(f"finished ({outcome}): {self.finished[1]}"[:400], to_owner=True)
             return "finished"
         raise ToolError(f"unknown tool {name!r}")

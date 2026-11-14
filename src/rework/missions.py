@@ -14,9 +14,11 @@ from pathlib import Path
 from typing import Any
 
 from rework.kernel.state.records import (
+    PRIORITIES,
     EventRecord,
     EventType,
     Mission,
+    check_priority,
     new_id,
 )
 from rework.kernel.state.store import StateStore
@@ -62,7 +64,11 @@ PLAN_FIX: dict = {
     "gates": ["ship"],
 }
 
-PLAN_FIX_PR: dict = {"steps": PLAN_FIX["steps"], "gates": ["open_pr"]}
+# `publish` marks the plans that end by pushing the coder branch and opening
+# a PR. It is separate from `gates`: publishing is mechanical, gating it is
+# the optional exception (ask_before_pr / project setting), so a fix-pr plan
+# has no gate by default but still publishes.
+PLAN_FIX_PR: dict = {"steps": PLAN_FIX["steps"], "gates": [], "publish": "pr"}
 
 PLANS = ("echo", "fix", "fix-pr")
 
@@ -107,7 +113,8 @@ def derive_title(objective: str) -> str | None:
     return line or None
 
 
-PLAYBOOK_GATES: dict[str, list[str]] = {"echo": [], "fix": ["ship"], "fix-pr": ["open_pr"]}
+PLAYBOOK_GATES: dict[str, list[str]] = {"echo": [], "fix": ["ship"], "fix-pr": []}
+PLAYBOOK_PUBLISH: dict[str, str] = {"echo": "", "fix": "", "fix-pr": "pr"}
 
 
 def default_budget() -> tuple[float, float]:
@@ -140,6 +147,7 @@ def orchestrated_plan(
         "playbook": playbook,
         "orchestrator": {"model": orchestrator_model, "effort": orchestrator_effort},
         "gates": list(PLAYBOOK_GATES.get(playbook, [])),
+        "publish": PLAYBOOK_PUBLISH.get(playbook, ""),
         "budget": {
             "max_usd": cap if budget_usd is None else budget_usd,
             "ask_every_usd": step if budget_step_usd is None else budget_step_usd,
@@ -325,6 +333,16 @@ async def _project_repo(project_id: str, name: str | None) -> tuple[str | None, 
     return None, url
 
 
+__all__ = ["PRIORITIES"]
+
+
+def _priority(value: str | None) -> str:
+    """Validate a mission priority: normal (default) or high, the two pickup
+    levels. Anything else is a caller bug, not something to store."""
+    level = (value or "normal").strip().lower()
+    return check_priority(level)
+
+
 async def create_mission(
     objective: str,
     *,
@@ -341,6 +359,7 @@ async def create_mission(
     budget_usd: float | None = None,
     budget_step_usd: float | None = None,
     title: str | None = None,
+    priority: str = "normal",
 ) -> Mission:
     """Create a mission row (+ created event) and return it. When `store` is
     given it is used and NOT closed (the TUI holds one open); otherwise a
@@ -403,6 +422,7 @@ async def create_mission(
                 # always wins; otherwise derive one so every mission has a
                 # short name for lists, PR titles and commit subjects
                 title=(title or "").strip()[:80] or derive_title(objective),
+                priority=_priority(priority),
                 plan=plan_spec,
             )
         )

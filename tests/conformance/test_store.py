@@ -611,3 +611,99 @@ async def test_a_schema_change_does_not_break_a_live_connection(
         await other._conn.execute("ALTER TABLE gates DROP COLUMN IF EXISTS zz_probe")
         await other._conn.commit()
         await other.aclose()
+
+
+async def test_mission_priority_defaults_to_normal_and_persists(store: StateStore) -> None:
+    """(c) priority defaults to normal and survives a reload; high sticks."""
+    m = await store.create_mission(Mission(id=new_id("m"), objective="plain"))
+    assert m.priority == "normal"
+    got = await store.get_mission(m.id)
+    assert got is not None and got.priority == "normal"
+
+    high = await store.create_mission(Mission(id=new_id("m"), objective="urgent", priority="high"))
+    reloaded = await store.get_mission(high.id)
+    assert reloaded is not None and reloaded.priority == "high"
+
+    flipped = await store.update_mission(m.id, priority="high")
+    assert flipped is not None and flipped.priority == "high"
+    again = await store.get_mission(m.id)
+    assert again is not None and again.priority == "high"
+
+
+async def _force_priority(store: StateStore, mission_id: str, value: str) -> None:
+    """Write a priority straight into the row, bypassing the store's write
+    validation (a hand-edited row, or a value stored before the check existed)."""
+    from rework.kernel.state.postgres import PostgresStore
+    from rework.kernel.state.sqlite import SqliteStore
+
+    if isinstance(store, PostgresStore):
+        await store._conn.execute(
+            "UPDATE missions SET priority = %s WHERE id = %s", (value, mission_id)
+        )
+        await store._conn.commit()
+    else:
+        assert isinstance(store, SqliteStore)
+        await store._db.execute(
+            "UPDATE missions SET priority = ? WHERE id = ?", (value, mission_id)
+        )
+        await store._db.commit()
+
+
+async def test_unknown_priority_is_rejected_on_write_and_coerced_on_read(
+    store: StateStore,
+) -> None:
+    """The stores constrain priority: an unknown level is a write error, and an
+    unknown/empty value already in the row decodes as normal (never raises, so
+    listing can't break on a hand-edited row)."""
+    m = await store.create_mission(Mission(id=new_id("m"), objective="plan"))
+    with pytest.raises(ValueError, match="urgent"):
+        await store.create_mission(Mission(id=new_id("m"), objective="bad", priority="urgent"))
+    with pytest.raises(ValueError, match="urgent"):
+        await store.update_mission(m.id, priority="urgent")
+
+    # a rejected write changed nothing
+    unchanged = await store.get_mission(m.id)
+    assert unchanged is not None and unchanged.priority == "normal"
+
+    for raw in ("urgent", "", "HIGH "):
+        await _force_priority(store, m.id, raw)
+        coerced = await store.get_mission(m.id)
+        assert coerced is not None
+        expected = "high" if raw.strip().lower() == "high" else "normal"
+        assert coerced.priority == expected
+        # listing keeps working on such a row
+        assert m.id in [x.id for x in await store.list_missions(limit=10)]
+
+
+async def test_next_pending_missions_orders_high_then_oldest(store: StateStore) -> None:
+    """(a) + (b) pickup order: every high before any normal, oldest first within
+    a level — and an old pending mission is never hidden behind newer ones."""
+    # created newest-first so insertion order cannot mask a wrong ORDER BY
+    newest_normal = await store.create_mission(
+        Mission(id=new_id("m"), objective="newest normal", created_at=400.0)
+    )
+    old_normal = await store.create_mission(
+        Mission(id=new_id("m"), objective="old normal", created_at=100.0)
+    )
+    new_high = await store.create_mission(
+        Mission(id=new_id("m"), objective="new high", priority="high", created_at=300.0)
+    )
+    old_high = await store.create_mission(
+        Mission(id=new_id("m"), objective="old high", priority="high", created_at=200.0)
+    )
+    await store.create_mission(
+        Mission(
+            id=new_id("m"),
+            objective="high but already done",
+            priority="high",
+            status=MissionStatus.DONE,
+            created_at=50.0,
+        )
+    )
+
+    pickup = [m.id for m in await store.next_pending_missions()]
+    assert pickup == [old_high.id, new_high.id, old_normal.id, newest_normal.id]
+
+    # the browse order the TUI uses is untouched: newest first
+    browse = [m.id for m in await store.list_missions(limit=10)]
+    assert browse[0] == newest_normal.id

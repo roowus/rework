@@ -113,6 +113,7 @@ class DashboardView(View):
                 yield Btn("Pause", "pause", variant="ghost")
                 yield Btn("Resume", "resume", variant="ghost")
                 yield Btn("Cancel", "cancel", variant="ghost")
+                yield Btn("Priority", "priority", variant="ghost")
                 yield Btn("Fetch result", "fetch", variant="ghost")
                 yield Btn("Copy id", "copy-id", variant="ghost")
         with ContentSwitcher(initial="dash-overview", id="dash-pages"):
@@ -389,6 +390,9 @@ class DashboardView(View):
             for btn in controls.query(Btn):
                 if btn.action in ("pause", "resume", "cancel", "fetch"):
                     btn.display = actions.can(btn.action, st)
+                elif btn.action == "priority":
+                    level = getattr(mission, "priority", "normal") if mission else "normal"
+                    btn.set_label(f"Priority: {level}")
 
     def on_breadcrumb_navigate(self, event: Breadcrumb.Navigate) -> None:
         event.stop()
@@ -427,6 +431,11 @@ class DashboardView(View):
             return
         if verb == "cancel":
             self._disarm(event.btn)
+        if verb == "priority":
+            mission = self.snap.mission(self.mission_id)
+            current = getattr(mission, "priority", "normal")
+            self.run_worker(actions.prioritize(self.rw, self.mission_id, current), group="control")
+            return
         self.run_worker(actions.control(self.rw, self.mission_id, verb), group="control")
 
     def _disarm(self, btn: Btn) -> None:

@@ -98,8 +98,23 @@ scripts/rework-local            # terminal 2: the TUI
 In the TUI, Work tab: pick project `rework`, pick the orchestrator model, and
 describe the change. The orchestrator proposes; Launch starts it. The local
 daemon clones `github.com/roowus/rework`, runs the roles in
-`~/.rework/work/`, and stops at the final gate (open_pr for fix-pr). Approving
-it pushes the branch and opens the PR with your local `gh` login.
+`~/.rework/work/`, and — after a clean audited `done` — pushes the last coder's
+branch and opens the PR with your local `gh` login. **No gate by default**: the
+audit rail already guarantees the change was reviewed. The orchestrator can ask
+for one (`finish(ask_before_pr=true, reason=...)`) when the change is risky or
+unusual, and a project setting controls it globally:
+
+Only a plan that publishes (`"publish": "pr"` — the `fix-pr` playbook; older
+plans carrying `"gates": ["open_pr"]` count too) pushes a branch or opens a PR
+at all. `echo` and `fix` missions deliver their result and stop.
+
+| project `settings.pr_gate` | effect |
+| --- | --- |
+| `auto` (default) | gate only when the orchestrator asks (or the plan lists `open_pr`) |
+| `always` | always gate before opening the PR |
+| `never` | never gate; an `ask_before_pr` is noted and overridden |
+
+Merging is always the owner's decision; no agent merges.
 
 A sleeping Mac pauses every local mission: nothing fails, it just stops
 until the lid opens (seen 2026-11-09: four stalls that looked like hangs
@@ -392,3 +407,19 @@ when done. The same command is reachable with no mission focused via **Mission
 > Preview a PR...**, which asks for the PR number and a local repo path
 (prefilled from the newest mission of the Work tab's project, if any) and
 refuses non-numeric PRs, missing paths and non-git directories.
+
+## Mission priority (`normal` | `high`)
+
+Every mission carries a pickup priority, `normal` by default. It only affects
+the order the daemon starts pending missions in: high priority first, oldest
+first within a level (`StateStore.next_pending_missions`). The TUI's mission
+list keeps its newest-first browse order.
+
+- `rework new "…" --priority high` creates a high-priority mission.
+- `rework prioritize <mission-id>` sets it to `high` (the default) and
+  `rework prioritize <mission-id> --priority normal` puts it back.
+- The Dashboard's mission controls have a **Priority** button that flips it in
+  one keypress and confirms in the status line.
+
+The default is `normal` for every project — there is no automatic high for
+non-rework projects; the explicit flag and the Dashboard button cover it.
