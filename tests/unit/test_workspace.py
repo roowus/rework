@@ -21,12 +21,16 @@ from rework.kernel.state.store import StateStore
 from rework.orchestrator.workspace import (
     EXCLUDE_DIRS,
     _area_lock,
+    archive_files_area,
     build_workspace_app,
+    ensure_files_area,
     mission_changes,
     pack_directory,
     pack_paths,
     save_mission_files,
+    seed_mission_workspace,
     stage_bundle,
+    update_files_area,
 )
 
 
@@ -417,3 +421,133 @@ def test_concurrent_save_backs_all_land(tmp_path: Path, monkeypatch: pytest.Monk
         assert (area / f"file{n}.md").read_text() == f"# {n}\n"
     status = _git("status", "--porcelain", cwd=area).stdout
     assert status.strip() == "", "everything is committed, nothing left behind"
+
+
+def test_pack_paths_rejects_a_missing_path(tmp_path: Path) -> None:
+    """A typo'd path used to pack to an empty tarball, so the daemon answered
+    200 and `rework project add-files` looked like it had added something."""
+    (tmp_path / "there.md").write_text("# there\n")
+    with pytest.raises(ValueError, match="no such file or folder"):
+        pack_paths([tmp_path / "there.md", tmp_path / "tehre.md"])
+
+
+def test_mission_changes_saves_files_the_coder_gitignore_hides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The coder role writes DEFAULT_GITIGNORE (dist/, build/) into its
+    worktree, so `git status` hid a real deliverable written to dist/out.txt
+    and it was never saved back nor reported."""
+    from rework.roles.builtin.coder import DEFAULT_GITIGNORE
+
+    monkeypatch.setenv("REWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    tree = _seeded_tree(tmp_path)
+    (tree / ".gitignore").write_text(DEFAULT_GITIGNORE)
+    _git("add", "-A", cwd=tree)
+    _commit(tree, "coder handoff")
+    (tree / "dist").mkdir()
+    (tree / "dist" / "out.txt").write_text("the deliverable\n")
+    (tree / "build").mkdir()
+    (tree / "build" / "x.txt").write_text("also\n")
+    (tree / "node_modules").mkdir()
+    (tree / "node_modules" / "junk.js").write_text("junk\n")
+
+    # it WAS a change all along — status just refused to say so
+    assert {"dist/out.txt", "build/x.txt"} <= {rel for rel, _k in mission_changes(tree)}
+
+    changed = save_mission_files("p-ignored", [tree], "mission m: files")
+    assert "dist/out.txt (new)" in changed and "build/x.txt (new)" in changed
+    area = project_files_dir("p-ignored")
+    assert (area / "dist" / "out.txt").read_text() == "the deliverable\n"
+    assert (area / "build" / "x.txt").read_text() == "also\n"
+    # _excluded() still drops the junk the ignore file was hiding alongside it
+    assert not (area / "node_modules").exists()
+    assert not (area / ".gitignore").exists(), "the boilerplate is still skipped"
+
+
+def test_archive_files_area_waits_for_a_mutation_holding_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reads used to be unlocked: a pull could pack a half-written area. The
+    archive now takes `_area_lock` — prove it BLOCKS while a mutation holds
+    it, rather than passing by luck on an idle area."""
+    monkeypatch.setenv("REWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    area = ensure_files_area("p-read-lock")
+    (area / "a.md").write_text("# a\n")
+    update_files_area("p-read-lock", pack_paths([area / "a.md"]), "seed")
+
+    started = threading.Event()
+    finished = threading.Event()
+
+    def _pack() -> bytes:
+        started.set()
+        data = archive_files_area("p-read-lock")
+        finished.set()
+        return data
+
+    with _area_lock("p-read-lock"):
+        worker = threading.Thread(target=_pack)
+        worker.start()
+        assert started.wait(timeout=5), "the packer never started"
+        time.sleep(0.3)
+        assert not finished.is_set(), "the archive read ignored the area lock"
+    worker.join(timeout=10)
+    assert finished.is_set(), "the archive never ran once the lock was free"
+    with tarfile.open(fileobj=io.BytesIO(archive_files_area("p-read-lock")), mode="r:gz") as tar:
+        assert "a.md" in tar.getnames()
+
+
+def test_seed_mission_workspace_waits_for_a_mutation_holding_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Seeding out of a half-written area started a mission from a torn tree;
+    the seed now locks, so it waits for the writer instead of reading through
+    it (and it must not deadlock now that it takes the lock itself)."""
+    monkeypatch.setenv("REWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    area = ensure_files_area("p-seed-lock")
+    (area / "a.md").write_text("# a\n")
+    update_files_area("p-seed-lock", pack_paths([area / "a.md"]), "seed")
+    dest = tmp_path / "seeded"
+    started = threading.Event()
+    finished = threading.Event()
+
+    def _seed() -> Path:
+        started.set()
+        path = seed_mission_workspace("p-seed-lock", dest)
+        finished.set()
+        return path
+
+    with _area_lock("p-seed-lock"):
+        worker = threading.Thread(target=_seed)
+        worker.start()
+        assert started.wait(timeout=5), "the seeder never started"
+        time.sleep(0.3)
+        assert not finished.is_set(), "seeding ignored the area lock"
+    worker.join(timeout=10)
+    assert finished.is_set()
+    assert (dest / "a.md").read_text() == "# a\n"
+    assert (dest / ".git").is_dir(), "the seeded workspace is still a repo"
+
+
+async def test_upload_route_maps_a_lock_timeout_to_503(
+    tmp_path: Path, store: StateStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lock TimeoutError is not a bad body: the 400 "not a readable tar.gz"
+    was a lie and made the client retry a perfectly good tarball."""
+    import rework.orchestrator.workspace as workspace_mod
+
+    monkeypatch.setenv("REWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    project = await _upload_project(store)
+    local = tmp_path / "local"
+    local.mkdir()
+    (local / "a.md").write_text("# a\n")
+    body = pack_paths([local / "a.md"])
+
+    def busy(*_args: object, **_kwargs: object) -> list[str]:
+        raise TimeoutError("project p files area is busy (no lock after 120s)")
+
+    monkeypatch.setattr(workspace_mod, "update_files_area", busy)
+    app = build_workspace_app(store, tmp_path / "workroot")
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(f"/projects/{project.id}/files", data=body)
+        assert resp.status == 503
+        assert "busy" in (await resp.json())["error"]

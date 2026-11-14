@@ -3410,12 +3410,51 @@ async def test_add_files_pushes_parsed_paths_into_an_upload_project(
         await _settle(pilot)
         form = app.screen
         assert isinstance(form, Form)
-        form.query_one("#f-paths").value = "~/notes.md, a.md"
+        form.query_one("#f-paths").text = "~/notes.md\na.md"
         await pilot.click(_btn(app, form, "submit"))
         await _settle(pilot, 1.0)
         assert not app.swallowed
     assert seen == [(ids["upload_project"], [str(tmp_path / "notes.md"), "a.md"])], seen
     assert any("1 path(s) added" in text for _, text in app.notifications_sent)
+
+
+async def test_add_files_accepts_a_path_with_a_space(
+    ids: dict[str, str], env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The form split its whole input on spaces, so `My Papers` could not be
+    entered at all: one path per line must survive the spaces."""
+    from rework.tui.data import TuiData
+    from rework.tui.widgets.modals import Form
+
+    seen: list[tuple[str, list[str]]] = []
+    spaced = tmp_path / "My Papers"
+    spaced.mkdir()
+    (spaced / "notes.md").write_text("# n\n")
+
+    async def fake(self: Any, project_id: str, paths: list[str]) -> list[str]:
+        seen.append((project_id, paths))
+        return ["notes.md (new)"]
+
+    monkeypatch.setattr(TuiData, "add_project_files", fake)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.action_tab("dashboard")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        dash.project = ids["upload_project"]
+        await pilot.click(_btn(app, dash, "add-files"))
+        await _settle(pilot)
+        form = app.screen
+        assert isinstance(form, Form)
+        label = str(form.query(".form-label").first().render())
+        assert "one path per line" in label, label
+        form.query_one("#f-paths").text = f"{spaced}\nnotes.md"
+        await pilot.click(_btn(app, form, "submit"))
+        await _settle(pilot, 1.0)
+        assert not app.swallowed
+    assert seen == [(ids["upload_project"], [str(spaced), "notes.md"])], seen
 
 
 async def test_add_files_refuses_a_git_project(

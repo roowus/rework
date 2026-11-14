@@ -151,6 +151,12 @@ the continuous bidirectional sync this ADR rejected under Alternatives:
   into the files area, committed there, and named in the mission report
   (`Project files updated: a.md (new), b.md (changed)`); deletions are not
   carried back — the save-back is additive by design;
+- **save-back is conditioned on DONE, and its failure is visible**: a
+  cancelled or ship-rejected mission leaves the area untouched, and a failed
+  save-back still ends the mission DONE but reports `Project files NOT
+  updated: <reason>`; two missions of one project must not run concurrently
+  against the same area — the per-operation lock serialises them, so the later
+  mission simply seeds from whatever state the earlier one has reached;
 - **`rework project add-files NAME PATHS...`** puts files from any machine
   into the area (TUI: the sidebar's "Add files" button or File → "Add project
   files…");

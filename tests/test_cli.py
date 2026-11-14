@@ -127,6 +127,32 @@ def test_project_create_rejects_git_transport_without_a_repo(rework_db: Path) ->
     assert "needs at least one --repo" in result.output
 
 
+def test_project_add_files_rejects_a_missing_path(
+    rework_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A typo'd path used to pack to an EMPTY tarball and come back 200, so a
+    wrong path looked like success. It now fails before any network call."""
+    created = runner.invoke(app, ["project", "create", "ADDF"])
+    assert created.exit_code == 0, created.output
+    project_id = created.output.strip()
+
+    def no_network(*_a: object, **_k: object) -> None:  # pragma: no cover
+        raise AssertionError("a missing path must fail before any HTTP call")
+
+    import rework.project_files as project_files
+
+    monkeypatch.setattr(project_files, "_check", no_network)
+    present = tmp_path / "there.md"
+    present.write_text("# there\n")
+
+    result = runner.invoke(
+        app, ["project", "add-files", project_id, str(present), str(tmp_path / "tehre.md")]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "no such file or folder" in result.output
+
+
 def test_help_exits_zero() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0

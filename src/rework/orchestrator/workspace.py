@@ -81,11 +81,21 @@ def pack_directory(src: Path) -> bytes:
 def pack_paths(paths: list[Path]) -> bytes:
     """Pack an explicit list of local files/folders into one tar.gz. Each path
     lands under its own name, so `add-files NAME notes.md docs/` merges both
-    into the project area and a pull gives back what was pushed. Sync."""
+    into the project area and a pull gives back what was pushed. Sync.
+
+    Every path must exist: a typo'd path used to pack to an EMPTY tarball, so
+    the daemon answered 200 and `add-files` looked like it had worked while
+    nothing was added. `ValueError` is what the CLI turns into a red message
+    and exit 1."""
+    roots: list[Path] = []
+    for src in paths:
+        root = src.expanduser().resolve()
+        if not root.exists():
+            raise ValueError(f"{src}: no such file or folder")
+        roots.append(root)
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        for src in paths:
-            root = src.expanduser().resolve()
+        for root in roots:
             if root.is_file():
                 tar.add(root, arcname=root.name, filter=_tar_filter)
                 continue
@@ -191,25 +201,42 @@ def stage_bundle(workroot: Path, data: bytes, name: str | None = None) -> Path:
     return dest
 
 
-def seed_mission_workspace(src: Path, dest: Path) -> Path:
+def seed_mission_workspace(project_id: str, dest: Path) -> Path:
     """Upload transport: a repo-less project's files area IS the mission's
     workspace, so copy it into the workroot and git-init the copy exactly as
     stage_bundle does. Roles, worktrees and read_root then need no special
     case. An empty (or missing) files area still yields a git-initialised
     workspace, so the mission starts with nothing but can still write.
-    Idempotent across restarts: an existing seeded workspace is reused."""
+    Idempotent across restarts: an existing seeded workspace is reused.
+
+    This is a READ of the area, so it takes `_area_lock`: seeding out of a
+    half-written area (an `add-files` POST landing at the same moment) would
+    start the mission from a torn tree. The lock is taken ONCE per path —
+    `ensure_files_area` never locks, so there is nothing to re-enter."""
     if (dest / ".git").is_dir():
-        return dest
-    dest.mkdir(parents=True, exist_ok=True)
-    if src.is_dir():
+        return dest  # already seeded by an earlier attempt: nothing to read
+    with _area_lock(project_id):
+        area = ensure_files_area(project_id)
+        dest.mkdir(parents=True, exist_ok=True)
         shutil.copytree(
-            src,
+            area,
             dest,
             dirs_exist_ok=True,
             ignore=shutil.ignore_patterns(*EXCLUDE_DIRS, *EXCLUDE_SUFFIXES),
         )
     git_init_commit(dest, "init")
     return dest
+
+
+def archive_files_area(project_id: str) -> bytes:
+    """The project's files area as a tar.gz (what `rework project pull` gets).
+
+    A READ, so it takes `_area_lock` the same way every mutation does: packing
+    while a save-back or an `add-files` POST is writing would ship a torn area
+    (and `pack_directory` walks the tree, so it can trip over a file that
+    vanished mid-walk)."""
+    with _area_lock(project_id):
+        return pack_directory(ensure_files_area(project_id))
 
 
 def ensure_files_area(project_id: str) -> Path:
@@ -255,6 +282,23 @@ def _status_changes(dest: Path) -> list[tuple[str, str]]:
     return out
 
 
+def _untracked_new(dest: Path) -> list[tuple[str, str]]:
+    """[(path, "new")] for the tree's untracked files, IGNORING its .gitignore.
+
+    The coder role writes DEFAULT_GITIGNORE (dist/, build/) into every
+    worktree, and `git status` then hides a real deliverable written to
+    `dist/out.txt`: it used to be silently dropped from the files area AND the
+    report. Listing without `--exclude-standard` surfaces it; `_excluded()`
+    still drops the genuine junk (.git, node_modules, __pycache__, …) at any
+    depth, so a worktree-local ignore file cannot smuggle junk back in."""
+    out: list[tuple[str, str]] = []
+    for rel in _z_fields(_git_out(dest, "ls-files", "--others", "-z")):
+        if not rel or _excluded(Path(rel)):
+            continue
+        out.append((rel, "new"))
+    return out
+
+
 def update_files_area(project_id: str, data: bytes, message: str) -> list[str]:
     """Unpack a bundle over the project's files area and commit it. Returns the
     touched paths as "a.md (new)" / "b.md (changed)". Sync; to_thread wraps."""
@@ -296,7 +340,10 @@ def mission_changes(tree: Path) -> list[tuple[str, str]]:
         if code[:1] == "D" or not rel or _excluded(Path(rel)):
             continue
         changes[rel] = "new" if code[:1] == "A" else "changed"
-    for rel, kind in _status_changes(tree):  # untracked files never show in a diff
+    # untracked files never show in a diff — and they must be listed WITHOUT
+    # the tree's own .gitignore, or the coder's boilerplate dist//build/ entry
+    # makes a real deliverable invisible (see _untracked_new)
+    for rel, kind in _untracked_new(tree):
         changes.setdefault(rel, kind)
     return sorted(changes.items())
 
@@ -305,10 +352,12 @@ def save_mission_files(project_id: str, trees: list[Path], message: str) -> list
     """Upload transport: copy what a finished mission produced into the
     project's files area and commit it there with a message naming the source.
 
-    `trees` are the mission's own checkouts in priority order (the seeded
-    workspace first, then role worktrees, so a coder's branch wins). Returns
-    the report lines, e.g. ["a.md (new)", "b.md (changed)"]. Sync; to_thread
-    wraps."""
+    `trees` are the mission's own checkouts OLDEST FIRST — the seeded
+    workspace, then each role worktree in run order — because for each path
+    the LAST copy wins. Passing them newest-first (reversed) once let an
+    earlier coder's stale revision overwrite the audit-revised FINAL one.
+    Returns the report lines, e.g. ["a.md (new)", "b.md (changed)"]. Sync;
+    to_thread wraps."""
     with _area_lock(project_id):
         area = ensure_files_area(project_id)
         kinds: dict[str, str] = {}
@@ -498,6 +547,13 @@ def build_workspace_app(store: StateStore, workroot: Path) -> web.Application:
         message = f"{source}: files added to project {project_id}"
         try:
             changed = await asyncio.to_thread(update_files_area, project_id, data, message)
+        except TimeoutError as exc:
+            # the area is locked by a mission's save-back or another upload:
+            # 400 "not a readable tar.gz" was a lie, and the client retried a
+            # body that was perfectly fine
+            return web.json_response(
+                {"error": f"project {project_id} files area is busy: {exc}"}, status=503
+            )
         except (tarfile.TarError, EOFError, OSError) as exc:
             return web.json_response({"error": f"body is not a readable tar.gz: {exc}"}, status=400)
         return web.json_response({"project_id": project_id, "changed": changed})
@@ -512,8 +568,15 @@ def build_workspace_app(store: StateStore, workroot: Path) -> web.Application:
             return web.json_response({"error": "bad project id"}, status=400)
         if await store.get_project(project_id) is None:
             return web.json_response({"error": f"unknown project {project_id}"}, status=404)
-        area = await asyncio.to_thread(ensure_files_area, project_id)
-        data = await asyncio.to_thread(pack_directory, area)
+        # the archive is a read of the area, so it locks like every mutation:
+        # packing a half-written area (a concurrent save-back) shipped a torn
+        # tree to `rework project pull`
+        try:
+            data = await asyncio.to_thread(archive_files_area, project_id)
+        except TimeoutError as exc:
+            return web.json_response(
+                {"error": f"project {project_id} files area is busy: {exc}"}, status=503
+            )
         return web.Response(
             body=data,
             content_type="application/gzip",

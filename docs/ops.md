@@ -167,6 +167,17 @@ mission report then ends with a line naming them, e.g. `Project files
 updated: a.md (new), b.md (changed)`. Deletions are not carried back: the
 save-back adds and updates only.
 
+Files are saved back **only when the mission ends DONE**: a cancelled or
+ship-rejected mission leaves the area untouched (its worktree is half-finished,
+not a deliverable). If the save-back itself fails, the mission still ends DONE
+but its report says `Project files NOT updated: <reason>` — never a silent
+success.
+
+Do **not** run two missions of the same project against the same files at the
+same time. The area is locked per operation, so they serialise rather than
+corrupt each other, but the later mission seeds from the state the earlier one
+has left so far, i.e. it starts from a mix of the two.
+
 Get results back on whichever machine you work from:
 
 ```bash

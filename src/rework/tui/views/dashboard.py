@@ -80,6 +80,36 @@ MTABS = [
 ]
 
 
+def parse_paths(raw: str) -> list[str]:
+    """The Add-files form's value -> paths ready to hand to `add-files`.
+
+    ONE PATH PER LINE is the primary form, so a path containing spaces
+    (`/Users/me/My Papers`) can finally be entered at all; a line that is a
+    shell-ish list is split like a shell (`shlex`), and the historical
+    comma/space-separated single line still works. `~` is expanded.
+
+    Splitting the whole input on spaces was the bug: a path with a space in it
+    was unenterable. A line that DOES exist on disk is never split, so the two
+    readings cannot disagree about a real path."""
+    import shlex
+
+    paths: list[str] = []
+    for line in raw.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        if Path(text).expanduser().exists():
+            paths.append(str(Path(text).expanduser()))
+            continue  # the line IS one real path, spaces and all
+        try:
+            parts = shlex.split(text)
+        except ValueError:  # unbalanced quote: take the line literally
+            parts = [text]
+        for part in parts:
+            paths.extend(str(Path(p).expanduser()) for p in part.replace(",", " ").split())
+    return [p for p in paths if p.strip()]
+
+
 class DashboardView(View):
     TAB = "dashboard"
     LABEL = "Dashboard"
@@ -456,8 +486,7 @@ class DashboardView(View):
         def done(values: dict[str, str] | None) -> None:
             if values is None:
                 return
-            raw = values.get("paths", "").replace(",", " ")
-            paths = [str(Path(part).expanduser()) for part in raw.split() if part.strip()]
+            paths = parse_paths(values.get("paths", ""))
             if not paths:
                 self.toast("No paths given", severity="warning")
                 return
@@ -469,8 +498,9 @@ class DashboardView(View):
                 [
                     Field(
                         "paths",
-                        "Local files/folders on this machine (space- or comma-separated)",
-                        placeholder="/path/to/file.md or ~/notes",
+                        "Local files/folders on this machine: one path per line"
+                        " (~ is expanded; commas and spaces also separate paths)",
+                        kind="area",
                     )
                 ],
                 submit="Add",

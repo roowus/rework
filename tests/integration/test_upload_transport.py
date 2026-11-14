@@ -10,6 +10,7 @@ the seeding, the worktree, the handoff commit and the save-back all run.
 from __future__ import annotations
 
 import asyncio
+import shutil
 import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -88,6 +89,7 @@ async def upload_world(
             "provider": provider,
             "ck": str(tmp_path / "ck.sqlite3"),
             "workroot": tmp_path / "work",
+            "tmp": tmp_path,
         }
     finally:
         await store.aclose()
@@ -258,3 +260,93 @@ async def test_mission_that_writes_nothing_saves_nothing(upload_world: dict[str,
     assert not (area / ".gitignore").exists()
     assert commits() == before, "a no-write mission must not commit into the area"
     assert not (area / "dist").exists()
+
+
+async def test_audit_revision_saves_the_final_coder_state(
+    upload_world: dict[str, Any],
+) -> None:
+    """A revision must END with the revised content: `_save_project_files`
+    built its tree list newest-first, and `shutil.copy2` makes the LAST copy of
+    a path win, so the EARLIEST coder's stale draft overwrote the audit-revised
+    FINAL one while the mission still reported DONE."""
+    from rework.kernel.state.records import Run, RunStatus, run_id
+
+    store: SqliteStore = upload_world["store"]
+    area: Path = upload_world["area"]
+    tmp: Path = upload_world["tmp"]
+    mission = upload_world["mission"]
+
+    # the seeded workspace the mission started from (the mission's repo_path)
+    repo = tmp / "seeded"
+    shutil.copytree(area, repo)
+    assert (repo / "a.md").is_file()
+    await store.update_mission(mission.id, repo_path=str(repo))
+
+    def coder_tree(name: str, body: str) -> Path:
+        tree = tmp / name
+        tree.mkdir()
+        (tree / "a.md").write_text("# a\n\nseeded\n")  # the seeded snapshot
+        git_init_commit(tree, "init")
+        (tree / "report.md").write_text(body)
+        subprocess.run(["git", "add", "-A"], cwd=tree, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-c", "user.name=r", "-c", "user.email=r@r", "commit", "-m", name],
+            cwd=tree,
+            check=True,
+            capture_output=True,
+        )
+        return tree
+
+    stale = coder_tree("coder1", "v1 stale\n")  # written, then an audit revision
+    final = coder_tree("coder2", "v2 FINAL\n")
+    # created_at-ordered, exactly as `list_runs` returns them
+    runs = [
+        await store.create_run(
+            Run(
+                id=run_id(mission.id, "code", "coder", attempt),
+                mission_id=mission.id,
+                role="coder",
+                step="code",
+                attempt=attempt,
+                status=RunStatus.COMPLETED,
+                artifact={"worktree": str(tree)},
+            )
+        )
+        for attempt, tree in enumerate((stale, final), start=1)
+    ]
+
+    note, error = await _runner_for(upload_world)._save_project_files(mission.id, runs)
+
+    assert error == ""
+    assert "report.md (new)" in note
+    assert (area / "report.md").read_text() == "v2 FINAL\n", "the FINAL revision must win"
+
+
+async def test_failed_save_back_is_reported_not_swallowed(
+    upload_world: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A save-back that raises must not read as success: the mission stays DONE
+    (bookkeeping may not fail finished work) but the summary carries the
+    NOT-updated line and never the success line."""
+    import rework.orchestrator.workspace as workspace_mod
+
+    store: SqliteStore = upload_world["store"]
+    provider: ScriptedProvider = upload_world["provider"]
+    area: Path = upload_world["area"]
+    provider.route("Fulfill the task", _coder_writes_and_edits())
+
+    def boom(*_args: Any, **_kwargs: Any) -> list[str]:
+        raise OSError("disk on fire")
+
+    monkeypatch.setattr(workspace_mod, "save_mission_files", boom)
+
+    await asyncio.wait_for(_runner_for(upload_world).run(), timeout=60)
+
+    mission = await store.get_mission(upload_world["mission"].id)
+    assert mission is not None and mission.status == MissionStatus.DONE
+    assert not (area / "b.md").exists(), "nothing was written"
+    assert mission.result["project_files_error"] == "disk on fire"
+    assert "project_files" not in mission.result
+    summary = mission.result["summary"]
+    assert "Project files NOT updated: disk on fire" in summary
+    assert "Project files updated:" not in summary
