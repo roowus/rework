@@ -574,7 +574,7 @@ class MissionRunner:
                     payload={"error": f"project files not updated: {reason}"},
                 )
             )
-            return "", ""
+            return "", reason
         if not changed:
             return "", ""
         await self._bus.publish(
