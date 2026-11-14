@@ -17,6 +17,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from textual.css.query import NoMatches
+
 from rework.tui.data import TuiData
 
 log = logging.getLogger("rework.tui")
@@ -68,6 +70,14 @@ class Hub:
         self._failures = 0
         self._next_try = 0.0
         self._on_offline: Callable[[str], None] | None = None
+        # teardown flag, set BEFORE the first await in aclose(): a poll worker
+        # suspended in a data await resumes after on_unmount started, when the
+        # store is closed and the app's widgets are gone. Then a query failing
+        # on the closed store is not an outage and a listener that cannot find
+        # its widget is not a bug -- it is teardown (found live: the app logged
+        # a fake "offline" plus a NoMatches traceback 0.6-1s into teardown,
+        # which the toast tests read as a second record for one error).
+        self._closing = False
 
     def subscribe(self, fn: Callable[[Snapshot], None]) -> None:
         self._listeners.append(fn)
@@ -79,7 +89,7 @@ class Hub:
     async def refresh(self) -> Snapshot:
         """One poll. Single-flight: an overlapping call returns the current
         snapshot instead of stacking queries on a slow link."""
-        if self._busy or time.monotonic() < self._next_try:
+        if self._closing or self._busy or time.monotonic() < self._next_try:
             return self.snapshot
         self._busy = True
         try:
@@ -105,12 +115,16 @@ class Hub:
                 self._failures = 0
                 self._next_try = 0.0
             except Exception as exc:  # stale data with an offline marker
+                if self._closing:  # the store went away under us: not an outage
+                    return self.snapshot
                 self._failures += 1
                 if self._failures == 1:  # log the transition, not every poll
                     log.warning("offline: %s", exc)
                 self._next_try = time.monotonic() + min(30.0, 2.0**self._failures)
                 snap.online = False
                 snap.error = f"{type(exc).__name__}: {exc}"[:200]
+            if self._closing:  # the awaits above took us into teardown
+                return self.snapshot
             snap.at = time.time()
             self.snapshot = snap
             self._broadcast()
@@ -137,6 +151,11 @@ class Hub:
         for fn in list(self._listeners):
             try:
                 fn(self.snapshot)
+            except NoMatches:  # teardown removed the widget the listener paints
+                if self._closing:
+                    log.debug("hub listener skipped: teardown", exc_info=True)
+                else:  # a live NoMatches is a real bug (wrong selector)
+                    log.exception("hub listener failed")
             except Exception:  # a broken view must not starve the others
                 log.exception("hub listener failed")
 
@@ -145,6 +164,8 @@ class Hub:
         try:
             return await call()
         except Exception as exc:
+            if self._closing:  # the store went away under us: not an outage
+                return default
             if self.snapshot.online:
                 log.warning("query failed: %s", exc)
                 self.snapshot.online = False
@@ -153,6 +174,7 @@ class Hub:
             return default
 
     async def aclose(self) -> None:
+        self._closing = True  # BEFORE the first await: see __init__
         try:
             await self.data.aclose()
         except Exception:
