@@ -145,7 +145,7 @@ async def test_a_no_matches_listener_is_excused_only_while_closing(caplog) -> No
     hub._broadcast()
     assert _records(caplog, logging.ERROR) == []
     assert [r.getMessage() for r in _records(caplog, logging.DEBUG)] == [
-        "listener queried a torn-down DOM during shutdown"
+        "hub listener stopped on a closed DOM"
     ], "the torn-down query is still noted, at debug"
 
 

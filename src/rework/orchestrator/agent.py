@@ -149,8 +149,8 @@ How you work:
 - Provider errors (timeouts, 5xx, rate limits) are NOT an escalation reason: they
   mean the endpoint is struggling, not that the model is too weak. Retry, or
   respawn that role on a model from a DIFFERENT provider at the same level
-  (another model on the same provider hits the same endpoint); never escalate
-  just to retry. Do not pick a stronger tier for any other reason.
+  (another model on the same provider hits the same endpoint); never move to
+  a pricier tier just to retry. Do not pick a stronger tier for any other reason.
 - Write every brief so the role can act without asking: what to do, why, what
   done looks like, and anything earlier roles found that it needs.
 - Scope briefs to the objective. Pass findings along as context, but do not turn
