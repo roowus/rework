@@ -1,7 +1,8 @@
 """The shell notices that the code on disk changed (finding 28: the owner's TUI
 ran code older than its checkout, so a crash traceback pointed at the wrong
 lines). It must SAY SO in the status bar and in tui.log, exactly once, and it
-must never restart anything."""
+must not drop what the owner is doing: it ARMS a reload that only happens once
+they are idle (finding 15; the exec itself lives in tests/tui/test_reload.py)."""
 
 from __future__ import annotations
 
@@ -14,7 +15,7 @@ import pytest
 from textual.widgets import Static
 
 from rework import logs, runtime
-from rework.runtime import CODE_CHANGED
+from rework.runtime import CODE_CHANGED_IDLE
 from rework.tui.app import ReworkApp
 
 SIZE = (140, 42)
@@ -70,13 +71,16 @@ async def test_a_code_change_shows_a_persistent_note_and_logs_once(
         values[0] = "b"
         app._check_code()
         await pilot.pause()
-        assert CODE_CHANGED in _note(app), _note(app)
+        assert CODE_CHANGED_IDLE in _note(app), _note(app)
+        assert app.reload_pending, "new code on disk arms a reload"
+        assert not app.reloaded, "but never while the owner is right here"
 
         # the note is PERSISTENT and the log line is written once, not per tick
         app._check_code()
         await pilot.pause()
-        assert CODE_CHANGED in _note(app), _note(app)
-        hits = [r for r in _records(tui_log) if r.get("msg") == CODE_CHANGED]
+        assert CODE_CHANGED_IDLE in _note(app), _note(app)
+        assert not app.reloaded
+        hits = [r for r in _records(tui_log) if r.get("msg") == CODE_CHANGED_IDLE]
         assert len(hits) == 1, hits
         assert hits[0]["level"] == "warning", hits[0]
         assert hits[0]["component"] == "tui", hits[0]
@@ -92,7 +96,8 @@ async def test_an_unchanged_checkout_says_nothing(
         app._check_code()
         await pilot.pause()
         assert _note(app) == ""
-        assert not [r for r in _records(tui_log) if r.get("msg") == CODE_CHANGED]
+        assert not [r for r in _records(tui_log) if r.get("msg") == CODE_CHANGED_IDLE]
+        assert not app.reload_pending
 
 
 async def test_the_shell_checks_its_own_interval_not_the_heartbeat(
