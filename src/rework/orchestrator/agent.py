@@ -91,8 +91,9 @@ PLAYBOOKS: dict[str, str] = {
         "medium-or-higher findings you are not willing to ship (ask_owner after three "
         "rounds). Pick each audit's `strictness` from risk (size, blast radius, prior "
         "findings) and re-decide it every round from the latest report, never once for "
-        "the whole mission. After you finish, the ENGINE pushes the last coder's branch "
-        "and opens the pull request when the owner approves the gate; agents never merge."
+        "the whole mission. After a clean audited done, the ENGINE pushes the last coder's "
+        "branch and opens the pull request itself, with no gate; pass ask_before_pr=true "
+        "with a reason to put the owner in front of it first. Agents never merge."
     ),
 }
 
@@ -107,8 +108,10 @@ How you work:
   conservative: parallelism costs money and most missions are sequential.
 - Pick each role's model from the catalog: cheap tiers for exploration and
   straightforward coding, stronger tiers for audits and hard problems. If a role
-  failed on provider errors (timeouts, 5xx, rate limits), the model's endpoint is
-  struggling: respawn it on a different model rather than the same one.
+  failed on provider errors (timeouts, 5xx, rate limits), its endpoint is
+  struggling: respawn it on a model from a DIFFERENT provider, because another
+  model on the same provider hits the same endpoint. Do not pick a pricier tier
+  just to retry: keep the same tier/price or cheaper, and say why in the note.
 - Write every brief so the role can act without asking: what to do, why, what
   done looks like, and anything earlier roles found that it needs.
 - Scope briefs to the objective. Pass findings along as context, but do not turn
@@ -128,10 +131,14 @@ How you work:
   a needed revision or audit to save budget. The budget gate asks the owner before
   the cap is passed.
 - Call `finish` when the mission's goal is met, or when it cannot be met (say why).
-  Final gates (ship / open a PR) happen after you finish; you do not open them.
-  The engine pushes the last coder's branch and opens the PR itself on approval:
-  never spawn a role to push, commit, or open PRs (each coder run also creates a
-  new branch, so a "push" coder only adds noise).
+  You never open PRs and never merge. After a clean audited `done` the engine
+  pushes the last coder's branch and opens the PR itself, with no gate. Pass
+  `ask_before_pr=true` plus a short `reason` when the change is risky, unusual,
+  or you are unsure the owner wants it shipped unreviewed: that puts a human
+  decision in front of the PR. A project setting can force that gate always or
+  never. Merging is always the owner's decision. Never spawn a role to push,
+  commit, or open PRs (each coder run also creates a new branch, so a "push"
+  coder only adds noise).
 - Respond with tool calls. Text without a tool call wastes a turn."""
 
 TOOLS: list[ToolSpec] = [
@@ -320,6 +327,16 @@ TOOLS: list[ToolSpec] = [
                     "description": "What happened, for the owner: what changed, why, and what "
                     "the audit found. This leads the PR body, so write it for a reviewer.",
                 },
+                "ask_before_pr": {
+                    "type": "boolean",
+                    "description": "Ask the owner to review before the PR opens. Default false: "
+                    "after a clean audited `done` the engine opens the PR itself.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why the owner should look before the PR opens (risky, "
+                    "unusual, unsure it should ship). Ignored unless ask_before_pr is true.",
+                },
                 "accepted_findings": {
                     "type": "array",
                     "description": "Judgment, not a bypass: for every open medium-or-higher "
@@ -379,6 +396,26 @@ def _short(value: Any, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+# where an entry's calls go when it leaves base_url unset (the adapters'
+# defaults; see kernel/llm/adapters)
+_DEFAULT_ENDPOINTS = {
+    "anthropic": "https://api.anthropic.com",
+    "openai": "https://api.openai.com/v1",
+}
+
+
+def endpoint_of(entry: Any) -> str:
+    """The URL this catalog entry's calls actually reach: its base_url, or the
+    adapter's default. Found live (m-b928ea6d51bc): after an Anthropic timeout
+    the orchestrator promised a retry "on a different model" and picked
+    claude-opus-4-5 -- the same api.anthropic.com endpoint that had just failed,
+    and the priciest tier -- because the catalog it was shown named model ids
+    only. Provider + endpoint is what makes "different endpoint" checkable."""
+    if entry.base_url:
+        return str(entry.base_url)
+    return _DEFAULT_ENDPOINTS.get(str(entry.provider), "provider default")
+
+
 def artifact_summary(artifact: dict[str, Any] | None) -> str:
     """One line a model can scan: summary, verdict, counts."""
     if not artifact:
@@ -434,6 +471,10 @@ class MissionOrchestrator:
         # one mechanical rail that blocks finish(done) requires them (see
         # _enforce_findings_accepted), and they lead the mission report/PR body
         self.accepted_findings: list[dict[str, str]] = []
+        # the orchestrator's optional request for a human look before the PR
+        # opens (engine opens the PR directly after a clean audited `done`)
+        self.ask_before_pr = False
+        self.pr_reason = ""
         self._providers: dict[str, Any] = {}
 
     def _usable(self) -> list[Any]:
@@ -549,7 +590,11 @@ class MissionOrchestrator:
                 _pre["accepted_findings"] = self.accepted_findings
             await self.r._store.update_mission(self.mid, result=_pre)
             ship, pr_url = await self.r._final_gates(
-                self.mission, results, audit.artifact if audit else None
+                self.mission,
+                results,
+                audit.artifact if audit else None,
+                ask_before_pr=self.ask_before_pr,
+                reason=self.pr_reason,
             )
         self.r._pr_url = pr_url
         await self.r._synthesize(
@@ -810,6 +855,8 @@ class MissionOrchestrator:
                 if call.get("name") == "finish" and answered.get(call.get("id")) == "finished":
                     args = call.get("arguments") or {}
                     self.accepted_findings = _accepted_findings(args.get("accepted_findings"))
+                    self.ask_before_pr = bool(args.get("ask_before_pr"))
+                    self.pr_reason = str(args.get("reason") or "")
                     return (str(args.get("outcome") or "done"), str(args.get("summary") or ""))
         return None
 
@@ -876,6 +923,8 @@ class MissionOrchestrator:
                 await self._enforce_findings_accepted(accepted)
             self.finished = (outcome, str(args.get("summary") or ""))
             self.accepted_findings = accepted
+            self.ask_before_pr = bool(args.get("ask_before_pr"))
+            self.pr_reason = str(args.get("reason") or "")
             await self._note(f"finished ({outcome}): {self.finished[1]}"[:400], to_owner=True)
             return "finished"
         raise ToolError(f"unknown tool {name!r}")
@@ -1493,7 +1542,8 @@ class MissionOrchestrator:
                 f"Default model: {spec.default_model}. INPUTS: {', '.join(inputs) or 'brief'}"
             )
         catalog = [
-            f"- {e.id}: tier {e.tier}, ${e.cost_in_per_mtok}/${e.cost_out_per_mtok} per Mtok"
+            f"- {e.id}: {e.provider} ({endpoint_of(e)}), tier {e.tier}, "
+            f"${e.cost_in_per_mtok}/${e.cost_out_per_mtok} per Mtok"
             + (f", {', '.join(sorted(e.capabilities))}" if e.capabilities else "")
             for e in self._usable()
         ]
@@ -1511,7 +1561,8 @@ class MissionOrchestrator:
                 "Automatic wiring: a coder receives the latest investigator handoff; an "
                 "auditor receives the latest coder's diff and worktree plus the latest "
                 "investigation. Put revision feedback in the brief.",
-                "CATALOG:\n" + "\n".join(catalog),
+                "CATALOG (provider and endpoint per model; two models on the same "
+                "endpoint share its health):\n" + "\n".join(catalog),
                 "MISSION:\n"
                 f"- id: {mission.id}\n- objective: {mission.objective}\n- repo: {repo}\n"
                 f"- final gates after you finish: {', '.join(gates) or 'none'}\n"

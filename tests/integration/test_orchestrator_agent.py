@@ -720,6 +720,55 @@ async def test_spawn_refuses_a_model_whose_provider_keeps_failing(world: dict[st
     assert not [r for r in await store.list_runs("mo") if r.step == "look"]
 
 
+async def test_the_catalog_shows_each_model_s_provider_and_endpoint(
+    world: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Found live (m-b928ea6d51bc): after an Anthropic timeout the orchestrator
+    promised a retry "on a different model" and picked claude-opus-4-5 -- the
+    same api.anthropic.com that had just failed, and the priciest tier. The
+    rendered catalog named model ids only, so it could not tell. It now shows
+    the provider and the endpoint each entry's calls reach."""
+    from rework.kernel.llm.catalog import ModelCatalog, ModelEntry
+    from rework.orchestrator.agent import MissionOrchestrator
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
+    monkeypatch.setenv("ZAI_API_KEY", "k")
+    world["catalog"] = ModelCatalog(
+        [
+            ModelEntry(id="haiku", provider="anthropic", model="claude-haiku-4-5", tier=1),
+            ModelEntry(id="opus", provider="anthropic", model="claude-opus-4-5", tier=3),
+            ModelEntry(
+                id="glm",
+                provider="openai-compatible",
+                model="glm-4.6",
+                tier=2,
+                base_url="https://api.z.ai/api/v4",
+                api_key_env="ZAI_API_KEY",
+            ),
+        ]
+    )
+    prompt = await MissionOrchestrator(runner(world), world["mission"])._system_prompt()
+    catalog = prompt.split("CATALOG")[1].split("MISSION:")[0]
+    # both Anthropic models name the SAME endpoint: that is the point
+    assert "haiku: anthropic (https://api.anthropic.com)" in catalog
+    assert "opus: anthropic (https://api.anthropic.com)" in catalog
+    assert "glm: openai-compatible (https://api.z.ai/api/v4)" in catalog
+    assert "tier 3" in catalog and "per Mtok" in catalog, "the rest of the line is intact"
+
+
+async def test_the_rules_say_to_retry_on_another_provider_and_not_a_pricier_tier(
+    world: dict[str, Any],
+) -> None:
+    """The other half of the same finding: "respawn on a different model" was
+    satisfied by another model on the failing endpoint, at a higher price."""
+    from rework.orchestrator.agent import MissionOrchestrator
+
+    prompt = await MissionOrchestrator(runner(world), world["mission"])._system_prompt()
+    rules = prompt.split("ROLES:")[0].lower()
+    assert "different provider" in rules
+    assert "pricier" in rules and "tier" in rules, "do not escalate the tier to retry"
+
+
 async def test_long_missions_still_see_their_newest_events(world: dict[str, Any]) -> None:
     """Found live on a 9000-event mission: events_since(0, limit=N) returns the
     OLDEST N events, so an owner message and a role's latest steps were

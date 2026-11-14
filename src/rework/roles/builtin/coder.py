@@ -84,7 +84,7 @@ class CoderSpec(RoleSpec):
         repo = Path(repo_str)
         branch = "rework/" + ctx.run.id.replace(":", "-")
         worktree_path = ctx.workdir / "worktree"
-        executor = LazyExecutor()
+        executor = LazyExecutor(mission_id=ctx.mission.id)
         catalog_id = str(ctx.run.model_ref.get("id") or self.default_model)
 
         system_prompt = (
