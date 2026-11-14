@@ -912,18 +912,12 @@ class MissionRunner:
             gate = await self._store.get_gate(gate_id)
             if gate is not None and gate.status != GateStatus.OPEN:
                 if gate.status == GateStatus.SENT_BACK:
-                    # Return the mission to running and deliver the feedback
-                    if gate.decision and isinstance(gate.decision, dict):
-                        feedback = gate.decision.get("text", "")
-                    else:
-                        feedback = str(gate.decision or "Mission sent back for revision")
-                    
-                    # Deliver the feedback as an owner message
+                    feedback = str(gate.decision_note or "Mission sent back for revision")
                     if feedback:
-                        await send_owner_message(self.mission_id, feedback)
+                        await send_owner_message(mission_id, feedback, store=self._store)
                     
                     # Return mission to running so it reaches _final_gates again
-                    await self._store.update_mission(self.mission_id, status=MissionStatus.RUNNING)
+                    await self._store.update_mission(mission_id, status=MissionStatus.RUNNING)
                     return None
                 return gate.status == GateStatus.APPROVED
             await asyncio.sleep(self._poll)

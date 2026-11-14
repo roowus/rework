@@ -320,7 +320,7 @@ async def test_send_back_at_gate_returns_mission_to_running(world: dict) -> None
     first_gate_id = first_gate.id
 
     # Send the gate back with feedback
-    decided = await gates.decide(first_gate_id, send_back=True, note="needs revision")
+    decided = await gates.decide(first_gate_id, approved=False, send_back=True, note="needs revision")
     assert decided is not None and decided.status == GateStatus.SENT_BACK
 
     # The mission should return to RUNNING (not DONE)
