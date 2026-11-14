@@ -276,6 +276,10 @@ MarkdownH1, MarkdownH2, MarkdownH3 { background: transparent; color: $fg; }
 #dash-stats .stat.-warn { color: $warn; }
 .subbar { height: 1; padding: 0 1; margin: 1 0 1 0; }
 .subbar-note { width: auto; }
+.mission-search { height: 1; margin: 0 0 1 0; }
+#mission-search { width: 1fr; height: 1; margin-right: 2; }
+#mission-note { height: 0; padding: 0 1; }
+#mission-note.has-text { height: 1; margin-bottom: 1; }
 #mission-list .row { margin-bottom: 1; }
 #mission-list .row.-header { margin-bottom: 0; margin-top: 1; color: $faint; }
 #mission-list .row.-header:hover { background: transparent; }

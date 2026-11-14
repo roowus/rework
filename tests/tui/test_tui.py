@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from textual.widgets import Input
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -763,6 +764,120 @@ async def test_dashboard_drill_down_and_back(ids: dict[str, str]) -> None:
         await pilot.pause()
         assert dash.mission_id is None
         assert app.is_running, "esc inside a drill-down navigates, never arms quit"
+
+
+async def test_dashboard_search_filters_and_clears(ids: dict[str, str]) -> None:
+    """The search bar above the mission list: "/" focuses it, typing filters
+    live (debounced), esc clears it and hands focus back to the list."""
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        lst = app.query_one("#mission-list", RowList)
+        before = len(lst.selectable)
+        assert before > 1
+
+        await pilot.press("slash")
+        bar = app.query_one("#mission-search", Input)
+        assert bar.has_focus, "/ focuses the search bar"
+        assert bar.placeholder == "Search missions…  (/ to focus)"
+        for ch in "flaky":
+            await pilot.press(ch)
+        await _settle(pilot, 0.8)  # the filter is debounced
+        dash = app.view("dashboard")
+        after = lst.selectable
+        assert after == [ids["running"]], after
+        assert dash.query_text == "flaky"
+        # the other filters still combine with the text
+        assert len(after) < before
+
+        await pilot.press("escape")
+        await _settle(pilot, 0.8)
+        assert bar.value == "" and not bar.has_focus
+        assert len(lst.selectable) == before, "esc clears the search"
+        assert lst.has_focus
+        assert app.is_running, "esc in the search bar must not arm quit"
+        assert not app.swallowed
+
+
+async def test_dashboard_ai_search_ranks_and_opens(
+    ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """✦ ranks missions through a provider and the ranked rows open missions."""
+    provider = script_provider(
+        monkeypatch,
+        [
+            ChatResult(
+                text=(
+                    "Sure — best first:\n```json\n"
+                    f'[{{"id": "{ids["running"]}", "reason": "the float tolerance fix"}}]\n'
+                    "```"
+                ),
+                usage=Usage(input_tokens=200, output_tokens=40),
+            )
+        ],
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        await pilot.press("slash")
+        for ch in "flaky":
+            await pilot.press(ch)
+        await _settle(pilot, 0.5)
+        await pilot.click(_btn(app, dash, "ai-search"))
+        await _settle(pilot, 1.5)
+        assert provider.requests, "the ✦ search asked the model"
+        assert "flaky" in provider.requests[0].messages[0]["content"]
+        assert dash.ai_results == [{"id": ids["running"], "reason": "the float tolerance fix"}]
+        lst = app.query_one("#mission-list", RowList)
+        assert lst.selectable == [ids["running"]]
+        assert "1 ranked" in str(app.query_one("#mission-note").render())
+        row = next(r for r in app.query("#mission-list .row") if r.key == ids["running"])
+        assert "float tolerance" in str(row.render()), "the reason rides the row"
+
+        lst.activate(ids["running"], via_mouse=True)
+        await _settle(pilot, 0.8)
+        assert dash.mission_id == ids["running"], "a ranked row opens its mission"
+
+        await pilot.press("escape")
+        await _settle(pilot, 0.5)
+        assert dash.ai_results is None
+        await pilot.press("escape")
+        await _settle(pilot, 0.5)
+        assert dash.mission_id is None
+        assert app.is_running
+        assert not app.swallowed
+
+
+async def test_dashboard_ai_search_without_credentials_says_so(
+    ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No key for any catalog model: a clean notice, never a crash."""
+    monkeypatch.setenv(
+        "REWORK_MODELS",
+        '[{"id":"haiku","provider":"anthropic","model":"claude-haiku-4-5","tier":1}]',
+    )
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        await pilot.press("slash")
+        await pilot.press("x")
+        await _settle(pilot, 0.5)
+        await pilot.click(_btn(app, dash, "ai-search"))
+        await _settle(pilot, 1.0)
+        assert dash.ai_results is None
+        assert "AI search unavailable: no model with credentials" in dash.ai_note
+        assert "no model with credentials" in str(app.query_one("#mission-note").render())
+        assert app.is_running
+        assert not app.swallowed
 
 
 async def test_dashboard_graph_and_tabs_render(ids: dict[str, str]) -> None:
