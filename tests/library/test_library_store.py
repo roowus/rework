@@ -317,3 +317,189 @@ async def test_sqlite_migration_adds_body_without_data_loss(tmp_path) -> None:
         assert (await index2.get_item("l-old")).body == "# filled in later\n"  # type: ignore[union-attr]
     finally:
         await index2.aclose()
+
+
+# -- Postgres reconnect: a dead connection self-heals once, then errors clear --
+
+
+class _FakeCursor:
+    def __init__(self, conn: _FakeConn) -> None:
+        self._conn = conn
+
+    async def __aenter__(self) -> _FakeCursor:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+    async def execute(self, sql: str, params: tuple = ()) -> None:
+        await self._conn.execute(sql, params)
+        self._conn.queries.append(sql)
+
+    async def fetchone(self) -> object:
+        return self._conn.row
+
+    async def fetchall(self) -> list:
+        return [self._conn.row] if self._conn.row else []
+
+
+class _FakeTxInfo:
+    from psycopg.pq import TransactionStatus
+
+    transaction_status = TransactionStatus.IDLE
+
+
+class _FakeConn:
+    """A stand-in psycopg connection that raises OperationalError until told
+    to recover (as a recreated DB container leaves the old socket)."""
+
+    def __init__(self) -> None:
+        import psycopg
+
+        self.fail = True
+        self.closed = False
+        self.row: dict | None = None
+        self.queries: list[str] = []
+        self.commits = 0
+        self.info = _FakeTxInfo()
+        self._err = psycopg.OperationalError("the connection is closed")
+
+    def cursor(self) -> _FakeCursor:
+        return _FakeCursor(self)
+
+    async def execute(self, sql: str, params: tuple = ()) -> None:
+        if self.fail:
+            raise self._err
+        self.queries.append(sql)
+
+    async def commit(self) -> None:
+        if self.fail:
+            raise self._err
+        self.commits += 1
+
+    async def rollback(self) -> None:
+        pass
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _item_row(item_id: str = "l-one") -> dict:
+    return {
+        "id": item_id,
+        "type": "skill",
+        "name": "one",
+        "description": "d",
+        "body_path": None,
+        "body": None,
+        "tags": "[]",
+        "provenance": "{}",
+        "status": "active",
+        "version": 1,
+        "uses": 0,
+        "created_at": 1.0,
+        "updated_at": 1.0,
+        "vectors": "{}",
+    }
+
+
+def _postgres_with_fake(monkeypatch, first: _FakeConn, rest: list[_FakeConn]):
+    from rework.library import store as store_mod
+
+    made: list[_FakeConn] = []
+
+    async def fake_connect(dsn: str) -> _FakeConn:
+        conn = rest[len(made)]
+        made.append(conn)
+        return conn
+
+    monkeypatch.setattr(store_mod, "_connect", fake_connect)
+    return store_mod.PostgresLibraryStore(first, dsn="postgresql://fake"), made
+
+
+async def test_dead_connection_reconnects_and_retries_once(monkeypatch) -> None:
+    """First use hits a closed connection (recreated DB container); the store
+    reconnects through the shared connect path and the read still answers."""
+    first, second = _FakeConn(), _FakeConn()
+    second.fail = False
+    second.row = _item_row()
+    store, made = _postgres_with_fake(monkeypatch, first, [second])
+
+    got = await store.get_item("l-one")
+    assert got is not None and got.id == "l-one"
+    assert made == [second], "reconnect happened exactly once"
+    assert first.closed, "the dead handle was dropped"
+    assert store._conn is second and store._op_lock._conn is second
+
+    # later reads just work (the fresh connection stays)
+    assert (await store.get_item("l-one")).id == "l-one"  # type: ignore[union-attr]
+    assert made == [second]
+
+
+async def test_reconnect_failure_is_a_clear_error_not_an_infinite_retry(
+    monkeypatch,
+) -> None:
+    """A second consecutive failure surfaces one clear error; no retry loop."""
+    import psycopg
+
+    first, second, third = _FakeConn(), _FakeConn(), _FakeConn()
+    store, made = _postgres_with_fake(monkeypatch, first, [second, third])
+
+    with pytest.raises(RuntimeError, match="library store unavailable after reconnect"):
+        await store.get_item("l-one")
+    assert made == [second], "retried exactly once, then gave up"
+    assert not isinstance(psycopg.OperationalError("x"), RuntimeError)  # distinct type
+
+
+async def test_record_use_write_path_recovers(monkeypatch) -> None:
+    """The write path self-heals too: the dead conn is closed (discarding any
+    half-applied write) before the retry runs on the fresh connection."""
+    first, second = _FakeConn(), _FakeConn()
+    second.fail = False
+    store, made = _postgres_with_fake(monkeypatch, first, [second])
+
+    await store.record_use("l-one")
+    assert made == [second]
+    assert any("UPDATE library_items SET uses" in q for q in second.queries)
+    assert second.commits == 1
+    assert first.closed
+
+
+async def test_non_connection_errors_are_not_retried(monkeypatch) -> None:
+    """A query error (not a dead connection) must propagate as-is, unretried."""
+
+    class _BorkedConn(_FakeConn):
+        async def execute(self, sql: str, params: tuple = ()) -> None:
+            raise ValueError("bad query")
+
+    from rework.library import store as store_mod
+
+    store = store_mod.PostgresLibraryStore(_BorkedConn(), dsn="postgresql://fake")
+    connect_calls = 0
+
+    async def fake_connect(dsn: str) -> _FakeConn:
+        nonlocal connect_calls
+        connect_calls += 1
+        return _FakeConn()
+
+    monkeypatch.setattr(store_mod, "_connect", fake_connect)
+    with pytest.raises(ValueError, match="bad query"):
+        await store.get_item("l-one")
+    assert connect_calls == 0
+
+
+async def test_a_store_without_a_dsn_never_reconnects(monkeypatch) -> None:
+    """The legacy construction (bare conn, no dsn) keeps the old behaviour:
+    the error propagates, nothing is retried."""
+    from rework.library import store as store_mod
+
+    store = store_mod.PostgresLibraryStore(_FakeConn())
+    monkeypatch.setattr(
+        store_mod,
+        "_connect",
+        lambda dsn: pytest.fail("must not reconnect without a dsn"),
+    )
+    import psycopg
+
+    with pytest.raises(psycopg.OperationalError):
+        await store.get_item("l-one")
