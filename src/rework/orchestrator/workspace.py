@@ -23,17 +23,22 @@ back — the same one-shot pack/unpack transport, with a version store at rest.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import fcntl
 import io
 import os
 import shutil
 import subprocess
 import tarfile
+import time
 import uuid
+from collections.abc import Iterator
 from pathlib import Path
 
 from aiohttp import web
 
 from rework.kernel.state.store import StateStore
+from rework.roles.builtin.coder import DEFAULT_GITIGNORE
 
 # junk that must never travel or come back (mirrors _prepare_repo's ignore
 # list and the coder DEFAULT_GITIGNORE)
@@ -97,15 +102,29 @@ def pack_paths(paths: list[Path]) -> bytes:
 
 def _git(dest: Path, *args: str) -> None:
     """Run git in `dest` (mechanical identity, no remotes, never pushed).
-    Sync by design like the rest of the packing helpers; to_thread wraps."""
-    subprocess.run(["git", *args], cwd=dest, check=True, capture_output=True)
+    Sync by design like the rest of the packing helpers; to_thread wraps.
+
+    `-c core.hooksPath=/dev/null` is not negotiable: an uploaded bundle can
+    plant `.git/hooks/*` (uploads are tar files from the network), and a plain
+    `git commit` would then EXECUTE the planted hook on the daemon."""
+    subprocess.run(
+        ["git", "-c", "core.hooksPath=/dev/null", *args],
+        cwd=dest,
+        check=True,
+        capture_output=True,
+    )
 
 
 def _git_out(dest: Path, *args: str) -> str:
     """stdout of a git command, "" when it fails (callers treat that as
     "nothing changed" rather than failing a mission over bookkeeping)."""
     try:
-        done = subprocess.run(["git", *args], cwd=dest, capture_output=True, text=True)
+        done = subprocess.run(
+            ["git", "-c", "core.hooksPath=/dev/null", *args],
+            cwd=dest,
+            capture_output=True,
+            text=True,
+        )
     except OSError:
         return ""
     return done.stdout if done.returncode == 0 else ""
@@ -135,9 +154,30 @@ def _excluded(rel: Path) -> bool:
 
 
 def unpack_into(dest: Path, data: bytes) -> None:
+    """Extract a received tarball into `dest`, member by member.
+
+    `filter="data"` alone is not enough: it does not use the member's own type
+    to decide whether a nested member may be written, so `s` (a symlink to
+    `.git`) plus `s/hooks/pre-commit` writes into the repo next to it — and the
+    next `git commit` runs that hook on the daemon. Only regular files and
+    directories are extracted at all, and anything `_excluded()` rejects (the
+    whole junk list, `.git` included, at any depth) is never written."""
     dest.mkdir(parents=True, exist_ok=True)
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
-        tar.extractall(dest, filter="data")  # py3.12 filter blocks path traversal
+        members = [info for info in tar.getmembers() if _safe_member(info)]
+        tar.extractall(dest, members=members, filter="data")
+
+
+def _safe_member(info: tarfile.TarInfo) -> bool:
+    """A member is written only if it is a plain file or directory whose
+    normalised, non-escaping path survives `_excluded()`."""
+    if not (info.isreg() or info.isdir()):
+        return False  # symlinks/hardlinks/devices: never, they are a write-elsewhere trick
+    name = info.name.replace("\\", "/")
+    rel = Path(name)
+    if rel.is_absolute() or ".." in rel.parts:
+        return False  # py3.12's data filter also blocks this; keep it explicit
+    return not _excluded(Path(os.path.normpath(name)))
 
 
 def stage_bundle(workroot: Path, data: bytes, name: str | None = None) -> Path:
@@ -185,13 +225,30 @@ def ensure_files_area(project_id: str) -> Path:
     return area
 
 
+def _z_fields(raw: str) -> list[str]:
+    """NUL-split git `-z` output. NUL separation is the only parse that
+    survives a non-ASCII name: without `-z`, git octal-quotes anything outside
+    ASCII (`"R\303\251sum\303\251.md"`) and the quoted name never matches a real
+    file, so the file silently vanished from the area and from the report."""
+    fields = raw.split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()  # trailing NUL terminates the last entry
+    return fields
+
+
 def _status_changes(dest: Path) -> list[tuple[str, str]]:
     """[(path, "new"|"changed")] from git status, deletions skipped."""
     out: list[tuple[str, str]] = []
-    for line in _git_out(dest, "status", "--porcelain", "--untracked-files=all").splitlines():
-        if len(line) < 4:
-            continue
-        code, rel = line[:2], line[3:].strip().strip('"')
+    fields = _z_fields(_git_out(dest, "status", "--porcelain", "-z", "--untracked-files=all"))
+    index = 0
+    while index < len(fields):
+        # porcelain is "XY <path>": both status columns are always present, so
+        # the path starts at offset 3 even when Y is a space ("R  new.md")
+        field = fields[index]
+        code, rel = field[:2], field[3:]
+        index += 1
+        if code[:1] in ("R", "C"):
+            index += 1  # "R  new\0old\0": the new name is what the area gets
         if not rel or _excluded(Path(rel)):
             continue
         out.append((rel, "new" if code.strip() == "??" else "changed"))
@@ -201,23 +258,14 @@ def _status_changes(dest: Path) -> list[tuple[str, str]]:
 def update_files_area(project_id: str, data: bytes, message: str) -> list[str]:
     """Unpack a bundle over the project's files area and commit it. Returns the
     touched paths as "a.md (new)" / "b.md (changed)". Sync; to_thread wraps."""
-    area = ensure_files_area(project_id)
-    unpack_into(area, data)
-    changes = _status_changes(area)
-    if not changes:
-        return []
-    _git(area, "add", "-A")
-    _git(
-        area,
-        "-c",
-        "user.name=rework",
-        "-c",
-        "user.email=rework@rework.local",
-        "commit",
-        "-m",
-        message,
-    )
-    return [f"{rel} ({kind})" for rel, kind in changes]
+    with _area_lock(project_id):
+        area = ensure_files_area(project_id)
+        unpack_into(area, data)
+        changes = _status_changes(area)
+        if not changes:
+            return []
+        _commit(area, message)
+        return [f"{rel} ({kind})" for rel, kind in changes]
 
 
 def mission_changes(tree: Path) -> list[tuple[str, str]]:
@@ -231,13 +279,23 @@ def mission_changes(tree: Path) -> list[tuple[str, str]]:
         return []
     base = roots[-1]  # several roots means merged histories; the seeded one is oldest
     changes: dict[str, str] = {}
-    for line in _git_out(tree, "diff", "--name-status", base).splitlines():
-        parts = line.split("\t")
-        if len(parts) < 2 or parts[0][:1] == "D":
+    # `git diff --name-status -z` is "<CODE>\0<path>\0" (a rename adds the new
+    # path after the old), so codes and paths alternate
+    fields = _z_fields(_git_out(tree, "diff", "--name-status", "-z", base))
+    index = 0
+    while index < len(fields):
+        code = fields[index]
+        index += 1
+        if index >= len(fields):
+            break
+        rel = fields[index]
+        index += 1
+        if code[:1] in ("R", "C") and index < len(fields):
+            rel = fields[index]  # keep the new name, not the old one
+            index += 1
+        if code[:1] == "D" or not rel or _excluded(Path(rel)):
             continue
-        rel = parts[-1].strip()
-        if rel and not _excluded(Path(rel)):
-            changes[rel] = "new" if parts[0][:1] == "A" else "changed"
+        changes[rel] = "new" if code[:1] == "A" else "changed"
     for rel, kind in _status_changes(tree):  # untracked files never show in a diff
         changes.setdefault(rel, kind)
     return sorted(changes.items())
@@ -251,20 +309,45 @@ def save_mission_files(project_id: str, trees: list[Path], message: str) -> list
     workspace first, then role worktrees, so a coder's branch wins). Returns
     the report lines, e.g. ["a.md (new)", "b.md (changed)"]. Sync; to_thread
     wraps."""
-    area = ensure_files_area(project_id)
-    kinds: dict[str, str] = {}
-    for tree in trees:
-        if not (tree / ".git").exists():
-            continue
-        for rel, kind in mission_changes(tree):
-            if not (tree / rel).is_file():
-                continue  # a second checkout no longer has it: the other one wins
-            target = area / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(tree / rel, target)
-            kinds[rel] = kind
-    if not kinds:
-        return []
+    with _area_lock(project_id):
+        area = ensure_files_area(project_id)
+        kinds: dict[str, str] = {}
+        for tree in trees:
+            if not (tree / ".git").exists():
+                continue
+            for rel, kind in mission_changes(tree):
+                source = tree / rel
+                if not source.is_file():
+                    continue  # a second checkout no longer has it: the other one wins
+                if _template_gitignore(source, tree):
+                    # the coder role writes DEFAULT_GITIGNORE into every
+                    # worktree: it is scaffolding, not mission output
+                    continue
+                target = area / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+                kinds[rel] = kind
+        if not kinds:
+            return []  # a mission that wrote nothing must not commit here
+        _commit(area, message)
+        return [f"{rel} ({kind})" for rel, kind in sorted(kinds.items())]
+
+
+def _template_gitignore(path: Path, tree: Path) -> bool:
+    """True for the coder's own boilerplate ignore file at the tree root.
+    Saving it back would both pollute the report (a mission that wrote nothing
+    would report a file) and, worse, make later `git add -A` calls in the area
+    skip dist/ and build/, so real deliverables under those names would never
+    be saved."""
+    if path.name != ".gitignore" or path.parent != tree:
+        return False
+    try:
+        return path.read_text() == DEFAULT_GITIGNORE
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _commit(area: Path, message: str) -> None:
     _git(area, "add", "-A")
     _git(
         area,
@@ -276,12 +359,50 @@ def save_mission_files(project_id: str, trees: list[Path], message: str) -> list
         "-m",
         message,
     )
-    return [f"{rel} ({kind})" for rel, kind in sorted(kinds.items())]
+
+
+AREA_LOCK_TIMEOUT_S = 120.0
+
+
+@contextlib.contextmanager
+def _area_lock(project_id: str, timeout_s: float = AREA_LOCK_TIMEOUT_S) -> Iterator[None]:
+    """Serialise every mutation of one project's files area across threads AND
+    processes: the HTTP routes (aiohttp's thread pool) and the engine both
+    write here, and two concurrent `git add`/`commit` runs race on
+    `.git/index.lock`. An flock on a file NEXT TO the area (never inside it, so
+    it can never be committed) is the smallest portable tool for both; a plain
+    asyncio lock cannot help because the callers are synchronous."""
+    from rework.config import project_files_dir
+
+    lock_path = project_files_dir(project_id).parent / ".files.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+") as handle:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"project {project_id} files area is busy "
+                        f"(no lock after {timeout_s:.0f}s)"
+                    ) from None
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def pack_worktree(worktree: Path) -> bytes:
     """Pack a finished worktree for the fetch results path."""
     return pack_directory(worktree)
+
+
+# uploads carry real documents (PDFs, docx, slide decks), not just markdown:
+# aiohttp's 1 MiB default rejected them with a bare 413
+MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 
 
 def _token_from_env() -> str | None:
@@ -354,7 +475,11 @@ def build_workspace_app(store: StateStore, workroot: Path) -> web.Application:
         return not project_id.replace("-", "").replace("_", "").isalnum()
 
     async def project_files_upload(request: web.Request) -> web.Response:
-        """Upload local files into a repo-less project's persistent area."""
+        """Upload local files into a repo-less project's persistent area.
+
+        Body: a tar.gz of up to 64 MiB (the app's client_max_size; PDFs and
+        docx are routinely over aiohttp's 1 MiB default), or 413 above it.
+        `.git` members are dropped: an upload may never plant a git hook."""
         if not _authorized(request, token):
             return web.json_response({"error": "unauthorized"}, status=401)
         project_id = request.match_info["project_id"]
@@ -362,6 +487,11 @@ def build_workspace_app(store: StateStore, workroot: Path) -> web.Application:
             return web.json_response({"error": "bad project id"}, status=400)
         if await store.get_project(project_id) is None:
             return web.json_response({"error": f"unknown project {project_id}"}, status=404)
+        if request.content_length is not None and request.content_length > MAX_UPLOAD_BYTES:
+            return web.json_response(
+                {"error": f"upload too large (max {MAX_UPLOAD_BYTES // (1024 * 1024)} MiB)"},
+                status=413,
+            )
         data = await request.read()
         if not data:
             return web.json_response({"error": "empty body (want a tar.gz)"}, status=400)
@@ -391,7 +521,7 @@ def build_workspace_app(store: StateStore, workroot: Path) -> web.Application:
             headers={"Content-Disposition": f'attachment; filename="{project_id}-files.tar.gz"'},
         )
 
-    app = web.Application()
+    app = web.Application(client_max_size=MAX_UPLOAD_BYTES)
     app.router.add_get("/healthz", healthz)
     app.router.add_post("/workspaces/{name}", upload)
     app.router.add_get("/workspaces/results/{mission_id}", result)

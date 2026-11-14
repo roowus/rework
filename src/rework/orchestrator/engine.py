@@ -946,14 +946,6 @@ class MissionRunner:
         shipped = getattr(self, "_shipped_branch", None)
         if shipped:
             result["branch"] = shipped
-        # Upload transport only: a repo-less project's work lives in its files
-        # area, so whatever the mission produced is copied back there and named
-        # in the report. Git projects deliver a pushed branch instead.
-        files_note = await self._save_project_files(mission_id, runs)
-        if files_note:
-            result["project_files"] = files_note
-            summary = f"{summary.rstrip()}\n\n{files_note}" if summary.strip() else files_note
-            result["summary"] = summary
         current = await self._store.get_mission(mission_id)
         if current is not None and current.status == MissionStatus.CANCELLED:
             # the burn gate (or an owner cancel) already set the verdict while
@@ -968,6 +960,18 @@ class MissionRunner:
             status = MissionStatus.FAILED
         else:
             status = MissionStatus.DONE
+        # Upload transport only, and ONLY for a mission that ends DONE: a
+        # repo-less project's work lives in its files area, so what the mission
+        # produced is copied back there and named in the report. A cancelled,
+        # failed or ship-rejected mission saves nothing — its worktrees are
+        # half-finished and the area must not change. Git projects deliver a
+        # pushed branch instead.
+        if status == MissionStatus.DONE:
+            files_note = await self._save_project_files(mission_id, runs)
+            if files_note:
+                result["project_files"] = files_note
+                summary = f"{summary.rstrip()}\n\n{files_note}" if summary.strip() else files_note
+                result["summary"] = summary
         await self._store.update_mission(mission_id, status=status, result=result)
         log.info("mission %s: %s", mission_id, status.value)
         event = EventType.MISSION_DONE if status == MissionStatus.DONE else EventType.MISSION_FAILED

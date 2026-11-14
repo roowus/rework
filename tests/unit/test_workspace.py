@@ -4,18 +4,28 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
+import subprocess
 import tarfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
+from rework.config import project_files_dir
 from rework.kernel.state.records import Mission, Project, Run, RunStatus, new_id, run_id
 from rework.kernel.state.store import StateStore
 from rework.orchestrator.workspace import (
     EXCLUDE_DIRS,
+    _area_lock,
     build_workspace_app,
+    mission_changes,
     pack_directory,
     pack_paths,
+    save_mission_files,
     stage_bundle,
 )
 
@@ -185,3 +195,225 @@ async def test_project_files_routes_404_for_unknown_project(
         body = pack_paths([local / "a.md"])
         assert (await client.post("/projects/p-nope/files", data=body)).status == 404
         assert (await client.get("/projects/p-nope/files/archive")).status == 404
+
+
+def _tar_with(members: list[tuple[str, bytes, str | None]]) -> bytes:
+    """A tar.gz from [(name, body, linkname)]; a linkname makes a symlink."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, body, linkname in members:
+            info = tarfile.TarInfo(name)
+            if linkname is not None:
+                info.type = tarfile.SYMTYPE
+                info.linkname = linkname
+                tar.addfile(info)
+                continue
+            info.size = len(body)
+            tar.addfile(info, io.BytesIO(body))
+    return buf.getvalue()
+
+
+def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def _init_commit(tree: Path) -> None:
+    _git("init", "-b", "main", cwd=tree)
+    _git("add", "-A", cwd=tree)
+
+
+def _commit(tree: Path, message: str = "init") -> None:
+    _git("-c", "user.name=r", "-c", "user.email=r@r", "commit", "-m", message, cwd=tree)
+
+
+async def test_upload_cannot_plant_a_git_hook(
+    tmp_path: Path, store: StateStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A POSTed tar must never write a `.git` path: the area's `git commit`
+    would then EXECUTE a planted hook on the daemon (audit-proven)."""
+    monkeypatch.setenv("REWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    marker = tmp_path / "hook-ran"
+    hook = f"#!/bin/sh\ntouch {marker}\n".encode()
+    project = await _upload_project(store)
+    app = build_workspace_app(store, tmp_path / "workroot")
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            f"/projects/{project.id}/files",
+            data=_tar_with(
+                [
+                    (".git/hooks/pre-commit", hook, None),
+                    ("x.md", b"# x\n", None),
+                    # the same trick in another shape: a symlink to `.git` plus
+                    # a nested member, which the data filter writes THROUGH
+                    ("s", b"", ".git"),
+                    ("s/hooks/pre-commit", hook, None),
+                ]
+            ),
+        )
+        assert resp.status == 200
+    area = project_files_dir(project.id)
+    assert (area / "x.md").read_text() == "# x\n"
+    assert not (area / ".git" / "hooks" / "pre-commit").exists()
+    # the symlink member is dropped, so the nested member lands in an ordinary
+    # directory named `s` — never redirected into the area's real `.git`
+    assert not (area / "s").is_symlink(), "a symlink member must not be extracted"
+    assert not (area / "s" / "hooks" / "pre-commit").is_symlink()
+    assert "init" in _git("log", "--oneline", cwd=area).stdout, "area commits still happen"
+    assert not marker.exists(), "the planted hook must not have run"
+
+
+async def test_upload_drops_junk_members(
+    tmp_path: Path, store: StateStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("REWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    project = await _upload_project(store)
+    app = build_workspace_app(store, tmp_path / "workroot")
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            f"/projects/{project.id}/files",
+            data=_tar_with(
+                [("__pycache__/junk.pyc", b"bytecode", None), ("keep.md", b"# keep\n", None)]
+            ),
+        )
+        assert resp.status == 200
+    area = project_files_dir(project.id)
+    assert (area / "keep.md").exists()
+    assert not (area / "__pycache__").exists()
+
+
+async def test_upload_accepts_more_than_one_mib(
+    tmp_path: Path, store: StateStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PDFs and docx routinely exceed aiohttp's 1 MiB default, which made
+    `add-files` fail with a bare 413."""
+    monkeypatch.setenv("REWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    project = await _upload_project(store)
+    big = os.urandom(3 * 1024 * 1024)  # incompressible: the body stays > 1 MiB
+    app = build_workspace_app(store, tmp_path / "workroot")
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            f"/projects/{project.id}/files", data=_tar_with([("big.pdf", big, None)])
+        )
+        assert resp.status == 200, await resp.text()
+    area = project_files_dir(project.id)
+    assert (area / "big.pdf").stat().st_size == len(big)
+
+
+def _seeded_tree(tmp_path: Path, name: str = "tree") -> Path:
+    """A worktree as `seed_mission_workspace`/`git_init_commit` leaves it: a
+    repo whose root commit is the seeded snapshot."""
+    tree = tmp_path / name
+    tree.mkdir()
+    (tree / "seed.md").write_text("# seeded\n")
+    _init_commit(tree)
+    _commit(tree)
+    return tree
+
+
+def test_mission_changes_keeps_special_filenames(tmp_path: Path) -> None:
+    """git octal-quotes non-ASCII paths unless `-z` is used, and a quoted name
+    never matches a real file: the file used to vanish from the area."""
+    tree = _seeded_tree(tmp_path)
+    (tree / "sub dir").mkdir()
+    names = ["Résumé.md", "日本.md", "sub dir/é.txt"]
+    for name in names:
+        (tree / name).write_text(f"# {name}\n")
+    assert sorted(rel for rel, _kind in mission_changes(tree)) == sorted(names)
+
+
+def test_mission_changes_names_a_renamed_file(tmp_path: Path) -> None:
+    tree = _seeded_tree(tmp_path)
+    (tree / "a.md").write_text("# a\n")
+    _git("add", "-A", cwd=tree)
+    _commit(tree, "a")
+    _git("mv", "a.md", "Résumé.md", cwd=tree)
+    # the rename's NEW name is what the area gets, never the octal-quoted pair
+    assert [rel for rel, _kind in mission_changes(tree)] == ["Résumé.md"]
+
+
+def test_save_mission_files_skips_the_boilerplate_gitignore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The coder writes DEFAULT_GITIGNORE into every worktree: saving it back
+    would report a file a no-write mission never produced, and the area's own
+    `git add -A` would then skip dist/ and build/ for good."""
+    from rework.roles.builtin.coder import DEFAULT_GITIGNORE
+
+    monkeypatch.setenv("REWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    tree = _seeded_tree(tmp_path)  # the seeded snapshot is the root commit
+    (tree / ".gitignore").write_text(DEFAULT_GITIGNORE)
+    _git("add", "-A", cwd=tree)
+    _commit(tree, "coder handoff")  # ...and the handoff commit adds the boilerplate
+    assert [rel for rel, _k in mission_changes(tree)] == [".gitignore"], "it IS a change"
+
+    assert save_mission_files("p-gitignore", [tree], "mission m: files") == []
+
+    area = project_files_dir("p-gitignore")
+    assert not (area / ".gitignore").exists()
+    assert len(_git("log", "--oneline", cwd=area).stdout.splitlines()) == 1, "only init"
+
+
+def test_save_mission_files_keeps_a_real_gitignore(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The skip is narrow: a gitignore a mission actually authored is saved."""
+    monkeypatch.setenv("REWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    tree = _seeded_tree(tmp_path)
+    (tree / ".gitignore").write_text("dist/\n")
+    _git("add", "-A", cwd=tree)
+    _commit(tree, "own gitignore")
+    (tree / ".gitignore").write_text("dist/\nout/\n")
+
+    assert save_mission_files("p-own", [tree], "mission m: files") == [".gitignore (new)"]
+    assert (project_files_dir("p-own") / ".gitignore").read_text() == "dist/\nout/\n"
+
+
+def test_area_lock_excludes_concurrent_mutations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The lock is the fix for `.git/index.lock` races; assert it actually
+    excludes, so the concurrency test below cannot pass by luck."""
+    monkeypatch.setenv("REWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    inside = 0
+    peak = 0
+    guard = threading.Lock()
+
+    def _critical(_n: int) -> None:
+        nonlocal inside, peak
+        with _area_lock("p-lock"):
+            with guard:
+                inside += 1
+                peak = max(peak, inside)
+            time.sleep(0.02)  # a git commit is not instantaneous either
+            with guard:
+                inside -= 1
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(_critical, range(8)))
+    assert peak == 1, f"{peak} threads held the area lock at once"
+    assert (project_files_dir("p-lock").parent / ".files.lock").exists()
+    assert not (project_files_dir("p-lock") / ".files.lock").exists(), "never inside the area"
+
+
+def test_concurrent_save_backs_all_land(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The routes (aiohttp's thread pool) and the engine mutate one area at
+    once: without a cross-thread lock they race on `.git/index.lock` and files
+    land last-writer-wins, uncommitted."""
+    monkeypatch.setenv("REWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    trees = [_seeded_tree(tmp_path, f"tree{n}") for n in range(6)]
+    for n, tree in enumerate(trees):
+        (tree / f"file{n}.md").write_text(f"# {n}\n")
+
+    def _save(item: tuple[int, Path]) -> list[str]:
+        n, tree = item
+        return save_mission_files("p-concurrent", [tree], f"mission m{n}: files")
+
+    with ThreadPoolExecutor(max_workers=len(trees)) as pool:
+        results = list(pool.map(_save, enumerate(trees)))
+
+    assert all(results), "every concurrent save reports its file"
+    area = project_files_dir("p-concurrent")
+    for n in range(len(trees)):
+        assert (area / f"file{n}.md").read_text() == f"# {n}\n"
+    status = _git("status", "--porcelain", cwd=area).stdout
+    assert status.strip() == "", "everything is committed, nothing left behind"
