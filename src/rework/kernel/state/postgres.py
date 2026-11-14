@@ -35,6 +35,8 @@ from rework.kernel.state.records import (
     Run,
     RunStatus,
     bucket_label,
+    check_priority,
+    coerce_priority,
 )
 
 _DDL = [
@@ -307,7 +309,7 @@ class PostgresStore:
             chat_id=row["chat_id"],
             title=row["title"],
             status=MissionStatus(row["status"]),
-            priority=row["priority"] or "normal",
+            priority=coerce_priority(row["priority"]),
             plan=_uj(row["plan"]) or None,
             result=_uj(row["result"]) or None,
             created_at=row["created_at"],
@@ -360,6 +362,7 @@ class PostgresStore:
     # -- missions -----------------------------------------------------------
     @_serialized
     async def create_mission(self, mission: Mission) -> Mission:
+        check_priority(mission.priority)
         await self._conn.execute(
             "INSERT INTO missions (id, objective, repo_path, repo_origin, project_id,"
             " chat_id, title, status, priority, plan, result, created_at, updated_at)"
@@ -418,6 +421,7 @@ class PostgresStore:
             sets.append("project_id = %s")
             params.append(project_id)
         if priority is not None:
+            check_priority(priority)
             sets.append("priority = %s")
             params.append(priority)
         if sets:

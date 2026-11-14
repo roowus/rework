@@ -847,3 +847,25 @@ def test_new_with_priority_high_and_prioritize_command(rework_db: Path) -> None:
 
     bad = runner.invoke(app, ["prioritize", other.id, "--priority", "urgent"])
     assert bad.exit_code != 0
+
+
+def test_new_with_unknown_priority_is_a_clean_cli_error(rework_db: Path) -> None:
+    """BLOCKER: `new --priority urgent` exits non-zero with a clear message, not
+    an unhandled ValueError traceback out of typer."""
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(app, ["new", "urgent fix", "--repo", url, "--priority", "urgent"])
+    assert result.exit_code != 0
+    output = result.output + (result.stderr if result.stderr else "")
+    assert "unknown priority 'urgent'; priorities: normal, high" in output
+    assert "Traceback" not in output
+    assert "ValueError" not in output
+
+    # and nothing was stored
+    async def all_missions() -> list[Mission]:
+        store = await open_sqlite(str(rework_db))
+        try:
+            return await store.list_missions()
+        finally:
+            await store.aclose()
+
+    assert asyncio.run(all_missions()) == []

@@ -101,6 +101,25 @@ class Mission(BaseModel):
     updated_at: float = Field(default_factory=now)
 
 
+# Pickup priority levels: "high" missions are picked before "normal" ones.
+# missions._priority is the source of truth; the stores validate on write and
+# coerce on read so a hand-edited row can never break listing.
+PRIORITIES = ("normal", "high")
+
+
+def check_priority(value: str) -> str:
+    """Validate a priority a store is about to write (caller bug otherwise)."""
+    if value not in PRIORITIES:
+        raise ValueError(f"unknown priority {value!r}; priorities: {', '.join(PRIORITIES)}")
+    return value
+
+
+def coerce_priority(value: str | None) -> str:
+    """Decode a stored priority: unknown/empty/legacy values read as normal."""
+    level = (value or "").strip().lower()
+    return level if level in PRIORITIES else "normal"
+
+
 class Project(BaseModel):
     """A label grouping missions, with per-project settings and zero-or-more
     repo references (ADR 0005). Repos are references, never synced by rework:

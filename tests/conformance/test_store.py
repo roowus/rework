@@ -594,6 +594,51 @@ async def test_mission_priority_defaults_to_normal_and_persists(store: StateStor
     assert again is not None and again.priority == "high"
 
 
+async def _force_priority(store: StateStore, mission_id: str, value: str) -> None:
+    """Write a priority straight into the row, bypassing the store's write
+    validation (a hand-edited row, or a value stored before the check existed)."""
+    from rework.kernel.state.postgres import PostgresStore
+    from rework.kernel.state.sqlite import SqliteStore
+
+    if isinstance(store, PostgresStore):
+        await store._conn.execute(
+            "UPDATE missions SET priority = %s WHERE id = %s", (value, mission_id)
+        )
+        await store._conn.commit()
+    else:
+        assert isinstance(store, SqliteStore)
+        await store._db.execute(
+            "UPDATE missions SET priority = ? WHERE id = ?", (value, mission_id)
+        )
+        await store._db.commit()
+
+
+async def test_unknown_priority_is_rejected_on_write_and_coerced_on_read(
+    store: StateStore,
+) -> None:
+    """The stores constrain priority: an unknown level is a write error, and an
+    unknown/empty value already in the row decodes as normal (never raises, so
+    listing can't break on a hand-edited row)."""
+    m = await store.create_mission(Mission(id=new_id("m"), objective="plan"))
+    with pytest.raises(ValueError, match="urgent"):
+        await store.create_mission(Mission(id=new_id("m"), objective="bad", priority="urgent"))
+    with pytest.raises(ValueError, match="urgent"):
+        await store.update_mission(m.id, priority="urgent")
+
+    # a rejected write changed nothing
+    unchanged = await store.get_mission(m.id)
+    assert unchanged is not None and unchanged.priority == "normal"
+
+    for raw in ("urgent", "", "HIGH "):
+        await _force_priority(store, m.id, raw)
+        coerced = await store.get_mission(m.id)
+        assert coerced is not None
+        expected = "high" if raw.strip().lower() == "high" else "normal"
+        assert coerced.priority == expected
+        # listing keeps working on such a row
+        assert m.id in [x.id for x in await store.list_missions(limit=10)]
+
+
 async def test_next_pending_missions_orders_high_then_oldest(store: StateStore) -> None:
     """(a) + (b) pickup order: every high before any normal, oldest first within
     a level — and an old pending mission is never hidden behind newer ones."""

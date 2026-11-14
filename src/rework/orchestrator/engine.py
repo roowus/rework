@@ -560,13 +560,9 @@ class MissionRunner:
                         ]
             index += 1
 
-        ship_decision, pr_url = await self._final_gates(
-            mission,
-            results,
-            last_audit_artifact,
-            ask_before_pr=getattr(self, "_ask_before_pr", False),
-            reason=getattr(self, "_pr_reason", ""),
-        )
+        # the mechanical path has no orchestrator to ask for the gate, so it
+        # uses _final_gates' defaults (the plan and the project setting decide)
+        ship_decision, pr_url = await self._final_gates(mission, results, last_audit_artifact)
         self._pr_url = pr_url
         await self._synthesize(mission.id, ship_decision)
 

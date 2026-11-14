@@ -14,9 +14,11 @@ from pathlib import Path
 from typing import Any
 
 from rework.kernel.state.records import (
+    PRIORITIES,
     EventRecord,
     EventType,
     Mission,
+    check_priority,
     new_id,
 )
 from rework.kernel.state.store import StateStore
@@ -331,16 +333,14 @@ async def _project_repo(project_id: str, name: str | None) -> tuple[str | None, 
     return None, url
 
 
-PRIORITIES = ("normal", "high")
+__all__ = ["PRIORITIES"]
 
 
 def _priority(value: str | None) -> str:
     """Validate a mission priority: normal (default) or high, the two pickup
     levels. Anything else is a caller bug, not something to store."""
     level = (value or "normal").strip().lower()
-    if level not in PRIORITIES:
-        raise ValueError(f"unknown priority {value!r}; priorities: {', '.join(PRIORITIES)}")
-    return level
+    return check_priority(level)
 
 
 async def create_mission(
