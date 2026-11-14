@@ -197,7 +197,8 @@ class CostView(View):
             )
         self._mission_rows = rows
         self.active_seconds = active
-        self._paint()
+        with self.painting():  # the app can close during the awaits above
+            self._paint()
 
     # -- paint ----------------------------------------------------------------
 

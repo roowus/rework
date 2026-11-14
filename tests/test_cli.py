@@ -41,12 +41,17 @@ def rework_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return db
 
 
-def _seed_mission(db: Path, *, mission_id: str, objective: str) -> None:
+def _seed_mission(db: Path, *, mission_id: str, objective: str, title: str | None = None) -> None:
     async def go() -> None:
         store = await open_sqlite(str(db))
         try:
             await store.create_mission(
-                Mission(id=mission_id, objective=objective, status=MissionStatus.PENDING)
+                Mission(
+                    id=mission_id,
+                    objective=objective,
+                    title=title,
+                    status=MissionStatus.PENDING,
+                )
             )
         finally:
             await store.aclose()
@@ -118,14 +123,82 @@ def test_new_accepts_git_url_without_plan(rework_db: Path) -> None:
 
 
 def test_ls_output_format(rework_db: Path) -> None:
-    """`ls` prints `{id}  {status:<14}  {objective}` (two spaces, status
-    left-justified to width 14)."""
+    """`ls` prints `{id}  {status:<14}  {name}` (two spaces, status
+    left-justified to width 14), where `name` is the title when the mission has
+    one and the flattened objective otherwise."""
     _seed_mission(rework_db, mission_id="m-abc123", objective="fix the planted bug")
 
     result = runner.invoke(app, ["ls"])
 
     assert result.exit_code == 0, result.output
     assert result.output == "m-abc123  pending         fix the planted bug\n"
+
+
+def test_ls_prints_one_row_per_mission_with_a_multiline_objective(rework_db: Path) -> None:
+    """Objectives are free text and are often numbered briefs; `ls` must render
+    one line per mission, never spill the objective across terminal rows."""
+    objective = (
+        "(1) 'rework update' must not print the whole objective\n"
+        "(2) derive a short title when none is given\n"
+        "   (6) gc must reclaim role scratch dirs\n"
+    )
+    _seed_mission(rework_db, mission_id="m-multi", objective=objective)
+
+    result = runner.invoke(app, ["ls"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert len(lines) == 1, result.output
+    assert "\n" not in result.output.rstrip("\n")
+    assert lines[0].startswith("m-multi  pending         (1) 'rework update'")
+    assert lines[0].endswith("\u2026")  # flattened and clipped, not cut mid-nowhere
+
+
+def test_ls_prefers_the_title_and_clips_a_long_one(rework_db: Path) -> None:
+    """A title (item 2) is what `ls` shows; it is clipped too, so a stray long
+    title cannot break the one-row-per-mission rule."""
+    _seed_mission(rework_db, mission_id="m-titled", objective="raw\nobjective", title="short name")
+    _seed_mission(rework_db, mission_id="m-long", objective="x", title="word " * 40)
+
+    result = runner.invoke(app, ["ls"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert len(lines) == 2, result.output
+    assert "short name" in lines[1]
+    assert "raw" not in result.output
+    assert all(len(line) <= 6 + 2 + 14 + 2 + 72 for line in lines)
+    assert lines[0].endswith("\u2026")
+
+
+def test_new_without_a_title_stores_a_derived_short_title(rework_db: Path) -> None:
+    """CLI-created missions used to store title=None, so the PR title fell back
+    to the objective's first line (found live: PR #24)."""
+    url = "https://github.com/example/repo.git"
+    objective = (
+        "Follow-up to #22 (just merged, NOT deployed to rewvis until this lands):"
+        " role_env scratch dirs pile up. Make gc reclaim them."
+    )
+    result = runner.invoke(app, ["new", objective, "--repo", url])
+
+    assert result.exit_code == 0, result.output
+    mission = _get_mission(rework_db, result.output.strip())
+    assert mission is not None
+    assert mission.title
+    assert "\n" not in mission.title
+    assert len(mission.title.split()) <= 8
+
+
+def test_new_title_option_wins(rework_db: Path) -> None:
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(
+        app, ["new", "a long objective. more words", "--repo", url, "--title", "My Title"]
+    )
+
+    assert result.exit_code == 0, result.output
+    mission = _get_mission(rework_db, result.output.strip())
+    assert mission is not None
+    assert mission.title == "My Title"
 
 
 def test_ls_on_empty_db_prints_nothing(rework_db: Path) -> None:

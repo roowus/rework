@@ -15,6 +15,7 @@ from typing import Any, ClassVar
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
+from textual.css.query import NoMatches
 from textual.notifications import SeverityLevel
 from textual.screen import ModalScreen
 from textual.widgets import ContentSwitcher
@@ -258,13 +259,19 @@ class ReworkApp(App[None]):
             log.warning("tick failed: %s", exc)
 
     def _on_snapshot(self, snap: Snapshot) -> None:
-        self.query_one(MenuBar).set_status(
-            online=snap.online,
-            gates=len(snap.gates),
-            spend_today=snap.spend_today,
-            error=snap.error,
-        )
-        self.query_one(TabBar).set_badge("gates", len(snap.gates))
+        try:
+            self.query_one(MenuBar).set_status(
+                online=snap.online,
+                gates=len(snap.gates),
+                spend_today=snap.spend_today,
+                error=snap.error,
+            )
+            self.query_one(TabBar).set_badge("gates", len(snap.gates))
+        except NoMatches:
+            # the DOM is gone: this app instance is shutting down, so there is
+            # nothing to paint and nothing to report. Any OTHER listener error
+            # still reaches Hub._broadcast, which logs it with a traceback.
+            return
         self._notify_new_gates(snap)
         for view in self.views():
             try:

@@ -1,10 +1,12 @@
 """`rework gc` reclaims role worktrees of finished missions only (found
-2026-11-10: 160 worktrees, 8.1 GB, nothing ever removed them)."""
+2026-11-10: 160 worktrees, 8.1 GB, nothing ever removed them) and, since
+2026-11-12, the role scratch dirs those runs leave in the system temp dir
+(~140 unattributed `rework-scratch-<random>` dirs had piled up in /tmp)."""
 
 import subprocess
 from pathlib import Path
 
-from rework.gc import collect, mission_of, remove
+from rework.gc import collect, collect_scratch, mission_of, remove, remove_scratch, scratch_mission
 
 DAY = 86400.0
 NOW = 1_000_000.0
@@ -90,3 +92,104 @@ def test_hard_linked_files_are_not_counted_as_freed(tmp_path: Path) -> None:
     os.link(cache, run / "worktree" / "linked.bin")
     found = collect(tmp_path / "work", {"m-bbbbbbbbbbbb": ("done", 0.0)}, DAY, now=NOW)
     assert found[0].bytes == 1000  # big.bin only; the linked file frees nothing
+
+
+def _scratch_dir(root: Path, name: str, payload: bytes = b"x" * 500) -> Path:
+    d = root / name
+    (d / "logs").mkdir(parents=True)
+    (d / "logs" / "run.log").write_bytes(payload)
+    return d
+
+
+def test_scratch_mission_reads_the_id_out_of_the_name() -> None:
+    assert scratch_mission("rework-scratch-m-58d05d4101c7-ab12cd34") == "m-58d05d4101c7"
+    assert scratch_mission("rework-scratch-m-58d05d4101c7") is None  # legacy, no id
+    assert scratch_mission("rework-scratch-ab12cd34") is None  # legacy, no id
+    assert scratch_mission("rework-scratch-") is None
+    assert scratch_mission("some-other-tool-xyz") is None
+    assert scratch_mission("m-58d05d4101c7_code6_coder_1") is None
+
+
+def test_finished_mission_scratch_dir_is_collected_and_removed(tmp_path: Path) -> None:
+    dead = _scratch_dir(tmp_path, "rework-scratch-m-58d05d4101c7-ab12cd34")
+
+    found = collect_scratch(tmp_path, {"m-58d05d4101c7"})
+
+    assert [c.path for c in found] == [dead]
+    assert found[0].mission_id == "m-58d05d4101c7"
+    assert found[0].bytes >= 500
+    assert remove_scratch(found) > 0
+    assert not dead.exists()
+
+
+def test_a_running_mission_scratch_dir_survives(tmp_path: Path) -> None:
+    live = _scratch_dir(tmp_path, "rework-scratch-m-live00000002-ff00aa11")
+
+    found = collect_scratch(tmp_path, {"m-58d05d4101c7"})  # a different mission
+
+    assert found == []
+    assert remove_scratch(found) == 0
+    assert live.exists()
+
+
+def test_a_legacy_unattributed_scratch_dir_survives(tmp_path: Path) -> None:
+    """No mission id in the name: nobody can say whose it is, so it is not ours
+    to delete (and a prefix-only sweep would have taken it)."""
+    legacy = _scratch_dir(tmp_path, "rework-scratch-ab12cd34")
+    empty_id = _scratch_dir(tmp_path, "rework-scratch-")
+
+    found = collect_scratch(tmp_path, {"m-58d05d4101c7"})
+
+    assert found == []
+    assert legacy.exists() and empty_id.exists()
+
+
+def test_a_non_matching_temp_entry_survives(tmp_path: Path) -> None:
+    other = _scratch_dir(tmp_path, "some-other-tool-xyz")
+    close = _scratch_dir(tmp_path, "not-rework-scratch-m-58d05d4101c7-ab12")
+    plain = tmp_path / "rework-scratch-m-58d05d4101c7-ab12"  # a FILE, not a dir
+    plain.write_text("x")
+
+    found = collect_scratch(tmp_path, {"m-58d05d4101c7"})
+
+    assert found == []  # the prefix is exact, and a dir is required
+    remove_scratch(found)
+    assert other.exists() and close.exists() and plain.exists()
+
+
+def test_a_missing_temp_dir_is_not_an_error(tmp_path: Path) -> None:
+    assert collect_scratch(tmp_path / "nope", {"m-58d05d4101c7"}) == []
+
+
+def test_an_unreadable_temp_dir_is_not_an_error(tmp_path: Path) -> None:
+    import os
+
+    if os.geteuid() == 0:  # root ignores the mode bits
+        return
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o000)
+    try:
+        assert collect_scratch(locked, {"m-58d05d4101c7"}) == []
+    finally:
+        locked.chmod(0o755)
+
+
+def test_a_dir_that_vanishes_mid_scan_does_not_crash(tmp_path: Path, monkeypatch) -> None:
+    """`itertools` sorted() runs first, so a dir removed between the listing and
+    the stat (another gc, a role cleaning up) must be skipped, not raise."""
+    doomed = _scratch_dir(tmp_path, "rework-scratch-m-58d05d4101c7-ab12cd34")
+    kept = _scratch_dir(tmp_path, "rework-scratch-m-58d05d4101c7-cd34ab12")
+
+    import rework.gc as gc_mod
+
+    real_size = gc_mod._size
+
+    def size(path: Path) -> int:
+        if path == doomed:
+            raise FileNotFoundError(path)
+        return real_size(path)
+
+    monkeypatch.setattr(gc_mod, "_size", size)
+    found = collect_scratch(tmp_path, {"m-58d05d4101c7"})
+    assert [c.path for c in found] == [kept]

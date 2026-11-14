@@ -265,7 +265,11 @@ gc` deletes the run worktrees of missions that are finished (done, failed or
 cancelled) and idle for `--older-than-days` (default 2). It keeps each
 mission's clone (`missions/<id>/repo`, which the Preview button uses), never
 touches an active mission, and skips directories of missions this database
-does not know. `--dry-run` lists what it would remove.
+does not know. It also reclaims the per-run scratch dirs `role_env` gives every
+non-checkout workdir in the system temp dir (`rework-scratch-<mission>-<random>`):
+the ones naming a finished mission are removed (they are dead the moment the
+mission ends), the unattributed legacy `rework-scratch-<random>` ones are left
+alone. `--dry-run` lists what it would remove and prints both counts.
 
 ```bash
 scripts/rework-local gc --dry-run      # the Mac

@@ -101,8 +101,10 @@ How you work:
   conservative: parallelism costs money and most missions are sequential.
 - Pick each role's model from the catalog: cheap tiers for exploration and
   straightforward coding, stronger tiers for audits and hard problems. If a role
-  failed on provider errors (timeouts, 5xx, rate limits), the model's endpoint is
-  struggling: respawn it on a different model rather than the same one.
+  failed on provider errors (timeouts, 5xx, rate limits), its endpoint is
+  struggling: respawn it on a model from a DIFFERENT provider, because another
+  model on the same provider hits the same endpoint. Do not pick a pricier tier
+  just to retry: keep the same tier/price or cheaper, and say why in the note.
 - Write every brief so the role can act without asking: what to do, why, what
   done looks like, and anything earlier roles found that it needs.
 - Scope briefs to the objective. Pass findings along as context, but do not turn
@@ -371,6 +373,26 @@ def orchestrator_run_id(mission_id: str) -> str:
 def _short(value: Any, limit: int) -> str:
     text = value if isinstance(value, str) else json.dumps(value, default=str)
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+# where an entry's calls go when it leaves base_url unset (the adapters'
+# defaults; see kernel/llm/adapters)
+_DEFAULT_ENDPOINTS = {
+    "anthropic": "https://api.anthropic.com",
+    "openai": "https://api.openai.com/v1",
+}
+
+
+def endpoint_of(entry: Any) -> str:
+    """The URL this catalog entry's calls actually reach: its base_url, or the
+    adapter's default. Found live (m-b928ea6d51bc): after an Anthropic timeout
+    the orchestrator promised a retry "on a different model" and picked
+    claude-opus-4-5 -- the same api.anthropic.com endpoint that had just failed,
+    and the priciest tier -- because the catalog it was shown named model ids
+    only. Provider + endpoint is what makes "different endpoint" checkable."""
+    if entry.base_url:
+        return str(entry.base_url)
+    return _DEFAULT_ENDPOINTS.get(str(entry.provider), "provider default")
 
 
 def artifact_summary(artifact: dict[str, Any] | None) -> str:
@@ -1447,7 +1469,8 @@ class MissionOrchestrator:
                 f"Default model: {spec.default_model}. INPUTS: {', '.join(inputs) or 'brief'}"
             )
         catalog = [
-            f"- {e.id}: tier {e.tier}, ${e.cost_in_per_mtok}/${e.cost_out_per_mtok} per Mtok"
+            f"- {e.id}: {e.provider} ({endpoint_of(e)}), tier {e.tier}, "
+            f"${e.cost_in_per_mtok}/${e.cost_out_per_mtok} per Mtok"
             + (f", {', '.join(sorted(e.capabilities))}" if e.capabilities else "")
             for e in self._usable()
         ]
@@ -1465,7 +1488,8 @@ class MissionOrchestrator:
                 "Automatic wiring: a coder receives the latest investigator handoff; an "
                 "auditor receives the latest coder's diff and worktree plus the latest "
                 "investigation. Put revision feedback in the brief.",
-                "CATALOG:\n" + "\n".join(catalog),
+                "CATALOG (provider and endpoint per model; two models on the same "
+                "endpoint share its health):\n" + "\n".join(catalog),
                 "MISSION:\n"
                 f"- id: {mission.id}\n- objective: {mission.objective}\n- repo: {repo}\n"
                 f"- final gates after you finish: {', '.join(gates) or 'none'}\n"

@@ -10,7 +10,8 @@ latency and token counts, every tool call with its duration, every crash with a
 traceback. `rework logs` reads them.
 
 Fields beyond the standard ones ride on `extra=`: mission, run, model, tool,
-ms, tokens_in, tokens_out, cost. Never log secrets or prompt bodies.
+ms, tokens_in, tokens_out, cost, cause (the exception cause chain of a failed
+model call). Never log secrets or prompt bodies.
 """
 
 from __future__ import annotations
@@ -25,7 +26,18 @@ import time
 from pathlib import Path
 from typing import Any
 
-FIELDS = ("mission", "run", "role", "model", "tool", "ms", "tokens_in", "tokens_out", "cost")
+FIELDS = (
+    "mission",
+    "run",
+    "role",
+    "model",
+    "tool",
+    "ms",
+    "tokens_in",
+    "tokens_out",
+    "cost",
+    "cause",
+)
 _configured: set[str] = set()
 
 # who is doing the work right now (set by role runs and the orchestrator); every
