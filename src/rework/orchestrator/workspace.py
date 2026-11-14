@@ -385,8 +385,7 @@ def _area_lock(project_id: str, timeout_s: float = AREA_LOCK_TIMEOUT_S) -> Itera
             except BlockingIOError:
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
-                        f"project {project_id} files area is busy "
-                        f"(no lock after {timeout_s:.0f}s)"
+                        f"project {project_id} files area is busy (no lock after {timeout_s:.0f}s)"
                     ) from None
                 time.sleep(0.05)
         try:
