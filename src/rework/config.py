@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -75,9 +76,19 @@ def projects_dir() -> Path:
     return DEFAULT_STATE_DIR / "projects"
 
 
+_UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9_-]")
+
+
 def project_files_dir(project_id: str) -> Path:
-    """A repo-less project's persistent files area: <projects_dir>/<id>/files."""
-    return projects_dir() / project_id / "files"
+    """A repo-less project's persistent files area: <projects_dir>/<id>/files.
+
+    The id is a path segment, so it is sanitised: a dot is not a legal id
+    character in practice (`new_id` mints `p-<hex>`), but anything that could
+    read as a traversal (".", "..", separators) must never escape the area."""
+    safe = _UNSAFE_ID_CHARS.sub("_", project_id)
+    if not safe.strip("_"):
+        raise ValueError(f"unusable project id for a files area: {project_id!r}")
+    return projects_dir() / safe / "files"
 
 
 def _default_db() -> str:

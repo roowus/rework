@@ -532,6 +532,10 @@ class MissionRunner:
         mission = await self._store.get_mission(mission_id)
         if mission is None or mission.project_id is None:
             return ""
+        if mission.status == MissionStatus.CANCELLED:
+            # an owner cancel (or the burn gate) stops the mission mid-flight:
+            # half-written worktrees must not land in the files area
+            return ""
         project = await self._store.get_project(mission.project_id)
         if project is None or not project_is_upload(project.settings):
             return ""  # NEVER for git projects: their worktree is the deliverable
@@ -547,7 +551,7 @@ class MissionRunner:
                 save_mission_files,
                 project.id,
                 trees,
-                f"mission {mission_id}: files updated by mission {mission_id}",
+                f"mission {mission_id}: project files updated",
             )
         except (OSError, subprocess.CalledProcessError) as exc:
             # bookkeeping must not fail a finished mission; the owner is told
