@@ -65,6 +65,21 @@ def default_reports_dir() -> Path:
     ).expanduser()
 
 
+def projects_dir() -> Path:
+    """Where per-project files areas live (upload transport, ADR 0005). This is
+    daemon-side internal state, so it sits under the same state root as the
+    database rather than in the visible deliverables directory."""
+    override = os.environ.get("REWORK_PROJECTS_DIR")
+    if override:
+        return Path(override).expanduser()
+    return DEFAULT_STATE_DIR / "projects"
+
+
+def project_files_dir(project_id: str) -> Path:
+    """A repo-less project's persistent files area: <projects_dir>/<id>/files."""
+    return projects_dir() / project_id / "files"
+
+
 def _default_db() -> str:
     return str(DEFAULT_STATE_DIR / "state.sqlite3")
 

@@ -19,12 +19,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from langgraph.types import Command
 
+from rework.config import project_files_dir
 from rework.kernel.events.bus import EventBus
 from rework.kernel.gates import GateManager
 from rework.kernel.llm.adapters import build_provider
@@ -45,6 +47,7 @@ from rework.kernel.state.records import (
 )
 from rework.kernel.state.store import StateStore
 from rework.logs import bind
+from rework.missions import project_is_upload
 from rework.nodes.report_sections import accepted_findings_section, mechanical_verdict
 from rework.roles.base import EscalationKind, RoleBuildCtx
 from rework.roles.registry import RoleRegistry
@@ -448,12 +451,21 @@ class MissionRunner:
             await self._supervisor.aclose()
 
     async def _ensure_repo(self, mission: Mission) -> Mission:
-        """Git transport (ADR 0005): a repo_origin with no path means the
-        daemon clones from origin itself, and the row then carries a path that
-        is real on this machine. Idempotent across restarts: an existing clone
-        is reused, and the row update persists so recovery skips the clone."""
-        if not mission.repo_origin or mission.repo_path:
+        """Materialise the mission's workspace before it goes RUNNING.
+
+        Git transport (ADR 0005): a repo_origin with no path means the daemon
+        clones from origin itself, and the row then carries a path that is real
+        on this machine. Upload transport: a repo-less project has no repo at
+        all, so its persistent files area on this host is copied into the
+        workroot and git-initialised, and THAT becomes the mission's repo_path —
+        roles, worktrees and read_root then need no special case.
+
+        Idempotent across restarts: an existing clone or seeded workspace is
+        reused, and the row update persists so recovery skips the copy."""
+        if mission.repo_path:
             return mission
+        if not mission.repo_origin:
+            return await self._seed_project_files(mission)
         from rework.nodes.git_ops import clone_origin
 
         dest = self._workroot / "missions" / mission.id / "repo"
@@ -472,6 +484,91 @@ class MissionRunner:
             )
         updated = await self._store.update_mission(mission.id, repo_path=str(dest))
         return updated or mission
+
+    async def _seed_project_files(self, mission: Mission) -> Mission:
+        """Upload transport (ADR 0005): copy the project's files area into the
+        mission's workspace and adopt it as repo_path. A project with no files
+        still starts: the workspace is git-initialised empty and the mission can
+        write into it. Missions outside an upload project are untouched."""
+        if mission.project_id is None:
+            return mission
+        project = await self._store.get_project(mission.project_id)
+        if project is None or not project_is_upload(project.settings):
+            return mission
+        from rework.orchestrator.workspace import ensure_files_area, seed_mission_workspace
+
+        dest = self._workroot / "missions" / mission.id / "repo"
+        try:
+            await asyncio.to_thread(ensure_files_area, project.id)
+            await asyncio.to_thread(seed_mission_workspace, project_files_dir(project.id), dest)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            # a files area that cannot be materialised must not silently run a
+            # mission against an empty workspace: fail loudly, the reason lands
+            # in the mission's own event log
+            await self._bus.publish(
+                EventRecord(
+                    mission_id=mission.id,
+                    type=EventType.INFO,
+                    payload={"error": f"project files unavailable: {exc}"},
+                )
+            )
+            raise
+        await self._bus.publish(
+            EventRecord(
+                mission_id=mission.id,
+                type=EventType.PROGRESS,
+                payload={"note": f"seeded from project {project.id} files (upload transport)"},
+            )
+        )
+        updated = await self._store.update_mission(mission.id, repo_path=str(dest))
+        return updated or mission
+
+    async def _save_project_files(self, mission_id: str, runs: list[Run]) -> str:
+        """Upload transport (ADR 0005) save-back: copy the mission's new and
+        changed files into the project's files area, commit them there, and
+        return the report line naming them. "" when there is nothing to say
+        (git projects, project-less missions, no changes) — the caller then
+        leaves the report untouched."""
+        mission = await self._store.get_mission(mission_id)
+        if mission is None or mission.project_id is None:
+            return ""
+        project = await self._store.get_project(mission.project_id)
+        if project is None or not project_is_upload(project.settings):
+            return ""  # NEVER for git projects: their worktree is the deliverable
+        trees = [Path(mission.repo_path)] if mission.repo_path else []
+        for run in reversed(runs):
+            worktree = (run.artifact or {}).get("worktree")
+            if worktree:
+                trees.append(Path(str(worktree)))
+        from rework.orchestrator.workspace import save_mission_files
+
+        try:
+            changed = await asyncio.to_thread(
+                save_mission_files,
+                project.id,
+                trees,
+                f"mission {mission_id}: files updated by mission {mission_id}",
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            # bookkeeping must not fail a finished mission; the owner is told
+            await self._bus.publish(
+                EventRecord(
+                    mission_id=mission_id,
+                    type=EventType.INFO,
+                    payload={"error": f"project files not updated: {exc}"},
+                )
+            )
+            return ""
+        if not changed:
+            return ""
+        await self._bus.publish(
+            EventRecord(
+                mission_id=mission_id,
+                type=EventType.INFO,
+                payload={"note": f"project {project.id} files updated ({len(changed)} paths)"},
+            )
+        )
+        return f"Project files updated: {', '.join(changed)}"
 
     async def _run_steps(self, mission: Mission) -> None:
         steps = list(_plan_steps(mission))
@@ -845,6 +942,14 @@ class MissionRunner:
         shipped = getattr(self, "_shipped_branch", None)
         if shipped:
             result["branch"] = shipped
+        # Upload transport only: a repo-less project's work lives in its files
+        # area, so whatever the mission produced is copied back there and named
+        # in the report. Git projects deliver a pushed branch instead.
+        files_note = await self._save_project_files(mission_id, runs)
+        if files_note:
+            result["project_files"] = files_note
+            summary = f"{summary.rstrip()}\n\n{files_note}" if summary.strip() else files_note
+            result["summary"] = summary
         current = await self._store.get_mission(mission_id)
         if current is not None and current.status == MissionStatus.CANCELLED:
             # the burn gate (or an owner cancel) already set the verdict while

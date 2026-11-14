@@ -159,8 +159,16 @@ def project_assign(
 @project_app.command("create")
 def project_create(
     name: str,
-    transport: str = typer.Option("git", help="git (daemon clones origins) | upload"),
-    results: str = typer.Option("push_branch", help="push_branch | fetch | both"),
+    transport: str | None = typer.Option(
+        None,
+        help="git (daemon clones origins) | upload (daemon keeps the files)."
+        " Defaults from --repo: given repos -> git, none -> upload.",
+    ),
+    results: str | None = typer.Option(
+        None,
+        help="push_branch | fetch | both. Defaults from --repo:"
+        " given repos -> push_branch, none -> fetch.",
+    ),
     # typer needs list for repeatable options (tuple[str, ...] chokes on the
     # Ellipsis); ruff B008 flags any list-annotated default, so noqa is the
     # only clean escape (matches the existing ASYNC240 noqa above)
@@ -175,6 +183,7 @@ def project_create(
     async def go() -> str:
         from rework.config import Config, open_store_from_config
         from rework.kernel.state.records import Project
+        from rework.missions import derive_transport
         from rework.missions import is_git_url as missions_is_git_url
 
         repos: list[dict] = []
@@ -184,10 +193,21 @@ def project_create(
             rname, url = spec.split("=", 1)
             kind = "github" if missions_is_git_url(url) else "path"
             repos.append({"name": rname, "kind": kind, "url": url})
+        # repos decide the transport (ADR 0005): a repo-less project travels by
+        # upload/fetch, never git/push_branch, because it has no origin to push to
+        derived_transport, derived_results = derive_transport({"repos": repos})
+        settings_transport = transport or derived_transport
+        settings_results = results or derived_results
+        if settings_transport == "git" and not repos:
+            raise typer.BadParameter("transport=git needs at least one --repo NAME=URL")
         cfg = Config.from_env()
         store = await open_store_from_config(cfg)
         try:
-            settings = {"transport": transport, "results": results, "repos": repos}
+            settings = {
+                "transport": settings_transport,
+                "results": settings_results,
+                "repos": repos,
+            }
             p = await store.create_project(Project(name=name, settings=settings))
             return p.id
         finally:
@@ -202,14 +222,16 @@ def project_ls() -> None:
 
     async def go() -> list[str]:
         from rework.config import Config, open_store_from_config
+        from rework.missions import derive_transport
 
         store = await open_store_from_config(Config.from_env())
         try:
             rows = []
             for p in await store.list_projects():
                 repos = (p.settings or {}).get("repos") or []
+                transport, results = derive_transport(p.settings)
                 rows.append(
-                    f"{p.id}  {p.name}  transport={(p.settings or {}).get('transport', 'git')}"
+                    f"{p.id}  {p.name}  transport={transport}  results={results}"
                     f"  repos={len(repos)}"
                 )
             return rows
@@ -218,6 +240,86 @@ def project_ls() -> None:
 
     for line in asyncio.run(go()):
         typer.echo(line)
+
+
+@project_app.command("add-files")
+def project_add_files(
+    project: str = typer.Argument(..., help="Project name or id."),
+    paths: list[str] = typer.Argument(..., help="Local files/folders to send."),  # noqa: B008
+    daemon_url: str | None = typer.Option(None, help="Override REWORK_DAEMON_URL."),
+) -> None:
+    """Copy local files into a repo-less project's files area on the daemon.
+    Every mission on that project then starts from them."""
+
+    async def go() -> tuple[str, list[str]]:
+        from rework.config import Config, open_store_from_config
+        from rework.missions import resolve_project
+
+        project_id = await resolve_project(project)
+        assert project_id is not None
+        store = await open_store_from_config(Config.from_env())
+        try:
+            found = await store.get_project(project_id)
+        finally:
+            await store.aclose()
+        from rework.missions import project_is_upload
+
+        if found is None or not project_is_upload(found.settings):
+            raise ValueError(f"project {project} is git transport: push a branch, not files")
+        from rework.project_files import add_project_files
+
+        changed = await asyncio.to_thread(add_project_files, project_id, list(paths), daemon_url)
+        return project_id, changed
+
+    try:
+        project_id, changed = asyncio.run(go())
+    except ValueError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+    if not changed:
+        typer.echo(f"{project_id}: no changes (files identical)")
+        return
+    typer.echo(f"{project_id}: {len(changed)} path(s) in the project files area")
+    for line in changed:
+        typer.echo(f"  {line}")
+
+
+@project_app.command("pull")
+def project_pull(
+    project: str = typer.Argument(..., help="Project name or id."),
+    dest: str = typer.Argument(..., help="Local folder to unpack the files into."),
+    daemon_url: str | None = typer.Option(None, help="Override REWORK_DAEMON_URL."),
+) -> None:
+    """Fetch a repo-less project's files area from the daemon into DEST."""
+
+    async def go() -> str:
+        from rework.config import Config, open_store_from_config
+        from rework.missions import resolve_project
+
+        project_id = await resolve_project(project)
+        assert project_id is not None
+        store = await open_store_from_config(Config.from_env())
+        try:
+            found = await store.get_project(project_id)
+        finally:
+            await store.aclose()
+        from rework.missions import project_is_upload
+
+        if found is None or not project_is_upload(found.settings):
+            raise ValueError(f"project {project} is git transport: clone its repo instead")
+        from pathlib import Path as _Path
+
+        from rework.project_files import pull_project_archive
+
+        path = await asyncio.to_thread(pull_project_archive, project_id, _Path(dest), daemon_url)
+        return str(path)
+
+    try:
+        path = asyncio.run(go())
+    except ValueError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"project files pulled into {path}")
 
 
 @project_app.command("show")
