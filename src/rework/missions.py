@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from rework.kernel.state.records import (
+    Chat,
     EventRecord,
     EventType,
     Mission,
@@ -388,6 +389,14 @@ async def create_mission(
         if effort:
             plan_spec["effort"] = effort
 
+    effective_chat = chat_id
+    if effective_chat is None:
+        # a mission created without a chat (the CLI's `rework new`) still gets
+        # one so it is reachable everywhere a chat-backed mission is: the Work
+        # tab's "to" picker and the Dashboard. The TUI conversation, which
+        # supplies its OWN chat_id, is untouched (GAP 1).
+        effective_chat = new_id("chat")
+
     async def _go(own_store: StateStore) -> Mission:
         from rework.kernel.events.bus import InProcessEventBus
 
@@ -398,7 +407,7 @@ async def create_mission(
                 repo_path=resolved["repo_path"],
                 repo_origin=resolved["repo_origin"],
                 project_id=project_id,
-                chat_id=chat_id,
+                chat_id=effective_chat,
                 # an explicit title (the TUI's LLM proposal, `new --title`)
                 # always wins; otherwise derive one so every mission has a
                 # short name for lists, PR titles and commit subjects
@@ -406,6 +415,17 @@ async def create_mission(
                 plan=plan_spec,
             )
         )
+        if chat_id is None:
+            # titled from the mission title so it reads like any TUI-created
+            # chat; linked back so the chat row knows which mission it owns
+            await own_store.create_chat(
+                Chat(
+                    id=effective_chat,
+                    title=(title or "").strip()[:80] or derive_title(objective),
+                    project_id=project_id,
+                    mission_id=mission.id,
+                )
+            )
         bus = InProcessEventBus(own_store)
         await bus.publish(
             EventRecord(
@@ -421,6 +441,33 @@ async def create_mission(
     own = await open_store_from_config(Config.from_env())
     try:
         return await _go(own)
+    finally:
+        await own.aclose()
+
+
+
+
+async def send_owner_message(mission_id: str, text: str, *, store: StateStore | None = None) -> Any:
+    """THE owner->mission message publisher (ADR 0007): appends an OWNER_MESSAGE
+    event; a running orchestrator is woken and sees it before its next turn.
+    One canonical implementation shared by the TUI (Work tab), the Dashboard
+    and `rework message` — do not duplicate the event-bus publish (GAP 1c).
+
+    When `store` is given it is used and NOT closed; otherwise a connection is
+    opened and closed here (CLI behavior)."""
+    from rework.kernel.state.records import EventRecord, EventType
+
+    if store is not None:
+        return await store.append_event(
+            EventRecord(mission_id=mission_id, type=EventType.OWNER_MESSAGE, payload={"text": text})
+        )
+    from rework.config import Config, open_store_from_config
+
+    own = await open_store_from_config(Config.from_env())
+    try:
+        return await own.append_event(
+            EventRecord(mission_id=mission_id, type=EventType.OWNER_MESSAGE, payload={"text": text})
+        )
     finally:
         await own.aclose()
 

@@ -614,12 +614,15 @@ class PostgresStore:
         approved: bool,
         note: str | None = None,
         decision: dict[str, Any] | None = None,
+        send_back: bool = False,
     ) -> Gate | None:
         await self._conn.execute(
             "UPDATE gates SET status = %s, decision_note = %s, decision = %s,"
             " decided_at = %s WHERE id = %s AND status = %s",
             (
-                GateStatus.APPROVED.value if approved else GateStatus.REJECTED.value,
+                GateStatus.SENT_BACK.value
+                if send_back
+                else (GateStatus.APPROVED.value if approved else GateStatus.REJECTED.value),
                 note,
                 _j(decision),
                 time.time(),

@@ -63,6 +63,8 @@ class GateStatus(StrEnum):
     OPEN = "open"
     APPROVED = "approved"
     REJECTED = "rejected"
+    SENT_BACK = "sent_back"  # the owner returned the work to the orchestrator:
+    # the mission keeps running and reaches the gate again
 
 
 class EventType(StrEnum):
