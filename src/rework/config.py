@@ -75,6 +75,10 @@ class Config:
     checkpoints_db: str  # sqlite path for role checkpoints (postgres shares db in M4)
     poll_interval_s: float = 0.5
     concurrency: int = 1  # sqlite deployments stay at 1 (docs/design.md)
+    # daemon-wide cap on concurrently RUNNING role runs, across all missions
+    # (REWORK_MAX_ROLES; 0/unset = os.cpu_count(), min 1). Runs beyond the cap
+    # are queued, not dropped: see orchestrator/limits.py
+    max_roles: int = 0
     git_author_name: str = "rework"  # agent commit identity; per-deployment via env
     git_author_email: str = "rework@rework.local"
 
@@ -96,7 +100,8 @@ class Config:
             return cls(
                 db=db,
                 checkpoints_db=db,
-                concurrency=int(os.environ.get("REWORK_CONCURRENCY", "4")),
+                concurrency=_concurrency(),
+                max_roles=_max_roles(),
                 git_author_name=author_name,
                 git_author_email=author_email,
             )
@@ -107,10 +112,45 @@ class Config:
         return cls(
             db=db,
             checkpoints_db=checkpoints,
-            concurrency=int(os.environ.get("REWORK_CONCURRENCY", "1")),
+            concurrency=_concurrency(sqlite_default=1),
+            max_roles=_max_roles(),
             git_author_name=author_name,
             git_author_email=author_email,
         )
+
+
+def _concurrency(sqlite_default: int | None = None) -> int:
+    """REWORK_CONCURRENCY, else a host-aware default: min(cpu_count, 4), min 1.
+    A sqlite deployment keeps its historical 1 unless the env says otherwise."""
+    from rework.nodes import hostlimits
+
+    raw = os.environ.get("REWORK_CONCURRENCY")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    if sqlite_default is not None:
+        return sqlite_default
+    return hostlimits.default_concurrency()
+
+
+def max_roles(config: Config) -> int:
+    """The daemon-wide role cap for this config (REWORK_MAX_ROLES, else CPUs)."""
+    return config.max_roles if config.max_roles > 0 else _max_roles()
+
+
+def _max_roles() -> int:
+    """REWORK_MAX_ROLES, else one role per CPU (min 1)."""
+    from rework.nodes import hostlimits
+
+    raw = os.environ.get("REWORK_MAX_ROLES")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return hostlimits.default_max_roles()
 
 
 def _prepare_sqlite_dir(db: str) -> str:

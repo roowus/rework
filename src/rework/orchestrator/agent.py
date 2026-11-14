@@ -1100,15 +1100,34 @@ class MissionOrchestrator:
                 for r in changed:
                     self.seen[r.id] = r.status.value
                     lines.append(await self._report(r))
-                live = [r.id for r in runs if r.status not in TERMINAL]
+                live = [self._live_label(r) for r in runs if r.status not in TERMINAL]
                 tail = f"\nstill running: {', '.join(live)}" if live else ""
                 return "\n".join(lines) + tail
             live_runs = [r for r in runs if r.status not in TERMINAL]
             if not live_runs:
                 return "no roles are running. spawn a role or finish."
             if deadline is not None and time.monotonic() >= deadline:
-                return "timeout; still running: " + ", ".join(r.id for r in live_runs)
+                return "timeout; still running: " + ", ".join(
+                    self._live_label(r) for r in live_runs
+                )
             await asyncio.sleep(self.r._poll)
+
+    def _queued_note(self, run_id: str) -> str | None:
+        """How the orchestrator sees a run that is waiting for a role slot
+        (REWORK_MAX_ROLES). Roles beyond the cap are QUEUED, not refused, and a
+        silent queue looks like a hung role; say it out loud."""
+        supervisor = self.r._supervisor
+        if supervisor is None:
+            return None
+        limiter = getattr(supervisor, "limiter", None)
+        if limiter is None:
+            return None
+        note: str | None = limiter.queue_note(run_id)
+        return note
+
+    def _live_label(self, run: Run) -> str:
+        note = self._queued_note(run.id)
+        return f"{run.id} (queued)" if note else run.id
 
     async def _report(self, run: Run) -> str:
         if run.status == RunStatus.COMPLETED:
@@ -1158,7 +1177,11 @@ class MissionOrchestrator:
                 lines.append(f"  -> {_short(body, 200)}")
             elif p.get("note") or p.get("error"):
                 lines.append(f"  ({_short(p.get('note') or p.get('error'), 200)})")
-        status = f"{run_id} is {run.status.value}"
+        queued = self._queued_note(run_id)
+        if queued:
+            status = f"{run_id} is {queued}"  # not started: waiting for a role slot
+        else:
+            status = f"{run_id} is {run.status.value}"
         return status + ("\n" + "\n".join(lines) if lines else "; no steps yet")
 
     async def _cancel(self, run_id: str, reason: str) -> str:
@@ -1245,14 +1268,16 @@ class MissionOrchestrator:
                 self.mid, kind=kind, question=question, for_run=run_id, spec=spec
             )
         await self.store.update_mission(self.mid, status=MissionStatus.AWAITING_GATE)
-        while True:
-            row = await self.store.get_gate(gate.id)
-            if row is not None and row.status != GateStatus.OPEN:
-                break
-            mission = await self.store.get_mission(self.mid)
-            if mission is not None and mission.status == MissionStatus.CANCELLED:
-                return "the owner cancelled the mission"
-            await asyncio.sleep(self.r._poll)
+        # waiting for the OWNER: hold no daemon mission slot meanwhile
+        async with self.r._waiting():
+            while True:
+                row = await self.store.get_gate(gate.id)
+                if row is not None and row.status != GateStatus.OPEN:
+                    break
+                mission = await self.store.get_mission(self.mid)
+                if mission is not None and mission.status == MissionStatus.CANCELLED:
+                    return "the owner cancelled the mission"
+                await asyncio.sleep(self.r._poll)
         await self.store.update_mission(self.mid, status=MissionStatus.RUNNING)
         text = answer_text(row)
         if run_id is not None:
@@ -1310,11 +1335,12 @@ class MissionOrchestrator:
                 spec={"turn_cap": True, "asked_by": "engine"},
             )
         await self.store.update_mission(self.mid, status=MissionStatus.AWAITING_GATE)
-        while True:
-            row = await self.store.get_gate(gate.id)
-            if row is not None and row.status != GateStatus.OPEN:
-                break
-            await asyncio.sleep(self.r._poll)
+        async with self.r._waiting():  # no daemon slot while the owner decides
+            while True:
+                row = await self.store.get_gate(gate.id)
+                if row is not None and row.status != GateStatus.OPEN:
+                    break
+                await asyncio.sleep(self.r._poll)
         await self.store.update_mission(self.mid, status=MissionStatus.RUNNING)
         return row.status == GateStatus.APPROVED
 
@@ -1355,11 +1381,12 @@ class MissionOrchestrator:
                 spec={"_call": call_id, "asked_by": "orchestrator", "budget_to": wanted},
             )
         await self.store.update_mission(self.mid, status=MissionStatus.AWAITING_GATE)
-        while True:
-            row = await self.store.get_gate(gate.id)
-            if row is not None and row.status != GateStatus.OPEN:
-                break
-            await asyncio.sleep(self.r._poll)
+        async with self.r._waiting():  # no daemon slot while the owner decides
+            while True:
+                row = await self.store.get_gate(gate.id)
+                if row is not None and row.status != GateStatus.OPEN:
+                    break
+                await asyncio.sleep(self.r._poll)
         await self.store.update_mission(self.mid, status=MissionStatus.RUNNING)
         if row.status != GateStatus.APPROVED:
             return (
