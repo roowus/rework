@@ -256,6 +256,9 @@ async def test_mission_that_writes_nothing_saves_nothing(upload_world: dict[str,
     mission = await store.get_mission(upload_world["mission"].id)
     assert mission is not None and mission.status == MissionStatus.DONE
     assert "project_files" not in (mission.result or {})
+    # the no-op guard is at the _synthesize level too: no save was even
+    # attempted, so a failed one cannot hide behind an empty change list
+    assert "project_files_error" not in (mission.result or {})
     assert "Project files updated:" not in str((mission.result or {}).get("summary") or "")
     assert not (area / ".gitignore").exists()
     assert commits() == before, "a no-write mission must not commit into the area"

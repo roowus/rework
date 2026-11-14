@@ -396,6 +396,29 @@ def test_save_mission_files_is_idempotent(tmp_path: Path, monkeypatch: pytest.Mo
     assert _git("rev-parse", "HEAD", cwd=area).stdout == head
 
 
+def test_save_mission_files_handles_names_git_reads_as_pathspec_magic(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A mission-produced name git parses as pathspec magic (`:x.md`,
+    `*.txt`) made `git add -- <paths>` exit 128, so the whole save-back raised
+    and was reported as "Project files NOT updated" even though the files had
+    been copied. `--literal-pathspecs` makes the names data, not patterns."""
+    monkeypatch.setenv("REWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    tree = _seeded_tree(tmp_path)
+    names = [":x.md", ":(top)a.md", "*.txt", "sp ace.md"]
+    for name in names:
+        (tree / name).write_text(f"# {name}\n")
+
+    changed = save_mission_files("p-magic", [tree], "mission m: files")
+
+    assert sorted(changed) == [f"{name} (new)" for name in sorted(names)]
+    area = project_files_dir("p-magic")
+    for name in names:
+        assert (area / name).read_text() == f"# {name}\n", "copied AND versioned"
+        assert name in _git("ls-files", "-z", cwd=area).stdout, f"{name} is tracked"
+    assert _git("status", "--porcelain", cwd=area).stdout.strip() == ""
+
+
 def test_save_mission_files_versions_output_the_area_gitignore_hides(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

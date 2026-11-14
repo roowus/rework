@@ -368,10 +368,15 @@ def _stage_paths(area: Path, rels: list[str]) -> None:
     `.gitignore` (an owner-authored `*.log`) hide a file the mission really
     produced: the save-back then looked like a no-op and the deliverable stayed
     unversioned in the area. `-f` is the whole point here; callers only pass
-    paths `_excluded()` accepted, so junk can never be force-added."""
+    paths `_excluded()` accepted, so junk can never be force-added.
+
+    `--literal-pathspecs` (a GLOBAL option, so it precedes the subcommand) is
+    what makes these paths DATA: a mission-produced `:x.md` or `*.txt` is
+    pathspec magic to git, which exited 128 and turned the whole save-back into
+    a reported failure even though the files had already been copied."""
     if not rels:
         return
-    _git(area, "add", "-f", "--", *rels)
+    _git(area, "--literal-pathspecs", "add", "-f", "--", *rels)
 
 
 def mission_changes(tree: Path) -> list[tuple[str, str]]:
