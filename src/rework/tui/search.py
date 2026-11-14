@@ -210,6 +210,40 @@ def parse_ai_ranking(text: str, known_ids: Iterable[str]) -> list[dict[str, str]
     return out
 
 
+def build_ai_request(model: str, query: str, missions_summaries: Sequence[dict[str, str]]) -> Any:
+    """The ranking request on its own, so a caller that has already spent part of
+    the budget can hand the remaining time to `run_ai_search`."""
+    from rework.kernel.llm.types import ChatRequest
+
+    return ChatRequest(
+        model=model,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": build_ai_prompt(query, missions_summaries)}],
+        max_tokens=MAX_TOKENS,
+        temperature=0,
+    )
+
+
+async def run_ai_search(
+    provider: Any,
+    request: Any,
+    missions_summaries: Sequence[dict[str, str]],
+    timeout: float = TIMEOUT_S,  # noqa: ASYNC109 - an explicit budget, not asyncio's
+) -> list[dict[str, str]]:
+    """Run a prebuilt request under `timeout` (the caller's remaining budget)."""
+    try:
+        result = await asyncio.wait_for(provider.complete(request), timeout)
+    except TimeoutError:
+        budget = f" after {timeout:.0f}s" if timeout >= 1 else ""
+        raise AISearchError(f"AI search timed out{budget}") from None
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # every provider failure is displayable, never fatal
+        raise AISearchError(f"AI search failed: {str(exc)[:160] or type(exc).__name__}") from exc
+    known = [summary["id"] for summary in missions_summaries]
+    return parse_ai_ranking(getattr(result, "text", "") or "", known)
+
+
 async def ai_search(
     provider: Any,
     model: str,
@@ -221,25 +255,8 @@ async def ai_search(
 
     Raises `AISearchError` with a displayable message on timeout or any
     provider failure, so a flaky endpoint can never take the dashboard down."""
-    from rework.kernel.llm.types import ChatRequest
-
-    request = ChatRequest(
-        model=model,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": build_ai_prompt(query, missions_summaries)}],
-        max_tokens=MAX_TOKENS,
-        temperature=0,
-    )
-    try:
-        result = await asyncio.wait_for(provider.complete(request), timeout)
-    except TimeoutError:
-        raise AISearchError(f"AI search timed out after {timeout:.0f}s") from None
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:  # every provider failure is displayable, never fatal
-        raise AISearchError(f"AI search failed: {str(exc)[:160] or type(exc).__name__}") from exc
-    known = [summary["id"] for summary in missions_summaries]
-    return parse_ai_ranking(getattr(result, "text", "") or "", known)
+    request = build_ai_request(model, query, missions_summaries)
+    return await run_ai_search(provider, request, missions_summaries, timeout)
 
 
 def pick_entry(catalog: Any) -> Any:

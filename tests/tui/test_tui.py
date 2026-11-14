@@ -3378,3 +3378,100 @@ async def test_dashboard_graph_collapsed_rounds_toggle(env: Path) -> None:
         assert keys() == folded, keys()
 
         assert not app.swallowed
+
+
+async def test_dashboard_ai_search_deadline_covers_the_run_fetch(
+    ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hung run fetch must not outlive the search budget: the ranking still
+    happens (summaries without run output) and the bar never sticks on ✦."""
+    import asyncio
+
+    from rework.tui import search
+
+    class _Provider:
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        async def complete(self, request: Any) -> ChatResult:
+            self.requests.append(request)
+            return ChatResult(
+                text=f'[{{"id": "{ids["running"]}", "reason": "still the closest"}}]',
+                usage=Usage(input_tokens=200, output_tokens=20),
+            )
+
+    provider = _Provider()
+    import rework.kernel.llm.adapters as adapters
+
+    monkeypatch.setattr(adapters, "build_provider", lambda entry, extra=None: provider)
+    monkeypatch.setattr(search, "TIMEOUT_S", 0.6)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+
+        async def hung(mission_id: str) -> list[Any]:
+            await asyncio.sleep(30)
+            return []
+
+        monkeypatch.setattr(dash.hub.data, "mission_runs", hung, raising=False)
+        await pilot.press("slash")
+        for ch in "flaky":
+            await pilot.press(ch)
+        await _settle(pilot, 0.5)
+        started = asyncio.get_running_loop().time()
+        await pilot.click(_btn(app, dash, "ai-search"))
+        await _settle(pilot, 2.0)
+        assert asyncio.get_running_loop().time() - started < 4.0, "the budget held"
+        assert provider.requests, "a hung fetch still reaches the model"
+        assert dash.ai_results == [{"id": ids["running"], "reason": "still the closest"}]
+        assert dash._ai_busy is False
+        assert "searching" not in str(app.query_one("#mission-note").render())
+        assert app.is_running
+
+
+async def test_dashboard_escape_dismisses_an_in_flight_ai_search(
+    ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """esc while ✦ is still running dismisses it — it never arms app quit."""
+    import asyncio
+
+    class _Slow:
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        async def complete(self, request: Any) -> ChatResult:
+            self.requests.append(request)
+            await asyncio.sleep(3)
+            return ChatResult(text=f'[{{"id": "{ids["running"]}", "reason": "late"}}]')
+
+    provider = _Slow()
+    import rework.kernel.llm.adapters as adapters
+
+    monkeypatch.setattr(adapters, "build_provider", lambda entry, extra=None: provider)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        await pilot.press("slash")
+        for ch in "flaky":
+            await pilot.press(ch)
+        await _settle(pilot, 0.5)
+        await pilot.click(_btn(app, dash, "ai-search"))
+        await _settle(pilot, 0.4)
+        assert dash._ai_busy is True, "the search is in flight"
+        await pilot.press("escape")
+        await _settle(pilot, 0.6)
+        assert dash._ai_busy is False
+        assert dash.ai_results is None
+        assert dash.ai_note == ""
+        assert app.is_running, "esc did not arm quit"
+        assert not app.swallowed
