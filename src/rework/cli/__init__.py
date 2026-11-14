@@ -196,10 +196,23 @@ def project_create(
         # repos decide the transport (ADR 0005): a repo-less project travels by
         # upload/fetch, never git/push_branch, because it has no origin to push to
         derived_transport, derived_results = derive_transport({"repos": repos})
-        settings_transport = transport or derived_transport
-        settings_results = results or derived_results
-        if settings_transport == "git" and not repos:
+        if transport == "git" and not repos:
             raise typer.BadParameter("transport=git needs at least one --repo NAME=URL")
+        if transport is not None and transport != derived_transport:
+            # storing the contradiction made `project show` print a transport the
+            # project does not have (and every reader derives it anyway): refuse
+            # it instead of quietly disagreeing with the repo list
+            raise typer.BadParameter(
+                "--transport upload needs no --repo; drop one"
+                if transport == "upload"
+                else f"--transport {transport} contradicts the repos"
+                f" (that project is transport={derived_transport})"
+            )
+        # the DERIVED pair is what gets stored, so settings never contradict the
+        # repo list; an explicit --results still wins where `derive_transport`
+        # honours it (a git project's push_branch | fetch | both)
+        settings_transport = derived_transport
+        settings_results = results or derived_results
         cfg = Config.from_env()
         store = await open_store_from_config(cfg)
         try:

@@ -127,6 +127,34 @@ def test_project_create_rejects_git_transport_without_a_repo(rework_db: Path) ->
     assert "needs at least one --repo" in result.output
 
 
+def test_project_create_rejects_a_transport_that_contradicts_the_repo(
+    rework_db: Path,
+) -> None:
+    """`--transport upload --repo r=URL` stored a transport the project does not
+    have (the repos derive git), and `project show` printed that stale value.
+    Storing the derived pair is the rule; a contradiction is refused outright."""
+    result = runner.invoke(
+        app, ["project", "create", "N4", "--transport", "upload", "--repo", "r=github.com/a/b"]
+    )
+
+    assert result.exit_code != 0, result.output
+    assert "--transport upload needs no --repo; drop one" in result.output
+
+
+def test_project_create_stores_the_transport_the_repos_derive(rework_db: Path) -> None:
+    """Whatever the flags say, the stored settings agree with the repo list, so
+    `project show` can never print a transport the project does not have."""
+    with_repo = runner.invoke(app, ["project", "create", "N5", "--repo", "r=github.com/a/b"])
+    assert with_repo.exit_code == 0, with_repo.output
+    assert _get_project(rework_db, with_repo.output.strip()).settings["transport"] == "git"
+    assert _get_project(rework_db, with_repo.output.strip()).settings["results"] == "push_branch"
+
+    bare = runner.invoke(app, ["project", "create", "N6"])
+    assert bare.exit_code == 0, bare.output
+    assert _get_project(rework_db, bare.output.strip()).settings["transport"] == "upload"
+    assert _get_project(rework_db, bare.output.strip()).settings["results"] == "fetch"
+
+
 def test_project_add_files_rejects_a_missing_path(
     rework_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

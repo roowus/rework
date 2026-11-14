@@ -372,6 +372,67 @@ def test_save_mission_files_keeps_a_real_gitignore(
     assert (project_files_dir("p-own") / ".gitignore").read_text() == "dist/\nout/\n"
 
 
+def test_save_mission_files_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Saving the same trees twice is a no-op, not a failure. It used to run
+    `git commit` on an EMPTY index, which exits 1 and surfaced as "Project
+    files NOT updated: ..." even though the files were on disk (the same shape
+    a recovery re-synthesize or a second identical mission hits)."""
+    monkeypatch.setenv("REWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    tree = _seeded_tree(tmp_path)
+    (tree / "out.md").write_text("# out\n")
+
+    assert save_mission_files("p-idem", [tree], "mission m: files") == ["out.md (new)"]
+    area = project_files_dir("p-idem")
+    head = _git("rev-parse", "HEAD", cwd=area).stdout
+
+    # (a) the identical trees again: no raise, no changes, no new commit
+    assert save_mission_files("p-idem", [tree], "mission m: files") == []
+    assert _git("rev-parse", "HEAD", cwd=area).stdout == head, "nothing was committed"
+
+    # (b) a second mission whose output equals what is already stored
+    twin = _seeded_tree(tmp_path, "twin")
+    (twin / "out.md").write_text("# out\n")
+    assert save_mission_files("p-idem", [twin], "mission m2: files") == []
+    assert _git("rev-parse", "HEAD", cwd=area).stdout == head
+
+
+def test_save_mission_files_versions_output_the_area_gitignore_hides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An owner-authored `.gitignore` in the area (`*.log`) made a bare
+    `git add -A` skip the mission's only deliverable: no commit, an error, and
+    the file left silently untracked. The mission's own paths are force-staged."""
+    monkeypatch.setenv("REWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    area = ensure_files_area("p-ignore-log")
+    (area / ".gitignore").write_text("*.log\n")
+    update_files_area("p-ignore-log", pack_paths([area / ".gitignore"]), "owner ignore")
+
+    tree = _seeded_tree(tmp_path)
+    (tree / "run.log").write_text("the only deliverable\n")
+
+    assert save_mission_files("p-ignore-log", [tree], "mission m: files") == ["run.log (new)"]
+    assert (area / "run.log").read_text() == "the only deliverable\n"
+    assert "run.log" in _git("ls-files", "-z", cwd=area).stdout, "it is tracked"
+    assert "run.log" in _git("log", "--name-only", "--oneline", cwd=area).stdout, "and committed"
+    # the area's ignore file itself was NOT re-added/force-added by the save
+    assert _git("status", "--porcelain", cwd=area).stdout.strip() == ""
+
+
+def test_update_files_area_is_a_noop_success_when_nothing_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Adding the same files twice is a success with an empty list, not a
+    raised CalledProcessError from an empty `git commit`."""
+    monkeypatch.setenv("REWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    src = tmp_path / "local"
+    src.mkdir()
+    (src / "a.md").write_text("# a\n")
+    body = pack_paths([src / "a.md"])
+
+    assert update_files_area("p-noop", body, "add files") == ["a.md (new)"]
+    assert update_files_area("p-noop", body, "add files") == []
+
+
 def test_area_lock_excludes_concurrent_mutations(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -150,9 +150,9 @@ rework project add-files applications ./docs ./notes.md
 ```
 
 In the TUI: the dashboard project sidebar's **Add files** button, or **File >
-Add project files...**, takes a space- or comma-separated list of local paths
-(home-relative `~` is expanded). It refuses a git project: for those, push a
-branch.
+Add project files...**, takes one local path per line (a path containing
+spaces is fine; home-relative `~` is expanded). It refuses a git project: for
+those, push a branch.
 
 Run a mission on it — no `--repo` needed:
 

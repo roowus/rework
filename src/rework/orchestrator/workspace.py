@@ -301,31 +301,29 @@ def _untracked_new(dest: Path) -> list[tuple[str, str]]:
 
 def update_files_area(project_id: str, data: bytes, message: str) -> list[str]:
     """Unpack a bundle over the project's files area and commit it. Returns the
-    touched paths as "a.md (new)" / "b.md (changed)". Sync; to_thread wraps."""
+    touched paths as "a.md (new)" / "b.md (changed)". Sync; to_thread wraps.
+
+    Uploading files the area already holds is a success with an empty list,
+    not an error: there is simply nothing to commit."""
     with _area_lock(project_id):
         area = ensure_files_area(project_id)
         unpack_into(area, data)
-        changes = _status_changes(area)
-        if not changes:
-            return []
+        _git(area, "add", "-A")
+        if not _has_staged_changes(area):
+            return []  # identical files again: nothing to commit, a success
+        changes = _staged_changes(area)
         _commit(area, message)
         return [f"{rel} ({kind})" for rel, kind in changes]
 
 
-def mission_changes(tree: Path) -> list[tuple[str, str]]:
-    """[(path, "new"|"changed")] this tree gained relative to the snapshot it
-    was seeded from: `git_init_commit` made that snapshot the repo's root
-    commit, so a diff against the root covers commits made on a coder's branch
-    as well as uncommitted edits. Deletions are deliberately NOT carried back
-    into the project's area (a repo-less project is additive by design)."""
-    roots = _git_out(tree, "rev-list", "--max-parents=0", "HEAD").split()
-    if not roots:
-        return []
-    base = roots[-1]  # several roots means merged histories; the seeded one is oldest
-    changes: dict[str, str] = {}
-    # `git diff --name-status -z` is "<CODE>\0<path>\0" (a rename adds the new
-    # path after the old), so codes and paths alternate
-    fields = _z_fields(_git_out(tree, "diff", "--name-status", "-z", base))
+def _name_status_changes(raw: str) -> list[tuple[str, str]]:
+    """[(path, "new"|"changed")] from `git diff --name-status -z` output.
+
+    NUL-separated records are "<CODE>\0<path>\0" (a rename/removal adds the
+    NEW path then the old), so codes and paths alternate. Deletions are
+    skipped: a repo-less project is additive by design."""
+    out: list[tuple[str, str]] = []
+    fields = _z_fields(raw)
     index = 0
     while index < len(fields):
         code = fields[index]
@@ -339,7 +337,56 @@ def mission_changes(tree: Path) -> list[tuple[str, str]]:
             index += 1
         if code[:1] == "D" or not rel or _excluded(Path(rel)):
             continue
-        changes[rel] = "new" if code[:1] == "A" else "changed"
+        out.append((rel, "new" if code[:1] == "A" else "changed"))
+    return out
+
+
+def _has_staged_changes(area: Path) -> bool:
+    """True when the area's index holds something to commit (`git diff --cached
+    --quiet` exits 1 then; `--quiet` prints nothing either way, so the exit code
+    is the only signal). This guard is what keeps an EMPTY `git commit` — which
+    exits 1 and surfaced as "Project files NOT updated" — from ever running."""
+    try:
+        done = subprocess.run(
+            ["git", "-c", "core.hooksPath=/dev/null", "diff", "--cached", "--quiet"],
+            cwd=area,
+            capture_output=True,
+        )
+    except OSError:
+        return False
+    return done.returncode == 1
+
+
+def _staged_changes(area: Path) -> list[tuple[str, str]]:
+    """[(path, "new"|"changed")] actually staged in the area's index right now
+    (the same parse `mission_changes` uses, over `--cached`)."""
+    return _name_status_changes(_git_out(area, "diff", "--cached", "--name-status", "-z"))
+
+
+def _stage_paths(area: Path, rels: list[str]) -> None:
+    """Force-stage exactly these paths. A bare `git add -A` let the AREA's own
+    `.gitignore` (an owner-authored `*.log`) hide a file the mission really
+    produced: the save-back then looked like a no-op and the deliverable stayed
+    unversioned in the area. `-f` is the whole point here; callers only pass
+    paths `_excluded()` accepted, so junk can never be force-added."""
+    if not rels:
+        return
+    _git(area, "add", "-f", "--", *rels)
+
+
+def mission_changes(tree: Path) -> list[tuple[str, str]]:
+    """[(path, "new"|"changed")] this tree gained relative to the snapshot it
+    was seeded from: `git_init_commit` made that snapshot the repo's root
+    commit, so a diff against the root covers commits made on a coder's branch
+    as well as uncommitted edits. Deletions are deliberately NOT carried back
+    into the project's area (a repo-less project is additive by design)."""
+    roots = _git_out(tree, "rev-list", "--max-parents=0", "HEAD").split()
+    if not roots:
+        return []
+    base = roots[-1]  # several roots means merged histories; the seeded one is oldest
+    changes: dict[str, str] = {}
+    for rel, kind in _name_status_changes(_git_out(tree, "diff", "--name-status", "-z", base)):
+        changes[rel] = kind
     # untracked files never show in a diff — and they must be listed WITHOUT
     # the tree's own .gitignore, or the coder's boilerplate dist//build/ entry
     # makes a real deliverable invisible (see _untracked_new)
@@ -376,10 +423,22 @@ def save_mission_files(project_id: str, trees: list[Path], message: str) -> list
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
                 kinds[rel] = kind
-        if not kinds:
-            return []  # a mission that wrote nothing must not commit here
+        # stage the mission's own paths, FORCEd: the area may carry an
+        # owner-authored .gitignore (`*.log`) that a bare `git add -A` would
+        # honour, leaving a real deliverable unversioned and the save-back
+        # looking like a no-op. kinds already passed `_excluded()`.
+        _stage_paths(area, sorted(kinds))
+        staged = _staged_changes(area)
+        if not staged:
+            # nothing new to record (a second save of the same trees, a
+            # recovery re-synthesize, or a mission whose output the area
+            # already holds): the area has the content, so this is a no-op
+            # SUCCESS — never a `git commit` with an empty index, which exits 1
+            # and used to be reported as "Project files NOT updated"
+            return []
         _commit(area, message)
-        return [f"{rel} ({kind})" for rel, kind in sorted(kinds.items())]
+        # report what the area actually versioned, not every file copied
+        return [f"{rel} ({kind})" for rel, kind in staged]
 
 
 def _template_gitignore(path: Path, tree: Path) -> bool:
@@ -397,7 +456,6 @@ def _template_gitignore(path: Path, tree: Path) -> bool:
 
 
 def _commit(area: Path, message: str) -> None:
-    _git(area, "add", "-A")
     _git(
         area,
         "-c",
