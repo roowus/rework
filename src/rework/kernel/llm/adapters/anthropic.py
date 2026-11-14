@@ -33,24 +33,47 @@ def _breakpoints(payload: dict[str, Any]) -> int:
     return count
 
 
+# block types that can carry a cache breakpoint (thinking / redacted_thinking
+# cannot, and a text block only when it is not empty)
+_CACHEABLE = ("text", "image", "document", "tool_use", "tool_result")
+
+
+def _blank(text: Any) -> bool:
+    return not isinstance(text, str) or not text.strip()
+
+
+def _cacheable(block: Any) -> bool:
+    if not isinstance(block, dict) or block.get("type") not in _CACHEABLE:
+        return False
+    return block["type"] != "text" or not _blank(block.get("text"))
+
+
 def _mark_message(message: dict[str, Any]) -> bool:
     """Put one cache breakpoint on a message; True if it was added. A str
     content is wrapped into a text block, otherwise the breakpoint goes on the
-    last block. The block is COPIED, never mutated in place: a list content
-    can be the caller's own persisted history, where a leftover cache_control
-    would ride along into the next request."""
+    last block that can take one (never an empty text block, never a thinking
+    block: the API rejects both, so a message with no such block is skipped).
+    The block is COPIED, never mutated in place: a list content can be the
+    caller's own persisted history, where a leftover cache_control would ride
+    along into the next request."""
     content = message.get("content")
     if isinstance(content, str):
+        if _blank(content):
+            return False
         message["content"] = [{"type": "text", "text": content, "cache_control": CACHE_BREAKPOINT}]
         return True
-    if isinstance(content, list) and content and isinstance(content[-1], dict):
-        if "cache_control" in content[-1]:
-            return False  # already marked: never attach a second one
-        message["content"] = [
-            *content[:-1],
-            {**content[-1], "cache_control": CACHE_BREAKPOINT},
-        ]
-        return True
+    if isinstance(content, list):
+        for i in range(len(content) - 1, -1, -1):
+            if not _cacheable(content[i]):
+                continue
+            if "cache_control" in content[i]:
+                return False  # already marked: never attach a second one
+            message["content"] = [
+                *content[:i],
+                {**content[i], "cache_control": CACHE_BREAKPOINT},
+                *content[i + 1 :],
+            ]
+            return True
     return False
 
 
@@ -84,9 +107,40 @@ def _mark_cache(payload: dict[str, Any]) -> None:
             marked += 1
 
 
+def _clean(content: Any) -> Any:
+    """Content without empty text: the API rejects an empty (or whitespace-only)
+    text block, with or without cache_control. A str stays a str; a list loses
+    its empty text parts. Returns None when nothing is left."""
+    if isinstance(content, str):
+        return None if _blank(content) else content
+    if isinstance(content, list):
+        kept = [
+            b
+            for b in content
+            if not (isinstance(b, dict) and b.get("type") == "text" and _blank(b.get("text")))
+        ]
+        return kept or None
+    return content
+
+
+def _blocks(content: Any) -> list[Any]:
+    return [{"type": "text", "text": content}] if isinstance(content, str) else list(content)
+
+
+def _signed(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Thinking blocks the API will accept back: a thinking block cut off
+    before its signature was written is useless (and a 400)."""
+    return [b for b in blocks if b.get("type") != "thinking" or b.get("signature")]
+
+
 def translate_request(request: ChatRequest) -> dict[str, Any]:
-    """Generic messages to the Anthropic Messages wire format."""
+    """Generic messages to the Anthropic Messages wire format. Empty text is
+    never sent (stored histories can hold it: a reply cut off while thinking is
+    persisted as an assistant turn with content ""), so a turn with nothing
+    left is dropped, and the user turns around it are merged to keep the roles
+    alternating."""
     messages: list[dict[str, Any]] = []
+    dropped = False
     for msg in request.messages:
         role = msg["role"]
         if role == "tool":
@@ -97,7 +151,7 @@ def translate_request(request: ChatRequest) -> dict[str, Any]:
                         {
                             "type": "tool_result",
                             "tool_use_id": msg["tool_call_id"],
-                            "content": msg["content"],
+                            "content": _clean(msg["content"]) or "",
                         }
                     ],
                 }
@@ -105,7 +159,7 @@ def translate_request(request: ChatRequest) -> dict[str, Any]:
         elif role == "assistant" and msg.get("tool_calls"):
             # thinking blocks first, exactly as received (the API checks them)
             blocks: list[dict[str, Any]] = list(msg.get("thinking_blocks") or [])
-            if msg.get("content"):
+            if not _blank(msg.get("content")):
                 blocks.append({"type": "text", "text": msg["content"]})
             for tc in msg["tool_calls"]:
                 args = tc["arguments"]
@@ -132,11 +186,25 @@ def translate_request(request: ChatRequest) -> dict[str, Any]:
                         "source": {"type": "base64", "media_type": mime, "data": data},
                     }
                 )
-            if msg.get("content"):
+            if not _blank(msg.get("content")):
                 content.append({"type": "text", "text": msg["content"]})
             messages.append({"role": role, "content": content})
         else:
-            messages.append({"role": role, "content": msg["content"]})
+            cleaned = _clean(msg.get("content"))
+            if cleaned is None and role == "assistant" and msg.get("thinking_blocks"):
+                # the cut-off shape: thinking and no text. The API accepts a
+                # thinking-only turn (checked live), so keep just the thinking
+                cleaned = _signed(list(msg["thinking_blocks"])) or None
+            if cleaned is None:
+                dropped = True
+                continue
+            if dropped and messages and messages[-1]["role"] == role:
+                messages[-1]["content"] = _blocks(messages[-1]["content"]) + _blocks(cleaned)
+            else:
+                messages.append({"role": role, "content": cleaned})
+            dropped = False
+            continue
+        dropped = False
 
     payload: dict[str, Any] = {
         "model": request.model,
