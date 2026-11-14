@@ -467,6 +467,9 @@ def test_sync_config_merges_only_key_lines_and_never_prints_values(
         calls.append((list(cmd), kwargs.get("input")))
         if cmd[:1] == ["ssh"] and len(cmd) > 2 and cmd[2].startswith("cat"):
             stdout = "REWORK_FIREWORKS_KEY=old\nREWORK_DB=keepme\n"
+            if "models.json" in cmd[2]:
+                # the read completed: the end marker the command checks for
+                stdout = "__REWORK_MODELS_EOF__\n"
             return type("P", (), {"stdout": stdout, "returncode": 0})()
         return type("P", (), {"stdout": "", "returncode": 0})()
 
@@ -563,6 +566,9 @@ def _sync_env(
         if cmd[:1] == ["ssh"] and len(cmd) > 2:
             if "models.json" in cmd[2]:
                 stdout = "" if remote_models is None else json.dumps(remote_models)
+                # the read is answered like a real shell: the file (or nothing)
+                # then the end-of-read marker the command checks for
+                stdout += "__REWORK_MODELS_EOF__\n"
             elif "rework.env" in cmd[2]:
                 stdout = "REWORK_FIREWORKS_KEY=old\nREWORK_DB=keepme\n"
         return type("P", (), {"stdout": stdout, "returncode": 0})()
@@ -609,6 +615,53 @@ def test_sync_config_skips_loopback_entries_and_their_keys(
     assert "  keep    rewvis-only: only on the target" in out
     assert "  replace flash:" in out and "  add     router-sibling:" in out
     assert not any(argv[0] == "scp" for argv, _ in calls)
+
+
+def test_sync_config_writes_nothing_when_the_remote_read_fails(
+    targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ssh read that never completed must not be mistaken for an empty
+    target catalog: the merge would then drop the target's own entries and
+    `cat >` would REPLACE the remote models.json with local-only ones. The
+    read carries an end marker only a finished shell run can produce, so a
+    missing marker aborts the whole write phase."""
+    calls, _ = _sync_env(tmp_path, monkeypatch, remote_models=REMOTE_MODELS)
+
+    def dead_run(cmd: list[str], **kwargs: object) -> object:
+        calls.append((list(cmd), kwargs.get("input")))
+        # unreachable host: ssh exits non-zero and prints a diagnostic, and the
+        # shell never ran, so the marker is absent (this is what ssh_run returns)
+        stdout = "ssh: connect to host 100.107.125.118 port 22: No route to host\n"
+        return type("P", (), {"stdout": stdout, "returncode": 255})()
+
+    monkeypatch.setattr("subprocess.run", dead_run)
+    result = runner.invoke(app, ["sync-config", "sandbox"])
+    assert result.exit_code != 0, "a failed remote read must exit non-zero"
+    assert "__REWORK_MODELS_EOF__" in result.output or "did not complete" in result.output
+    assert "100.107.125.118" in result.output  # names the target
+    assert "nothing was written" in result.output
+    writes = [
+        argv
+        for argv, _ in calls
+        if argv[0] == "scp" or (argv[0] == "ssh" and ("cat >" in argv[2] or "chmod" in argv[2]))
+    ]
+    assert not writes, f"a failed remote read still wrote to the target: {writes}"
+
+    # --dry-run must report the same problem, not crash, and still write nothing
+    calls2, _ = _sync_env(tmp_path, monkeypatch, remote_models=REMOTE_MODELS)
+    monkeypatch.setattr("subprocess.run", dead_run)
+    result = runner.invoke(app, ["sync-config", "sandbox", "--dry-run"])
+    assert result.exit_code != 0
+    assert "nothing was written" in result.output
+    assert not [a for a, _ in calls2 if a[0] == "scp" or (a[0] == "ssh" and "cat >" in a[2])]
+
+    # ...while a SUCCESSFUL read of an absent file still writes the local
+    # catalog (empty target: no file, only the marker)
+    calls3, _ = _sync_env(tmp_path, monkeypatch, remote_models=None)
+    ok = runner.invoke(app, ["sync-config", "sandbox"])
+    assert ok.exit_code == 0, ok.output
+    merged = json.loads(_ssh_write(calls3, "models.json"))
+    assert [e["id"] for e in merged] == ["flash", "router-sibling"]
 
 
 def test_sync_config_keeps_a_key_a_kept_entry_also_uses(
@@ -669,7 +722,11 @@ def test_sync_config_never_writes_a_models_json_the_loader_cannot_read(
 
     def bad_run(cmd: list[str], **kwargs: object) -> object:
         calls2.append((list(cmd), kwargs.get("input")))
-        stdout = "{not json" if cmd[:1] == ["ssh"] and "models.json" in cmd[2] else ""
+        stdout = (
+            "{not json__REWORK_MODELS_EOF__\n"
+            if cmd[:1] == ["ssh"] and "models.json" in cmd[2]
+            else ""
+        )
         return type("P", (), {"stdout": stdout, "returncode": 0})()
 
     monkeypatch.setattr("subprocess.run", bad_run)

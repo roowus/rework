@@ -1731,8 +1731,30 @@ def sync_config_cmd(
         typer.echo(f"no REWORK_*_KEY lines in {local_env}: nothing to merge")
 
     # -- remote models.json: read, merge by id, write the merged document ------
+    # `ssh_run` cannot tell a failed ssh from an empty file (it returns stdout
+    # either way), and an empty read is ALSO what a target with no models.json
+    # gives. Those two must not be confused: treating a failed read as "the
+    # target has no catalog" makes the merge below see no target entries and
+    # then REPLACE the remote file with local-only ones, destroying the
+    # target-only entries this command exists to preserve. So the read appends
+    # a sentinel that only a completed shell run can produce.
     target_doc: Any = None
-    remote_models = ssh_run("cat ~/.rework/models.json 2>/dev/null || true")
+    models_sentinel = "__REWORK_MODELS_EOF__"
+    remote_models = ssh_run(
+        f"cat ~/.rework/models.json 2>/dev/null || true; echo {models_sentinel}"
+    )
+    if models_sentinel not in remote_models:
+        typer.secho(
+            f"cannot read {host}:~/.rework/models.json: the ssh read did not complete"
+            f" (no {models_sentinel} marker in the output), so the target's catalog"
+            " cannot be merged; nothing was written and the local files are untouched",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(1)
+    remote_models = remote_models.split(models_sentinel, 1)[0]
+    if remote_models.endswith("\n"):
+        remote_models = remote_models[:-1]
     if remote_models.strip():
         try:
             target_doc = json.loads(remote_models)
@@ -1787,8 +1809,11 @@ def sync_config_cmd(
         )
         typer.echo(f"merged rework.env written to {host} (mode 600 preserved)")
     if local_doc is not None:
-        ssh_run("cat > ~/.rework/models.json", input_text=json.dumps(merged_doc, indent=2) + "\n")
-        typer.echo(f"merged models.json written to {host}:~/.rework/models.json")
+        ssh_run(
+            "cat > ~/.rework/models.json && chmod 600 ~/.rework/models.json",
+            input_text=json.dumps(merged_doc, indent=2) + "\n",
+        )
+        typer.echo(f"merged models.json written to {host}:~/.rework/models.json (mode 600)")
 
 
 def _models_doc_entries(doc: Any) -> list[dict[str, Any]]:
