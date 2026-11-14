@@ -105,6 +105,7 @@ async def seed(db_path: str, *, history_days: int = 120) -> dict[str, str]:
             )
         )
         rw = await store.create_project(Project(name="rework", settings={"repos": []}))
+        ids["upload_project"] = rw.id
         ids["project"] = poly.id
 
         # -- a running mission with a live coder -------------------------------

@@ -79,6 +79,7 @@ def _menus() -> dict[str, list[MenuItem]]:
         "File": [
             MenuItem("New chat", "app.new_chat", "ctrl+n"),
             MenuItem("New project…", "app.new_project"),
+            MenuItem("Add project files…", "app.project_files"),
             MenuItem("New library item…", "app.new_library_item"),
             SEPARATOR,
             MenuItem("Refresh", "app.refresh", "ctrl+r"),
@@ -657,6 +658,11 @@ class ReworkApp(App[None]):
             await self.hub.refresh()
         except Exception as exc:
             self.notify(f"Could not create project: {exc}", severity="error", markup=False)
+
+    def action_project_files(self) -> None:
+        """Add local files to the selected repo-less project's files area."""
+        self.action_tab("dashboard")
+        self.view("dashboard").add_project_files()
 
     def action_new_library_item(self) -> None:
         self.action_tab("library")

@@ -538,9 +538,7 @@ class TuiData:
 
     # -- writes ------------------------------------------------------------
 
-    async def create_project(
-        self, name: str, repos: list[dict[str, Any]] | None = None
-    ) -> Project:
+    async def create_project(self, name: str, repos: list[dict[str, Any]] | None = None) -> Project:
         """Store settings that are always self-consistent: the transport and
         the results handling are DERIVED from the repos, never hardcoded. No
         repo means an upload project (rework keeps the files, results are

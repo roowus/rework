@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import time
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 from textual import work
@@ -56,6 +57,7 @@ from rework.tui.widgets.graph import (
     mission_layers,
     mission_nodes,
 )
+from rework.tui.widgets.modals import Field, Form
 from rework.tui.widgets.trajectory import Trajectory, role_of
 
 ALL = "*"
@@ -126,6 +128,10 @@ class DashboardView(View):
                     yield Stat("spend · 7d", id="st-week")
                 with Horizontal():
                     with Vertical(classes="sidebar", id="dash-side"):
+                        with Horizontal(classes="side-actions"):
+                            # only an upload-transport (repo-less) project has a
+                            # files area to add to; a git project is told to push
+                            yield Btn("Add files", "add-files", variant="ghost")
                         yield Label("Projects")
                         yield RowList(id="proj-list")
                     with Vertical(classes="main"):
@@ -409,6 +415,11 @@ class DashboardView(View):
             self._paint_detail_tabs()
 
     def on_btn_pressed(self, event: Btn.Pressed) -> None:
+        if event.action == "add-files":
+            # the selected PROJECT decides, not a mission: works with nothing open
+            event.stop()
+            self.add_project_files()
+            return
         if not self.mission_id:
             return
         event.stop()
@@ -428,6 +439,56 @@ class DashboardView(View):
         if verb == "cancel":
             self._disarm(event.btn)
         self.run_worker(actions.control(self.rw, self.mission_id, verb), group="control")
+
+    def add_project_files(self) -> None:
+        """Push local files into the selected project's files area (upload
+        transport only). The daemon keeps them; missions seed from there."""
+        from rework.missions import project_is_upload
+
+        project = next((p for p in self.snap.projects if p.id == self.project), None)
+        if project is None:
+            self.toast("Select a project first", severity="warning")
+            return
+        if not project_is_upload(project.settings):
+            self.toast("this project uses git: push a branch instead", severity="warning")
+            return
+
+        def done(values: dict[str, str] | None) -> None:
+            if values is None:
+                return
+            raw = values.get("paths", "").replace(",", " ")
+            paths = [str(Path(part).expanduser()) for part in raw.split() if part.strip()]
+            if not paths:
+                self.toast("No paths given", severity="warning")
+                return
+            self.run_worker(self._add_project_files(project.id, paths), group="add-files")
+
+        self.rw.push_screen(
+            Form(
+                f"Add files to {project.name}",
+                [
+                    Field(
+                        "paths",
+                        "Local files/folders on this machine (space- or comma-separated)",
+                        placeholder="/path/to/file.md or ~/notes",
+                    )
+                ],
+                submit="Add",
+            ),
+            done,
+        )
+
+    async def _add_project_files(self, project_id: str, paths: list[str]) -> None:
+        try:
+            changed = await self.hub.data.add_project_files(project_id, paths)
+        except Exception as exc:
+            self.toast(f"Could not add files: {exc}", severity="error")
+            return
+        if changed:
+            self.toast(f"{len(changed)} path(s) added to the project files")
+        else:
+            self.toast("no changes (identical)")
+        await self.hub.refresh()
 
     def _disarm(self, btn: Btn) -> None:
         btn.remove_class("-armed")
