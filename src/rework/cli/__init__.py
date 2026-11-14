@@ -997,19 +997,27 @@ def message(
 ) -> None:
     """Send a message to a mission. The orchestrator receives it and wakes."""
 
-    async def go() -> str:
-        from rework.config import Config
+    async def go() -> None:
+        from rework.config import Config, open_store_from_config
         from rework.missions import send_owner_message
 
-        await send_owner_message(mission_id, text)
-        return mission_id
+        store = await open_store_from_config(Config.from_env())
+        try:
+            if await store.get_mission(mission_id) is None:
+                typer.echo(f"unknown mission {mission_id}", err=True)
+                raise typer.Exit(1)
+            await send_owner_message(mission_id, text, store=store)
+        finally:
+            await store.aclose()
 
     try:
-        mission_id_result = asyncio.run(go())
-        typer.echo(f"{mission_id_result}: message sent")
+        asyncio.run(go())
+    except typer.Exit:
+        raise
     except Exception as exc:
         typer.secho(f"failed to send message: {exc}", fg=typer.colors.RED)
         raise typer.Exit(1) from exc
+    typer.echo(f"{mission_id}: message sent")
 
 
 @app.command()

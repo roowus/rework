@@ -294,13 +294,18 @@ class TuiData:
         *,
         note: str | None = None,
         decision: dict[str, Any] | None = None,
+        send_back: bool = False,
     ) -> bool:
         """Answer a gate. `note` is human-facing; `decision` is a TYPED answer
         the paused role receives as its interrupt() result (e.g. free-text
         feedback, or a choice among options the gate offered)."""
         store = await self.store()
-        gate = await store.decide_gate(gate_id, approved, note, decision)
-        return gate is not None and gate.status.value == ("approved" if approved else "rejected")
+        gate = await store.decide_gate(gate_id, approved, note, decision, send_back)
+        if gate is None:
+            return False
+        if send_back:  # the third verdict: the mission resumes with `note` as feedback
+            return gate.status.value == "sent_back"
+        return gate.status.value == ("approved" if approved else "rejected")
 
     async def set_mission_status(self, mission_id: str, status: str) -> Any:
         """Owner controls: cancel / pause / resume. The daemon reads the row, so

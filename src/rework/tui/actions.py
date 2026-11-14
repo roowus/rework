@@ -79,11 +79,14 @@ async def decide(
     *,
     note: str | None = None,
     decision: dict[str, Any] | None = None,
+    send_back: bool = False,
 ) -> bool:
     """Answer a gate. Verified by re-reading: a gate that silently stays open is
     the worst failure this UI has had, so a False result is shown loudly."""
     try:
-        ok = await app.hub.data.decide_gate(gate_id, approved, note=note, decision=decision)
+        ok = await app.hub.data.decide_gate(
+            gate_id, approved, note=note, decision=decision, send_back=send_back
+        )
     except Exception as exc:
         app.notify(f"Could not answer gate: {exc}", severity="error", timeout=10)
         return False
@@ -95,7 +98,7 @@ async def decide(
         )
         await app.hub.refresh()
         return False
-    app.notify("Approved" if approved else "Rejected", timeout=2)
+    app.notify("Sent back" if send_back else ("Approved" if approved else "Rejected"), timeout=2)
     await app.hub.refresh()
     return True
 

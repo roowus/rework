@@ -51,6 +51,9 @@ from rework.roles.registry import RoleRegistry
 
 log = logging.getLogger("rework.engine")
 
+# how many times the owner may send a mission back from a final gate in one run
+MAX_SEND_BACKS = 5
+
 DEFAULT_PLAN: dict[str, Any] = {"steps": [{"step": "echo", "role": "echo"}]}
 
 # a callable returning (checkpointer, close_fn) for one run's checkpoint thread
@@ -474,7 +477,39 @@ class MissionRunner:
         return updated or mission
 
     async def _run_steps(self, mission: Mission) -> None:
-        steps = list(_plan_steps(mission))
+        """The plan's steps then the final gates, looped: an owner SEND-BACK at a
+        final gate re-runs the plan with the owner's feedback in every step's
+        context and reaches the final gates again, where a FRESH gate opens.
+        Bounded by MAX_SEND_BACKS so a never-satisfied owner cannot spin it."""
+        base_steps = list(_plan_steps(mission))
+        self._send_back_feedback = ""
+        for attempt in range(MAX_SEND_BACKS + 1):
+            steps = base_steps
+            if attempt:
+                steps = [
+                    {
+                        **s,
+                        "context": {
+                            **(s.get("context") or {}),
+                            "_revision": 1000 + attempt,
+                            "owner_feedback": self._send_back_feedback,
+                        },
+                    }
+                    for s in base_steps
+                ]
+            if await self._run_steps_once(mission, list(steps)) != "sent_back":
+                return
+        await self._synthesize(
+            mission.id,
+            None,
+            outcome="failed",
+            summary=f"owner sent the mission back more than {MAX_SEND_BACKS} times; giving up",
+        )
+
+    async def _run_steps_once(self, mission: Mission, steps: list[dict[str, Any]]) -> str:
+        """One pass: all steps, then the final gates. Returns "sent_back" when
+        the owner sent the work back (mission is RUNNING again, not
+        synthesized), else "done" (synthesized)."""
         results: dict[str, Run] = {}  # step_name -> latest terminal run
         audit_rounds: dict[str, int] = {}
         last_audit_artifact: dict[str, Any] | None = None
@@ -484,18 +519,18 @@ class MissionRunner:
             signal = await self._owner_signal()
             if signal == "cancelled":
                 await self._synthesize(mission.id, ship_decision=None)
-                return
+                return "done"
             if signal == "paused":
                 if await self._pause_until_resumed() == "cancelled":
                     await self._synthesize(mission.id, ship_decision=None)
-                    return
+                    return "done"
             step = steps[index]
             step_name = str(step.get("step") or step["role"])
             runs = await self._dispatch_step(mission, step)
             pump_result = await self._pump_until_terminal(runs)
             if pump_result == "cancelled":
                 await self._synthesize(mission.id, ship_decision=None)
-                return
+                return "done"
             fresh = await self._store.get_run(runs[-1].id)
             if fresh is not None:
                 results[step_name] = fresh
@@ -560,14 +595,14 @@ class MissionRunner:
                         ]
             index += 1
 
-        ship_decision, pr_url, send_back_status = await self._final_gates(mission, results, last_audit_artifact)
-        if ship_decision is None and pr_url is None and "ship" in (mission.plan or {}).get("gates", []):
-            # Send-back: mission returned to running, don't synthesize
-            pass
-        else:
-            # Normal completion or no gates: always synthesize
-            self._pr_url = pr_url
-            await self._synthesize(mission.id, ship_decision)
+        ship_decision, pr_url, send_back_status = await self._final_gates(
+            mission, results, last_audit_artifact
+        )
+        if send_back_status:
+            return "sent_back"
+        self._pr_url = pr_url
+        await self._synthesize(mission.id, ship_decision)
+        return "done"
 
     async def _final_gates(
         self,
@@ -900,22 +935,21 @@ class MissionRunner:
     async def _gate_decision(self, mission_id: str, gate_id: str) -> bool | None:
         """Read the decision from the gate ROW (the source of truth). Returns:
         - True if APPROVED
-        - False if REJECTED  
+        - False if REJECTED
         - None if SENT_BACK (mission returns to running with feedback)
-        
+
         The row-update and its event commit separately, so the event log can lag
         the empty-open-gates check by a beat; polling the row closes that race
         (found as a rare CI-only 'ship rejected despite approval')."""
         from rework.missions import send_owner_message
-        
+
         while True:
             gate = await self._store.get_gate(gate_id)
             if gate is not None and gate.status != GateStatus.OPEN:
                 if gate.status == GateStatus.SENT_BACK:
                     feedback = str(gate.decision_note or "Mission sent back for revision")
-                    if feedback:
-                        await send_owner_message(mission_id, feedback, store=self._store)
-                    
+                    self._send_back_feedback = feedback
+                    await send_owner_message(mission_id, feedback, store=self._store)
                     # Return mission to running so it reaches _final_gates again
                     await self._store.update_mission(mission_id, status=MissionStatus.RUNNING)
                     return None
@@ -1298,7 +1332,8 @@ class MissionRunner:
         event is published, and a 5000-event scan can also miss a gate on a
         long mission while the table cannot."""
         gates = [
-            g for g in await self._store.list_gates(self.mission_id) 
+            g
+            for g in await self._store.list_gates(self.mission_id)
             if g.kind == kind and g.status != GateStatus.SENT_BACK
         ]
         return gates[-1] if gates else None

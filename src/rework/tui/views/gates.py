@@ -51,6 +51,9 @@ ACTION_LABELS = {
     "question": ("Send answer", "Decline"),
 }
 
+# the plan's final gates: the only ones with a third "send back" verdict
+SEND_BACK_KINDS = {"ship", "open_pr"}
+
 KIND_LABEL = {
     "ship": "ship it?",
     "open_pr": "open a PR?",
@@ -72,6 +75,7 @@ class GatesView(View):
         # can't eat them); the macOS å / ≈ spellings are handled by the App
         Binding("alt+a", "decide(True)", "approve", show=False, priority=True),
         Binding("alt+x", "decide(False)", "reject", show=False, priority=True),
+        Binding("alt+b", "send_back", "send back", show=False, priority=True),
     ]
 
     def __init__(self) -> None:
@@ -131,6 +135,7 @@ class GatesView(View):
                         with Horizontal(classes="gate-actions"):
                             yield Btn("Approve  alt+a", "approve", variant="primary")
                             yield Btn("Reject  alt+x", "reject", variant="danger")
+                            yield Btn("Send back  alt+b", "send-back", variant="ghost")
                             yield Static("", classes="spacer")
                             yield Static(
                                 f"[{FAINT}]a reject with feedback resumes the agent[/]",
@@ -273,6 +278,9 @@ class GatesView(View):
                 btn.set_label(f"{yes}  alt+a")
             elif btn.action == "reject":
                 btn.set_label(f"{no}  alt+x")
+            elif btn.action == "send-back":
+                # the third verdict exists only for the plan's final gates
+                btn.display = is_open and gate.kind.value in SEND_BACK_KINDS
         decided = self.query_one("#gate-decided", Static)
         decided.display = not is_open
         if not is_open:
@@ -431,6 +439,9 @@ class GatesView(View):
         if event.action in ("approve", "reject"):
             event.stop()
             self.action_decide(event.action == "approve")
+        elif event.action == "send-back":
+            event.stop()
+            self.action_send_back()
         elif event.action == "open-mission" and self.selected is not None:
             event.stop()
             self.rw.open_mission(self.selected.mission_id, self.selected.for_run)
@@ -453,11 +464,35 @@ class GatesView(View):
             decision = {"answer": text} if approved else {"feedback": text}
         self._decide(gate, approved, text or None, decision)
 
+    def action_send_back(self) -> None:
+        """Third verdict on a final gate: not shipped yet, do this first. The
+        typed text is the owner's feedback; the mission resumes with it."""
+        gate = self.selected
+        if gate is None or gate.status.value != "open":
+            self.toast("Select an open gate first", severity="warning")
+            return
+        if gate.kind.value not in SEND_BACK_KINDS:
+            self.toast("Only the ship / open-PR gates can be sent back", severity="warning")
+            return
+        text = self.query_one("#gate-text", TextArea).text.strip()
+        if not text:
+            self.toast("Type what should change first", severity="warning")
+            self.query_one("#gate-text", TextArea).focus()
+            return
+        self._decide(gate, False, text, {"feedback": text}, send_back=True)
+
     @work(exclusive=True, group="decide")
     async def _decide(
-        self, gate: Any, approved: bool, note: str | None, decision: dict[str, Any] | None
+        self,
+        gate: Any,
+        approved: bool,
+        note: str | None,
+        decision: dict[str, Any] | None,
+        send_back: bool = False,
     ) -> None:
-        ok = await actions.decide(self.rw, gate.id, approved, note=note, decision=decision)
+        ok = await actions.decide(
+            self.rw, gate.id, approved, note=note, decision=decision, send_back=send_back
+        )
         if not ok:
             return
         with self.painting():  # the app can close during the await above

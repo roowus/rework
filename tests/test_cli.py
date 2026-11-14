@@ -81,6 +81,17 @@ def _get_mission(db: Path, mission_id: str) -> Mission | None:
     return asyncio.run(go())
 
 
+def _get_chat(db: Path, chat_id: str):
+    async def go():
+        store = await open_sqlite(str(db))
+        try:
+            return await store.get_chat(chat_id)
+        finally:
+            await store.aclose()
+
+    return asyncio.run(go())
+
+
 def test_help_exits_zero() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
@@ -368,6 +379,13 @@ def test_new_creates_an_orchestrated_mission_by_default(rework_db: Path) -> None
     assert plan["gates"] == ["open_pr"]
     assert plan["orchestrator"]["model"]
     assert plan["budget"]["max_usd"] == 3.0
+    # a CLI-created mission gets a chat titled from the mission title, so it is
+    # reachable from the Work tab / Dashboard like any chat-backed mission
+    assert mission.chat_id is not None
+    chat = _get_chat(rework_db, mission.chat_id)
+    assert chat is not None
+    assert chat.title == mission.title
+    assert chat.mission_id == mission.id
 
 
 def test_new_mechanical_keeps_the_legacy_pipeline(rework_db: Path) -> None:
@@ -820,3 +838,33 @@ def test_main_stderr_and_exit_code_are_consistent(main_home: Path) -> None:
         assert result.returncode == 2
         assert needle in result.stderr
         assert needle not in result.stdout
+
+
+def test_message_publishes_an_owner_message(rework_db: Path) -> None:
+    """`rework message ID TEXT` appends an OWNER_MESSAGE for that mission;
+    an unknown id fails loudly and publishes nothing."""
+    from rework.kernel.state.records import EventType
+
+    async def seed() -> None:
+        store = await open_sqlite(str(rework_db))
+        try:
+            await store.create_mission(Mission(id="m-msg", objective="talk to me"))
+        finally:
+            await store.aclose()
+
+    async def owner_texts(mission_id: str) -> list[str]:
+        store = await open_sqlite(str(rework_db))
+        try:
+            events = await store.events_since(0, mission_id=mission_id)
+            return [e.payload["text"] for e in events if e.type == EventType.OWNER_MESSAGE]
+        finally:
+            await store.aclose()
+
+    asyncio.run(seed())
+    result = runner.invoke(app, ["message", "m-msg", "please also add tests"])
+    assert result.exit_code == 0, result.output
+    assert asyncio.run(owner_texts("m-msg")) == ["please also add tests"]
+
+    missing = runner.invoke(app, ["message", "m-nope", "hello"])
+    assert missing.exit_code != 0
+    assert asyncio.run(owner_texts("m-nope")) == []

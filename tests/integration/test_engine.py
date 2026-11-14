@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -15,7 +16,14 @@ from rework.config import Config
 from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.gates import GateManager
 from rework.kernel.llm.catalog import ModelCatalog, ModelEntry
-from rework.kernel.state.records import EventType, Mission, MissionStatus, new_id
+from rework.kernel.state.records import (
+    EventType,
+    GateKind,
+    GateStatus,
+    Mission,
+    MissionStatus,
+    new_id,
+)
 from rework.kernel.state.sqlite import SqliteStore, open_sqlite
 from rework.orchestrator.daemon import sqlite_checkpointer_factory
 from rework.orchestrator.engine import MissionRunner
@@ -284,79 +292,91 @@ async def test_git_transport_clones_from_origin(world: dict, tmp_path: Path) -> 
     assert (again / ".git").is_dir()
 
 
+async def _next_final_gate(
+    store: SqliteStore, gates: GateManager, mission_id: str, seen: set[str]
+) -> Any:
+    """Wait for the next FINAL (plan-level, not role-escalation) gate not in
+    `seen`, approving the echo role's own per-run gate along the way."""
+    found: list[Any] = []
+
+    async def _look() -> bool:
+        for g in await store.list_open_gates(mission_id):
+            if not g.question.startswith(("Ship the mission", "Open a pull request")):
+                await gates.decide(g.id, True)  # the echo role's own escalation gate
+            elif g.id not in seen:
+                found.append(g)
+                return True
+        return False
+
+    await _wait_for(_look, what="a final gate to open")
+    seen.add(found[0].id)
+    return found[0]
+
+
 async def test_send_back_at_gate_returns_mission_to_running(world: dict) -> None:
-    """When a gate is SENT_BACK, the mission returns to RUNNING without synthesis,
-    and the owner's feedback is delivered as an owner message. A second pass through
-    _final_gates opens a FRESH gate (reuse trap regression test)."""
-    from rework.kernel.state.records import GateStatus
-    
+    """A SENT_BACK final (open_pr) gate resumes the mission: the owner's feedback becomes an
+    owner message, the run LOOPS (plan re-runs) and a FRESH gate opens in the same
+    run; the sent-back gate is never reused and the mission is not synthesized."""
     store: SqliteStore = world["store"]
     mission = await store.create_mission(
         Mission(
             id=new_id("m"),
             objective="send me back",
-            plan={"steps": [{"step": "echo", "role": "echo"}], "gates": ["ship"]},
+            plan={"steps": [{"step": "echo", "role": "echo"}], "gates": ["open_pr"]},
         )
     )
-
     runner = make_runner(world, mission.id)
     run_task = asyncio.create_task(runner.run())
-
-    # Wait for the ship gate to open
-    await _wait_for(
-        lambda: _open_gate_exists(store, mission.id),
-        what="ship gate to open",
-    )
-    await _wait_for(
-        lambda: _mission_is(store, mission.id, MissionStatus.AWAITING_GATE),
-        what="mission AWAITING_GATE",
-    )
-
-    # Get the first gate and send it back
     gates = GateManager(store, InProcessEventBus(store))
-    open_gates = await gates.open_gates(mission.id)
-    assert len(open_gates) == 1
-    first_gate = open_gates[0]
-    first_gate_id = first_gate.id
+    seen: set[str] = set()
 
-    # Send the gate back with feedback
-    decided = await gates.decide(first_gate_id, approved=False, send_back=True, note="needs revision")
+    first = await _next_final_gate(store, gates, mission.id, seen)
+    assert first.kind == GateKind.OPEN_PR
+    decided = await gates.decide(first.id, False, send_back=True, note="needs revision")
     assert decided is not None and decided.status == GateStatus.SENT_BACK
 
-    # The mission should return to RUNNING (not DONE)
-    await _wait_for(
-        lambda: _mission_is(store, mission.id, MissionStatus.RUNNING),
-        what="mission back to RUNNING after send-back",
-    )
+    # the loop re-entered: a second, FRESH gate opens within the same run
+    second = await _next_final_gate(store, gates, mission.id, seen)
+    assert second.id != first.id and second.kind == GateKind.OPEN_PR
+    assert second.status == GateStatus.OPEN
+    assert not run_task.done()
+    reread = await store.get_gate(first.id)
+    assert reread is not None and reread.status == GateStatus.SENT_BACK
 
-    # Check that an owner message was published with the feedback
     events = await store.events_since(0, mission_id=mission.id)
-    owner_messages = [e for e in events if e.type == EventType.OWNER_MESSAGE]
-    assert len(owner_messages) > 0, "owner message should be published for send-back"
-    assert "needs revision" in owner_messages[-1].payload.get("text", "")
+    texts = [e.payload.get("text", "") for e in events if e.type == EventType.OWNER_MESSAGE]
+    assert any("needs revision" in t for t in texts)
+    # the plan really re-ran: a second echo run exists
+    assert len([r for r in await store.list_runs(mission.id) if r.role == "echo"]) == 2
 
-    # On the next gate opening (reuse trap test), it should be FRESH (not reuse the SENT_BACK gate)
-    await _wait_for(
-        lambda: _open_gate_exists(store, mission.id),
-        what="second ship gate to open after send-back",
-    )
-    
-    second_gates = await gates.open_gates(mission.id)
-    # Should have a second gate now (first was sent_back, so new one opens)
-    assert len(second_gates) >= 1
-    second_gate = second_gates[-1]
-    
-    # The second gate should be different from the first (fresh gate)
-    # or at least in OPEN status (not reusing the SENT_BACK one)
-    assert second_gate.status == GateStatus.OPEN
-
-    # Approve the second gate
-    await gates.decide(second_gate.id, approved=True, note="approved on retry")
-
-    # Wait for completion
+    await gates.decide(second.id, True, note="approved on retry")
     await asyncio.wait_for(run_task, timeout=15)
-
-    # Mission should be DONE
     done = await store.get_mission(mission.id)
     assert done is not None and done.status == MissionStatus.DONE
-    assert done.result is not None and done.result.get("ship") is None  # not "rejected at ship gate"
+    assert not (done.result or {}).get("pr_url")  # no coder artifact in an echo plan
+
+
+async def test_plain_reject_at_open_pr_gate_terminates_without_pr(world: dict) -> None:
+    """Plain reject is unchanged: no send-back loop, no fresh gate, no PR."""
+    store: SqliteStore = world["store"]
+    mission = await store.create_mission(
+        Mission(
+            id=new_id("m"),
+            objective="reject me",
+            plan={"steps": [{"step": "echo", "role": "echo"}], "gates": ["open_pr"]},
+        )
+    )
+    runner = make_runner(world, mission.id)
+    run_task = asyncio.create_task(runner.run())
+    gates = GateManager(store, InProcessEventBus(store))
+    gate = await _next_final_gate(store, gates, mission.id, set())
+    assert gate.kind == GateKind.OPEN_PR
+    await gates.decide(gate.id, False, note="no")
+    await asyncio.wait_for(run_task, timeout=15)
+
+    done = await store.get_mission(mission.id)
+    assert done is not None and done.status == MissionStatus.DONE
+    assert not (done.result or {}).get("pr_url")
+    finals = [g for g in await store.list_gates(mission.id) if g.kind == GateKind.OPEN_PR]
+    assert [g.status for g in finals] == [GateStatus.REJECTED]
+    assert len([r for r in await store.list_runs(mission.id) if r.role == "echo"]) == 1

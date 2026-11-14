@@ -421,7 +421,7 @@ async def create_mission(
             await own_store.create_chat(
                 Chat(
                     id=effective_chat,
-                    title=(title or "").strip()[:80] or derive_title(objective),
+                    title=(title or "").strip()[:80] or derive_title(objective) or "",
                     project_id=project_id,
                     mission_id=mission.id,
                 )
@@ -443,8 +443,6 @@ async def create_mission(
         return await _go(own)
     finally:
         await own.aclose()
-
-
 
 
 async def send_owner_message(mission_id: str, text: str, *, store: StateStore | None = None) -> Any:
