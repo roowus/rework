@@ -44,6 +44,12 @@ Plans you can choose:
 - fix     — investigate, code, audit, then a ship gate
 - fix-pr  — same, but finishes by opening a pull request
 
+A project may also be repo-less: its transport is "upload", which means rework
+keeps that project's files itself. For an upload project, fix and fix-pr do NOT
+need a repo — the project's files area supplies the files, and results are
+fetched, not pushed. Pass no repo for such a project, and never tell the owner
+one is required.
+
 Every mission starts from the repo's default branch: you cannot hand it an
 earlier mission's branch, results or worktree, so never promise that. Describe
 only what the plans above actually do. If earlier work matters, put what it

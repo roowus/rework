@@ -538,14 +538,33 @@ class TuiData:
 
     # -- writes ------------------------------------------------------------
 
-    async def create_project(self, name: str, transport: str = "git") -> Project:
+    async def create_project(
+        self, name: str, repos: list[dict[str, Any]] | None = None
+    ) -> Project:
+        """Store settings that are always self-consistent: the transport and
+        the results handling are DERIVED from the repos, never hardcoded. No
+        repo means an upload project (rework keeps the files, results are
+        fetched); a repo means git/push_branch."""
         from rework.kernel.state.records import Project as ProjectRecord
+        from rework.missions import derive_transport
 
+        repo_list = [dict(r) for r in repos or []]
+        transport, results = derive_transport({"repos": repo_list})
         store = await self.store()
         project = ProjectRecord(
-            name=name, settings={"transport": transport, "results": "push_branch", "repos": []}
+            name=name,
+            settings={"transport": transport, "results": results, "repos": repo_list},
         )
         return await store.create_project(project)
+
+    async def add_project_files(self, project_id: str, paths: list[str]) -> list[str]:
+        """Push local paths into a repo-less project's files area. The HTTP
+        helper is sync (shared with the CLI), so it runs off the event loop."""
+        import asyncio
+
+        from rework.project_files import add_project_files as _add
+
+        return await asyncio.to_thread(_add, project_id, paths)
 
     async def create_mission(self, **kwargs: Any) -> Mission:
         from rework.missions import create_mission as _create

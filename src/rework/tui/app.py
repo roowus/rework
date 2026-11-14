@@ -634,8 +634,9 @@ class ReworkApp(App[None]):
                     Field("name", "Name", placeholder="e.g. polystats"),
                     Field(
                         "repo",
-                        "Repo URL (optional)",
-                        placeholder="https://github.com/you/repo.git",
+                        "Repo URL (optional). Leave empty and rework keeps this project's "
+                        "files itself, on the daemon host: results are fetched, not pushed",
+                        placeholder="https://github.com/you/repo.git  (empty = upload project)",
                     ),
                 ],
                 submit="Create",
@@ -645,14 +646,13 @@ class ReworkApp(App[None]):
 
     async def _create_project(self, values: dict[str, str]) -> None:
         try:
-            project = await self.hub.data.create_project(values["name"].strip())
             repo = values.get("repo", "").strip()
+            repos: list[dict[str, str]] = []
             if repo:
-                store = await self.hub.data.store()
-                settings = dict(project.settings)
                 name = repo.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") or "repo"
-                settings["repos"] = [{"name": name, "kind": "git", "url": repo}]
-                await store.update_project(project.id, settings=settings)
+                repos.append({"name": name, "kind": "git", "url": repo})
+            # transport/results are derived from the repos inside create_project
+            project = await self.hub.data.create_project(values["name"].strip(), repos)
             self.notify(f"Project {project.name} created", timeout=3, markup=False)
             await self.hub.refresh()
         except Exception as exc:
