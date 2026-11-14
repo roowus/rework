@@ -69,6 +69,12 @@ class RoleLimiter:
             await fut
         except asyncio.CancelledError:
             self._forget(run_id)
+            if fut.done() and not fut.cancelled():
+                # _admit() handed this run its slot in the same tick the task
+                # was cancelled, so the run never proceeds: give the slot back
+                # instead of leaking it for the life of the daemon.
+                self.running = max(0, self.running - 1)
+                self._admit()
             log.info("run %s cancelled while queued; no slot was held", run_id)
             raise
         finally:
