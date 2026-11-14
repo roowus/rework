@@ -79,10 +79,17 @@ def new(
         "--mechanical",
         help="Legacy: run the canned step pipeline instead of an LLM orchestrator.",
     ),
+    priority: str = typer.Option(
+        "normal",
+        "--priority",
+        help="Pickup priority: normal | high. High missions are picked up before"
+        " normal ones; the oldest first within a level.",
+    ),
 ) -> None:
     """Create a mission; the daemon picks it up. An LLM orchestrator runs it
     (ADR 0007), following the plan as a playbook: `fix` = investigate, code,
-    audit, then a ship gate; `fix-pr` ends at an open-PR gate instead."""
+    audit, then a ship gate; `fix-pr` opens a PR instead (no gate by default,
+    unless the project's `pr_gate` setting or the orchestrator asks for one)."""
 
     async def go() -> str:
         from rework.missions import create_mission, resolve_project
@@ -98,6 +105,7 @@ def new(
             project_id=project_id,
             title=title,
             plan=plan,
+            priority=priority,
             orchestrator_model=orch_model,
             orchestrator_effort=effort,
             budget_usd=budget,
@@ -842,6 +850,40 @@ def pause(mission_id: str) -> None:
 def resume(mission_id: str) -> None:
     """Resume a paused mission (or un-cancel one that never got far)."""
     _set_mission_status(mission_id, "running")
+
+
+@app.command()
+def prioritize(
+    mission_id: str,
+    priority: str = typer.Option(
+        "high",
+        "--priority",
+        help="normal | high. Defaults to high: prioritizing is the common case,"
+        " and --priority normal puts a mission back in the normal queue.",
+    ),
+) -> None:
+    """Set a mission's pickup priority (high missions are picked up first,
+    oldest first within a level). Does not touch a running mission."""
+    from rework.missions import PRIORITIES
+
+    level = (priority or "high").strip().lower()
+    if level not in PRIORITIES:
+        raise typer.BadParameter(f"unknown priority {priority!r}; priorities: normal, high")
+
+    async def go() -> str:
+        from rework.config import Config, open_store_from_config
+
+        store = await open_store_from_config(Config.from_env())
+        try:
+            updated = await store.update_mission(mission_id, priority=level)
+            if updated is None:
+                typer.echo(f"unknown mission {mission_id}", err=True)
+                raise typer.Exit(1)
+            return updated.priority
+        finally:
+            await store.aclose()
+
+    typer.echo(f"{mission_id}: priority {asyncio.run(go())}")
 
 
 def _set_mission_status(mission_id: str, status: str) -> None:

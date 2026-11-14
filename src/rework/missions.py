@@ -62,7 +62,7 @@ PLAN_FIX: dict = {
     "gates": ["ship"],
 }
 
-PLAN_FIX_PR: dict = {"steps": PLAN_FIX["steps"], "gates": ["open_pr"]}
+PLAN_FIX_PR: dict = {"steps": PLAN_FIX["steps"], "gates": []}
 
 PLANS = ("echo", "fix", "fix-pr")
 
@@ -107,7 +107,7 @@ def derive_title(objective: str) -> str | None:
     return line or None
 
 
-PLAYBOOK_GATES: dict[str, list[str]] = {"echo": [], "fix": ["ship"], "fix-pr": ["open_pr"]}
+PLAYBOOK_GATES: dict[str, list[str]] = {"echo": [], "fix": ["ship"], "fix-pr": []}
 
 
 def default_budget() -> tuple[float, float]:
@@ -325,6 +325,18 @@ async def _project_repo(project_id: str, name: str | None) -> tuple[str | None, 
     return None, url
 
 
+PRIORITIES = ("normal", "high")
+
+
+def _priority(value: str | None) -> str:
+    """Validate a mission priority: normal (default) or high, the two pickup
+    levels. Anything else is a caller bug, not something to store."""
+    level = (value or "normal").strip().lower()
+    if level not in PRIORITIES:
+        raise ValueError(f"unknown priority {value!r}; priorities: {', '.join(PRIORITIES)}")
+    return level
+
+
 async def create_mission(
     objective: str,
     *,
@@ -341,6 +353,7 @@ async def create_mission(
     budget_usd: float | None = None,
     budget_step_usd: float | None = None,
     title: str | None = None,
+    priority: str = "normal",
 ) -> Mission:
     """Create a mission row (+ created event) and return it. When `store` is
     given it is used and NOT closed (the TUI holds one open); otherwise a
@@ -403,6 +416,7 @@ async def create_mission(
                 # always wins; otherwise derive one so every mission has a
                 # short name for lists, PR titles and commit subjects
                 title=(title or "").strip()[:80] or derive_title(objective),
+                priority=_priority(priority),
                 plan=plan_spec,
             )
         )

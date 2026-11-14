@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS missions (
     chat_id TEXT,
     title TEXT,
     status TEXT NOT NULL,
+    priority TEXT NOT NULL DEFAULT 'normal',
     plan TEXT,
     result TEXT,
     created_at REAL NOT NULL,
@@ -184,6 +185,7 @@ class SqliteStore:
             chat_id=row["chat_id"],
             title=row["title"],
             status=MissionStatus(row["status"]),
+            priority=row["priority"] or "normal",
             plan=_uj(row["plan"]) or None,
             result=_uj(row["result"]) or None,
             created_at=row["created_at"],
@@ -237,8 +239,8 @@ class SqliteStore:
     async def create_mission(self, mission: Mission) -> Mission:
         await self._db.execute(
             "INSERT INTO missions (id, objective, repo_path, repo_origin, project_id,"
-            " chat_id, title, status, plan, result, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " chat_id, title, status, priority, plan, result, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 mission.id,
                 mission.objective,
@@ -248,6 +250,7 @@ class SqliteStore:
                 mission.chat_id,
                 mission.title,
                 mission.status.value,
+                mission.priority,
                 _j(mission.plan),
                 _j(mission.result),
                 mission.created_at,
@@ -270,6 +273,7 @@ class SqliteStore:
         result: dict[str, Any] | None = None,
         repo_path: str | None = None,
         project_id: str | None = None,
+        priority: str | None = None,
     ) -> Mission | None:
         sets: list[str] = []
         params: list[Any] = []
@@ -288,6 +292,9 @@ class SqliteStore:
         if project_id is not None:
             sets.append("project_id = ?")
             params.append(project_id)
+        if priority is not None:
+            sets.append("priority = ?")
+            params.append(priority)
         if not sets:
             return await self.get_mission(mission_id)
         sets.append("updated_at = ?")
@@ -315,6 +322,19 @@ class SqliteStore:
         params.append(limit)
         rows = await self._fetch_all(
             f"SELECT * FROM missions{clause} ORDER BY created_at DESC LIMIT ?", tuple(params)
+        )
+        return [self._mission(r) for r in rows]
+
+    async def next_pending_missions(self, limit: int = 100) -> list[Mission]:
+        """Pending missions in pickup order: high priority first, oldest first
+        within a level. The TUI list stays created_at DESC (newest on top, what
+        people browse); this is the daemon's queue, where an old mission must
+        not starve behind newer ones."""
+        rows = await self._fetch_all(
+            "SELECT * FROM missions WHERE status = ?"
+            " ORDER BY CASE priority WHEN 'high' THEN 0 ELSE 1 END, created_at ASC"
+            " LIMIT ?",
+            (MissionStatus.PENDING.value, limit),
         )
         return [self._mission(r) for r in rows]
 
@@ -948,6 +968,8 @@ async def open_sqlite(path: str) -> SqliteStore:
         await db.execute("ALTER TABLE missions ADD COLUMN chat_id TEXT")
     if "title" not in names:
         await db.execute("ALTER TABLE missions ADD COLUMN title TEXT")
+    if "priority" not in names:
+        await db.execute("ALTER TABLE missions ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'")
     cols = await db.execute("PRAGMA table_info(gates)")
     names = {row[1] for row in await cols.fetchall()}
     if "for_run" not in names:

@@ -92,6 +92,9 @@ class Mission(BaseModel):
     chat_id: str | None = None  # the conversation that launched it (one chat, many missions)
     title: str | None = None  # a few words for lists (the orchestrator proposes it)
     status: MissionStatus = MissionStatus.PENDING
+    # pickup order: "high" missions are picked before "normal" ones, oldest
+    # first within a level (see StateStore.next_pending_mission)
+    priority: str = "normal"
     plan: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
     created_at: float = Field(default_factory=now)

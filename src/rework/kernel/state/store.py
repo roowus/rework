@@ -50,6 +50,7 @@ class StateStore(Protocol):
         result: dict[str, Any] | None = None,
         repo_path: str | None = None,
         project_id: str | None = None,
+        priority: str | None = None,
     ) -> Mission | None: ...
 
     async def list_missions(
@@ -58,6 +59,12 @@ class StateStore(Protocol):
         limit: int = 50,
         chat_id: str | None = None,
     ) -> list[Mission]: ...
+
+    async def next_pending_missions(self, limit: int = 100) -> list[Mission]:
+        """Pending missions in PICKUP order: priority high first, then oldest
+        first within a level. Not the browse order of list_missions (created_at
+        DESC): an old pending mission must not starve behind newer ones."""
+        ...
 
     # -- projects (ADR 0005) ------------------------------------------------
     async def create_project(self, project: Project) -> Project: ...

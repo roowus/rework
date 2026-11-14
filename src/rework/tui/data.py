@@ -319,6 +319,12 @@ class TuiData:
     async def resume_mission(self, mission_id: str) -> Any:
         return await self.set_mission_status(mission_id, "running")
 
+    async def prioritize_mission(self, mission_id: str, priority: str = "high") -> Any:
+        """Pickup priority (normal | high): the daemon reads the row, so this
+        works from any machine and never touches a running mission."""
+        store = await self.store()
+        return await store.update_mission(mission_id, priority=priority)
+
     async def spend_history(self, **kwargs: Any) -> list[dict[str, Any]]:
         return await self._resilient(
             f"spend_history:{sorted(kwargs.items())}",

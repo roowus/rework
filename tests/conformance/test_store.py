@@ -575,3 +575,54 @@ async def test_a_schema_change_does_not_break_a_live_connection(
         await other._conn.execute("ALTER TABLE gates DROP COLUMN IF EXISTS zz_probe")
         await other._conn.commit()
         await other.aclose()
+
+
+async def test_mission_priority_defaults_to_normal_and_persists(store: StateStore) -> None:
+    """(c) priority defaults to normal and survives a reload; high sticks."""
+    m = await store.create_mission(Mission(id=new_id("m"), objective="plain"))
+    assert m.priority == "normal"
+    got = await store.get_mission(m.id)
+    assert got is not None and got.priority == "normal"
+
+    high = await store.create_mission(Mission(id=new_id("m"), objective="urgent", priority="high"))
+    reloaded = await store.get_mission(high.id)
+    assert reloaded is not None and reloaded.priority == "high"
+
+    flipped = await store.update_mission(m.id, priority="high")
+    assert flipped is not None and flipped.priority == "high"
+    again = await store.get_mission(m.id)
+    assert again is not None and again.priority == "high"
+
+
+async def test_next_pending_missions_orders_high_then_oldest(store: StateStore) -> None:
+    """(a) + (b) pickup order: every high before any normal, oldest first within
+    a level — and an old pending mission is never hidden behind newer ones."""
+    # created newest-first so insertion order cannot mask a wrong ORDER BY
+    newest_normal = await store.create_mission(
+        Mission(id=new_id("m"), objective="newest normal", created_at=400.0)
+    )
+    old_normal = await store.create_mission(
+        Mission(id=new_id("m"), objective="old normal", created_at=100.0)
+    )
+    new_high = await store.create_mission(
+        Mission(id=new_id("m"), objective="new high", priority="high", created_at=300.0)
+    )
+    old_high = await store.create_mission(
+        Mission(id=new_id("m"), objective="old high", priority="high", created_at=200.0)
+    )
+    await store.create_mission(
+        Mission(
+            id=new_id("m"),
+            objective="high but already done",
+            priority="high",
+            status=MissionStatus.DONE,
+            created_at=50.0,
+        )
+    )
+
+    pickup = [m.id for m in await store.next_pending_missions()]
+    assert pickup == [old_high.id, new_high.id, old_normal.id, newest_normal.id]
+
+    # the browse order the TUI uses is untouched: newest first
+    browse = [m.id for m in await store.list_missions(limit=10)]
+    assert browse[0] == newest_normal.id

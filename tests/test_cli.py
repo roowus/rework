@@ -365,7 +365,7 @@ def test_new_creates_an_orchestrated_mission_by_default(rework_db: Path) -> None
     assert mission is not None
     plan = mission.plan or {}
     assert plan["kind"] == "auto" and plan["playbook"] == "fix-pr"
-    assert plan["gates"] == ["open_pr"]
+    assert plan["gates"] == []
     assert plan["orchestrator"]["model"]
     assert plan["budget"]["max_usd"] == 3.0
 
@@ -820,3 +820,30 @@ def test_main_stderr_and_exit_code_are_consistent(main_home: Path) -> None:
         assert result.returncode == 2
         assert needle in result.stderr
         assert needle not in result.stdout
+
+
+def test_new_with_priority_high_and_prioritize_command(rework_db: Path) -> None:
+    """(d) `new --priority high` and `prioritize` both flip the stored level."""
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(app, ["new", "urgent fix", "--repo", url, "--priority", "high"])
+    assert result.exit_code == 0, result.output
+    mission = _get_mission(rework_db, result.output.strip())
+    assert mission is not None and mission.priority == "high"
+
+    plain = runner.invoke(app, ["new", "a later fix", "--repo", url])
+    assert plain.exit_code == 0, plain.output
+    other = _get_mission(rework_db, plain.output.strip())
+    assert other is not None and other.priority == "normal"
+
+    # focusing a mission is a flag: default high, --priority normal goes back
+    focused = runner.invoke(app, ["prioritize", other.id])
+    assert focused.exit_code == 0, focused.output
+    assert focused.output.strip() == f"{other.id}: priority high"
+    assert (_get_mission(rework_db, other.id) or other).priority == "high"
+
+    back = runner.invoke(app, ["prioritize", other.id, "--priority", "normal"])
+    assert back.exit_code == 0, back.output
+    assert (_get_mission(rework_db, other.id) or other).priority == "normal"
+
+    bad = runner.invoke(app, ["prioritize", other.id, "--priority", "urgent"])
+    assert bad.exit_code != 0

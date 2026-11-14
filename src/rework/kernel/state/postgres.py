@@ -48,6 +48,7 @@ _DDL = [
         chat_id TEXT,
         title TEXT,
         status TEXT NOT NULL,
+        priority TEXT NOT NULL DEFAULT 'normal',
         plan TEXT,
         result TEXT,
         created_at DOUBLE PRECISION NOT NULL,
@@ -306,6 +307,7 @@ class PostgresStore:
             chat_id=row["chat_id"],
             title=row["title"],
             status=MissionStatus(row["status"]),
+            priority=row["priority"] or "normal",
             plan=_uj(row["plan"]) or None,
             result=_uj(row["result"]) or None,
             created_at=row["created_at"],
@@ -360,8 +362,8 @@ class PostgresStore:
     async def create_mission(self, mission: Mission) -> Mission:
         await self._conn.execute(
             "INSERT INTO missions (id, objective, repo_path, repo_origin, project_id,"
-            " chat_id, title, status, plan, result, created_at, updated_at)"
-            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            " chat_id, title, status, priority, plan, result, created_at, updated_at)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
             (
                 mission.id,
                 mission.objective,
@@ -371,6 +373,7 @@ class PostgresStore:
                 mission.chat_id,
                 mission.title,
                 mission.status.value,
+                mission.priority,
                 _j(mission.plan),
                 _j(mission.result),
                 mission.created_at,
@@ -395,6 +398,7 @@ class PostgresStore:
         result: dict[str, Any] | None = None,
         repo_path: str | None = None,
         project_id: str | None = None,
+        priority: str | None = None,
     ) -> Mission | None:
         sets: list[str] = []
         params: list[Any] = []
@@ -413,6 +417,9 @@ class PostgresStore:
         if project_id is not None:
             sets.append("project_id = %s")
             params.append(project_id)
+        if priority is not None:
+            sets.append("priority = %s")
+            params.append(priority)
         if sets:
             sets.append("updated_at = %s")
             params.append(time.time())
@@ -442,6 +449,20 @@ class PostgresStore:
         params.append(limit)
         rows = await self._fetch_all(
             f"SELECT * FROM missions{clause} ORDER BY created_at DESC LIMIT %s", tuple(params)
+        )
+        return [self._mission(r) for r in rows]
+
+    @_serialized
+    async def next_pending_missions(self, limit: int = 100) -> list[Mission]:
+        """Pending missions in pickup order: high priority first, oldest first
+        within a level. The TUI list stays created_at DESC (newest on top, what
+        people browse); this is the daemon's queue, where an old mission must
+        not starve behind newer ones."""
+        rows = await self._fetch_all(
+            "SELECT * FROM missions WHERE status = %s"
+            " ORDER BY CASE priority WHEN 'high' THEN 0 ELSE 1 END, created_at ASC"
+            " LIMIT %s",
+            (MissionStatus.PENDING.value, limit),
         )
         return [self._mission(r) for r in rows]
 
@@ -1143,6 +1164,11 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("missions", "project_id", "ALTER TABLE missions ADD COLUMN project_id TEXT"),
     ("missions", "chat_id", "ALTER TABLE missions ADD COLUMN chat_id TEXT"),
     ("missions", "title", "ALTER TABLE missions ADD COLUMN title TEXT"),
+    (
+        "missions",
+        "priority",
+        "ALTER TABLE missions ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'",
+    ),
     ("gates", "for_run", "ALTER TABLE gates ADD COLUMN for_run TEXT"),
     ("gates", "decision", "ALTER TABLE gates ADD COLUMN decision TEXT"),
     ("gates", "spec", "ALTER TABLE gates ADD COLUMN spec TEXT"),

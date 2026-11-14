@@ -560,7 +560,13 @@ class MissionRunner:
                         ]
             index += 1
 
-        ship_decision, pr_url = await self._final_gates(mission, results, last_audit_artifact)
+        ship_decision, pr_url = await self._final_gates(
+            mission,
+            results,
+            last_audit_artifact,
+            ask_before_pr=getattr(self, "_ask_before_pr", False),
+            reason=getattr(self, "_pr_reason", ""),
+        )
         self._pr_url = pr_url
         await self._synthesize(mission.id, ship_decision)
 
@@ -569,6 +575,9 @@ class MissionRunner:
         mission: Mission,
         results: dict[str, Run],
         last_audit_artifact: dict[str, Any] | None,
+        *,
+        ask_before_pr: bool = False,
+        reason: str = "",
     ) -> tuple[bool | None, str | None]:
         """The plan's fixed final human decisions (ship / open_pr), shared by
         the mechanical runner and the orchestrator (ADR 0007: the model never
@@ -600,17 +609,46 @@ class MissionRunner:
             if ship_decision:
                 await self._deliver_branch(mission, results)
 
-        # open_pr gate: human approves publishing the branch as a PR, then the
-        # push + PR creation are mechanical (agents never merge; ADR 0003)
+        # open_pr: publishing the branch as a PR is mechanical by default
+        # (agents never merge; ADR 0003). The audit rail has already guaranteed
+        # a clean, reviewed `done`, so no human gate is needed unless the
+        # orchestrator asks, the plan asks, or the project forces one.
         pr_url: str | None = None
-        if "open_pr" in gates_spec:
+        setting = "auto"
+        if mission.project_id:
+            project = await self._store.get_project(mission.project_id)
+            raw = str(
+                ((project.settings if project else {}) or {}).get("pr_gate") or "auto"
+            ).lower()
+            setting = raw if raw in ("auto", "always", "never") else "auto"
+        want_gate = "open_pr" in gates_spec
+        if setting == "always":
+            want_gate = True
+        elif setting == "never":
+            want_gate = False
+            if ask_before_pr:
+                await self._bus.publish(
+                    EventRecord(
+                        mission_id=mission.id,
+                        type=EventType.INFO,
+                        payload={
+                            "note": "project setting pr_gate=never overrides the "
+                            "orchestrator's ask_before_pr: opening the PR without a gate"
+                        },
+                    )
+                )
+        elif ask_before_pr:
+            want_gate = True
+
+        if want_gate:
             gate = await self._latest_gate_of_kind(GateKind.OPEN_PR)
             if gate is None:
                 verdict = mechanical_verdict(last_audit_artifact)
+                question = f"Open a pull request for this change? audit verdict: {verdict}"
+                if reason:
+                    question += f". Orchestrator asked for review: {reason}"
                 gate = await self._gates.request(
-                    mission.id,
-                    kind=GateKind.OPEN_PR,
-                    question=(f"Open a pull request for this change? audit verdict: {verdict}"),
+                    mission.id, kind=GateKind.OPEN_PR, question=question
                 )
                 await self._bus.publish(
                     EventRecord(
@@ -624,6 +662,8 @@ class MissionRunner:
             pr_approved = await self._gate_decision(mission.id, gate.id)
             if pr_approved:
                 pr_url = await self._create_pr(mission, results)
+        else:
+            pr_url = await self._create_pr(mission, results)
 
         return ship_decision, pr_url
 
