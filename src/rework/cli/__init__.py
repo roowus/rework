@@ -991,6 +991,28 @@ def approve(
 
 
 @app.command()
+def message(
+    mission_id: str,
+    text: str = typer.Argument(..., help="Message text to send to the mission."),
+) -> None:
+    """Send a message to a mission. The orchestrator receives it and wakes."""
+
+    async def go() -> str:
+        from rework.config import Config
+        from rework.missions import send_owner_message
+
+        await send_owner_message(mission_id, text)
+        return mission_id
+
+    try:
+        mission_id_result = asyncio.run(go())
+        typer.echo(f"{mission_id_result}: message sent")
+    except Exception as exc:
+        typer.secho(f"failed to send message: {exc}", fg=typer.colors.RED)
+        raise typer.Exit(1) from exc
+
+
+@app.command()
 def attach(mission_id: str, follow: bool = True) -> None:
     """Stream a mission's events (replay from the beginning, then follow)."""
 

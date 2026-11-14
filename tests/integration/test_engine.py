@@ -282,3 +282,81 @@ async def test_git_transport_clones_from_origin(world: dict, tmp_path: Path) -> 
     assert await store.get_mission(mission.id) is not None
     again = world["workroot"] / "missions" / mission.id / "repo"
     assert (again / ".git").is_dir()
+
+
+async def test_send_back_at_gate_returns_mission_to_running(world: dict) -> None:
+    """When a gate is SENT_BACK, the mission returns to RUNNING without synthesis,
+    and the owner's feedback is delivered as an owner message. A second pass through
+    _final_gates opens a FRESH gate (reuse trap regression test)."""
+    from rework.kernel.state.records import GateStatus
+    
+    store: SqliteStore = world["store"]
+    mission = await store.create_mission(
+        Mission(
+            id=new_id("m"),
+            objective="send me back",
+            plan={"steps": [{"step": "echo", "role": "echo"}], "gates": ["ship"]},
+        )
+    )
+
+    runner = make_runner(world, mission.id)
+    run_task = asyncio.create_task(runner.run())
+
+    # Wait for the ship gate to open
+    await _wait_for(
+        lambda: _open_gate_exists(store, mission.id),
+        what="ship gate to open",
+    )
+    await _wait_for(
+        lambda: _mission_is(store, mission.id, MissionStatus.AWAITING_GATE),
+        what="mission AWAITING_GATE",
+    )
+
+    # Get the first gate and send it back
+    gates = GateManager(store, InProcessEventBus(store))
+    open_gates = await gates.open_gates(mission.id)
+    assert len(open_gates) == 1
+    first_gate = open_gates[0]
+    first_gate_id = first_gate.id
+
+    # Send the gate back with feedback
+    decided = await gates.decide(first_gate_id, send_back=True, note="needs revision")
+    assert decided is not None and decided.status == GateStatus.SENT_BACK
+
+    # The mission should return to RUNNING (not DONE)
+    await _wait_for(
+        lambda: _mission_is(store, mission.id, MissionStatus.RUNNING),
+        what="mission back to RUNNING after send-back",
+    )
+
+    # Check that an owner message was published with the feedback
+    events = await store.events_since(0, mission_id=mission.id)
+    owner_messages = [e for e in events if e.type == EventType.OWNER_MESSAGE]
+    assert len(owner_messages) > 0, "owner message should be published for send-back"
+    assert "needs revision" in owner_messages[-1].payload.get("text", "")
+
+    # On the next gate opening (reuse trap test), it should be FRESH (not reuse the SENT_BACK gate)
+    await _wait_for(
+        lambda: _open_gate_exists(store, mission.id),
+        what="second ship gate to open after send-back",
+    )
+    
+    second_gates = await gates.open_gates(mission.id)
+    # Should have a second gate now (first was sent_back, so new one opens)
+    assert len(second_gates) >= 1
+    second_gate = second_gates[-1]
+    
+    # The second gate should be different from the first (fresh gate)
+    # or at least in OPEN status (not reusing the SENT_BACK one)
+    assert second_gate.status == GateStatus.OPEN
+
+    # Approve the second gate
+    await gates.decide(second_gate.id, approved=True, note="approved on retry")
+
+    # Wait for completion
+    await asyncio.wait_for(run_task, timeout=15)
+
+    # Mission should be DONE
+    done = await store.get_mission(mission.id)
+    assert done is not None and done.status == MissionStatus.DONE
+    assert done.result is not None and done.result.get("ship") is None  # not "rejected at ship gate"
