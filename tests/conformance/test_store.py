@@ -69,6 +69,42 @@ async def test_list_missions_by_status(store: StateStore) -> None:
     assert len(everything) == 2
 
 
+async def test_list_missions_for_pickup_is_oldest_first(store: StateStore) -> None:
+    """Pickup must never hide an old mission behind newer ones: the daemon's
+    window is oldest-first, so `limit` only trims the newest end. create_mission
+    persists the record's created_at, so the timestamps are set explicitly
+    (time.time() ties would otherwise decide the order)."""
+    # two same-timestamp missions pin the id tiebreak down: created_at is not
+    # unique, so the secondary `id ASC` key must decide. "tie-b" is inserted
+    # BEFORE "tie-a" (i.e. earlier in rowid/insertion order) so a backend that
+    # happens to return ties in insertion order still fails without the tiebreak.
+    seeds = {
+        "m-oldest": 1_000.0,
+        "tie-b": 2_000.0,
+        "tie-a": 2_000.0,
+        "m-newest": 3_000.0,
+    }
+    # insert out of order so insertion order cannot be mistaken for created order
+    for mid in ["tie-b", "m-newest", "m-oldest", "tie-a"]:
+        created = seeds[mid]
+        await store.create_mission(
+            Mission(id=mid, objective=f"mission {mid}", created_at=created, updated_at=created)
+        )
+    await store.create_mission(
+        Mission(id="m-done", objective="already done", status=MissionStatus.DONE, created_at=0.0)
+    )
+
+    picked = await store.list_missions_for_pickup(status=MissionStatus.PENDING, limit=10)
+    assert [m.id for m in picked] == ["m-oldest", "tie-a", "tie-b", "m-newest"]
+
+    # other statuses are never candidates, even when they are the oldest rows
+    assert "m-done" not in {m.id for m in picked}
+
+    # the limit trims the NEWEST end: the oldest stays visible with limit 2
+    oldest_two = await store.list_missions_for_pickup(status=MissionStatus.PENDING, limit=2)
+    assert [m.id for m in oldest_two] == ["m-oldest", "tie-a"]
+
+
 async def test_run_create_is_idempotent(store: StateStore) -> None:
     m = await store.create_mission(Mission(id=new_id("m"), objective="o"))
     rid = run_id(m.id, "investigate", "investigator", 1)

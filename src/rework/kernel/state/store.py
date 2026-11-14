@@ -59,6 +59,15 @@ class StateStore(Protocol):
         chat_id: str | None = None,
     ) -> list[Mission]: ...
 
+    async def list_missions_for_pickup(self, status: MissionStatus, limit: int) -> list[Mission]:
+        """Missions the daemon should start now: OLDEST created first.
+
+        list_missions is newest-first for humans; pickup must never hide an old
+        mission behind newer ones, so this seam orders ASC with an id tiebreak
+        (created_at is not unique). A limit therefore only trims the newest.
+        """
+        ...
+
     # -- projects (ADR 0005) ------------------------------------------------
     async def create_project(self, project: Project) -> Project: ...
 

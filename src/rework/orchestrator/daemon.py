@@ -207,7 +207,11 @@ class Daemon:
                 await self._spawn_runner(mission.id)
 
     async def _pickup_pending(self) -> None:
-        for mission in await self._store.list_missions(status=MissionStatus.PENDING, limit=10):
+        # oldest-first: newest-first listing starves old pending missions once
+        # ten newer ones exist (the limit only trims the newest end)
+        for mission in await self._store.list_missions_for_pickup(
+            status=MissionStatus.PENDING, limit=10
+        ):
             runner = self._runners.get(mission.id)
             if runner is not None and not runner.done():
                 continue  # queued behind the concurrency limit; logged once
