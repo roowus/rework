@@ -22,6 +22,14 @@ import re
 import time
 from typing import TYPE_CHECKING, Any
 
+from rework.budget_policy import (
+    budget_policy,
+    ensure_original,
+    finite_usd,
+    raises_summary,
+    record_raise,
+    try_auto_raise,
+)
 from rework.kernel.llm.adapters.retry import _is_transient
 from rework.kernel.llm.types import ChatRequest, ToolSpec
 from rework.kernel.state.records import (
@@ -389,8 +397,12 @@ _TOOLS: list[ToolSpec] = [
     ToolSpec(
         name="request_budget",
         description=(
-            "Ask the owner to raise this mission's budget cap before it runs out. On "
-            "approval the cap is raised (use this, never ask_owner, for money)."
+            "Re-estimate this mission's budget once you have investigated, and raise the "
+            "cap before it runs out (use this, never ask_owner, for money). The first "
+            "raises are AUTOMATIC while the new cap stays within 2x the original "
+            "budget, so a small increase costs nobody a wake-up; past that (or once the "
+            "automatic raises are used) the owner is asked. Call it once with a "
+            "reasoned number instead of topping up in small steps."
         ),
         input_schema={
             "type": "object",
@@ -1721,21 +1733,53 @@ class MissionOrchestrator:
         kept the old $2 cap and would have asked the owner again."""
         from rework.kernel.state.records import GateKind
 
-        try:
-            wanted = float(args.get("max_usd") or 0)
-        except (TypeError, ValueError) as exc:
-            raise ToolError("max_usd must be a number") from exc
+        # NaN/inf used to get through this: `NaN <= cap` is False (so it read
+        # as a raise) and `NaN > original*factor` is False (so the ceiling let
+        # it through), and a NaN cap then makes `spent > max_usd` False for
+        # ever — a mission with no cap. Reject anything not a finite number.
+        wanted = finite_usd(args.get("max_usd"))
+        if wanted is None or wanted <= 0:
+            raise ToolError("max_usd must be a finite number greater than 0")
         mission = await self.store.get_mission(self.mid) or self.mission
         plan = dict(mission.plan or {})
-        budget = dict(plan.get("budget") or {})
+        budget = ensure_original(plan)
         cap = float(budget.get("max_usd") or 0)
         if wanted <= cap:
             raise ToolError(f"the cap is already ${cap:.2f}")
+        reason = str(args.get("reason") or "").strip()
+        settings = await self._project_budget_settings()
+        max_auto_raises, factor = budget_policy(settings)
+        if await try_auto_raise(
+            self.store,
+            self.bus,
+            mission,
+            wanted,
+            reason,
+            max_auto_raises=max_auto_raises,
+            ceiling_factor=factor,
+        ):
+            # no gate, no parking: the first raises inside the ceiling are the
+            # point of the policy (see budget_policy)
+            await self._refresh_plan_cap()
+            raised = await self.store.get_mission(self.mid) or mission
+            count = int(((raised.plan or {}).get("budget") or {}).get("auto_raises") or 0)
+            await self._note(f"budget auto-raised to ${wanted:.2f} ({reason})")
+            return (
+                f"auto-approved: cap now ${wanted:.2f} (auto raise {count} of "
+                f"{max_auto_raises}, ceiling ${float(budget['original_max_usd']) * factor:.2f})"
+            )
         spend = await self.store.mission_spend(self.mid)
         question = (
             f"Raise this mission's budget from ${cap:.2f} to ${wanted:.2f}? "
-            f"(${spend.spent_usd:.2f} spent) {str(args.get('reason') or '').strip()}"
+            f"(${spend.spent_usd:.2f} spent) {reason}"
         )
+        # the owner must see the history AND the rail the ask is measured
+        # against: 'Earlier raises: ... Original budget $2.00.' once there is
+        # one, plain 'Original budget $2.00.' on the first
+        earlier = raises_summary(await self._fresh_plan()) or (
+            f"Original budget ${float(budget['original_max_usd']):.2f}."
+        )
+        question = f"{question} {earlier}"
         gate = next(
             (
                 g
@@ -1763,13 +1807,30 @@ class MissionOrchestrator:
             return (
                 f"owner declined the budget raise (cap stays ${cap:.2f}): {row.decision_note or ''}"
             )
-        budget["max_usd"] = wanted
-        plan["budget"] = budget
-        await self.store.update_mission(self.mid, plan=plan)
-        if isinstance(self.r._plan, dict):  # the burn gate reads this copy
-            self.r._plan["budget"] = budget
+        await record_raise(self.store, mission, cap, wanted, reason, auto=False)
+        await self._refresh_plan_cap()
         await self._note(f"budget raised to ${wanted:.2f} by the owner")
         return f"budget raised to ${wanted:.2f}"
+
+    async def _fresh_plan(self) -> dict[str, Any]:
+        mission = await self.store.get_mission(self.mid) or self.mission
+        return dict(mission.plan or {})
+
+    async def _refresh_plan_cap(self) -> None:
+        """Keep the runner's plan copy in step: the burn gate reads THAT copy,
+        and a raise it does not see asks the owner again for money already
+        approved (found live)."""
+        self.r._plan = await self._fresh_plan()
+        if isinstance(self.r._plan, dict):
+            await self.store.update_mission(self.mid, plan=self.r._plan)
+
+    async def _project_budget_settings(self) -> dict[str, Any]:
+        """This mission's Project.settings, for budget_policy()."""
+        project_id = self.mission.project_id
+        if not project_id:
+            return {}
+        project = await self.store.get_project(project_id)
+        return dict(project.settings or {}) if project is not None else {}
 
     async def _redirect(self, run_id: str, instruction: str) -> str:
         run = await self.store.get_run(run_id)

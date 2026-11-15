@@ -472,6 +472,133 @@ async def test_empty_assistant_turns_are_never_persisted(store: Any) -> None:
     assert [m["role"] for m in chat._history] == ["user"]
 
 
+# -- the budget a proposal carries --------------------------------------------------
+
+
+def _proposal_chat(arguments: dict[str, Any]) -> tuple[Any, Any]:
+    provider = ScriptedProvider()
+    provider.route(
+        "orchestrator",
+        [ChatResult(tool_calls=[ToolCall(id="c1", name="propose_mission", arguments=arguments)])],
+    )
+    return OrchestratorChat(provider, role_catalog(), "flash"), provider
+
+
+async def test_propose_mission_keeps_the_budget_the_model_sized() -> None:
+    """The model knows the task, so its sizing wins when it gives a usable one."""
+    chat, _ = _proposal_chat(
+        {
+            "objective": "add a dark mode toggle to the settings page",
+            "plan": "fix",
+            "budget_usd": 4.5,
+            "budget_reason": "normal feature-sized change",
+        }
+    )
+    result = await chat.send("add a dark mode toggle")
+    assert result.proposal is not None
+    assert result.proposal.budget_usd == 4.5
+    assert result.proposal.budget_reason == "normal feature-sized change"
+
+
+async def test_propose_mission_falls_back_to_the_estimate_without_a_budget() -> None:
+    """No model budget (an old prompt, a model that skipped the optional field):
+    the estimate sizes it, so a proposal is never unpriced."""
+    from rework.budget_policy import estimate_budget
+
+    objective = "fix the typo in the readme"
+    chat, _ = _proposal_chat({"objective": objective, "plan": "fix"})
+    result = await chat.send(objective)
+    expected, expected_reason = estimate_budget(objective)
+    assert result.proposal is not None
+    assert result.proposal.budget_usd == expected > 0
+    assert result.proposal.budget_reason == expected_reason
+    # the docs-sized band, not the blanket default
+    assert result.proposal.budget_usd <= 2.0
+
+
+async def test_propose_mission_never_raises_on_garbage_budget_output() -> None:
+    """A model that answers `"a lot"`, `-3`, `true` or NaN to `budget_usd` must
+    not kill the turn: the estimate answers instead."""
+    from rework.budget_policy import estimate_budget
+
+    objective = "migrate the missions table to the new schema"
+    expected, _ = estimate_budget(objective)
+    for garbage in ("a lot", -3, 0, True, None, "NaN", "inf", []):
+        chat, _ = _proposal_chat(
+            {"objective": objective, "plan": "fix", "budget_usd": garbage, "budget_reason": "  "}
+        )
+        result = await chat.send(objective)
+        assert result.proposal is not None, garbage
+        # a large, risky brief: the estimator's $8+ band, and a reason line
+        assert result.proposal.budget_usd >= 8.0, garbage
+        assert result.proposal.budget_usd == expected, garbage
+        assert result.proposal.budget_reason, garbage
+
+
+async def test_proposal_summary_shows_the_budget_and_its_reason() -> None:
+    """The transcript line is what the owner reads in the chat: it must carry
+    the money, with the reason in parentheses."""
+    from rework.orchestrator.chat import Proposal
+
+    summary = Proposal(
+        objective="fix the parser", budget_usd=3.0, budget_reason="normal feature-sized change"
+    ).summary()
+    assert "budget $3.00 (normal feature-sized change)" in summary
+    assert Proposal(objective="x").summary().find("budget") == -1
+
+
+async def test_a_replayed_proposal_card_keeps_its_budget() -> None:
+    """proposal_from_args rebuilds the card from stored tool args: a reloaded
+    chat must show the same budget, including the estimate for args saved
+    before the model could price a mission."""
+    from rework.budget_policy import estimate_budget
+    from rework.tui.conversation import proposal_from_args
+
+    priced = proposal_from_args(
+        {
+            "objective": "add dark mode",
+            "plan": "fix",
+            "budget_usd": 4.5,
+            "budget_reason": "normal feature-sized change",
+        }
+    )
+    assert priced.budget_usd == 4.5
+    assert priced.budget_reason == "normal feature-sized change"
+
+    legacy = proposal_from_args({"objective": "fix the typo in the readme", "plan": "fix"})
+    expected, expected_reason = estimate_budget("fix the typo in the readme")
+    assert legacy.budget_usd == expected > 0
+    assert legacy.budget_reason == expected_reason
+
+
+async def test_a_replayed_card_is_priced_like_the_live_one(store: Any) -> None:
+    """Parity with the live path: `chat.py` sizes a proposal with
+    `typical_finished_cost(store)`, so a replay that SKIPPED it showed (and then
+    stamped at launch) a different cap for the same stored arguments.
+
+    A dear shop: the $3-5 feature band is nudged to $4.50 live, and the replay
+    from the same stored args must land on exactly that number."""
+    from rework.budget_policy import typical_finished_cost
+    from rework.kernel.state.records import Charge, MissionStatus
+    from rework.kernel.state.records import Mission as M
+    from rework.tui.conversation import proposal_from_args
+
+    for mid, cost in (("m-done1", 2.0), ("m-done2", 4.0)):
+        await store.create_mission(M(id=mid, objective="earlier", status=MissionStatus.DONE))
+        await store.charge(
+            Charge(mission_id=mid, model="m", input_tokens=10, output_tokens=10, cost_usd=cost)
+        )
+    live_history = await typical_finished_cost(store)
+    assert live_history == 3.0
+    args = {"objective": "add a feature to the parser, " * 20, "plan": "fix"}
+    live = proposal_from_args(args, cost_history=live_history)
+    assert live.budget_usd == 4.5
+
+    blind = proposal_from_args(args)  # a caller with no store: keyword estimate only
+    assert blind.budget_usd == 5.0, "without the history the band's ceiling is used"
+    assert live.budget_usd != blind.budget_usd, "the history is what this test is about"
+
+
 # -- several proposals from one request ---------------------------------------
 
 

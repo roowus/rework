@@ -321,6 +321,23 @@ class TuiData:
             lambda: self._call(lambda s: s.events_since(since, mission_id=mission_id, limit=limit)),
         )
 
+    async def events_after(self, seq: int, limit: int = 200) -> list[Any]:
+        """Events after `seq` across all missions: the shell tails this to toast
+        budget raises (a raise nobody notices is a raise the policy wasted)."""
+        return await self._resilient(
+            f"events_after:{seq}",
+            lambda: self._call(lambda s: s.events_since(seq, limit=limit)),
+        )
+
+    async def newest_event_seq(self) -> int:
+        """The newest event seq, to start a tail from "now" (a fresh shell must
+        not toast the raises of missions that finished yesterday)."""
+        events = await self._resilient(
+            "newest_event_seq",
+            lambda: self._call(lambda s: s.events_since(0, limit=1, newest_first=True)),
+        )
+        return int(events[-1].seq or 0) if events else 0
+
     async def recent_event_stamps(
         self, mission_id: str, limit: int = 40, deep_limit: int = 400
     ) -> dict[str, float]:

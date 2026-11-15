@@ -49,17 +49,30 @@ def args_text(arguments: Any) -> str:
     return str(arguments or "")
 
 
-def proposal_from_args(args: dict[str, Any]) -> Any:
-    from rework.orchestrator.chat import Proposal
+def proposal_from_args(args: dict[str, Any], *, cost_history: float | None = None) -> Any:
+    """A stored propose_mission call rebuilt as a Proposal: a replayed card must
+    show the same budget the live one did, including the estimate fallback for
+    arguments saved before the model could price a mission.
 
+    `cost_history` is what the live path passes (`typical_finished_cost`), and
+    it only matters for an UNPRICED proposal: the estimate's band is nudged by
+    it, so a replay without it would show — and then stamp at launch — a
+    different cap than the live card. A caller that has no store (a pure
+    replay test) may omit it and gets the keyword estimate."""
+    from rework.orchestrator.chat import Proposal, proposal_budget
+
+    objective = str(args.get("objective", "")).strip()
+    budget_usd, budget_reason = proposal_budget(args, objective, cost_history=cost_history)
     return Proposal(
-        objective=str(args.get("objective", "")).strip(),
+        objective=objective,
         title=str(args.get("title", "")).strip(),
         plan=str(args.get("plan", "fix")).strip() or "fix",
         project=str(args.get("project", "")).strip(),
         repo=str(args.get("repo", "")).strip(),
         model=str(args.get("model", "")).strip(),
         effort=str(args.get("effort", "")).strip(),
+        budget_usd=budget_usd,
+        budget_reason=budget_reason,
     )
 
 
@@ -131,13 +144,16 @@ def parse_launch_note(display: str) -> LaunchNote:
     return LaunchNote(mission_id=mission_id, plan=parts[1].strip(), objective=parts[2])
 
 
-def items_from_messages(messages: list[Any]) -> list[Item]:
+def items_from_messages(messages: list[Any], *, cost_history: float | None = None) -> list[Item]:
     """Stored ChatMessages -> renderable items (tool calls included).
 
     Every `propose_mission` call in an assistant message becomes its own
     proposal item, in call order: one request can span several separate pieces
     of work and each is its own mission. A proposal stays `live` (still
-    decidable) unless a launch note settles it; see `_settle_launched`."""
+    decidable) unless a launch note settles it; see `_settle_launched`.
+
+    `cost_history` is forwarded to `proposal_from_args` so a replayed proposal
+    card is priced exactly like the live one (see that function)."""
     items: list[Item] = []
     for msg in messages:
         body = msg.body or {}
@@ -182,7 +198,7 @@ def items_from_messages(messages: list[Any]) -> list[Item]:
                 except (ValueError, TypeError):
                     args = {}
                 if name == "propose_mission":
-                    proposals.append(proposal_from_args(args))
+                    proposals.append(proposal_from_args(args, cost_history=cost_history))
                 elif name == "ask":
                     asked = str(args.get("question") or "")
             text = str(body.get("content") or "").strip()
@@ -312,7 +328,19 @@ class Conversation:
         return str(self.chat.id)
 
     async def items(self) -> list[Item]:
-        return items_from_messages(await self.data.chat_messages(self.id))
+        return items_from_messages(
+            await self.data.chat_messages(self.id), cost_history=await self.cost_history()
+        )
+
+    async def cost_history(self) -> float | None:
+        """What finished missions really cost here, for pricing a replayed
+        proposal: the same number the live path uses, so both cards agree."""
+        try:
+            from rework.budget_policy import typical_finished_cost
+
+            return await typical_finished_cost(await self.data.store())
+        except Exception:  # a replay must never die for lack of a ledger
+            return None
 
     async def ensure_engine(self, snap: Snapshot, on_turn: Any) -> Any:
         """(Re)build the OrchestratorChat for the chat's current model/effort.
@@ -392,6 +420,12 @@ class Conversation:
         repo = (getattr(proposal, "repo", "") or "").strip()
         if repo and not upload:
             kwargs["repo"] = repo
+
+        # the owner may have edited the estimate on the card: whatever the
+        # budget field holds at launch is the cap the mission is created with
+        budget_usd = float(getattr(proposal, "budget_usd", 0.0) or 0.0)
+        if budget_usd > 0 and _accepts(create_mission, "budget_usd"):
+            kwargs["budget_usd"] = budget_usd
 
         # forward-compatible: once missions carry their own orchestrator model
         # (ADR 0007) and a chat link (M7 P0), pass them

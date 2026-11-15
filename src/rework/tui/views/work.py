@@ -268,7 +268,9 @@ class WorkView(View):
         # by the live render, so no later replay may paint them again
         self._rendered_max_id = self._chat_cursor
         own.difference_update(i for i in list(own) if i <= self._chat_cursor)
-        items = items_from_messages(fresh)
+        # price a replayed proposal exactly like the live card did
+        history = await self.hub.guard(self.convo.cost_history, None)
+        items = items_from_messages(fresh, cost_history=history)
         if items:
             with self.painting():  # the app can close during the awaits above
                 self._render_items(items)
@@ -391,7 +393,8 @@ class WorkView(View):
         # the cursor comes from the rows actually rendered, so a row committed
         # while we read can never fall below it unseen
         messages = await self.hub.guard(partial(self.hub.data.chat_messages, chat_id), [])
-        items = items_from_messages(messages)
+        history = await self.hub.guard(convo.cost_history, None)
+        items = items_from_messages(messages, cost_history=history)
         cursor = max((int(m.id or 0) for m in messages), default=0)
         if self._loading_chat != chat_id:
             return

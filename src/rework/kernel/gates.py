@@ -79,6 +79,52 @@ def notify_owner(gate: Gate) -> asyncio.Task[None] | None:
     return task
 
 
+def notify_text(
+    message: str,
+    mission_id: str,
+    kind: str = "budget_raise",
+    extra_env: dict[str, str] | None = None,
+) -> asyncio.Task[None] | None:
+    """Run REWORK_NOTIFY_CMD for an event that is NOT a gate — the same
+    fire-and-forget contract as `notify_owner` (30s cap, never raises), so a
+    budget raise the policy took on its own still reaches a phone. The command
+    gets REWORK_NOTIFY_KIND / REWORK_MISSION_ID / REWORK_NOTIFY_MESSAGE plus
+    anything in `extra_env` (budget raises add REWORK_BUDGET_OLD/_NEW)."""
+    command = os.environ.get("REWORK_NOTIFY_CMD", "").strip()
+    if not command:
+        return None
+    env = {
+        **os.environ,
+        "REWORK_NOTIFY_KIND": kind,
+        "REWORK_MISSION_ID": mission_id,
+        "REWORK_NOTIFY_MESSAGE": message[:500],
+        **(extra_env or {}),
+    }
+
+    async def run() -> None:
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                env=env,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=30)
+            if proc.returncode:
+                log.warning("notify command exited %s: %s", proc.returncode, err.decode()[:200])
+        except Exception as exc:  # never let a notifier hurt a mission
+            log.warning("notify command failed: %s", exc)
+
+    try:
+        task = asyncio.get_running_loop().create_task(run())
+    except RuntimeError:
+        return None
+    _notify_tasks.add(task)
+    task.add_done_callback(_notify_tasks.discard)
+    return task
+
+
 class GateManager:
     def __init__(self, store: StateStore, bus: EventBus) -> None:
         self._store = store

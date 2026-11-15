@@ -3,13 +3,14 @@ mission (status, last steps, its gate with answer buttons, controls)."""
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
-from textual.widgets import Static
+from textual.widgets import Input, Static
 
 from rework.tui import spinner
 from rework.tui.actions import can
@@ -91,11 +92,36 @@ class ProposalCard(Vertical):
             f"[{ACCENT}]PROPOSAL[/]\n{heading}\n[{MUTED}]" + "  ·  ".join(meta) + "[/]",
             classes="card-body",
         )
+        budget = float(getattr(p, "budget_usd", 0.0) or 0.0)
+        reason = str(getattr(p, "budget_reason", "") or "")
+        if budget > 0:
+            yield Static(self.budget_line(budget, reason), classes="card-body pc-budget")
+            with Horizontal(classes="pc-budget-row"):
+                # the owner can reprice before Launch: the card writes the value
+                # back onto the proposal, which is what launch() reads
+                yield Static(f"[{MUTED}]budget $[/]", classes="pc-budget-label")
+                yield Input(
+                    f"{budget:.2f}",
+                    id="budget",
+                    type="number",
+                    compact=True,
+                    classes="pc-budget-input",
+                )
+                yield Static(f"[{FAINT}]usd, editable[/]", classes="spacer")
         with Horizontal(classes="card-actions"):
             yield Btn("Launch", "launch", variant="primary")
             yield Btn("Scrap", "scrap", variant="ghost")
             yield Btn("Launch all", "launch-all", variant="primary", classes="pc-allbtn")
             yield Static("", classes="spacer pc-hint")
+
+    @staticmethod
+    def budget_line(usd: float, reason: str) -> str:
+        """`budget $3.00 (normal feature-sized change)`, the one line that shows
+        how much the mission may spend and why."""
+        line = f"[b]budget {money(usd)}[/b]"
+        if reason:
+            line = f"{line} [{MUTED}]({esc(reason)})[/]"
+        return line
 
     def on_mount(self) -> None:
         self.set_live(self.live)
@@ -114,9 +140,30 @@ class ProposalCard(Vertical):
             f"[{FAINT}]or reply with changes · “yes” launches all {'of them' if on else ''}[/]"
         )
 
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """Keep the proposal's budget in step with the field. Garbage and <= 0
+        are ignored: the last good value stands and nothing crashes."""
+        if event.input.id != "budget":
+            return
+        event.stop()
+        self.apply_budget(event.value)
+
+    def apply_budget(self, value: Any) -> None:
+        """Write an edited budget onto the proposal (no-op when unusable)."""
+        try:
+            usd = float(str(value).strip().lstrip("$"))
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(usd) or usd <= 0:
+            return
+        self.proposal.budget_usd = usd
+        self.proposal.budget_reason = "owner-set"
+
     def set_live(self, live: bool) -> None:
         self.live = live
         self.query_one(".card-actions").display = live
+        for row in self.query(".pc-budget-row"):
+            row.display = live  # a settled proposal is history, not a form
         if not live:
             self.remove_class("-accent")
 

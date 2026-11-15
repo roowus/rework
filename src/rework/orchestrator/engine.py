@@ -27,6 +27,7 @@ from typing import Any
 
 from langgraph.types import Command
 
+from rework.budget_policy import budget_policy, raises_summary, record_raise, try_auto_raise
 from rework.kernel.events.bus import EventBus
 from rework.kernel.gates import GateManager
 from rework.kernel.llm.adapters import build_provider
@@ -1398,6 +1399,14 @@ class MissionRunner:
                 return "ok"
             await asyncio.sleep(self._poll)
 
+    async def _reload_plan(self) -> None:
+        """Re-read the plan cap after a raise. The runner keeps `_plan` in
+        memory (roles read their cap from it), so a raise that only touched the
+        row would be invisible until a restart."""
+        mission = await self._store.get_mission(self.mission_id)
+        if mission is not None and mission.plan is not None:
+            self._plan = mission.plan
+
     async def _burn_gate_hit(self) -> str:
         """The owner's burn-gate: plan budget cap exceeded puts the mission
         ON_HOLD and opens a continue/abort gate (ADR 0003 decision 6).
@@ -1413,13 +1422,46 @@ class MissionRunner:
             return "ok"  # already held, or not ours to hold
         step = ((self._plan or {}).get("budget") or {}).get("ask_every_usd")
         new_cap = float(cap) + float(step) if step else float(cap) * 2
+        reason = f"burn cap hit at ${spend.spent_usd:.2f} spent"
+        settings: dict[str, Any] = {}
+        if mission.project_id:
+            project = await self._store.get_project(mission.project_id)
+            settings = dict((project.settings if project else {}) or {})
+        max_auto_raises, factor = budget_policy(settings)
+        if await try_auto_raise(
+            self._store,
+            self._bus,
+            mission,
+            new_cap,
+            reason,
+            max_auto_raises=max_auto_raises,
+            ceiling_factor=factor,
+        ):
+            # inside the policy's band: no ON_HOLD, no cancelled roles, no gate
+            await self._reload_plan()
+            await self._bus.publish(
+                EventRecord(
+                    mission_id=self.mission_id,
+                    type=EventType.INFO,
+                    payload={"note": f"burn cap auto-raised: ${float(cap):.2f} -> ${new_cap:.2f}"},
+                )
+            )
+            return "ok"
+        question = (
+            f"Burn cap hit: ${spend.spent_usd:.2f} spent (cap ${float(cap):.2f})."
+            f" Continue up to ${new_cap:.2f}, or cancel?"
+        )
+        plan_now = dict(mission.plan or {})
+        original = float(((plan_now.get("budget") or {}).get("original_max_usd")) or 0.0)
+        earlier = raises_summary(plan_now) or (
+            f"Original budget ${original:.2f}." if original else ""
+        )
+        if earlier:
+            question = f"{question} {earlier}"
         gate = await self._gates.request(
             self.mission_id,
             kind=GateKind.GENERIC,
-            question=(
-                f"Burn cap hit: ${spend.spent_usd:.2f} spent (cap ${float(cap):.2f})."
-                f" Continue up to ${new_cap:.2f}, or cancel?"
-            ),
+            question=question,
         )
         await self._store.update_mission(self.mission_id, status=MissionStatus.ON_HOLD)
         # stop spending while the owner decides: live roles are cancelled and
@@ -1451,14 +1493,8 @@ class MissionRunner:
                 result={"reason": "burn cap rejected"},
             )
             return "cancelled"
-        budget = (self._plan or {}).get("budget") or {}
-        budget["max_usd"] = new_cap
-        if isinstance(self._plan, dict):
-            self._plan["budget"] = budget
-            await self._store.update_mission(
-                self.mission_id,
-                plan=self._plan,
-            )
+        await record_raise(self._store, mission, float(cap), new_cap, reason, auto=False)
+        await self._reload_plan()
         await self._store.update_mission(self.mission_id, status=MissionStatus.RUNNING)
         for run in await self._store.list_runs(self.mission_id):
             if not _terminal(run) and run.status != RunStatus.HALTED_ESCALATED:

@@ -394,10 +394,13 @@ async def test_ship_gate_decided_while_down_not_duplicated(world: dict[str, Any]
 
 
 async def test_burn_gate_rejection_cancels_and_stays_cancelled(
-    world: dict[str, Any],
+    world: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Rejecting the burn cap must CANCEL the mission — and synthesis (which
     runs right after, with no failed runs) must not resurrect it as DONE."""
+    # rejecting a gate only happens when a gate opens: pin auto-raises off, or
+    # the first raise is taken by the budget policy without asking
+    monkeypatch.setenv("REWORK_BUDGET_AUTO_RAISES", "0")
     store: SqliteStore = world["store"]
     mission = await store.create_mission(
         Mission(

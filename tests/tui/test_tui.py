@@ -609,6 +609,74 @@ async def test_chat_proposes_then_launch_creates_mission(
         await store.aclose()
 
 
+async def test_the_edited_budget_is_the_cap_the_mission_is_created_with(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The card's budget field is the whole wiring: the owner reprices before
+    Launch and the created mission is capped at what they typed, not at the
+    estimate the orchestrator proposed."""
+    script_provider(
+        monkeypatch,
+        [
+            propose(
+                objective="say hello",
+                plan="echo",
+                project="polystats",
+                budget_usd=3.0,
+                budget_reason="normal feature-sized change",
+            )
+        ],
+    )
+    from rework.tui.widgets.cards import ProposalCard
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        for ch in "say hello":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        await _settle(pilot, 1.0)
+        card = list(app.query(ProposalCard))[-1]
+        assert card.proposal.budget_usd == 3.0
+        card.query_one("#budget", Input).value = "7.50"
+        await _settle(pilot, 0.3)
+        await pilot.click(_btn(app, card, "launch"))
+        await _settle(pilot, 1.0)
+    store = await _store(env)
+    try:
+        new = [m for m in await store.list_missions(limit=100) if m.objective == "say hello"]
+    finally:
+        await store.aclose()
+    assert len(new) == 1
+    assert new[0].plan["budget"]["max_usd"] == 7.5, "the edited budget is the cap"
+
+
+async def test_a_bare_yes_keeps_the_estimated_budget(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Auto-launching with "yes" never opens the field, so the estimate the
+    proposal carried is what the mission is created with (not the deployment
+    default of REWORK_BUDGET_USD)."""
+    from rework.budget_policy import estimate_budget
+
+    objective = "typo in the readme"
+    script_provider(monkeypatch, [propose(objective=objective, plan="echo")])
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        for keys in (["t", "y", "p", "o", "enter"], ["y", "e", "s", "enter"]):
+            await pilot.press(*keys)
+            await _settle(pilot, 1.0)
+    expected, _ = estimate_budget(objective)
+    store = await _store(env)
+    try:
+        new = [m for m in await store.list_missions(limit=100) if m.objective == objective]
+    finally:
+        await store.aclose()
+    assert len(new) == 1, "a typed yes launches the proposal"
+    assert new[0].plan["budget"]["max_usd"] == expected
+
+
 async def test_typing_yes_launches(
     ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
