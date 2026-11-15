@@ -342,13 +342,19 @@ async def test_pr_body_leads_with_orchestrator_summary(
 # ---------------------------------------------------------------------------
 
 
-def _with_reason(script: list[Any], *, reason: str, ask: bool = True) -> list[Any]:
-    """The same orchestrator script, but its finish call asks for a review."""
+def _with_reason(
+    script: list[Any], *, reason: str, ask: bool = True, category: str = "security"
+) -> list[Any]:
+    """The same orchestrator script, but its finish call asks for a review. A
+    gate ask is strict (issue #36): it needs a reason AND one of the four
+    high-stakes categories, so both are patched in."""
     patched = list(script)
     last = patched[-1]
     finish = last.tool_calls[-1]
     args = dict(finish.arguments)
     args["ask_before_pr"] = ask
+    if category:
+        args["gate_category"] = category
     if reason:
         args["reason"] = reason
     patched[-1] = last.model_copy(
@@ -421,7 +427,10 @@ async def test_ask_before_pr_gates_the_pr_and_shows_the_reason(
         await asyncio.sleep(0.05)
     open_gates = await orch_world["store"].list_open_gates(orch_world["mission"].id)
     assert open_gates and open_gates[0].kind.value == "open_pr"
-    assert reason in open_gates[0].question
+    question = open_gates[0].question
+    assert reason in question
+    # the strict gate shows WHICH high-stakes category justified it (issue #36)
+    assert "Gate category: security" in question
     await _decide(orch_world["store"], orch_world["db"], orch_world["mission"].id, True)
     await asyncio.wait_for(task, timeout=60)
     mission = await orch_world["store"].get_mission(orch_world["mission"].id)
@@ -468,6 +477,10 @@ async def test_pr_gate_always_forces_the_gate_without_an_ask(
         if await orch_world["store"].list_open_gates(orch_world["mission"].id):
             break
         await asyncio.sleep(0.05)
+    forced = await orch_world["store"].list_open_gates(orch_world["mission"].id)
+    # a category-less forced gate still renders sensibly (no empty category)
+    assert forced and "pr_gate=always" in forced[0].question
+    assert "Gate category:" not in forced[0].question
     await _decide(orch_world["store"], orch_world["db"], orch_world["mission"].id, True)
     await asyncio.wait_for(task, timeout=60)
     gates = await orch_world["store"].list_gates(orch_world["mission"].id)
