@@ -192,16 +192,13 @@ class TuiData:
             lambda: self._call(lambda s: s.events_since(since, mission_id=mission_id, limit=limit)),
         )
 
-    async def budget_raises(self, since: int, limit: int = 100) -> list[Any]:
-        """BUDGET_RAISED events after `since`, across all missions: the shell
-        toasts them (a raise nobody notices is a raise the policy wasted)."""
-        from rework.kernel.state.records import EventType
-
-        events = await self._resilient(
-            f"budget_raises:{since}",
-            lambda: self._call(lambda s: s.events_since(since, limit=limit, newest_first=True)),
+    async def events_after(self, seq: int, limit: int = 200) -> list[Any]:
+        """Events after `seq` across all missions: the shell tails this to toast
+        budget raises (a raise nobody notices is a raise the policy wasted)."""
+        return await self._resilient(
+            f"events_after:{seq}",
+            lambda: self._call(lambda s: s.events_since(seq, limit=limit)),
         )
-        return [e for e in events if e.type == EventType.BUDGET_RAISED]
 
     async def newest_event_seq(self) -> int:
         """The newest event seq, to start a tail from "now" (a fresh shell must
