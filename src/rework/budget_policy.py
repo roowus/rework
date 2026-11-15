@@ -144,7 +144,7 @@ _DOCS_SIGNALS: tuple[re.Pattern[str], ...] = tuple(
 
 # "this is large and risky" signals, named the way the reason line names them.
 _RISK_SIGNALS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("migration", re.compile(r"\bmigrations?\b")),
+    ("migration", re.compile(r"\bmigrat\w*\b")),
     ("schema", re.compile(r"\bschemas?\b")),
     ("auth", re.compile(r"\bauth\b")),
     ("authentication", re.compile(r"\bauthentication\b")),

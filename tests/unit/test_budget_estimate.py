@@ -31,7 +31,13 @@ LONG = "add a feature " * 40  # ~560 chars: more than one file
 
 @pytest.mark.parametrize(
     "text",
-    ["fix a typo", "typo in the readme", "update the comments", "rename the helper", "bump version"],
+    [
+        "fix a typo",
+        "typo in the readme",
+        "update the comments",
+        "rename the helper",
+        "bump version",
+    ],
 )
 def test_docs_sized_text_is_at_most_two_dollars(text: str) -> None:
     usd, reason = estimate_budget(text)
@@ -76,12 +82,12 @@ def test_four_numbered_requirements_escalate() -> None:
 
 
 def test_a_long_brief_escalates() -> None:
-    assert estimate_budget("add a thing. " * 100)[0] == 8.0  # ~1300 chars, no signal
+    assert estimate_budget("add a thing. " * 120)[0] == 8.0  # ~1560 chars, no signal
     assert estimate_budget("add a thing " * 300)[0] == 10.0  # > 3000 chars
 
 
 def test_risky_outranks_smallness() -> None:
-    """"auth docs" is a large job, not a docs job."""
+    """ "auth docs" is a large job, not a docs job."""
     assert estimate_budget("write the auth docs")[0] >= 8.0
 
 

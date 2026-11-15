@@ -1168,7 +1168,9 @@ def test_new_estimates_the_budget_and_keeps_stdout_the_bare_mission_id(
     so stdout stays one machine-readable line (the mission id)."""
     monkeypatch.delenv("REWORK_BUDGET_USD", raising=False)
     url = "https://github.com/example/repo.git"
-    result = runner.invoke(app, ["new", "fix the typo in the readme", "--repo", url, "--plan", "fix"])
+    result = runner.invoke(
+        app, ["new", "fix the typo in the readme", "--repo", url, "--plan", "fix"]
+    )
 
     assert result.exit_code == 0, result.output
     assert result.stdout.strip().startswith("m-")  # stdout is the bare id
@@ -1229,14 +1231,15 @@ def test_template_plan_carries_an_explicit_budget(rework_db: Path) -> None:
     assert budget["raises"] == []
 
 
-def test_template_plan_without_a_budget_has_no_budget_key(rework_db: Path) -> None:
+def test_template_plan_without_a_budget_has_no_budget_key() -> None:
     """No regression: a template mission created WITHOUT a cap keeps no
-    plan['budget'], because engine._build_graph would then enforce one."""
-    url = "https://github.com/example/repo.git"
-    result = runner.invoke(
-        app, ["new", "fix it", "--repo", url, "--plan", "fix", "--mechanical"]
+    plan['budget'], because engine._build_graph would then enforce one.
+
+    `create_mission` is called directly on purpose: `rework new` always passes
+    an estimated cap now, so the CLI cannot reach this path any more."""
+    from rework.missions import create_mission
+
+    mission = asyncio.run(
+        create_mission("fix it", repo="https://github.com/example/repo.git", plan="fix")
     )
-    assert result.exit_code == 0, result.output
-    mission = _get_mission(rework_db, result.stdout.strip())
-    assert mission is not None
     assert "budget" not in (mission.plan or {})
