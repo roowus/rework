@@ -327,6 +327,14 @@ class DashboardView(View):
             lambda: data.spend_history(bucket="total", since=time.time() - 7 * 86400), []
         )
         self.spend_week = sum(float(r.get("cost_usd") or 0) for r in week)
+        # NOTE: this selection still keys off `actions.ACTIVE` while the
+        # sections key off `section_for`, so the one divergent case below has no
+        # role/cost chip: a TERMINAL mission (cancelled/failed/done) that still
+        # holds an open gate lands under "needs you" but is not ACTIVE, so
+        # neither `visible` nor the role branch reaches it. Aligning it with
+        # `section_for` would also drop the [:12] cap for every non-recent row
+        # (cost chips would appear on rows that never had one), so the chips
+        # are deliberately left alone.
         visible = [m for m in self._filtered() if status_value(m.status) in actions.ACTIVE]
         visible += [m for m in self._filtered() if m not in visible][:12]
         for mission in visible:
@@ -371,8 +379,10 @@ class DashboardView(View):
 
     def _paint_overview(self) -> None:
         snap = self.snap
-        # the strip counts SECTIONS, not raw statuses, so a number here always
-        # matches the number of rows in that section
+        # the strip counts SECTIONS over the WHOLE snapshot, ignoring the
+        # current filter and project selection, so a number here need NOT match
+        # the rows painted below it (filter="done" shows #st-running = 2 and no
+        # running rows); the rows are the filtered view of these same buckets
         by_section: dict[str, int] = dict.fromkeys(SECTIONS, 0)
         for m in snap.missions:
             title = section_for(m, snap)
@@ -494,12 +504,12 @@ class DashboardView(View):
             mission = self.snap.mission(hit["id"])
             if mission is None:
                 continue
-            st = status_value(mission.status)
+            section = section_for(mission, self.snap)
             reason = esc(hit.get("reason") or "")
             rows.append(
                 RowData(
                     mission.id,
-                    f"{glyph(st)} [b]{esc(clip(mission.objective, 100))}[/b]\n"
+                    f"{row_glyph(mission, section)} [b]{esc(clip(mission.objective, 100))}[/b]\n"
                     f"  [{FAINT}]{esc(clip(mission.id, 60))}[/]"
                     + (f"  [{ACCENT}]{reason}[/]" if reason else ""),
                 )

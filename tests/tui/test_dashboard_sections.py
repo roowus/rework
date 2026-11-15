@@ -256,6 +256,30 @@ async def test_a_stale_awaiting_gate_row_under_running_paints_no_amber_diamond()
         assert row_glyph(stale, "needs you") == f"[{WARN}]◆[/]"
 
 
+async def test_the_ai_ranked_list_paints_the_section_glyph_too() -> None:
+    """Same bug, one ✦ search away: `_ai_rows` built its rows from the raw stored
+    status while `_paint_overview` swaps the whole list in, so a stale
+    `awaiting_gate` ranked by ✦ painted the amber ◆ again (with no section
+    header at all to contradict it). The ranked rows go through row_glyph now."""
+    view, snap = _overview()
+    app = DashApp(view)
+    async with app.run_test() as pilot:
+        view.snap = snap
+        view.ai_results = [
+            {"id": IDS["stale"], "reason": "closest to your query"},
+            {"id": IDS["needs"], "reason": "also close"},
+        ]
+        view._paint_overview()
+        await pilot.pause()
+
+        rows = {r.key: r for r in view.query("#mission-list Row")}
+        stale = rows[IDS["stale"]]._markup.split("\n")[0]
+        assert stale.startswith(f"[{ACCENT}]●[/]"), f"a ranked stale row looks running: {stale!r}"
+        assert f"[{WARN}]◆[/]" not in stale, f"no amber diamond in the ✦ list: {stale!r}"
+        needs = rows[IDS["needs"]]._markup.split("\n")[0]
+        assert needs.startswith(f"[{WARN}]◆[/]"), f"a ranked needs-you row keeps the ◆: {needs!r}"
+
+
 async def test_the_active_tab_keeps_every_live_section_and_search_still_filters() -> None:
     view, snap = _overview()
     app = DashApp(view)
