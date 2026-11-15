@@ -1531,6 +1531,9 @@ def parse_target_flag(argv: list[str]) -> tuple[str | None, list[str]]:
     KEPT in rest, in its original order: an empty rest means "no arguments,
     open the TUI", so silently dropping `--help` / `-h` made `rework --help`
     look like a bare `rework` and start the dashboard instead of printing help.
+    Because they are kept, rest's FIRST element is not necessarily the
+    subcommand: `rework --help update` parses to ["--help", "update"], so the
+    command name comes from _subcommand() and never from rest[0].
     """
     kept: list[str] = []  # leading flags that are not ours, preserved in order
     i = 0
@@ -1553,6 +1556,12 @@ def parse_target_flag(argv: list[str]) -> tuple[str | None, list[str]]:
             continue
         return None, kept + argv[i:]  # the subcommand: the global-option scan is over
     return None, kept
+
+
+def _subcommand(rest: list[str]) -> str:
+    """The first NON-FLAG token of rest: the subcommand itself, or "" when rest
+    is flags only. Leading flags are kept in rest, so rest[0] can be `--help`."""
+    return next((arg for arg in rest if not arg.startswith("-")), "")
 
 
 def _subcommand_names() -> set[str]:
@@ -1581,7 +1590,7 @@ def main() -> None:
     # `rework update --target NAME` is NOT the global target flag: the update
     # command owns a --target of its own (a remote host to update over ssh), so
     # the after-the-subcommand rejection below must not fire for it.
-    _sub = _rest[0] if _rest else ""
+    _sub = _subcommand(_rest)
     if _explicit and _flag is None and _sub != "update":
         # --target on the argv line without a consumable NAME: either it was
         # left off entirely (`rework --target --help`, `rework --target=`, the
@@ -1618,7 +1627,7 @@ def main() -> None:
 
         run_tui()
         return
-    if _rest[0] not in ("serve", "logs", "library-mcp"):
+    if _sub not in ("serve", "logs", "library-mcp"):
         from rework.logs import setup_logging
 
         setup_logging("cli")

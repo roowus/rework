@@ -1351,3 +1351,71 @@ def test_main_bare_and_target_only_argv_still_open_the_tui(
         monkeypatch.setattr(sys, "argv", argv)
         main()
         assert calls == ["started"], argv
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_main_help_flag_before_a_subcommand_still_prints_help(
+    flag: str,
+    dispatched_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """REGRESSION: `rework --help update --target rewvis` is still a help request.
+
+    Leading flags are now KEPT in rest, so `_rest[0]` can be a flag: keying the
+    `update` exemption off it read the subcommand as "--help", fired the --target
+    usage-error guard, and turned a help request that printed help at base
+    eb7556c into a red usage error. The command name must come from the first
+    non-flag token.
+    """
+    import rework.tui as tui
+    from rework.cli import main
+
+    monkeypatch.setattr(tui, "run_tui", _tui_must_not_start)
+    monkeypatch.setattr(sys, "argv", ["rework", flag, "update", "--target", "rewvis"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 0
+    captured = capsys.readouterr()
+    assert "Usage: rework" in captured.out
+    assert "needs a name" not in captured.out
+    assert "needs a name" not in captured.err
+
+
+def test_main_update_target_stays_exempt_from_the_guard(
+    dispatched_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Positive control: `rework update --target NAME` is still exempt.
+
+    The update command owns its own --target, so the guard must not fire: the
+    command itself runs and reports the unknown target (exit 1), never the
+    "needs a name" usage error (exit 2).
+    """
+    from rework.cli import main
+
+    monkeypatch.setattr(sys, "argv", ["rework", "update", "--target", "rewvis"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert "no target named 'rewvis'" in captured.err
+    assert "needs a name" not in captured.err
+
+
+def test_main_target_after_a_subcommand_still_errors(
+    dispatched_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Positive control: the guard itself is unchanged for `rework ls --target sandbox`."""
+    from rework.cli import main
+
+    monkeypatch.setattr(sys, "argv", ["rework", "ls", "--target", "sandbox"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 2
+    assert "must come before the subcommand" in capsys.readouterr().err
