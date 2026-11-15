@@ -621,6 +621,140 @@ async def test_launch_all_creates_one_mission_per_proposal(
         await store.aclose()
 
 
+async def test_a_second_proposing_turn_retires_the_first_turns_card(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The engine REPLACES its pending list on a proposing turn: the card the
+    earlier turn proposed is withdrawn, cannot launch, and is never part of a
+    "Launch all"."""
+    script_provider(
+        monkeypatch,
+        [
+            propose_many({"objective": "say hello", "plan": "echo", "title": "Greeting"}),
+            propose_many(
+                {"objective": "say goodbye", "plan": "echo", "title": "Farewell"},
+                {"objective": "say thanks", "plan": "echo", "title": "Thanks"},
+            ),
+        ],
+    )
+    from rework.tui.widgets.cards import ProposalCard
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        for ch in "hello":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        await _settle(pilot, 1.0)
+        first = list(app.query(ProposalCard))
+        assert [c.proposal.objective for c in first] == ["say hello"]
+        assert first[0].live
+        for ch in "goodbye and thanks":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        await _settle(pilot, 1.5)
+        cards = list(app.query(ProposalCard))
+        assert [c.proposal.objective for c in cards] == ["say hello", "say goodbye", "say thanks"]
+        assert not cards[0].live, "the superseded proposal is settled"
+        assert cards[0].query_one(".card-actions").display is False
+        assert cards[1].live and cards[2].live, "the new turn's proposals are the pending ones"
+        chat_id = app.view("work").convo.id
+        # the withdrawn proposal is inert: its Launch finds nothing pending, so
+        # no mission is created for it
+        app.view("work").on_proposal_card_decided(ProposalCard.Decided(cards[0], True))
+        await _settle(pilot, 1.0)
+        # "Launch all" runs only the new turn's proposals
+        await pilot.click(_btn(app, cards[1], "launch-all"))
+        await _settle(pilot, 2.0)
+        assert not any(card.live for card in cards)
+        assert not app.swallowed
+    store = await _store(env)
+    try:
+        missions = await store.list_missions(limit=100, chat_id=chat_id)
+        assert sorted(m.objective for m in missions) == ["say goodbye", "say thanks"]
+    finally:
+        await store.aclose()
+
+
+async def test_double_launch_creates_one_mission(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two clicks on one card's Launch arrive as two messages in one batch: the
+    second must not create a second mission for the same proposal."""
+    script_provider(
+        monkeypatch, [propose_many({"objective": "say hello", "plan": "echo", "title": "Greeting"})]
+    )
+    from rework.tui.widgets.cards import ProposalCard
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        for ch in "say hello":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        await _settle(pilot, 1.0)
+        cards = list(app.query(ProposalCard))
+        assert len(cards) == 1
+        launch = cards[0].query_one(Btn)
+        assert launch.action == "launch"
+        # a double click delivers both presses as two messages in ONE batch,
+        # before either worker has started (a pilot.click awaits a pause first,
+        # which would let the first launch finish and hide the race)
+        launch.post_message(Btn.Pressed(launch))
+        launch.post_message(Btn.Pressed(launch))
+        await _settle(pilot, 2.0)
+        chat_id = app.view("work").convo.id
+        assert not app.swallowed
+    store = await _store(env)
+    try:
+        missions = await store.list_missions(limit=100, chat_id=chat_id)
+        assert [m.objective for m in missions] == ["say hello"], "exactly one mission"
+    finally:
+        await store.aclose()
+
+
+async def test_a_single_remaining_card_does_not_offer_launch_all(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two proposals offer the group action; once one launches and only one is
+    pending, the survivor's "Launch all" would just repeat its own Launch."""
+    script_provider(
+        monkeypatch,
+        [
+            propose_many(
+                {"objective": "say hello", "plan": "echo", "title": "Greeting"},
+                {"objective": "say goodbye", "plan": "echo", "title": "Farewell"},
+            )
+        ],
+    )
+    from rework.tui.widgets.cards import ProposalCard
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        for ch in "hello and goodbye":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        await _settle(pilot, 1.0)
+        cards = list(app.query(ProposalCard))
+        assert len(cards) == 2
+        assert all(card.query_one(".pc-allbtn", Btn).display for card in cards)
+        await pilot.click(_btn(app, cards[0], "launch"))
+        await _settle(pilot, 1.0)
+        assert not cards[0].live
+        assert cards[1].live
+        assert not cards[1].query_one(".pc-allbtn", Btn).display, "no dead group action"
+        assert not app.swallowed
+    store = await _store(env)
+    try:
+        missions = await store.list_missions(limit=100)
+        assert sorted(m.objective for m in missions if m.objective.startswith("say ")) == [
+            "say hello"
+        ]
+    finally:
+        await store.aclose()
+
+
 async def test_a_saved_chat_with_two_unlaunched_proposals_shows_and_launches_both(
     ids: dict[str, str], env: Path
 ) -> None:

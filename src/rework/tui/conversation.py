@@ -289,6 +289,15 @@ class Conversation:
         when the plan needs a repo nobody named (the caller asks for one)."""
         from rework.missions import create_mission, project_is_upload
 
+        # A proposal is launchable only while it is still PENDING in the engine:
+        # a later proposing turn replaces the pending list, and a click that
+        # lost the race to a sibling launch arrives too late. Creating the
+        # mission before checking is what let one proposal run twice.
+        if self.engine is not None and not any(
+            same_proposal(p, proposal) for p in self.engine.proposals
+        ):
+            return None
+
         project_id = resolve_project(snap, proposal.project, self.chat.project_id)
         # the project's OWN settings decide whether a repo is meaningful: for an
         # upload project the files area supplies the files (results fetched).

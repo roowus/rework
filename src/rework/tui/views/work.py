@@ -365,18 +365,30 @@ class WorkView(View):
             if isinstance(widget, ProposalCard):
                 widget.live = item.live
             widgets.append(widget)
-        # a RELOADED chat can hold several pending proposals too: the group
-        # action is offered whenever more than one is live, not only on the turn
-        # that proposed them
-        live = [w for w in widgets if isinstance(w, ProposalCard) and w.live]
-        if len(live) > 1:
-            for widget in live:
-                widget.set_launch_all(True)
         log.add(*widgets)
+        # a RELOADED chat can hold several pending proposals too: the group
+        # action is offered whenever more than one is pending, not only on the
+        # turn that proposed them
+        self._sync_launch_all([w for w in widgets if isinstance(w, ProposalCard)])
 
     def _pending_cards(self) -> list[ProposalCard]:
         """The proposal cards still waiting for a decision, in transcript order."""
         return [card for card in self.query(ProposalCard) if card.live]
+
+    def _sync_launch_all(self, extra: list[Any] | None = None) -> None:
+        """One source of truth for the group action.
+
+        "Launch all" is offered exactly when MORE THAN ONE proposal is still
+        pending: with a lone survivor it would only repeat that card's own
+        Launch, and once nothing is pending it is dead. `extra` covers cards
+        that are about to be mounted, which `self.query` cannot see yet."""
+        pending: list[ProposalCard] = self._pending_cards()
+        for card in extra or []:
+            if isinstance(card, ProposalCard) and card.live and card not in pending:
+                pending.append(card)
+        offer = len(pending) > 1
+        for card in [*self.query(ProposalCard), *pending]:
+            card.set_launch_all(offer)
 
     def _item_widget(self, item: Item) -> Any:
         if item.kind == "user":
@@ -409,6 +421,18 @@ class WorkView(View):
     def _retire_proposals(self) -> None:
         for card in self.query(ProposalCard):
             card.set_live(False)
+        self._sync_launch_all()
+
+    def _settle_stale_proposals(self, proposals: list[Any]) -> None:
+        """Settle the cards an EARLIER turn proposed.
+
+        The engine REPLACES its pending list on a proposing turn (chat.py: the
+        newest turn's proposals ARE the pending ones), so a card left from a
+        previous turn can no longer be launched: leaving it live would let the
+        transcript offer a mission the orchestrator has withdrawn."""
+        for card in self._pending_cards():
+            if not any(same_proposal(card.proposal, p) for p in proposals):
+                card.set_live(False)
 
     # -- sending ----------------------------------------------------------------------
 
@@ -492,10 +516,19 @@ class WorkView(View):
                 prompt.text = text  # never lose input
                 return
             if result.launched_all and result.proposals:
-                # a typed "yes" with proposals pending means launch them ALL
+                # a typed "yes" with proposals pending means launch them ALL.
+                # The engine has ALREADY emptied its pending list for a yes, so
+                # hand those proposals back before launching: `Conversation.
+                # launch` only runs a proposal that is still pending, which is
+                # what stops a second click from creating a second mission
+                if self.convo is not None and self.convo.engine is not None:
+                    self.convo.engine.proposals = list(result.proposals)
                 await self._launch_all(result.proposals)
                 return
             if result.proposals:
+                # the engine replaced its pending list with THIS turn's
+                # proposals, so anything an earlier turn proposed is withdrawn
+                self._settle_stale_proposals(result.proposals)
                 log.add(assistant_step(result.reply or "Here's what I'd run."))
                 log.add(*self._proposal_cards(result.proposals))
             elif result.reply:
@@ -564,15 +597,20 @@ class WorkView(View):
         event.stop()
         if self._sending:
             return
-        self._launch_all_cards()
+        # claim the slot BEFORE scheduling: a per-card Launch and a Launch all
+        # dispatched in one event-loop batch would both pass a read-only gate
+        self._sending = True
+        try:
+            self._launch_all_cards()
+        except Exception:
+            self._sending = False
+            raise
 
     def _proposal_cards(self, proposals: list[Any]) -> list[ProposalCard]:
         """One card per proposal, plus ONE "Launch all" for the group when there
         is more than one (with a single proposal it would just duplicate it)."""
         cards = [ProposalCard(proposal) for proposal in proposals]
-        if len(cards) > 1:
-            for card in cards:
-                card.set_launch_all(True)
+        self._sync_launch_all(cards)
         return cards
 
     def on_proposal_card_decided(self, event: ProposalCard.Decided) -> None:
@@ -580,6 +618,9 @@ class WorkView(View):
         if self._sending:
             return
         if event.launch:
+            # as above: set synchronously, a double click arrives as two
+            # messages before either worker has started
+            self._sending = True
             self._launch_worker(event.card.proposal)
         else:
             self._scrap(event.card)
@@ -593,15 +634,17 @@ class WorkView(View):
         engine = self.convo.engine if self.convo is not None else None
         if engine is not None:
             engine.proposals = [p for p in engine.proposals if not same_proposal(p, card.proposal)]
+        self._sync_launch_all()
 
     def _launch_all_cards(self) -> None:
         """The "Launch all" button: every pending proposal, in transcript order."""
         cards = self._pending_cards()
         if not cards:
+            self._sending = False
             return
         self._launch_all_worker([card.proposal for card in cards], cards)
 
-    @work(group="send")
+    @work(group="send", exclusive=True)
     async def _launch_all_worker(self, proposals: list[Any], cards: list[Any]) -> None:
         self._sending = True
         try:
@@ -628,6 +671,7 @@ class WorkView(View):
             for card in cards:
                 if same_proposal(card.proposal, proposal):
                     card.set_live(False)
+        self._sync_launch_all()
         if launched:
             self.toast(
                 f"Launched {len(launched)} mission{'s' if len(launched) != 1 else ''}",
@@ -635,7 +679,7 @@ class WorkView(View):
             )
             await self.hub.refresh()
 
-    @work(group="send")
+    @work(group="send", exclusive=True)
     async def _launch_worker(self, proposal: Any) -> None:
         self._sending = True
         try:
@@ -665,6 +709,11 @@ class WorkView(View):
         except Exception as exc:
             log.add(Step(f"[{DANGER}]✗ launch failed: {esc(clip(str(exc), 300))}[/]"))
             return None
+        if mission is None:
+            # the proposal is no longer pending (a racing click already launched
+            # or scrapped it): nothing was created, so just settle the card
+            self._settle_card(proposal)
+            return None
         if settle:
             self._settle_card(proposal)
         card = MissionCard(mission.id)
@@ -680,6 +729,7 @@ class WorkView(View):
         for card in self.query(ProposalCard):
             if same_proposal(card.proposal, proposal):
                 card.set_live(False)
+        self._sync_launch_all()
 
     # -- live mission cards -------------------------------------------------------------
 
