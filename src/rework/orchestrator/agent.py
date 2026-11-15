@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -38,6 +39,7 @@ from rework.kernel.state.records import (
 from rework.kernel.state.records import run_id as make_run_id
 from rework.logs import bind
 from rework.nodes.report_sections import blocking_findings, open_blockers
+from rework.orchestrator.engine import MAX_SEND_BACKS
 
 log = logging.getLogger("rework.orchestrator")
 
@@ -427,7 +429,9 @@ _TOOLS: list[ToolSpec] = [
                 "summary": {
                     "type": "string",
                     "description": "What happened, for the owner: what changed, why, and what "
-                    "the audit found. This leads the PR body, so write it for a reviewer.",
+                    "the audit found. This becomes the PR body ('## What changed') that a "
+                    "reviewer reads, so write it for them; a status note such as 'finished', "
+                    "'done' or 'all good' is rejected.",
                 },
                 "ask_before_pr": {
                     "type": "boolean",
@@ -538,6 +542,52 @@ def _short(value: Any, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+# a finish summary leads the PR body ("## What changed"), so a status note like
+# "FINISHED ALREADY." (PR #34) is refused: it says nothing to a reviewer.
+_MIN_SUMMARY_CHARS = 20
+_STATUS_WORDS = frozenset(
+    {"done", "finished", "complete", "completed", "merged", "ok", "okay", "lgtm", "good", "shipped"}
+)
+_STATUS_FILLER = frozenset(
+    {
+        "a",
+        "all",
+        "already",
+        "and",
+        "been",
+        "everything",
+        "for",
+        "has",
+        "have",
+        "here",
+        "i",
+        "is",
+        "it",
+        "its",
+        "just",
+        "now",
+        "s",
+        "the",
+        "to",
+        "up",
+        "we",
+    }
+)
+
+
+def _reads_like_status_note(summary: str) -> bool:
+    """`done!`, `FINISHED ALREADY.`, `all good`, `LGTM`: a state, not a change."""
+    words = re.sub(r"[^a-z0-9 ]+", " ", summary.lower()).split()
+    rest = [w for w in words if w not in _STATUS_FILLER]
+    return bool(rest) and all(w in _STATUS_WORDS for w in rest)
+
+
+def _substantive_summary(summary: str) -> bool:
+    """Usable as a PR body: not blank, not very short, not a status note."""
+    text = " ".join(summary.split())
+    return len(text) >= _MIN_SUMMARY_CHARS and not _reads_like_status_note(text)
+
+
 # where an entry's calls go when it leaves base_url unset (the adapters'
 # defaults; see kernel/llm/adapters)
 _DEFAULT_ENDPOINTS = {
@@ -609,6 +659,11 @@ class MissionOrchestrator:
         self._events: list[Any] = []
         self._event_cursor = 0
         self.finished: tuple[str, str] | None = None
+        # the finish this mission had ALREADY recorded when this run loaded, if
+        # its summary would lead a PR body. The status-note rail reuses ONLY
+        # this: a finish accepted earlier in THIS run is an intermediate note,
+        # not a restart boundary (see _load and the finish branch of _dispatch)
+        self._resumed_finish_summary: str | None = None
         # findings the orchestrator shipped with, and its reason for each: the
         # one mechanical rail that blocks finish(done) requires them (see
         # _enforce_findings_accepted), and they lead the mission report/PR body
@@ -675,6 +730,16 @@ class MissionOrchestrator:
         self.owner_seq = max(
             [int(m.get("owner_seq") or 0) for m in self.history if m.get("role") == "user"] + [0]
         )
+        # what this mission had recorded BEFORE this run started: the only
+        # summary a status-note finish may reuse (PR #34). Captured here, from
+        # the freshly loaded history, so a finish accepted later in THIS run
+        # cannot masquerade as a pre-restart one.
+        recorded = self._recorded_finish()
+        self._resumed_finish_summary = (
+            " ".join(recorded[1].split())
+            if recorded is not None and _substantive_summary(recorded[1])
+            else None
+        )
 
     async def _append(self, message: dict[str, Any], display: str = "") -> None:
         self.history.append(message)
@@ -721,43 +786,64 @@ class MissionOrchestrator:
             self.finished = self._recorded_finish()
             if self.finished is None:
                 await self._finish_interrupted_turn()
-        if self.finished is None:
-            await self._loop()
-        if self.finished is None:
-            return  # cancelled by the owner or the burn gate
-        outcome, summary = self.finished
-        results = await self._results_by_role()
-        audit = results.get("audit")
-        ship, pr_url = (None, None)
-        if outcome == "done":
-            # Persist the orchestrator's finish summary and accepted_findings
-            # into mission.result BEFORE _final_gates runs, so _create_pr /
-            # _pr_body reads the real summary instead of falling back to the
-            # coder's handoff text. (Fix: PR #21 — _synthesize was called after
-            # _final_gates, so result["summary"] was empty when _pr_body ran.)
-            _current = await self.r._store.get_mission(self.mid)
-            _pre = dict((_current.result if _current else None) or {})
-            if summary:
-                _pre["summary"] = summary
-            if self.accepted_findings:
-                _pre["accepted_findings"] = self.accepted_findings
-            await self.r._store.update_mission(self.mid, result=_pre)
-            ship, pr_url = await self.r._final_gates(
-                self.mission,
-                results,
-                audit.artifact if audit else None,
-                ask_before_pr=self.ask_before_pr,
-                reason=self.pr_reason,
-                gate_category=self.pr_gate_category,
+        send_backs = 0
+        while True:
+            if self.finished is None:
+                await self._loop()
+            if self.finished is None:
+                return  # cancelled by the owner or the burn gate
+            outcome, summary = self.finished
+            results = await self._results_by_role()
+            audit = results.get("audit")
+            ship, pr_url = (None, None)
+            if outcome == "done":
+                # Persist the orchestrator's finish summary and accepted_findings
+                # into mission.result BEFORE _final_gates runs, so _create_pr /
+                # _pr_body reads the real summary instead of falling back to the
+                # coder's handoff text. (Fix: PR #21 — _synthesize was called after
+                # _final_gates, so result["summary"] was empty when _pr_body ran.)
+                _current = await self.r._store.get_mission(self.mid)
+                _pre = dict((_current.result if _current else None) or {})
+                if summary:
+                    _pre["summary"] = summary
+                if self.accepted_findings:
+                    _pre["accepted_findings"] = self.accepted_findings
+                await self.r._store.update_mission(self.mid, result=_pre)
+                ship, pr_url, sent_back = await self.r._final_gates(
+                    self.mission,
+                    results,
+                    audit.artifact if audit else None,
+                    ask_before_pr=self.ask_before_pr,
+                    reason=self.pr_reason,
+                    gate_category=self.pr_gate_category,
+                )
+                if sent_back:
+                    # the owner sent the work back: the engine already queued their
+                    # feedback as an owner message and flipped the mission to
+                    # RUNNING. Un-finish and re-enter the turn loop so the
+                    # orchestrator revises, re-audits and reaches a FRESH gate.
+                    send_backs += 1
+                    if send_backs > MAX_SEND_BACKS:
+                        await self.r._synthesize(
+                            self.mid,
+                            None,
+                            outcome="failed",
+                            summary=f"owner sent the mission back more than {MAX_SEND_BACKS} "
+                            "times; giving up",
+                        )
+                        return
+                    await self._note(f"owner sent the mission back (#{send_backs}); resuming")
+                    self.finished = None
+                    continue
+            self.r._pr_url = pr_url
+            await self.r._synthesize(
+                self.mid,
+                ship,
+                outcome=outcome,
+                summary=summary,
+                accepted_findings=self.accepted_findings,
             )
-        self.r._pr_url = pr_url
-        await self.r._synthesize(
-            self.mid,
-            ship,
-            outcome=outcome,
-            summary=summary,
-            accepted_findings=self.accepted_findings,
-        )
+            return
 
     async def _loop(self) -> None:
         idle = 0
@@ -965,6 +1051,8 @@ class MissionOrchestrator:
             m.get("tool_call_id"): m.get("content") for m in self.history if m.get("role") == "tool"
         }
         for message in reversed(self.history):
+            if message.get("role") == "user" and message.get("owner_seq"):
+                return None  # the owner spoke after any finish (send-back): not finished
             for call in message.get("tool_calls") or []:
                 if call.get("name") == "finish" and answered.get(call.get("id")) == "finished":
                     args = call.get("arguments") or {}
@@ -1046,7 +1134,23 @@ class MissionOrchestrator:
                 accepted = _accepted_findings(args.get("accepted_findings"))
                 await self._enforce_audit_fresh()
                 await self._enforce_findings_accepted(accepted)
-            self.finished = (outcome, str(args.get("summary") or ""))
+            summary = " ".join(str(args.get("summary") or "").split())
+            if not _substantive_summary(summary):
+                # a restart must not degrade the PR body to "finished": reuse
+                # the summary this mission had recorded BEFORE this run loaded
+                # (_load captured it and only kept a substantive one). A thin
+                # finish accepted earlier in THIS run is an intermediate note,
+                # not the mission's story, so it is never promoted here.
+                previous = self._resumed_finish_summary
+                if previous is None:
+                    raise ToolError(
+                        "summary must say what changed for the owner: it becomes the PR body "
+                        "('## What changed'), so name the change and why it was made. A status "
+                        "note such as 'finished', 'done' or 'all good' is refused."
+                    )
+                await self._note("finish summary was a status note; reusing the earlier one")
+                summary = previous
+            self.finished = (outcome, summary)
             self.accepted_findings = accepted
             self.ask_before_pr = ask
             self.pr_reason = reason

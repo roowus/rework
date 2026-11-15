@@ -137,6 +137,11 @@ def default_orchestrator_model(catalog: Any = None) -> str:
 project_app = typer.Typer(no_args_is_help=True, add_completion=False, help="Projects (ADR 0005).")
 app.add_typer(project_app, name="project")
 
+mission_app = typer.Typer(
+    no_args_is_help=True, add_completion=False, help="Mission owner actions (retry-pr)."
+)
+app.add_typer(mission_app, name="mission")
+
 
 @project_app.command("assign")
 def project_assign(
@@ -1028,6 +1033,42 @@ def _set_mission_status(mission_id: str, status: str) -> None:
     typer.echo(f"{mission_id}: {asyncio.run(go())}")
 
 
+@app.command("retry-pr")
+def retry_pr_cmd(mission_id: str) -> None:
+    """Retry the PR delivery of a mission that finished but whose push or
+    `gh pr create` failed (a transient remote hiccup must not cost the work).
+
+    Pushes the recorded branch and opens the missing PR with the persisted
+    title/body; on success the pending marker is cleared, on failure the
+    remote's FULL message is printed and nothing else is touched.
+    """
+    from rework.orchestrator.delivery import retry_pr
+
+    async def go() -> tuple[bool, str]:
+        from rework.config import Config, open_store_from_config
+        from rework.kernel.events.bus import InProcessEventBus
+
+        store = await open_store_from_config(Config.from_env())
+        try:
+            return await retry_pr(store, InProcessEventBus(store), mission_id)
+        finally:
+            await store.aclose()
+
+    ok, detail = asyncio.run(go())
+    if ok:
+        typer.echo(f"{mission_id}: PR opened: {detail}")
+        return
+    # the whole error, every line: the useful one is the LAST (git prints the
+    # rejection reason after the remote banner and the forge's hints)
+    typer.echo(f"{mission_id}: PR still not delivered:\n{detail}", err=True)
+    raise typer.Exit(1)
+
+
+# the same command under the `mission` group the docs use (`rework mission
+# retry-pr ID`); the top-level spelling stays, like every other mission command
+mission_app.command("retry-pr")(retry_pr_cmd)
+
+
 @app.command()
 def complaints(
     status: str | None = typer.Option(
@@ -1151,6 +1192,36 @@ def approve(
         typer.secho(status, fg=typer.colors.RED)
         raise typer.Exit(1)
     typer.echo(f"gate {gate_id}: {status}")
+
+
+@app.command()
+def message(
+    mission_id: str,
+    text: str = typer.Argument(..., help="Message text to send to the mission."),
+) -> None:
+    """Send a message to a mission. The orchestrator receives it and wakes."""
+
+    async def go() -> None:
+        from rework.config import Config, open_store_from_config
+        from rework.missions import send_owner_message
+
+        store = await open_store_from_config(Config.from_env())
+        try:
+            if await store.get_mission(mission_id) is None:
+                typer.echo(f"unknown mission {mission_id}", err=True)
+                raise typer.Exit(1)
+            await send_owner_message(mission_id, text, store=store)
+        finally:
+            await store.aclose()
+
+    try:
+        asyncio.run(go())
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        typer.secho(f"failed to send message: {exc}", fg=typer.colors.RED)
+        raise typer.Exit(1) from exc
+    typer.echo(f"{mission_id}: message sent")
 
 
 @app.command()

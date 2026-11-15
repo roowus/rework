@@ -1,12 +1,21 @@
 name: ci
 
-# Manual only. rework's roles run these same checks locally (the coder and
-# auditor prompts point at this file for WHAT to run), and scripts/ci-local
-# runs them on any PR. Running on every push used the private repo's whole
-# free allowance by 2026-11-11 (215 runs, about 2,011 of 2,000 minutes), and
-# GitHub then refused every job.
+# Runs on every push to main and on every pull request. It was manual-only
+# from 2026-11-11 to 2026-11-15, while the repo was private and the free
+# allowance (2,000 minutes) was spent (215 runs, about 2,011 minutes). The repo
+# is public now, which makes Actions minutes free. scripts/ci-local still runs
+# the same checks locally, and the coder and auditor prompts point at this file
+# for WHAT to run.
 on:
+  push:
+    branches: [main]
+  pull_request:
   workflow_dispatch:
+
+# a newer push to the same PR cancels the older run instead of queueing it
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint:

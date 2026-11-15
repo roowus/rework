@@ -6,8 +6,9 @@ Add a backend: implement the store, then extend `BACKENDS` + `_make_store`.
 
 from __future__ import annotations
 
+import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -346,3 +347,52 @@ def _isolated_command_registry(
 ) -> None:
     """run_command records process groups under REWORK_RUN_DIR; never ~/.rework."""
     monkeypatch.setenv("REWORK_RUN_DIR", str(tmp_path_factory.mktemp("run")))
+
+
+@pytest.fixture(scope="session")
+def log_isolation(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The one log directory this test session may write into."""
+    return tmp_path_factory.mktemp("logs")
+
+
+@pytest.fixture(scope="session")
+def _log_baseline() -> list[logging.Handler]:
+    """The root handlers pytest itself installed, before any setup_logging()."""
+    return list(logging.getLogger().handlers)
+
+
+def reset_logging(baseline: list[logging.Handler]) -> None:
+    """Detach every handler setup_logging() attached and forget the components it
+    configured. `_configured` is the trap: setup_logging() returns EARLY for an
+    already-configured component and attaches no new handler, so a stale handler
+    keeps writing to the directory of the test that installed it."""
+    from rework import logs
+
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        if handler not in baseline:
+            root.removeHandler(handler)
+            handler.close()
+    logs._configured.clear()
+
+
+@pytest.fixture
+def reset_logs(_log_baseline: list[logging.Handler]) -> Callable[[], None]:
+    """reset_logging for tests that must exercise setup_logging() more than once."""
+    return lambda: reset_logging(_log_baseline)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_logs(
+    monkeypatch: pytest.MonkeyPatch,
+    log_isolation: Path,
+    _log_baseline: list[logging.Handler],
+) -> Iterator[None]:
+    """No test may write into the owner's real ~/.rework/logs. An entrypoint
+    driven in-process (run_tui() in tests/tui/test_reload.py) calls
+    setup_logging(), which falls back to DEFAULT_STATE_DIR/logs when
+    REWORK_LOG_DIR is unset and appends to the real tui.log."""
+    monkeypatch.setenv("REWORK_LOG_DIR", str(log_isolation))
+    reset_logging(_log_baseline)
+    yield
+    reset_logging(_log_baseline)

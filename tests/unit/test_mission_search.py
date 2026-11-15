@@ -72,16 +72,44 @@ def test_matches_id_project_and_status() -> None:
     assert ids(search.search_missions(MISSIONS, "done")) == ["m-flaky"]
 
 
-def test_fuzzy_subsequence_is_the_fallback() -> None:
-    """'flky' is no substring of anything: it only hits as a subsequence."""
-    assert ids(search.search_missions(MISSIONS, "flky")) == ["m-flaky"]
+def test_no_fuzzy_subsequence_fallback() -> None:
+    """m7 finding #44: the old fuzzy fallback matched the letters in order, so
+    'flky' hit "fix the flaky test" and near-everything matched short queries.
+    Strictness is the point: a non-substring is a miss."""
+    assert ids(search.search_missions(MISSIONS, "flky")) == []
     assert ids(search.search_missions(MISSIONS, "zzzz")) == []
+    # subsequence in the middle of a field, but never a substring of one
+    assert ids(search.search_missions(MISSIONS, "lutl")) == []
+    assert ids(search.search_missions([mission("m-2", "load edge request")], "ledger")) == []
 
 
-def test_literal_hits_rank_above_fuzzy_ones() -> None:
-    literal = mission("m-1", "ledger audit")
-    fuzzy = mission("m-2", "load edge request")  # only l…e…d…g…e…r in order
-    assert ids(search.search_missions([fuzzy, literal], "ledger")) == ["m-1", "m-2"]
+def test_short_queries_do_not_return_everything() -> None:
+    """The reported symptom: 'tst' (and every other short skeleton) matched every
+    mission, because the letters occurred in order somewhere in a long
+    objective. Now only real substrings match."""
+    objectives = [
+        mission("m-1", "fix the flaky test in toyrepo"),
+        mission("m-2", "add a heatmap to the cost tab"),
+        mission("m-3", "ship the parser"),
+    ]
+    assert ids(search.search_missions(objectives, "tst")) == []  # t…s…t in "test"
+    assert ids(search.search_missions(objectives, "hmap")) == []  # h…m…a…p in "heatmap"
+    assert ids(search.search_missions(objectives, "test")) == ["m-1"]
+    assert ids(search.search_missions(objectives, "heatmap")) == ["m-2"]
+    assert search.search_missions(MISSIONS, "zzzz") == []
+
+
+def test_matches_are_unranked_and_keep_caller_order() -> None:
+    """No scoring: pure substring filtering, in the order the caller gave."""
+    a = mission("m-1", "ledger audit")
+    b = mission("m-2", "audit the ledger too")
+    assert ids(search.search_missions([a, b], "ledger")) == ["m-1", "m-2"]
+    assert ids(search.search_missions([b, a], "ledger")) == ["m-2", "m-1"]
+
+
+def test_token_matches_is_plain_substring() -> None:
+    assert search.token_matches("lak", ["fix the flaky test"]) is True
+    assert search.token_matches("flky", ["fix the flaky test"]) is False
 
 
 # -- summaries & prompt -----------------------------------------------------
@@ -120,16 +148,24 @@ def test_build_ai_prompt_contains_ids_query_and_stays_small() -> None:
     assert f"m-{search.MAX_CANDIDATES + 24}" not in capped
 
 
-def test_candidates_prefilters_only_over_the_cap() -> None:
+def test_candidates_only_ever_offers_strict_matches() -> None:
+    """A query decides who the model may rank, at every size: the candidates are
+    its strict hits (capped at MAX_CANDIDATES) and nothing else, so the ranking
+    can reorder the hits but never widen them."""
     few = [mission(f"m-{i}", f"obj {i}", created_at=float(i)) for i in range(5)]
     assert search.candidates(few, "obj") == few
+    assert [m.id for m in search.candidates(few, "obj 3")] == ["m-3"]
+    # a match under the cap is still the only candidate: no recent fallback
+    assert search.candidates(few, "zzz") == []
 
     many = [mission(f"m-{i}", f"obj {i}", created_at=float(i)) for i in range(100)]
     picked = search.candidates(many, "obj 42")
     assert len(picked) == 1 and picked[0].id == "m-42"
+    assert search.candidates(many, "zzz") == []
 
-    # nothing matches the text search: the newest win
-    newest = search.candidates(many, "zzz")
+    # no query: nothing to isolate, so all of them (or the newest under the cap)
+    assert search.candidates(few, "") == few
+    newest = search.candidates(many, "")
     assert len(newest) == search.MAX_CANDIDATES
     assert newest[0].id == "m-99"
 

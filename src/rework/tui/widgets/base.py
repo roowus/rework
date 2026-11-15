@@ -231,6 +231,16 @@ class RowList(VerticalScroll, can_focus=True):
             self.selected = None
         self._paint_selection()
 
+    def set_empty(self, text: str) -> None:
+        """Swap the placeholder shown while the list has no rows (search: an
+        explicit "no matches" instead of "nothing here yet")."""
+        if text == self._empty:
+            return
+        self._empty = text
+        for empty in self.query(".rowlist-empty"):
+            if isinstance(empty, Static):
+                empty.update(text)
+
     @property
     def keys(self) -> list[str]:
         return list(self._keys)
