@@ -193,13 +193,12 @@ class WorkView(View):
             # re-seeds both from the rows it paints; rows written while we were
             # disconnected are included, and nothing already on screen repeats.
             self._store_epoch = data.store_epoch
-            # deliberately NOT awaited: `load-chat` is exclusive, and awaiting
-            # it from inside the exclusive `chat-poll` worker would ask the
-            # worker system for a slot this very run holds, so the reload could
-            # be cancelled mid-way. Group exclusivity already keeps the next
-            # tick out while it runs. `open_chat` awaits it for the opposite
-            # reason: it must keep a stale tick from slipping through behind
-            # the load it just started.
+            # scheduled, not awaited: `_load_chat` returns a Textual Worker,
+            # which is not awaitable (`await` on it raises TypeError). The
+            # exclusive `load-chat` group keeps a second load from starting on
+            # top of this one, and the replay it paints clears the log first,
+            # so a tick that runs in the meantime cannot duplicate a row.
+            # `open_chat` schedules it the same way.
             self._load_chat(chat_id)
             return
         head = await self.hub.guard(partial(data.chat_messages_max_id, chat_id), None)

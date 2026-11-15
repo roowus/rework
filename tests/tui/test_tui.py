@@ -8,9 +8,10 @@ sets REWORK_DB to a tmp file before the app is constructed."""
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 from textual.widgets import Input
@@ -56,12 +57,52 @@ async def _store(db: Path) -> Any:
     return await open_sqlite(str(db))
 
 
+def db_path() -> str:
+    return os.environ["REWORK_DB"]
+
+
 def _app() -> ReworkApp:
     return ReworkApp(poll_seconds=0.3)
 
 
 async def _settle(pilot: Any, t: float = 0.5) -> None:
     await pilot.pause(t)
+
+
+async def _wait_for(pilot: Any, condition: Callable[[], bool], *, tries: int = 200) -> None:
+    """Poll `condition` for up to ~10 s and return on the first true.
+
+    A fixed `pause` before a count assertion is a race: on a loaded machine the
+    scripted turn can still be mid-flight when the sleep elapses, and the count
+    then sees a half-painted screen (one run in ten failed with `2 cards` for a
+    single proposal). Polling is both faster in the normal case and
+    deterministic. On expiry this returns too, so the CALLER's assertion fails
+    with its own diagnostic message rather than a generic timeout."""
+    for _ in range(tries):
+        if condition():
+            return
+        await pilot.pause(0.05)
+
+
+async def _diag(app: Any) -> str:
+    """What is on screen and what the store holds, for a failing count."""
+    from rework.tui.widgets.cards import ProposalCard
+
+    work = app.view("work")
+    chat_id = getattr(getattr(work, "convo", None), "id", None)
+    if not chat_id:
+        return "no chat open"
+    objectives = [c.proposal.objective for c in app.query(ProposalCard)]
+    from rework.kernel.state.sqlite import open_sqlite
+
+    # a separate connection: this is a failure path, and the app's own handle
+    # may be the thing under test
+    store = await open_sqlite(db_path())
+    try:
+        missions = await store.list_missions(limit=100, chat_id=chat_id)
+    finally:
+        await store.aclose()
+    return f"chat {chat_id}: cards {objectives}, store missions {[m.objective for m in missions]}"
 
 
 def _btn(app: ReworkApp, root: Any, action: str) -> Btn:
@@ -538,7 +579,7 @@ async def test_a_turn_proposing_two_missions_renders_two_cards(
         for ch in "hello and goodbye":
             await pilot.press(ch if ch != " " else "space")
         await pilot.press("enter")
-        await _settle(pilot, 1.0)
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 2)
         cards = list(app.query(ProposalCard))
         assert len(cards) == 2, [c.proposal.objective for c in cards]
         assert [c.proposal.objective for c in cards] == ["say hello", "say goodbye"]
@@ -578,7 +619,7 @@ async def test_launching_one_card_leaves_its_sibling_pending(
         for ch in "hello and goodbye":
             await pilot.press(ch if ch != " " else "space")
         await pilot.press("enter")
-        await _settle(pilot, 1.0)
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 2)
         cards = list(app.query(ProposalCard))
         assert len(cards) == 2
         await pilot.click(_btn(app, cards[0], "launch"))
@@ -632,7 +673,7 @@ async def test_launch_all_creates_one_mission_per_proposal(
         for ch in "hello and goodbye":
             await pilot.press(ch if ch != " " else "space")
         await pilot.press("enter")
-        await _settle(pilot, 1.0)
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 2)
         cards = list(app.query(ProposalCard))
         assert len(cards) == 2
         await pilot.click(_btn(app, cards[0], "launch-all"))
@@ -673,14 +714,14 @@ async def test_a_second_proposing_turn_retires_the_first_turns_card(
         for ch in "hello":
             await pilot.press(ch if ch != " " else "space")
         await pilot.press("enter")
-        await _settle(pilot, 1.0)
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 1)
         first = list(app.query(ProposalCard))
         assert [c.proposal.objective for c in first] == ["say hello"]
         assert first[0].live
         for ch in "goodbye and thanks":
             await pilot.press(ch if ch != " " else "space")
         await pilot.press("enter")
-        await _settle(pilot, 1.5)
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 3)
         cards = list(app.query(ProposalCard))
         assert [c.proposal.objective for c in cards] == ["say hello", "say goodbye", "say thanks"]
         assert not cards[0].live, "the superseded proposal is settled"
@@ -720,9 +761,9 @@ async def test_double_launch_creates_one_mission(
         for ch in "say hello":
             await pilot.press(ch if ch != " " else "space")
         await pilot.press("enter")
-        await _settle(pilot, 1.0)
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 1)
         cards = list(app.query(ProposalCard))
-        assert len(cards) == 1
+        assert len(cards) == 1, await _diag(app)
         launch = cards[0].query_one(Btn)
         assert launch.action == "launch"
         # a double click delivers both presses as two messages in ONE batch,
@@ -763,7 +804,7 @@ async def test_a_single_remaining_card_does_not_offer_launch_all(
         for ch in "hello and goodbye":
             await pilot.press(ch if ch != " " else "space")
         await pilot.press("enter")
-        await _settle(pilot, 1.0)
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 2)
         cards = list(app.query(ProposalCard))
         assert len(cards) == 2
         assert all(card.query_one(".pc-allbtn", Btn).display for card in cards)
@@ -874,7 +915,7 @@ async def test_a_replayed_chat_settles_the_launched_proposal_not_its_twin(
     async with app.run_test(size=SIZE) as pilot:
         await _settle(pilot)
         app.query_one("#chat-list", RowList).activate(chat.id, via_mouse=True)
-        await _settle(pilot, 1.0)
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 2)
         assert app.view("work").convo.id == chat.id
         cards = list(app.query(ProposalCard))
         assert [c.proposal.plan for c in cards] == ["echo", "draft"]
@@ -977,7 +1018,7 @@ async def test_a_legacy_bare_launch_note_still_settles_the_oldest(
     async with app.run_test(size=SIZE) as pilot:
         await _settle(pilot)
         app.query_one("#chat-list", RowList).activate(chat.id, via_mouse=True)
-        await _settle(pilot, 1.0)
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 2)
         cards = list(app.query(ProposalCard))
         assert [c.proposal.objective for c in cards] == ["say hello", "say goodbye"]
         assert not cards[0].live, "a bare note settles the oldest pending proposal"
@@ -1049,7 +1090,7 @@ async def test_a_saved_chat_with_two_unlaunched_proposals_shows_and_launches_bot
     async with app.run_test(size=SIZE) as pilot:
         await _settle(pilot)
         app.query_one("#chat-list", RowList).activate(chat.id, via_mouse=True)
-        await _settle(pilot, 1.0)
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 2)
         assert app.view("work").convo.id == chat.id
         cards = list(app.query(ProposalCard))
         assert [c.proposal.objective for c in cards] == ["say hello", "say goodbye"]
@@ -2464,8 +2505,8 @@ async def test_a_replayed_chat_does_not_duplicate_its_proposal_cards(
         for ch in "hello and goodbye":
             await pilot.press(ch if ch != " " else "space")
         await pilot.press("enter")
-        await _settle(pilot, 1.0)
-        assert len(app.query(ProposalCard)) == 2, "the turn rendered its two cards"
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 2)
+        assert len(app.query(ProposalCard)) == 2, await _diag(app)
         chat_id = work.convo.id
         messages = await app.hub.data.chat_messages(chat_id)
         row_ids = [int(m.id or 0) for m in messages]
@@ -2585,7 +2626,7 @@ async def test_a_store_swap_repaints_the_transcript_without_loss_or_duplication(
             await store.aclose()
 
         await work._tick_chat(chat_id).wait()  # the epoch branch of the tick
-        await _settle(pilot, 0.8)
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 3)
 
         def shown() -> str:
             return "\n".join(str(s.render()) for s in app.query("#chat-log Step"))
@@ -2594,12 +2635,15 @@ async def test_a_store_swap_repaints_the_transcript_without_loss_or_duplication(
         # three proposals are in the transcript (the two from the turn plus the
         # one written during the outage) and NOT four: 4 would be the replayed
         # pair painted on top of the pair already on screen
-        assert len(cards) == 3, f"{len(cards)} cards for three stored proposals"
+        assert len(cards) == 3, await _diag(app)
         assert [c.proposal.objective for c in cards] == [
             "say hello",
             "say goodbye",
             "say thanks",
         ]  # the two originals survive, in order, and the foreign one follows
+        # nothing was launched, so every replayed card must still be launchable:
+        # a replay that settled them would tell the owner the work already ran
+        assert all(card.live for card in cards), "the replayed proposals are still pending"
         assert "while you were swapped" in shown(), "the row written during the outage was lost"
         # the view consumed the swap and re-seeded its pointers from the rows,
         # instead of keeping the stale ones it held across the reconnect
