@@ -518,7 +518,7 @@ async def test_revision_coder_continues_the_previous_branch(world: dict[str, Any
                 call("spawn_role", "v3", role="coder", step="code", brief="also tidy it"),
                 call("wait", "v4"),
             ),
-            turn(call("finish", "v5", outcome="failed", summary="two coders")),
+            turn(call("finish", "v5", outcome="failed", summary="two coders ran the parser fix")),
         ],
     )
     provider.route("Fulfill the task", _coder_script("first") + _coder_script("second"))
@@ -553,7 +553,7 @@ async def test_turn_budget_stops_a_role(world: dict[str, Any]) -> None:
                 ),
                 call("wait", "t2"),
             ),
-            turn(call("finish", "t3", outcome="failed", summary="budgeted")),
+            turn(call("finish", "t3", outcome="failed", summary="budget spent on the parser fix")),
         ],
     )
     reads = [
@@ -842,7 +842,14 @@ async def test_request_budget_raises_the_real_cap(world: dict[str, Any]) -> None
         MARKER,
         [
             turn(call("request_budget", "b1", max_usd=5, reason="one more coder")),
-            turn(call("finish", "b2", outcome="failed", summary="checked budget")),
+            turn(
+                call(
+                    "finish",
+                    "b2",
+                    outcome="failed",
+                    summary="checked budget before the third coder",
+                )
+            ),
         ],
     )
     task = asyncio.create_task(runner(world).run())
@@ -1383,11 +1390,41 @@ async def test_a_second_finish_keeps_the_summary_the_first_one_gave(
     assert await finish_turn(orch, "d1", outcome="failed", summary=first) == "finished"
     assert orch.finished == ("failed", first)
 
-    orch.finished = None  # the restart re-finished the mission (PR #34)
-    assert await finish_turn(orch, "d2", outcome="failed", summary="FINISHED ALREADY.") == (
+    # the daemon restarted: the mission comes back up, reads the finish it had
+    # already recorded out of the persisted history (_load does that), and only
+    # then re-runs the finish with a status note (PR #34)
+    restarted = MissionOrchestrator(runner(world), world["mission"])
+    await restarted._load()
+    assert restarted._resumed_finish_summary == first, "the pre-restart summary was captured"
+    restarted.finished = restarted._recorded_finish()  # what run() does on a reloaded history
+    assert restarted.finished == ("failed", first), "the restart resumes the recorded finish"
+    restarted.finished = None  # ...and then re-finished the mission
+    assert await finish_turn(restarted, "d2", outcome="failed", summary="FINISHED ALREADY.") == (
         "finished"
     )
-    assert orch.finished == ("failed", first), "the status note did not overwrite the story"
+    assert restarted.finished == ("failed", first), "the status note did not overwrite the story"
+
+
+async def test_a_thin_finish_from_this_run_is_not_promoted_by_a_later_one(
+    world: dict[str, Any],
+) -> None:
+    """The rail's reuse is bounded by the restart boundary. A finish accepted
+    earlier in THIS run is an intermediate note, not a mission summary: when the
+    orchestrator later finishes with "FINISHED ALREADY.", the thin middle note
+    must not become the PR body -- the finish is refused instead."""
+    from rework.orchestrator.agent import MissionOrchestrator
+
+    thin = "shipping the add fix"
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    await orch._load()
+    assert orch._resumed_finish_summary is None, "nothing was recorded before this run"
+    assert await finish_turn(orch, "i1", outcome="failed", summary=thin) == "finished"
+    assert orch.finished == ("failed", thin)
+
+    reply = await finish_turn(orch, "i2", outcome="failed", summary="FINISHED ALREADY.")
+    assert reply.startswith("error:"), reply
+    assert "summary must say what changed for the owner" in reply
+    assert orch.finished == ("failed", thin), "the refused finish changed nothing"
 
 
 async def test_a_short_but_descriptive_summary_finishes_the_mission(

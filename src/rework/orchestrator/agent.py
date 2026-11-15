@@ -571,6 +571,11 @@ class MissionOrchestrator:
         self._events: list[Any] = []
         self._event_cursor = 0
         self.finished: tuple[str, str] | None = None
+        # the finish this mission had ALREADY recorded when this run loaded, if
+        # its summary would lead a PR body. The status-note rail reuses ONLY
+        # this: a finish accepted earlier in THIS run is an intermediate note,
+        # not a restart boundary (see _load and the finish branch of _dispatch)
+        self._resumed_finish_summary: str | None = None
         # findings the orchestrator shipped with, and its reason for each: the
         # one mechanical rail that blocks finish(done) requires them (see
         # _enforce_findings_accepted), and they lead the mission report/PR body
@@ -635,6 +640,16 @@ class MissionOrchestrator:
         self.history = [m.body for m in await self.store.chat_messages(self.chat_id) if m.body]
         self.owner_seq = max(
             [int(m.get("owner_seq") or 0) for m in self.history if m.get("role") == "user"] + [0]
+        )
+        # what this mission had recorded BEFORE this run started: the only
+        # summary a status-note finish may reuse (PR #34). Captured here, from
+        # the freshly loaded history, so a finish accepted later in THIS run
+        # cannot masquerade as a pre-restart one.
+        recorded = self._recorded_finish()
+        self._resumed_finish_summary = (
+            " ".join(recorded[1].split())
+            if recorded is not None and _substantive_summary(recorded[1])
+            else None
         )
 
     async def _append(self, message: dict[str, Any], display: str = "") -> None:
@@ -934,24 +949,6 @@ class MissionOrchestrator:
                     return (str(args.get("outcome") or "done"), str(args.get("summary") or ""))
         return None
 
-    def _previous_substantive_finish_summary(self) -> str | None:
-        """The last `finish` this mission already executed whose summary would
-        lead a PR body. Found live (PR #34): a restart re-finished the mission
-        with "FINISHED ALREADY." and that became the whole PR body, losing the
-        summary the first finish carried."""
-        answered = {
-            m.get("tool_call_id"): m.get("content") for m in self.history if m.get("role") == "tool"
-        }
-        for message in reversed(self.history):
-            for call in message.get("tool_calls") or []:
-                if call.get("name") != "finish" or answered.get(call.get("id")) != "finished":
-                    continue
-                args = call.get("arguments") or {}
-                summary = " ".join(str(args.get("summary") or "").split())
-                if _substantive_summary(summary):
-                    return summary
-        return None
-
     async def _finish_interrupted_turn(self) -> None:
         """A crash between recording an assistant turn and its tool results
         leaves calls unanswered; providers reject that history. Re-execute them
@@ -1015,9 +1012,12 @@ class MissionOrchestrator:
                 await self._enforce_findings_accepted(accepted)
             summary = " ".join(str(args.get("summary") or "").split())
             if not _substantive_summary(summary):
-                # a restart or a rail-retry must not degrade the PR body to
-                # "finished": reuse what this mission already said it changed
-                previous = self._previous_substantive_finish_summary()
+                # a restart must not degrade the PR body to "finished": reuse
+                # the summary this mission had recorded BEFORE this run loaded
+                # (_load captured it and only kept a substantive one). A thin
+                # finish accepted earlier in THIS run is an intermediate note,
+                # not the mission's story, so it is never promoted here.
+                previous = self._resumed_finish_summary
                 if previous is None:
                     raise ToolError(
                         "summary must say what changed for the owner: it becomes the PR body "
