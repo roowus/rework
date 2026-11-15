@@ -117,5 +117,16 @@ class RoleSpec(ABC):
         """Assemble and return the compiled graph. The engine supplies the
         checkpointer at run time; compile bare here."""
 
+    def resolve_model(self, ctx: RoleBuildCtx) -> str:
+        """The catalog id this run actually uses: the plan/brief's explicit
+        override first, then the role's own default, then the CONFIGURED
+        default (REWORK_DEFAULT_MODEL). One resolution path, so a role whose
+        plan names no model gets the configured default and switching it is
+        env-only."""
+        from rework.config import default_model_id
+
+        explicit = ctx.run.model_ref.get("id")
+        return str(explicit or self.default_model or default_model_id(ctx.catalog))
+
     def initial_state(self, ctx: RoleBuildCtx) -> dict[str, Any]:
         return {"objective": ctx.mission.objective}

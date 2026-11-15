@@ -56,6 +56,47 @@ PROVIDER_FAILURE_LIMIT = 2  # failed runs on one model before spawn_role refuses
 STRICTNESS_LEVELS = ("light", "standard", "strict")
 DEFAULT_STRICTNESS = "standard"
 
+
+def model_policy() -> tuple[str, str]:
+    """(default model id, escalation model id) from config, read at RUNTIME so
+    changing REWORK_DEFAULT_MODEL / REWORK_ESCALATION_MODEL changes the prompt
+    text (and every role default) with no code change."""
+    from rework.config import default_model_id, escalation_model_id
+
+    return default_model_id(), escalation_model_id()
+
+
+def render(text: str) -> str:
+    """Fill the model-policy placeholders in prompt/tool text from config."""
+    default, escalation = model_policy()
+    return text.replace("$DEFAULT_MODEL", default).replace("$ESCALATION_MODEL", escalation)
+
+
+def _render_schema(node: Any) -> Any:
+    """Every string inside a tool's JSON schema, placeholders filled. The
+    policy text lives in the spawn_role `model` field's description, so
+    rendering only the tool's top-level description would ship a literal
+    `$DEFAULT_MODEL` to the model."""
+    if isinstance(node, str):
+        return render(node)
+    if isinstance(node, dict):
+        return {key: _render_schema(value) for key, value in node.items()}
+    if isinstance(node, list):
+        return [_render_schema(item) for item in node]
+    return node
+
+
+def render_tool(tool: ToolSpec) -> ToolSpec:
+    """One tool with the configured model policy rendered into its description
+    AND its input_schema (spawn_role's `model` field carries the policy)."""
+    return tool.model_copy(
+        update={
+            "description": render(tool.description),
+            "input_schema": _render_schema(tool.input_schema),
+        }
+    )
+
+
 PLAYBOOKS: dict[str, str] = {
     "echo": (
         "Plumbing check: spawn the `echo` role once with the objective as its brief, "
@@ -100,12 +141,16 @@ How you work:
   work is hard or failure-prone; for easy work just wait for the handoff.
 - You may run roles in parallel (several spawn_role calls in one turn), but be
   conservative: parallelism costs money and most missions are sequential.
-- Pick each role's model from the catalog: cheap tiers for exploration and
-  straightforward coding, stronger tiers for audits and hard problems. If a role
-  failed on provider errors (timeouts, 5xx, rate limits), its endpoint is
-  struggling: respawn it on a model from a DIFFERENT provider, because another
-  model on the same provider hits the same endpoint. Do not pick a pricier tier
-  just to retry: keep the same tier/price or cheaper, and say why in the note.
+- MODEL POLICY: run every role on the default model ($DEFAULT_MODEL). Escalate a
+  role ONLY to the escalation model ($ESCALATION_MODEL), and only when (i) a run
+  on the default model failed on the WORK (the change itself was wrong or
+  incomplete), or (ii) it is a strict audit of a high-risk change (auth, money,
+  migrations, core control flow). When you escalate, say WHY in the brief.
+- Provider errors (timeouts, 5xx, rate limits) are NOT an escalation reason: they
+  mean the endpoint is struggling, not that the model is too weak. Retry, or
+  respawn that role on a model from a DIFFERENT provider at the same level
+  (another model on the same provider hits the same endpoint); never move to
+  a pricier tier just to retry. Do not pick a stronger tier for any other reason.
 - Write every brief so the role can act without asking: what to do, why, what
   done looks like, and anything earlier roles found that it needs.
 - Scope briefs to the objective. Pass findings along as context, but do not turn
@@ -135,7 +180,15 @@ How you work:
   coder only adds noise).
 - Respond with tool calls. Text without a tool call wastes a turn."""
 
-TOOLS: list[ToolSpec] = [
+
+def orchestrator_tools() -> list[ToolSpec]:
+    """The orchestrator's tools. UNRENDERED templates: the descriptions and the
+    spawn_role `model` schema still carry the $DEFAULT_MODEL / $ESCALATION_MODEL
+    placeholders, so every caller must pass them through render_tool()."""
+    return _TOOLS
+
+
+_TOOLS: list[ToolSpec] = [
     ToolSpec(
         name="spawn_role",
         description=(
@@ -158,7 +211,15 @@ TOOLS: list[ToolSpec] = [
                     "to a run id or step name, optionally with .field (e.g. "
                     '{"diff": "code.diff"}). Usual wiring is automatic.',
                 },
-                "model": {"type": "string", "description": "Catalog id (default: role's)."},
+                "model": {
+                    "type": "string",
+                    "description": "Catalog id. Leave it OUT to run the role on the"
+                    " default model ($DEFAULT_MODEL). The only other value you may"
+                    " pass is the escalation model ($ESCALATION_MODEL), and only for"
+                    " a run that already failed on the WORK or for a strict audit of"
+                    " a high-risk change; provider errors (timeouts, 5xx, rate"
+                    " limits) are never a reason to escalate.",
+                },
                 "effort": {"type": "string", "enum": ["low", "medium", "high"]},
                 "max_turns": {
                     "type": "integer",
@@ -446,9 +507,9 @@ class MissionOrchestrator:
         catalog = runner._catalog
         wanted = str(orch.get("model") or "")
         try:
-            self.entry = catalog.resolve(wanted) if wanted else self._strongest()
+            self.entry = catalog.resolve(wanted) if wanted else self._default_entry()
         except Exception:
-            self.entry = self._strongest()
+            self.entry = self._default_entry()
         self.effort = orch.get("effort") or None
         self.history: list[dict[str, Any]] = []
         self.seen: dict[str, str] = {}  # run id -> status already reported
@@ -470,16 +531,26 @@ class MissionOrchestrator:
         self.ask_before_pr = False
         self.pr_reason = ""
         self._providers: dict[str, Any] = {}
+        # built once per orchestrator: the model-policy text is rendered from
+        # config and the system prompt stays byte-stable for prompt caching
+        self.tools = [render_tool(t) for t in orchestrator_tools()]
 
     def _usable(self) -> list[Any]:
         """Catalog entries this daemon can actually call (real ones first)."""
-        entries = self.r._catalog.all()
-        real = [e for e in entries if e.provider != "fake" and e.has_credentials()]
-        return real or [e for e in entries if e.has_credentials()] or entries
+        return self.r._catalog.usable()
 
-    def _strongest(self) -> Any:
-        entries = self._usable()
-        return max(entries, key=lambda e: (e.tier, -e.cost_in_per_mtok))
+    def _default_entry(self) -> Any:
+        """The orchestrator's OWN model when the plan names none: the configured
+        default (REWORK_DEFAULT_MODEL), resolved against this catalog. Cost
+        control starts with the orchestrator; a stronger tier is never an
+        automatic choice."""
+        from rework.config import default_model_id
+
+        catalog = self.r._catalog
+        try:
+            return catalog.resolve(default_model_id(catalog))
+        except Exception:
+            return catalog.strongest_usable() or catalog.all()[0]
 
     # -- provider ------------------------------------------------------------
 
@@ -666,7 +737,7 @@ class MissionOrchestrator:
                 model=entry.model,
                 system=system,
                 messages=messages,
-                tools=TOOLS,
+                tools=self.tools,
                 max_tokens=min(int(entry.max_output or 4096), 4096),
                 effort=self.effort,
                 session_id=self.run_id,
@@ -1512,6 +1583,7 @@ class MissionOrchestrator:
         mission = await self.store.get_mission(self.mid) or self.mission
         plan = mission.plan or {}
         registry = self.r._registry
+        default, _ = model_policy()
         roles = []
         for name in registry.sorted_by_name():
             spec = registry.get(name)
@@ -1520,7 +1592,8 @@ class MissionOrchestrator:
             inputs = sorted(getattr(spec, "context_manifest", set()) or [])
             roles.append(
                 f"- {name}: {spec.description} Goal: {spec.goal or '-'} "
-                f"Default model: {spec.default_model}. INPUTS: {', '.join(inputs) or 'brief'}"
+                f"Default model: {spec.default_model or default}. "
+                f"INPUTS: {', '.join(inputs) or 'brief'}"
             )
         catalog = [
             f"- {e.id}: {e.provider} ({endpoint_of(e)}), tier {e.tier}, "
@@ -1536,8 +1609,9 @@ class MissionOrchestrator:
             [
                 f"{MARKER} for rework, a multi-agent workflow engine. You run one "
                 "mission by delegating work to roles.",
-                RULES,
-                f"PLAYBOOK ({self.playbook}): {PLAYBOOKS.get(self.playbook, PLAYBOOKS['fix'])}",
+                render(RULES),
+                f"PLAYBOOK ({self.playbook}): "
+                f"{render(PLAYBOOKS.get(self.playbook, PLAYBOOKS['fix']))}",
                 "ROLES:\n" + "\n".join(roles),
                 "Automatic wiring: a coder receives the latest investigator handoff; an "
                 "auditor receives the latest coder's diff and worktree plus the latest "

@@ -10,17 +10,20 @@ on that session; esc steps back out."""
 
 from __future__ import annotations
 
+import asyncio
 import time
 from functools import partial
-from typing import Any
+from typing import Any, ClassVar
 
 from textual import work
 from textual.app import ComposeResult
+from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
-from textual.widgets import ContentSwitcher, Markdown, Static
+from textual.timer import Timer
+from textual.widgets import ContentSwitcher, Input, Markdown, Static
 
-from rework.tui import actions
+from rework.tui import actions, search
 from rework.tui.hub import Snapshot
 from rework.tui.theme import (
     ACCENT,
@@ -60,6 +63,9 @@ from rework.tui.widgets.trajectory import Trajectory, role_of
 
 ALL = "*"
 NONE = "-"
+#: the smallest slice of the AI-search budget we still hand to the model, so a
+#: blown deadline comes back as a clean "timed out" rather than an instant 0s call
+_MIN_BUDGET = 0.5
 
 SECTIONS = [
     ("needs you", {"awaiting_gate"}),
@@ -82,11 +88,27 @@ class DashboardView(View):
     TAB = "dashboard"
     LABEL = "Dashboard"
 
+    BINDINGS: ClassVar[list[BindingType]] = [
+        # "/" jumps to the search bar, the way every list UI does. Modal-free:
+        # the Input keeps its own keys (a printable "/" typed there is text).
+        Binding("slash", "focus_search", show=False),
+    ]
+
     def __init__(self) -> None:
         super().__init__()
         self.snap = Snapshot()
         self.project: str = ALL
         self.filter = "all"
+        # mission search: the live text filter + the ✦ ranking
+        self.query_text = ""
+        self.ai_results: list[dict[str, str]] | None = None  # None = normal list
+        self.ai_note = ""
+        self.ai_armed = False  # set by the ✦ button: Enter then ranks
+        self._ai_busy = False
+        # bumped when a ranking is dismissed, so an in-flight worker's result is
+        # dropped instead of landing on a bar the user has already moved past
+        self._ai_gen = 0
+        self._debounce: Timer | None = None
         self.mission_id: str | None = None
         self.run_id: str | None = None
         self.mtab = "traj"
@@ -141,6 +163,14 @@ class DashboardView(View):
                                 "all",
                                 id="dash-filter",
                             )
+                        with Horizontal(classes="mission-search"):
+                            yield Input(
+                                placeholder="Search missions…  (/ to focus)",
+                                id="mission-search",
+                            )
+                            yield Btn("Search", "search", variant="ghost")
+                            yield Btn("✦", "ai-search", variant="ghost", tooltip="AI search")
+                        yield Static("", id="mission-note", classes="subbar-note")
                         yield RowList(
                             id="mission-list",
                             empty=f"[{FAINT}]No missions here yet. Start one from Work.[/]",
@@ -171,11 +201,12 @@ class DashboardView(View):
 
     def on_mount(self) -> None:
         self._paint_head()
+        self._paint_search_note()
 
     def hints(self) -> list[tuple[str, str]]:
         if self.mission_id:
             return [("click", "focus a session"), ("esc", "back"), ("ctrl+c", "copy")]
-        return [("click", "open mission"), ("↑↓", "move"), ("enter", "open")]
+        return [("/", "search"), ("click", "open mission"), ("↑↓", "move"), ("enter", "open")]
 
     def shown(self) -> None:
         target = "#run-list" if self.mission_id else "#mission-list"
@@ -246,7 +277,7 @@ class DashboardView(View):
             if self.filter == "failed" and st not in ("failed", "cancelled"):
                 continue
             out.append(m)
-        return out
+        return search.search_missions(out, self.query_text)
 
     def _paint_overview(self) -> None:
         snap = self.snap
@@ -304,6 +335,8 @@ class DashboardView(View):
             for m in group:
                 mrows.append(RowData(m.id, self._mission_row(m)))
         mlist = self.query_one("#mission-list", RowList)
+        if self.ai_results is not None:
+            mrows = self._ai_rows()
         mlist.set_rows(mrows)
 
     def _proj_row(self, name: str, missions: list[Any], dim: bool = False) -> str:
@@ -340,6 +373,26 @@ class DashboardView(View):
             f"  [{FAINT}]{esc('  ·  '.join(bits))}[/]{gate_note}"
         )
 
+    def _ai_rows(self) -> list[RowData]:
+        """The ✦ ranking: one row per ranked mission, objective + its reason.
+        Built from the snapshot so a mission that vanished mid-search drops."""
+        rows: list[RowData] = []
+        for hit in self.ai_results or []:
+            mission = self.snap.mission(hit["id"])
+            if mission is None:
+                continue
+            st = status_value(mission.status)
+            reason = esc(hit.get("reason") or "")
+            rows.append(
+                RowData(
+                    mission.id,
+                    f"{glyph(st)} [b]{esc(clip(mission.objective, 100))}[/b]\n"
+                    f"  [{FAINT}]{esc(clip(mission.id, 60))}[/]"
+                    + (f"  [{ACCENT}]{reason}[/]" if reason else ""),
+                )
+            )
+        return rows
+
     def on_row_list_activated(self, event: RowList.Activated) -> None:
         event.stop()
         lid = event.rows.id
@@ -366,6 +419,172 @@ class DashboardView(View):
             self.mtab = event.value
             self.query_one("#m-pages", ContentSwitcher).current = f"m-{event.value}"
             self._paint_detail_tabs()
+
+    # -- search -----------------------------------------------------------------------
+
+    def action_focus_search(self) -> None:
+        self.query_one("#mission-search", Input).focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "mission-search":
+            return
+        event.stop()
+        self.query_text = event.value
+        self.ai_results = None  # typing means the plain filter again
+        self.ai_armed = False
+        if self._debounce is not None:
+            self._debounce.stop()
+        self._debounce = self.set_timer(0.25, self._apply_search)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """Enter in the bar: run the plain filter now, or the ✦ ranking when the
+        ✦ button is armed. Down moves into the results, as in the Library."""
+        if event.input.id != "mission-search":
+            return
+        event.stop()
+        self.query_text = event.value
+        if self.ai_armed:
+            self._run_ai_search()
+        else:
+            self._apply_search()
+
+    def on_key(self, event: Any) -> None:
+        if event.key == "down" and isinstance(self.screen.focused, Input):
+            rows = self.query_one("#mission-list", RowList)
+            if rows.selectable:
+                event.stop()
+                rows.focus()
+                rows.select(rows.selectable[0])
+
+    def _apply_search(self) -> None:
+        with self.painting():
+            self._paint_overview()
+            self._paint_search_note()
+
+    def _paint_search_note(self) -> None:
+        """The one line under the bar: the ✦ state (searching…, a result count,
+        a failure) or nothing at all, so the normal list stays uncluttered."""
+        note = ""
+        if self._ai_busy:
+            note = f"[{ACCENT}]✦ searching…[/]"
+        elif self.ai_note:
+            note = f"[{WARN}]{esc(self.ai_note)}[/]"
+        elif self.ai_results is not None:
+            note = (
+                f"[{ACCENT}]✦ {len(self.ai_results)} ranked[/]  "
+                f"[{FAINT}]enter opens · esc dismisses[/]"
+            )
+        with self.painting():
+            widget = self.query_one("#mission-note", Static)
+            widget.update(note)
+            # a blank note must not eat a line of the list
+            widget.set_class(bool(note), "has-text")
+
+    def _run_ai_search(self) -> None:
+        query = self.query_text.strip()
+        if not query:
+            self.ai_note = "AI search needs a query"
+            self._paint_search_note()
+            return
+        self._ai_search(query)
+
+    @work(exclusive=True, group="dash-ai-search")
+    async def _ai_search(self, query: str) -> None:
+        from rework.config import load_catalog
+        from rework.kernel.llm.adapters import build_provider
+
+        gen = self._ai_gen
+        self._ai_busy = True
+        self.ai_results = None
+        self.ai_note = ""
+        self.ai_armed = True
+        self._paint_search_note()
+        # One clock over BOTH halves: the per-candidate run fetch is a query per
+        # mission, so leaving it unbounded would let "✦ searching…" outlive the
+        # budget the model call is already held to.
+        deadline = time.monotonic() + search.TIMEOUT_S
+        try:
+            catalog = load_catalog()
+            entry = search.pick_entry(catalog)
+            if entry is None:
+                self.ai_note = "AI search unavailable: no model with credentials"
+            else:
+                picks = search.candidates(self.snap.missions, query)
+                try:
+                    summaries = await asyncio.wait_for(
+                        self._fetch_summaries(picks), self._budget(deadline)
+                    )
+                except TimeoutError:
+                    # a slow/hung store must not cost the ranking: rank what fits
+                    summaries = await self._fetch_summaries(picks, deadline=deadline)
+                ranked = await search.run_ai_search(
+                    build_provider(entry),
+                    search.build_ai_request(entry.model, query, summaries),
+                    summaries,
+                    self._budget(deadline),
+                )
+                if gen != self._ai_gen:
+                    return  # dismissed while it ran: the note is already clear
+                self.ai_results = ranked
+                if not ranked:
+                    self.ai_note = "✦ found no mission for that query"
+        except search.AISearchError as exc:
+            if gen == self._ai_gen:
+                self.ai_note = str(exc)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # a worker must never take the app down
+            if gen == self._ai_gen:
+                self.ai_note = f"AI search failed: {str(exc)[:160] or type(exc).__name__}"
+        finally:
+            if gen == self._ai_gen:
+                self._ai_busy = False
+                with self.painting():
+                    self._paint_overview()
+                    self._paint_search_note()
+
+    @staticmethod
+    def _budget(deadline: float) -> float:
+        """Time left before `deadline`. Past it we still hand over a token slice,
+        so the model call reports a clean timeout instead of firing for nothing."""
+        return max(deadline - time.monotonic(), _MIN_BUDGET)
+
+    async def _fetch_summaries(
+        self, picks: list[Any], deadline: float | None = None
+    ) -> list[dict[str, str]]:
+        """One compact summary per candidate. With a `deadline`, the results are
+        fetched concurrently and whatever is not back by then is summarized
+        without run output: a degraded ranking beats a stuck bar."""
+        data = self.hub.data
+        if deadline is None:
+            plain: list[dict[str, str]] = []
+            for mission in picks:
+                runs = await self.hub.guard(partial(data.mission_runs, mission.id), [])
+                plain.append(search.summarize(mission, runs))
+            return plain
+        tasks = [asyncio.ensure_future(data.mission_runs(mission.id)) for mission in picks]
+        done: set[Any] = set()
+        if tasks:
+            done, _ = await asyncio.wait(tasks, timeout=self._budget(deadline))
+        for task in tasks:
+            if task not in done:
+                task.cancel()
+        summarised: list[dict[str, str]] = []
+        for mission, task in zip(picks, tasks, strict=True):
+            fresh: Any = []
+            if task in done and not task.cancelled() and task.exception() is None:
+                fresh = task.result()
+            summarised.append(search.summarize(mission, fresh))
+        return summarised
+
+    def _dismiss_ai(self) -> None:
+        if self.ai_results is None and not self.ai_note and not self._ai_busy:
+            return
+        self._ai_gen += 1  # any in-flight worker's result is now stale
+        self.ai_results = None
+        self.ai_note = ""
+        self.ai_armed = False
+        self._apply_search()
 
     # -- head -------------------------------------------------------------------------
 
@@ -413,6 +632,20 @@ class DashboardView(View):
             self._paint_detail_tabs()
 
     def on_btn_pressed(self, event: Btn.Pressed) -> None:
+        if event.action == "search":
+            event.stop()
+            self.query_text = self.query_one("#mission-search", Input).value
+            self.ai_results = None
+            self.ai_note = ""
+            self._apply_search()
+            self.query_one("#mission-search", Input).focus()
+            return
+        if event.action == "ai-search":
+            event.stop()
+            self.query_text = self.query_one("#mission-search", Input).value
+            self.ai_armed = True
+            self._run_ai_search()
+            return
         if not self.mission_id:
             return
         event.stop()
@@ -475,6 +708,29 @@ class DashboardView(View):
         self.query_one("#mission-list", RowList).focus()
 
     def back(self) -> bool:
+        if self._ai_busy:
+            # an in-flight ranking is dismissable state: drop it and stay put
+            self.workers.cancel_group(self, "dash-ai-search")
+            self._ai_busy = False
+            self.ai_results = None
+            self.ai_note = ""
+            self.ai_armed = False
+            self._apply_search()
+            return True
+        if self.ai_results is not None or self.ai_note:
+            self._dismiss_ai()
+            return True
+        bar = self.query_one("#mission-search", Input)
+        if bar.has_focus:
+            bar.value = ""
+            self.query_text = ""
+            self.ai_armed = False
+            self._apply_search()
+            if self.mission_id:
+                self.query_one("#run-list", RowList).focus()
+            else:
+                self.query_one("#mission-list", RowList).focus()
+            return True
         if self.run_id:
             self.run_id = None
             self.query_one("#run-list", RowList).select(ALL)

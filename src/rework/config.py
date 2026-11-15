@@ -16,6 +16,17 @@ if TYPE_CHECKING:
 
 DEFAULT_STATE_DIR = Path.home() / ".rework"
 
+# The cheap, strong model every role runs on unless a plan/brief names another
+# one. One env var (or one catalog edit) switches it deployment-wide: no code
+# change, no literal id in a default path.
+DEFAULT_MODEL_ENV = "REWORK_DEFAULT_MODEL"
+DEFAULT_MODEL_ID = "flash"
+# The one model a role is escalated TO (a run that failed on the WORK, or a
+# strict audit of a high-risk change). NOT a ban on anything: the default and
+# the escalation target are pure config, so moving either later is env-only.
+ESCALATION_MODEL_ENV = "REWORK_ESCALATION_MODEL"
+ESCALATION_MODEL_ID = "claude-sonnet-5-5"
+
 
 def load_env_file(path: Path | None = None) -> list[str]:
     """Read KEY=VALUE lines from ~/.rework/rework.env (REWORK_ENV_FILE) into
@@ -168,6 +179,47 @@ async def open_store_from_config(config: Config) -> StateStore:
     from rework.kernel.state.sqlite import open_sqlite
 
     return await open_sqlite(await asyncio.to_thread(_prepare_sqlite_dir, config.db))
+
+
+def _configured_model(
+    env_var: str,
+    fallback_id: str,
+    *,
+    catalog: ModelCatalog | None = None,
+    cheapest: bool,
+) -> str:
+    """Resolve one configured model id against the catalog.
+
+    The requested id wins when it exists AND this process can call it. A
+    missing id or one with no key here falls back to the cheapest (or
+    strongest) USABLE entry, so a machine that does not hold a key still runs
+    on something it can actually call. With no usable entry at all the
+    requested id is returned unresolved (the engine reports it)."""
+    wanted = (os.environ.get(env_var) or fallback_id).strip() or fallback_id
+    cat = catalog if catalog is not None else load_catalog()
+    entry = next((e for e in cat.all() if e.id == wanted), None)
+    if entry is not None and entry.has_credentials():
+        return entry.id
+    pick = cat.cheapest_usable() if cheapest else cat.strongest_usable()
+    return pick.id if pick is not None else wanted
+
+
+def default_model_id(catalog: ModelCatalog | None = None) -> str:
+    """THE default model: REWORK_DEFAULT_MODEL (default 'flash'), resolved
+    against the catalog. Every role, plan step, the TUI knob and the
+    orchestrator's own model use this one function, so switching the default
+    is env-only."""
+    return _configured_model(DEFAULT_MODEL_ENV, DEFAULT_MODEL_ID, catalog=catalog, cheapest=True)
+
+
+def escalation_model_id(catalog: ModelCatalog | None = None) -> str:
+    """THE escalation model: REWORK_ESCALATION_MODEL (default
+    'claude-sonnet-5-5'), resolved against the catalog, falling back to the
+    strongest usable entry. Used wherever a role is escalated; nothing is
+    excluded, ever."""
+    return _configured_model(
+        ESCALATION_MODEL_ENV, ESCALATION_MODEL_ID, catalog=catalog, cheapest=False
+    )
 
 
 def load_catalog() -> ModelCatalog:
