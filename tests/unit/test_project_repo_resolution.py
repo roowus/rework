@@ -102,6 +102,21 @@ def test_project_is_upload() -> None:
     assert project_is_upload({"repos": [{"name": "r", "kind": "git", "url": URL}]}) is False
 
 
+async def test_mechanical_draft_gets_its_own_plan_not_the_echo_default(db: str) -> None:
+    """`draft` without an orchestrator model used to fall through the template
+    branch, leaving plan_spec None: the engine's DEFAULT_PLAN (echo) then ran a
+    mission that does nothing instead of failing or drafting."""
+    pid = await _project(db, [{"name": "rework", "kind": "git", "url": URL}])
+    mission = await create_mission("write the README", plan="draft", project_id=pid)
+    plan = mission.plan or {}
+    assert plan.get("kind") == "draft", f"draft fell through to {plan!r}"
+    assert [s["role"] for s in plan["steps"]] == ["investigator", "coder", "auditor"]
+    assert plan["gates"] == [], "a writing mission ships files, not a branch or a PR"
+    # negative controls: the mechanical templates are unchanged
+    fix = await create_mission("fix it", plan="fix", project_id=pid)
+    assert (fix.plan or {})["kind"] == "fix" and fix.plan["gates"] == ["ship"]
+
+
 async def test_resolve_project_accepts_a_name(db: str) -> None:
     from rework.missions import resolve_project
 

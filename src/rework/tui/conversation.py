@@ -149,7 +149,9 @@ def context_note(snap: Snapshot, project_id: str | None) -> str:
     lines.append(
         "Plans: echo (no repo). fix and fix-pr need a repo for a git-transport "
         "project; for an upload-transport project they do NOT need one — the "
-        "project's files area supplies the files, and results are fetched, not pushed."
+        "project's files area supplies the files, and results are fetched, not pushed. "
+        "draft (document work: research with the web tools, write files in the "
+        "project, no PR) follows the same repo rule as fix."
     )
     return "\n".join(lines)
 
