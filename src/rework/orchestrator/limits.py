@@ -14,6 +14,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
 log = logging.getLogger("rework.limits")
 
@@ -106,25 +107,77 @@ class RoleLimiter:
             fut.set_result(None)
 
 
+class PrioritySlots:
+    """The daemon's mission slots (REWORK_CONCURRENCY): a counting semaphore
+    where a mission that was already running (it only stepped aside to wait at
+    a gate, for the owner, or on hold) gets its slot back AHEAD of missions that
+    never started. FIFO order is kept inside each class.
+
+    Found live (2026-11-14): with a plain FIFO semaphore an approved gate waited
+    hours behind brand-new missions, while the mission row still said
+    awaiting_gate and the Gates tab was empty. The approved mission's remaining
+    work (push, open the PR) is seconds long; making it queue behind every
+    never-started mission is exactly backwards.
+    """
+
+    def __init__(self, value: int) -> None:
+        if value < 1:
+            raise ValueError("slots must be >= 1")
+        self._free = value
+        self._resumed: list[asyncio.Future[None]] = []
+        self._fresh: list[asyncio.Future[None]] = []
+
+    async def acquire(self, *, resumed: bool = False) -> None:
+        if self._free > 0 and not self._resumed and (resumed or not self._fresh):
+            self._free -= 1
+            return
+        fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        (self._resumed if resumed else self._fresh).append(fut)
+        try:
+            await fut
+        except asyncio.CancelledError:
+            if fut.done() and not fut.cancelled():
+                self._free += 1  # admitted, then cancelled before it resumed
+                self._wake()
+            raise
+
+    def release(self) -> None:
+        self._free += 1
+        self._wake()
+
+    def _wake(self) -> None:
+        while self._free > 0:
+            queue = self._resumed or self._fresh
+            while queue and queue[0].done():
+                queue.pop(0)  # cancelled while queued: it never gets a slot
+            if not queue:
+                return
+            self._free -= 1
+            queue.pop(0).set_result(None)
+
+
 class MissionSlot:
     """One daemon mission slot (REWORK_CONCURRENCY, docs/ops.md#rewvis).
 
     A mission that is only WAITING — at a gate, for the owner, on hold — must
     not hold this slot, or an approved gate sits behind a mission that is doing
     nothing. :meth:`while_waiting` drops the slot for the duration of a wait and
-    takes it back (fairly, at the back of the queue) before work resumes.
-    Re-entrant: nested waits release once.
+    takes it back before work resumes, AHEAD of missions that never started
+    (see :class:`PrioritySlots`). Re-entrant: nested waits release once.
     """
 
-    def __init__(self, sem: asyncio.Semaphore, mission_id: str) -> None:
+    def __init__(self, sem: Any, mission_id: str) -> None:
         self._sem = sem
         self._mission_id = mission_id
         self.held = False
 
-    async def acquire(self) -> None:
+    async def acquire(self, *, resumed: bool = False) -> None:
         if self.held:
             return
-        await self._sem.acquire()
+        if resumed and isinstance(self._sem, PrioritySlots):
+            await self._sem.acquire(resumed=True)
+        else:
+            await self._sem.acquire()
         self.held = True
 
     def release(self) -> None:
@@ -142,4 +195,4 @@ class MissionSlot:
         try:
             yield
         finally:
-            await self.acquire()
+            await self.acquire(resumed=True)
