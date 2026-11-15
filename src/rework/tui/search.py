@@ -115,15 +115,15 @@ def summarize(mission: Any, runs: Sequence[Any] = ()) -> dict[str, str]:
 
 
 def candidates(missions: Sequence[Any], query: str, limit: int = MAX_CANDIDATES) -> list[Any]:
-    """Which missions the AI ranks. Under the cap: all of them. Over it: the
-    text search's hits when it has any (so a phrased query still reaches the
-    right mission), else the most recent `limit`."""
+    """Which missions the AI ranks. With a query, ONLY its strict matches: a
+    ranking reorders the hits, it never widens them, and no hits at all means
+    nothing to rank (no fallback to recent missions). With no query there is
+    nothing to isolate: under the cap, all of them, else the most recent."""
     missions = list(missions)
+    if str(query or "").strip():
+        return search_missions(missions, query)[:limit]
     if len(missions) <= limit:
         return missions
-    hits = search_missions(missions, query)
-    if hits:
-        return hits[:limit]
     return sorted(missions, key=lambda m: float(getattr(m, "created_at", 0) or 0), reverse=True)[
         :limit
     ]

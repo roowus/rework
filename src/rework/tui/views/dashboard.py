@@ -155,7 +155,7 @@ class DashboardView(View):
                 with Horizontal():
                     with Vertical(classes="sidebar", id="dash-side"):
                         yield Label("Projects")
-                        yield Input(placeholder="Filter projects…  (tab)", id="proj-search")
+                        yield Input(placeholder="Filter projects…  (tab ⇥)", id="proj-search")
                         yield RowList(id="proj-list")
                     with Vertical(classes="main"):
                         with Horizontal(classes="subbar"):
@@ -218,7 +218,7 @@ class DashboardView(View):
             return [("click", "focus a session"), ("esc", "back"), ("ctrl+c", "copy")]
         return [
             ("/", "search"),
-            ("tab", "project filter"),
+            ("tab ⇥", "cycle focus"),
             ("click", "open mission"),
             ("↑↓", "move"),
             ("enter", "open"),
@@ -311,10 +311,12 @@ class DashboardView(View):
 
     def _in_rank_order(self, missions: list[Any], ranked: list[dict[str, str]]) -> list[Any]:
         """The ranked missions that survive the project/status filters, best
-        first. Same list object as the plain search: the model decides who is in
-        it and in what order, nothing else."""
+        first. Same list object as the plain search: the model decides the ORDER
+        of the hits only. The query still decides who is in the list, so a pick
+        that is not a strict match for it is dropped, never resurrected (a
+        zero-match query must never grow rows because ✦ was pressed)."""
         order = {hit["id"]: i for i, hit in enumerate(ranked)}
-        hits = [m for m in missions if m.id in order]
+        hits = [m for m in search.search_missions(missions, self.query_text) if m.id in order]
         hits.sort(key=lambda m: order[m.id])
         return hits
 
@@ -601,6 +603,13 @@ class DashboardView(View):
         from rework.kernel.llm.adapters import build_provider
 
         gen = self._ai_gen
+        # A query must isolate, including here: with no strict match there is
+        # nothing to rank, so the model is not called and the list keeps saying
+        # why it is empty.
+        if not search.search_missions(self._scope(), query):
+            self.ai_note = f"✦ no missions match “{query}” — nothing to rank"
+            self._apply_search()
+            return
         self._ai_busy = True
         self.ai_results = None
         self.ai_query = query  # this search answers this query, nothing else

@@ -148,16 +148,24 @@ def test_build_ai_prompt_contains_ids_query_and_stays_small() -> None:
     assert f"m-{search.MAX_CANDIDATES + 24}" not in capped
 
 
-def test_candidates_prefilters_only_over_the_cap() -> None:
+def test_candidates_only_ever_offers_strict_matches() -> None:
+    """A query decides who the model may rank, at every size: the candidates are
+    its strict hits (capped at MAX_CANDIDATES) and nothing else, so the ranking
+    can reorder the hits but never widen them."""
     few = [mission(f"m-{i}", f"obj {i}", created_at=float(i)) for i in range(5)]
     assert search.candidates(few, "obj") == few
+    assert [m.id for m in search.candidates(few, "obj 3")] == ["m-3"]
+    # a match under the cap is still the only candidate: no recent fallback
+    assert search.candidates(few, "zzz") == []
 
     many = [mission(f"m-{i}", f"obj {i}", created_at=float(i)) for i in range(100)]
     picked = search.candidates(many, "obj 42")
     assert len(picked) == 1 and picked[0].id == "m-42"
+    assert search.candidates(many, "zzz") == []
 
-    # nothing matches the text search: the newest win
-    newest = search.candidates(many, "zzz")
+    # no query: nothing to isolate, so all of them (or the newest under the cap)
+    assert search.candidates(few, "") == few
+    newest = search.candidates(many, "")
     assert len(newest) == search.MAX_CANDIDATES
     assert newest[0].id == "m-99"
 

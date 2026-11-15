@@ -782,9 +782,12 @@ async def test_dashboard_search_filters_and_clears(ids: dict[str, str]) -> None:
         bar = app.query_one("#mission-search", Input)
         assert bar.has_focus, "/ focuses the search bar"
         assert bar.placeholder == "Search missions…  (/ to focus)"
-        # the project-name filter is reachable without a mouse, and says how
-        assert app.query_one("#proj-search", Input).placeholder == "Filter projects…  (tab)"
-        assert ("tab", "project filter") in app.view("dashboard").hints()
+        # the project-name filter is reachable without a mouse. The hint says
+        # "cycle focus", not "project filter": tab is Textual's global
+        # focus_next, so it takes more than one press to land in the box and the
+        # hint must not promise a one-press shortcut to it.
+        assert app.query_one("#proj-search", Input).placeholder == "Filter projects…  (tab ⇥)"
+        assert ("tab ⇥", "cycle focus") in app.view("dashboard").hints()
         for ch in "flaky":
             await pilot.press(ch)
         await _settle(pilot, 0.8)  # the filter is debounced
@@ -839,6 +842,9 @@ async def test_dashboard_ai_search_ranks_and_opens(
         lst = app.query_one("#mission-list", RowList)
         assert lst.selectable == [ids["running"]]
         assert "✦ top 1 from AI" in str(app.query_one("#mission-note").render())
+        # the boundary clamp holds even if a pick somehow names a non-match: the
+        # ranking reorders the query's hits, it never widens them
+        assert dash._in_rank_order(dash._scope(), [{"id": ids["waiting"], "reason": "x"}]) == []
         row = next(r for r in app.query("#mission-list .row") if r.key == ids["running"])
         assert "float tolerance" in str(row.render()), "the reason rides the row"
 
@@ -987,6 +993,112 @@ async def test_dashboard_ai_search_uses_the_one_list(
         await _settle(pilot, 0.8)
         assert _row_texts(app) == plain
         assert len(provider.requests) == before
+        assert app.is_running and not app.swallowed
+
+
+async def test_dashboard_ai_search_never_resurrects_a_zero_match_query(
+    ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """✦ on a query nothing matches keeps the empty state: no model call, no
+    rows, and no status line claiming a ranking (it said "top 2 from AI" while
+    showing non-matching missions)."""
+    provider = script_provider(
+        monkeypatch,
+        [
+            ChatResult(
+                text=f'[{{"id": "{ids["waiting"]}", "reason": "looks recent"}}, '
+                f'{{"id": "{ids["running"]}", "reason": "also recent"}}]',
+                usage=Usage(input_tokens=200, output_tokens=40),
+            )
+        ],
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        lst = app.query_one("#mission-list", RowList)
+
+        await pilot.press("slash")
+        for ch in "zzz":
+            await pilot.press(ch)
+        await _settle(pilot, 0.8)
+        assert _row_texts(app) == []
+        empty = app.query_one("#mission-list .rowlist-empty")
+        assert empty.display and "No missions match" in str(empty.render())
+
+        await pilot.click(_btn(app, dash, "ai-search"))
+        await _settle(pilot, 1.5)
+
+        # nothing was asked of the model: there is no match to rank
+        assert provider.requests == [], "a zero-match query never calls the model"
+        assert dash.ai_results is None
+        # the list is still empty and still says why
+        assert _row_texts(app) == [], "no non-matching mission row appeared"
+        assert lst.selectable == []
+        empty = app.query_one("#mission-list .rowlist-empty")
+        assert empty.display
+        assert "No missions match “zzz”" in str(empty.render())
+        # and the status line does not claim a ranking it never ran
+        note = str(app.query_one("#mission-note").render())
+        assert "top" not in note, note
+        assert "from AI" not in note, note
+        assert "nothing to rank" in note, note
+        assert not dash._ai_busy, "the bar is not left spinning"
+        assert app.is_running and not app.swallowed
+
+
+async def test_dashboard_ai_search_drops_picks_that_do_not_match(
+    ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The general form: the model may reorder the query's strict matches, never
+    add to them. A returned id that is not a match is dropped."""
+    # the first pick does NOT match "flaky"; the second does
+    provider = script_provider(
+        monkeypatch,
+        [
+            ChatResult(
+                text=f'[{{"id": "{ids["waiting"]}", "reason": "unrelated"}}, '
+                f'{{"id": "{ids["running"]}", "reason": "the flaky test"}}]',
+                usage=Usage(input_tokens=200, output_tokens=40),
+            )
+        ],
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        lst = app.query_one("#mission-list", RowList)
+
+        await pilot.press("slash")
+        for ch in "flaky":
+            await pilot.press(ch)
+        await _settle(pilot, 0.8)
+        strict = [k for k in lst.selectable if not k.startswith("§")]
+        assert strict == [ids["running"]], strict
+
+        await pilot.click(_btn(app, dash, "ai-search"))
+        await _settle(pilot, 1.5)
+        assert provider.requests, "a matching query does call the model"
+        # the model was only offered the strict match
+        prompt = provider.requests[0].messages[0]["content"]
+        assert ids["running"] in prompt
+        assert ids["waiting"] not in prompt, "a non-match is never a candidate"
+
+        ranked = _row_texts(app)
+        assert len(ranked) == 1, ranked
+        assert "fix the flaky test in test_rolling_mean" in ranked[0], ranked
+        assert not any("dark mode to the settings page" in t for t in ranked), ranked
+        assert [k for k in lst.selectable if not k.startswith("§")] == [ids["running"]]
+        assert "unrelated" not in " ".join(ranked), "a dropped pick leaves no reason behind"
+        # every match came back ranked, so the note does not narrow with "of M"
+        assert "✦ top 1 from AI" in str(app.query_one("#mission-note").render())
+        # the boundary clamp holds even if a pick somehow names a non-match: the
+        # ranking reorders the query's hits, it never widens them
+        assert dash._in_rank_order(dash._scope(), [{"id": ids["waiting"], "reason": "x"}]) == []
         assert app.is_running and not app.swallowed
 
 
