@@ -31,6 +31,16 @@ runner = CliRunner()
 
 
 @pytest.fixture(autouse=True)
+def plain_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Typer/rich colour error panels when FORCE_COLOR is set (GitHub Actions
+    sets it), which splits messages with ANSI codes: asserting on
+    `result.output` then fails in CI only. Tests read plain text."""
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "dumb")
+
+
+@pytest.fixture(autouse=True)
 def rework_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point REWORK_DB at a tmp sqlite file for every test in this module.
 

@@ -302,8 +302,11 @@ def command_prefix(
             props += ["--nice=10"]
         if ionice:
             # idle IO class, same as the fallback below: a role's mypy must not
-            # starve the box's own DB writes/journald
-            props += ["--property=IOSchedulingClass=idle"]
+            # starve the box's own DB writes/journald. NOT a --property: a
+            # transient SCOPE rejects IOSchedulingClass ("Unknown assignment",
+            # exit 1 for every command; found on the first GitHub CI run), so
+            # ionice runs INSIDE the scope instead.
+            shell = [str(ionice), "-c3", "-n7", *shell]
         if scope_available():
             return [str(srun), "--user", "--scope", "--quiet", *props, *shell]
         if system_scope():
