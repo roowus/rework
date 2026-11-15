@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
 import pytest
 
@@ -720,3 +721,62 @@ async def test_a_dead_socket_then_an_auth_failure_with_unchanged_credentials_is_
     assert store._dsn == stale
     messages = [r.getMessage() for r in caplog.records if r.name == "rework.library"]
     assert CREDENTIALS_RELOADED not in messages, "nothing was reloaded"
+
+
+async def test_two_writers_do_not_make_the_store_flap_between_dsns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Found in audit with two writers: the store compared the env FILE against
+    os.environ, so after adopting password B it could read a file the other
+    writer had not updated yet (still A) and adopt A BACK, then B again on the
+    next failure - the recovery never converged. Comparing against the dsn the
+    connection actually holds, and refusing one it already left, makes it
+    monotone."""
+    import logging
+
+    from rework.credentials import CREDENTIALS_RELOADED
+    from rework.library import store as store_mod
+
+    stale = "postgresql://postgres:STALEPASS@host:5433/rework_library"
+    fresh = "postgresql://postgres:LIVEHOSTPASS@host:5433/rework_library"
+    env_file = _rotated_env(monkeypatch, tmp_path, fresh)
+    monkeypatch.setenv("REWORK_DB", stale)
+    caplog.set_level(logging.DEBUG, logger="rework.library")
+
+    class _AuthFailedConn(_FakeConn):
+        def __init__(self) -> None:
+            super().__init__()
+            self._err = _rotated_password_error()
+
+    first = _AuthFailedConn()
+    second = _FakeConn()
+    second.fail = False
+    second.row = _item_row()
+    dsn_seen: list[str] = []
+
+    async def fake_connect(dsn: str) -> _FakeConn:
+        dsn_seen.append(dsn)
+        return second
+
+    monkeypatch.setattr(store_mod, "_connect", fake_connect)
+    store = store_mod.PostgresLibraryStore(first, dsn=stale)
+
+    # 1. the rotated password is picked up: one reconnect on the NEW dsn
+    assert await store.get_item("l-one") is not None
+    assert store._dsn == fresh and dsn_seen == [fresh]
+
+    # 2. the other writer has not caught up and the file is momentarily back to
+    #    the OLD dsn: it must not be adopted again
+    env_file.write_text(f"REWORK_DB={stale}\n")
+    assert await store._reload_credentials(store._dsn) is False
+    assert store._dsn == fresh, "never traded back for the dsn it already left"
+    assert os.environ["REWORK_DB"] == fresh, "and nothing was written back"
+    # a third reload of the same file is still a no-op: bounded, no flap
+    assert await store._reload_credentials(store._dsn) is False
+    assert store._dsn == fresh
+
+    messages = [r.getMessage() for r in caplog.records if r.name == "rework.library"]
+    assert messages.count(CREDENTIALS_RELOADED) == 1
+    blob = " ".join(messages) + " ".join(str(r.args) for r in caplog.records)
+    for secret in ("STALEPASS", "LIVEHOSTPASS", stale, fresh):
+        assert secret not in blob, "no password or URL ever reaches the log"

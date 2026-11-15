@@ -89,6 +89,22 @@ class TuiData:
         # (Config.from_env, then the shared factory); a test injects a fake.
         self._store_factory = store_factory or (lambda: open_store_from_config(Config.from_env()))
         self._store: StateStore | None = None
+        # The DSN the OPEN connection really used ('' until one is opened). The
+        # recovery compares the env FILE against this value, never against the
+        # environment: another writer may move os.environ on without this
+        # connection having adopted it, and that mismatch is what made the
+        # multi-writer case flap between two passwords.
+        self._dsn: str = ""
+        # the URL the CURRENT open attempt used, captured right BEFORE the
+        # factory is called. Only consulted when no connection was ever
+        # established (an open that fails on stale credentials has no other
+        # record of what it was holding); recovery never re-reads it.
+        self._attempted_dsn: str = ""
+        # the last rotated DSN this process adopted; kept across drop_store()
+        self._recovered_dsn: str = ""
+        # DSNs this process has already moved away from: a file that comes
+        # back to one of them must not drag us back (no oscillation)
+        self._retired_dsns: set[str] = set()
         self.own_chat_ids: set[int] = set()
         self._index: LibraryStore | None = None
         self._git: GitLibrary | None = None
@@ -100,10 +116,28 @@ class TuiData:
 
     async def store(self) -> StateStore:
         if self._store is None:
+            import os
+
+            self._attempted_dsn = os.environ.get("REWORK_DB", "")
             store = await _maybe_await(self._store_factory())
             self._track_own_chat_writes(store)
+            self._dsn = self._opened_dsn(store)
             self._store = store
         return self._store
+
+    @staticmethod
+    def _opened_dsn(store: StateStore) -> str:
+        """The database URL THIS connection was opened with, captured once at
+        open time. Postgres stores keep it for their own reconnects; a store
+        that keeps none (sqlite, a test fake) was opened from the URL this
+        process had then, so that value is the one in use. Never re-read at
+        recovery time: another writer may have moved the environment on."""
+        import os
+
+        opened = getattr(store, "_dsn", "")
+        if isinstance(opened, str) and opened:
+            return opened
+        return os.environ.get("REWORK_DB", "")
 
     def _track_own_chat_writes(self, store: StateStore) -> None:
         """Remember the ids of chat rows THIS process persists (the orchestrator
@@ -129,16 +163,38 @@ class TuiData:
             with contextlib.suppress(Exception):
                 await self._store.aclose()
             self._store = None
+            self._dsn = ""
+
+    def _current_dsn(self) -> str:
+        """The DSN this process is actually HOLDING: the last one it adopted,
+        else the open connection's, else (nothing was ever opened) the URL the
+        last open attempt used. That is the value the recovery compares the env
+        FILE against, so a file another writer has not updated yet can never
+        pull this process back to credentials it has already left. Never
+        os.environ at recovery time: that is what made it flap."""
+        return self._recovered_dsn or self._dsn or self._attempted_dsn
 
     async def _reload_credentials(self) -> bool:
         """Apply a rotated database URL from the env file. True when the file
         holds a different URL and it was applied (so the reopen uses it). The
         URL is never logged: it carries the password."""
         try:
-            fresh = await asyncio.to_thread(recover_db_credentials)
+            # `avoid`: a file that momentarily points back at credentials this
+            # process has already left must not drag it back (the two-writer
+            # flap). The filter lives in the decision, so nothing is written to
+            # the environment before the veto.
+            fresh = await asyncio.to_thread(
+                recover_db_credentials,
+                current_url=self._current_dsn(),
+                avoid=self._retired_dsns,
+            )
         except Exception:  # pragma: no cover - recovery must never mask the error
             return False
         if fresh is not None:
+            held = self._current_dsn()
+            if held:
+                self._retired_dsns.add(held)
+            self._recovered_dsn = fresh
             # the library index (library-mcp holds it for the whole session)
             # reads a URL out of Config.from_env too, so drop the cached handle
             # and let `library()` reopen on the fresh credentials
@@ -195,7 +251,16 @@ class TuiData:
                         return self._last_good[key]
                     raise
                 await self.drop_store()
-                result = await asyncio.wait_for(_maybe_await(call()), QUERY_TIMEOUT_S)
+                try:
+                    result = await asyncio.wait_for(_maybe_await(call()), QUERY_TIMEOUT_S)
+                except Exception:
+                    # Bounded at 3 opens, so this failure ends the ladder the
+                    # same way every other one does: keep the last good payload
+                    # behind the offline note instead of escaping the caller.
+                    self._reconnecting_hint = f"{type(first).__name__}: {first}"[:160]
+                    if key in self._last_good:
+                        return self._last_good[key]
+                    raise
                 reloaded = True
             if reloaded:
                 log.info(CREDENTIALS_RELOADED)

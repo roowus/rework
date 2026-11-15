@@ -16,7 +16,7 @@ embed a value (the URL carries a password).
 from __future__ import annotations
 
 import os
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
@@ -152,6 +152,7 @@ def fresh_db_url(
     env_file: Path | None,
     current_url: str | None,
     var_names: Sequence[str] = (DEFAULT_DB_ENV,),
+    avoid: Collection[str] = (),
 ) -> str | None:
     """The database URL the env FILE holds now, or None when there is nothing
     to recover.
@@ -165,7 +166,12 @@ def fresh_db_url(
     host, port, database name and any non-credential connection parameter must
     match `current_url`, with only the user/password changing. A value that
     moves the target is rejected (None), so a mis-resolved or other-target
-    variable can never redirect this process's writes."""
+    variable can never redirect this process's writes.
+
+    `avoid` lists the URLs this process has already left behind. A file another
+    writer has not updated yet can still hold one of them, and re-adopting it
+    is the flap that kept the recovery from converging (found with two
+    writers): such a value is skipped, so the sequence is monotone."""
     values = parse_env_file(env_file)
     current = (current_url or "").strip()
     # No known current target means "cannot prove it is the same database",
@@ -175,7 +181,7 @@ def fresh_db_url(
         return None
     for name in var_names:
         value = values.get(name, "").strip()
-        if not value or value == current:
+        if not value or value == current or value in avoid:
             continue
         if target_key(value) == current_key:
             return value
@@ -187,6 +193,7 @@ def recover_db_credentials(
     current_url: str | None = None,
     env_file: Path | None = None,
     var_names: Sequence[str] | None = None,
+    avoid: Collection[str] = (),
 ) -> str | None:
     """Re-read the env file and, when it holds a DIFFERENT database URL, put it
     where the store factory will see it (REWORK_DB). Returns the fresh URL, or
@@ -198,6 +205,7 @@ def recover_db_credentials(
             env_file,
             os.environ.get(DEFAULT_DB_ENV) if current_url is None else current_url,
             db_env_vars() if var_names is None else var_names,
+            avoid,
         )
         if fresh is None:
             return None

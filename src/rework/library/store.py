@@ -311,6 +311,10 @@ class PostgresLibraryStore:
     def __init__(self, conn: Any, dsn: str = "") -> None:
         self._conn = conn
         self._dsn = dsn
+        # DSNs this connection has already moved away from, so an env file
+        # another writer has not updated yet cannot drag it back to a password
+        # this process failed with (the two-writer flap, found in audit).
+        self._retired_dsns: set[str] = set()
         self._op_lock = _LibLock(conn)
 
     async def aclose(self) -> None:
@@ -330,11 +334,15 @@ class PostgresLibraryStore:
         """Re-read the env file and keep the fresh dsn; True when it changed.
         The value is never logged: it carries the password."""
         try:
-            fresh = await asyncio.to_thread(recover_db_credentials, current_url=current)
+            fresh = await asyncio.to_thread(
+                recover_db_credentials, current_url=current, avoid=self._retired_dsns
+            )
         except Exception:  # pragma: no cover - recovery must never mask the error
             return False
         if fresh is None:
             return False
+        if current:
+            self._retired_dsns.add(current)
         self._dsn = fresh
         return True
 
