@@ -163,6 +163,79 @@ Stop the daemon with ctrl+c in its terminal. Never leave a local daemon
 running against the deployment DB: it holds the leader lock and idle
 transactions that block migrations (this happened once, for 1d20h).
 
+## Repo-less projects (documents, no code repo)
+
+A project with no repo is an **upload** project: `rework` keeps its working
+files itself, on the daemon host, so missions on it need no repo at all (ADR
+0005, Amendment). Create one by leaving `--repo` off:
+
+```bash
+rework project create applications   # -> transport=upload, results=fetch
+rework project ls                    # verify: transport=upload results=fetch
+```
+
+In the TUI: **File > New project...** and leave the repo field empty — the
+form says rework keeps the project's files itself and results are fetched, not
+pushed. (A project created *with* a repo is `git`/`push_branch`; the transport
+and results are derived from the repos and cannot be set against them.)
+
+Put files in from any machine, any number of times, before or between
+missions:
+
+```bash
+rework project add-files applications ./docs ./notes.md
+```
+
+In the TUI: the dashboard project sidebar's **Add files** button, or **File >
+Add project files...**, takes one local path per line (a path containing
+spaces is fine; home-relative `~` is expanded). It refuses a git project: for
+those, push a branch.
+
+Run a mission on it — no `--repo` needed:
+
+```bash
+rework new --plan fix --project applications "tidy the applications folder"
+```
+
+In the TUI, a chat proposal that names an upload project launches the same
+mission (a repo the model names is dropped). The mission starts from the
+project's files and saves its new/changed files back when it finishes; the
+mission report then ends with a line naming them, e.g. `Project files
+updated: a.md (new), b.md (changed)`. Deletions are not carried back: the
+save-back adds and updates only.
+
+Files are saved back **only when the mission ends DONE**: a cancelled or
+ship-rejected mission leaves the area untouched (its worktree is half-finished,
+not a deliverable). If the save-back itself fails, the mission still ends DONE
+but its report says `Project files NOT updated: <reason>` — never a silent
+success.
+
+Do **not** run two missions of the same project against the same files at the
+same time. The area is locked per operation, so they serialise rather than
+corrupt each other, but the later mission seeds from the state the earlier one
+has left so far, i.e. it starts from a mix of the two.
+
+Get results back on whichever machine you work from:
+
+```bash
+rework project pull applications ./out    # the whole project files area
+rework fetch m-0d75f495121a               # one mission's own final worktree
+```
+
+The files area lives on the **daemon host** (rewvis) at
+`~/.rework/projects/<project-id>/files`; `REWORK_PROJECTS_DIR` overrides the
+root. It is a plain directory and a git repository (local history, no remote),
+so back it up like any data directory — copy or archive it:
+
+```bash
+ssh ubuntu@100.107.125.118 'tar czf ~/backups/projects-$(date +%F).tar.gz -C ~/.rework projects'
+```
+
+Files are **never pushed anywhere**: the area has no remote and nothing ever
+uploads it. Code still travels through git only — a project that carries code
+gets a repo and the git/push_branch transport, and its deliverable is a pushed
+branch, not this area.
+
 ## Logs
 
 Every process writes JSON lines to `~/.rework/logs/<component>.log`

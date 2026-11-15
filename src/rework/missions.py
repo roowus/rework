@@ -222,6 +222,41 @@ def upload_repo_dir(dir_arg: str, ws_name: str, daemon_url: str | None = None) -
     return str(resp.json()["path"])
 
 
+TRANSPORT_GIT = "git"
+TRANSPORT_UPLOAD = "upload"
+RESULTS_PUSH = "push_branch"
+RESULTS_FETCH = "fetch"
+
+
+def derive_transport(settings: dict[str, Any] | None) -> tuple[str, str]:
+    """(transport, results) derived from a project's settings.
+
+    Repos decide: a project with at least one repo reference travels by git and
+    delivers a pushed branch; a project with none has no VCS to travel by, so
+    it uses the upload transport and `rework project pull` brings the result
+    back. The stored keys are honoured only when they agree with that rule —
+    empty repos can never yield git/push_branch, because a fix mission would
+    then need an origin that does not exist."""
+    stored = settings or {}
+    repos = [r for r in (stored.get("repos") or []) if r]
+    if repos:
+        transport = TRANSPORT_GIT
+        default_results = RESULTS_PUSH
+    else:
+        transport = TRANSPORT_UPLOAD
+        default_results = RESULTS_FETCH
+    results = str(stored.get("results") or default_results)
+    if transport == TRANSPORT_UPLOAD and results == RESULTS_PUSH:
+        # no origin to push to: a repo-less project fetches, always
+        results = default_results
+    return transport, results
+
+
+def project_is_upload(settings: dict[str, Any] | None) -> bool:
+    """True for a repo-less ("upload" transport) project."""
+    return derive_transport(settings)[0] == TRANSPORT_UPLOAD
+
+
 async def resolve_repo(
     *,
     repo: str | None,
@@ -340,6 +375,18 @@ def _priority(value: str | None) -> str:
     return check_priority(level)
 
 
+async def _upload_project(project_id: str) -> bool:
+    """True when this project travels by the upload transport (no repo refs)."""
+    from rework.config import Config, open_store_from_config
+
+    store = await open_store_from_config(Config.from_env())
+    try:
+        found = await store.get_project(project_id)
+    finally:
+        await store.aclose()
+    return project_is_upload(found.settings if found else None)
+
+
 async def create_mission(
     objective: str,
     *,
@@ -377,7 +424,15 @@ async def create_mission(
         project_id = await project_for_repo(resolved["repo_origin"] or repo or "")
     if plan not in PLANS:
         raise ValueError(f"unknown plan {plan!r}; plans: {', '.join(PLANS)}")
-    if plan in ("fix", "fix-pr") and not resolved["repo_path"] and not resolved["repo_origin"]:
+    upload_project = project_id is not None and await _upload_project(project_id)
+    if (
+        plan in ("fix", "fix-pr")
+        and not resolved["repo_path"]
+        and not resolved["repo_origin"]
+        and not upload_project
+    ):
+        # a repo-less ("upload" transport) project supplies its own workspace
+        # from the daemon's files area, so the repo requirement does not apply
         raise ValueError(f"--plan {plan} requires a repo (URL, path, folder, or project ref)")
     plan_spec: dict | None = None
     if orchestrator_model:
