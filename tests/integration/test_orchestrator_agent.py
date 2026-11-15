@@ -1645,3 +1645,107 @@ async def test_a_coder_that_finished_after_the_audit_started_is_unaudited(
     orch = MissionOrchestrator(runner(world), world["mission"])
     with pytest.raises(ToolError, match="after the last completed audit"):
         await orch._enforce_audit_fresh()
+
+
+# -- a reply cut off at the output limit is not idleness ----------------------
+
+
+SUMMARY = (
+    "Retries a cut-off thinking reply with more room instead of counting it idle, "
+    "so the mission reaches its tool call."
+)
+
+
+def cut_off() -> ChatResult:
+    """A reply that spent its whole output budget thinking: no text, no tool call."""
+    return ChatResult(
+        text="",
+        thinking_blocks=[{"type": "thinking", "thinking": "hmm" * 50, "signature": "s"}],
+        stop_reason="max_tokens",
+        usage=Usage(input_tokens=500, output_tokens=4096),
+    )
+
+
+async def set_orchestrator_effort(world: dict[str, Any], effort: str) -> None:
+    plan = orchestrated_plan("fix", "pro", orchestrator_effort=effort)
+    world["mission"] = await world["store"].update_mission("mo", plan=plan)
+
+
+async def test_a_cut_off_thinking_reply_is_retried_not_counted_idle(
+    world: dict[str, Any],
+) -> None:
+    """Found live: with an effort set, thinking ate the whole 4096-token cap three
+    turns running, and the mission failed with 'orchestrator stopped calling tools'."""
+    await set_orchestrator_effort(world, "high")
+    provider: ScriptedProvider = world["provider"]
+    provider.route(
+        MARKER,
+        [cut_off(), turn(call("finish", "f", outcome="failed", summary=SUMMARY))],
+    )
+    await asyncio.wait_for(runner(world).run(), timeout=30)
+    mission = await world["store"].get_mission("mo")
+    result = (mission.result if mission else None) or {}
+    assert result.get("summary") == SUMMARY
+    assert "stopped calling tools" not in str(result)
+    first, second = provider.requests
+    assert first.effort == "high" and second.effort == "high"
+    assert first.max_tokens >= 16_384, "the turn budget is no longer capped at 4096"
+    assert second.max_tokens > first.max_tokens, "the retry gets a larger budget"
+    notes = [
+        e.payload.get("note", "")
+        for e in await world["store"].events_since(0, mission_id="mo")
+        if "cut off" in str(e.payload.get("note", ""))
+    ]
+    assert len(notes) == 1 and "high" in notes[0] and str(second.max_tokens) in notes[0]
+
+
+async def test_three_cut_offs_in_a_row_still_reach_the_tool_call(world: dict[str, Any]) -> None:
+    await set_orchestrator_effort(world, "high")
+    provider: ScriptedProvider = world["provider"]
+    provider.route(
+        MARKER,
+        [
+            cut_off(),
+            cut_off(),
+            cut_off(),
+            turn(call("finish", "f", outcome="failed", summary=SUMMARY)),
+        ],
+    )
+    await asyncio.wait_for(runner(world).run(), timeout=30)
+    mission = await world["store"].get_mission("mo")
+    result = (mission.result if mission else None) or {}
+    assert result.get("summary") == SUMMARY
+    efforts = [r.effort for r in provider.requests]
+    # 1st try, retry with a bigger budget, retry at a lower effort, then the idle nudge
+    assert efforts == ["high", "high", "medium", "medium"]
+    budgets = [r.max_tokens for r in provider.requests]
+    assert budgets[1] > budgets[0] and budgets[2] == budgets[1]
+
+
+async def test_cut_off_overrides_do_not_leak_into_later_turns(world: dict[str, Any]) -> None:
+    await set_orchestrator_effort(world, "high")
+    provider: ScriptedProvider = world["provider"]
+    provider.route(
+        MARKER,
+        [
+            cut_off(),
+            turn(call("message_owner", "m", text="hi")),
+            turn(call("finish", "f", outcome="failed", summary=SUMMARY)),
+        ],
+    )
+    await asyncio.wait_for(runner(world).run(), timeout=30)
+    first, later = provider.requests[0], provider.requests[2]
+    assert (later.effort, later.max_tokens) == (first.effort, first.max_tokens)
+
+
+async def test_endless_cut_offs_terminate_as_a_failure(world: dict[str, Any]) -> None:
+    await set_orchestrator_effort(world, "high")
+    provider: ScriptedProvider = world["provider"]
+    provider.route(MARKER, [cut_off() for _ in range(12)])
+    await asyncio.wait_for(runner(world).run(), timeout=30)
+    mission = await world["store"].get_mission("mo")
+    result = (mission.result if mission else None) or {}
+    assert result.get("outcome") == "failed"
+    assert "stopped calling tools" in str(result)
+    # 2 bounded retries, then the 3 idle strikes: bounded, not a loop
+    assert len(provider.requests) == 5

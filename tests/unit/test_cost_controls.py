@@ -229,3 +229,74 @@ async def test_a_hung_model_call_hits_the_hard_deadline(monkeypatch) -> None:  #
     with pytest.raises(TimeoutError) as caught:
         await LoggedProvider(Hung()).complete(ChatRequest(model="m"))
     assert _is_transient(caught.value)
+
+
+async def test_a_max_tokens_reply_is_not_idle_and_does_not_fail_the_mission() -> None:
+    """Cut-off replies are retried with overrides and never count toward
+    MAX_IDLE_NUDGES: two cut-offs plus two genuinely idle replies stay under the
+    limit, so the mission reaches its tool call instead of failing."""
+    from types import SimpleNamespace
+
+    from rework.kernel.llm.types import ChatResult, ToolCall
+    from rework.orchestrator.agent import MissionOrchestrator
+
+    def reply(stop: str, *calls: ToolCall) -> ChatResult:
+        return ChatResult(text="", tool_calls=list(calls), stop_reason=stop)
+
+    finish = ToolCall(id="f", name="finish", arguments={})
+    script = [
+        reply("max_tokens"),
+        reply("max_tokens"),
+        reply("end_turn"),
+        reply("end_turn"),
+        reply("tool_use", finish),
+    ]
+    thinks: list[dict[str, object]] = []
+    notes: list[str] = []
+    agent = object.__new__(MissionOrchestrator)
+    agent.finished = None
+    agent.effort = "high"
+    agent.entry = SimpleNamespace(max_output=8192)
+    agent.history = []
+    agent.mid = "m"
+
+    async def gate() -> str:
+        return "ok"
+
+    async def turn_cap() -> int:
+        return 1000
+
+    async def nothing(*_a: object, **_k: object) -> None:
+        return None
+
+    async def think(max_tokens: int | None = None, effort: str | None = None) -> ChatResult:
+        thinks.append({"max_tokens": max_tokens, "effort": effort})
+        return script.pop(0)
+
+    async def execute(calls: list[ToolCall]) -> None:
+        agent.finished = ("done", "ok")
+
+    async def note(text: str, **_k: object) -> None:
+        notes.append(text)
+
+    async def append(message: dict[str, object], **_k: object) -> None:
+        agent.history.append(message)
+
+    agent._owner_gate = gate  # type: ignore[method-assign]
+    agent._turn_cap = turn_cap  # type: ignore[method-assign]
+    agent._deliver_owner_messages = nothing  # type: ignore[method-assign]
+    agent._think = think  # type: ignore[method-assign]
+    agent._execute_calls = execute  # type: ignore[method-assign]
+    agent._note = note  # type: ignore[method-assign]
+    agent._append = append  # type: ignore[method-assign]
+
+    await agent._loop()
+
+    assert agent.finished == ("done", "ok"), "a cut-off reply must not fail the mission"
+    assert not script
+    # the bigger budget applies to the first retry, a lower effort to the second;
+    # later (idle) turns of the same series keep them, and nothing was left in _think
+    assert thinks[0] == {"max_tokens": None, "effort": None}
+    assert thinks[1] == {"max_tokens": 32_768, "effort": "high"}
+    assert thinks[2] == {"max_tokens": 32_768, "effort": "medium"}
+    assert len(notes) == 2 and "high -> medium" in notes[1] and "32768" in notes[1]
