@@ -3993,3 +3993,108 @@ async def test_an_unchanged_url_does_not_loop(
     assert len(attempts) == 2, "two attempts total, never a third"
     assert data._reconnecting_hint, "and the offline note is set"
     await data.aclose()
+
+
+async def test_a_dead_socket_then_an_auth_failure_on_reopen_still_recovers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The real sequence: the tailnet drops (or the DB restarts) FIRST, so the
+    first error is a non-auth dead socket, and only the REOPEN meets the
+    rotated password. The reload still has to happen, and total attempts stay
+    bounded at 2 reconnects."""
+    import logging
+
+    from rework.tui.data import CREDENTIALS_RELOADED, TuiData
+
+    stale, fresh = (
+        "postgresql://postgres:STALEPASS@host:5433/rework_state",
+        "postgresql://postgres:LIVEHOSTPASS@host:5433/rework_state",
+    )
+    monkeypatch.setenv("REWORK_DB", stale)
+    _rotate_env(monkeypatch, tmp_path, fresh)
+    caplog.set_level(logging.DEBUG, logger="rework.tui")
+
+    store = _RotatingStore(OSError("the connection is closed"))
+    attempts: list[int] = []
+
+    async def factory() -> _RotatingStore:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise OSError("the connection is closed")
+        if len(attempts) == 2:
+            raise _auth_failure()  # the reopen is where the new password shows
+        assert os.environ["REWORK_DB"] == fresh, "the third attempt sees the new URL"
+        return store
+
+    data = TuiData(store_factory=factory)
+    assert await data.projects() == store.row, "recovered instead of offline forever"
+    assert len(attempts) == 3, "two reconnects, never a third"
+    assert data._reconnecting_hint == ""
+
+    messages = [r.getMessage() for r in caplog.records if r.name == "rework.tui"]
+    assert messages.count(CREDENTIALS_RELOADED) == 1, "exactly one reload line"
+    blob = " ".join(messages) + " ".join(str(r.args) for r in caplog.records)
+    for secret in ("STALEPASS", "LIVEHOSTPASS", stale, fresh):
+        assert secret not in blob, "no password or URL ever reaches the log"
+    await data.aclose()
+
+
+async def test_a_dead_socket_then_an_auth_failure_with_the_same_url_is_bounded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Same sequence with unchanged credentials: the offline path is today's,
+    and there is no third attempt (an unchanged URL never buys a retry)."""
+    from rework.tui.data import TuiData
+
+    same = "postgresql://postgres:same@host:5433/rework_state"
+    monkeypatch.setenv("REWORK_DB", same)
+    _rotate_env(monkeypatch, tmp_path, same)
+    attempts: list[int] = []
+
+    async def factory() -> Any:
+        attempts.append(1)
+        raise _auth_failure() if len(attempts) > 1 else OSError("the connection is closed")
+
+    data = TuiData(store_factory=factory)
+    import psycopg
+
+    with pytest.raises(psycopg.OperationalError):
+        await data.projects()
+    assert len(attempts) == 2, "two attempts total, never a third"
+    assert data._reconnecting_hint, "and the offline note is set"
+    await data.aclose()
+
+
+async def test_a_reload_drops_the_cached_library_handle_and_reopens_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The library index caches its own connection for the whole session, so a
+    rotated URL has to drop it too, or `library()` would keep serving the dead
+    one. Dropping it must not raise when nothing was opened yet."""
+    from rework.tui.data import TuiData
+
+    fresh = "postgresql://postgres:LIVEHOSTPASS@host:5433/rework_state"
+    monkeypatch.setenv("REWORK_DB", "postgresql://postgres:STALEPASS@host:5433/rework_state")
+    _rotate_env(monkeypatch, tmp_path, fresh)
+
+    closed: list[int] = []
+
+    class _Index:
+        async def aclose(self) -> None:
+            closed.append(1)
+
+    data = TuiData()
+    index = _Index()
+    data._index = index  # type: ignore[assignment]
+    data._git = object()  # type: ignore[assignment]
+    assert await data._reload_credentials() is True
+    assert closed == [1], "the stale index was closed"
+    assert data._index is None and data._git is None, "and dropped for a fresh open"
+    assert os.environ["REWORK_DB"] == fresh
+
+    # an unchanged URL drops nothing and reports False
+    assert await data._reload_credentials() is False
+    assert closed == [1]
+    # and with no library opened at all, the drop is a no-op, not an error
+    assert await data._reload_credentials() is False
+    await data.aclose()

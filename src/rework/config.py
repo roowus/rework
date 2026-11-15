@@ -57,7 +57,11 @@ def parse_env_file(path: Path | None = None) -> dict[str, str]:
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
             value = value[1:-1]
         if name:
-            values[name] = value
+            # setdefault, not assignment: a repeated key keeps its FIRST value,
+            # which is what the old line-by-line loader did ("if name not in
+            # os.environ"). The owner hand-edits this file, and the default
+            # path has to stay byte-for-byte compatible.
+            values.setdefault(name, value)
     return values
 
 

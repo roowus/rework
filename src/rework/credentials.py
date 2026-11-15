@@ -18,9 +18,13 @@ from __future__ import annotations
 import os
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 from rework.config import parse_env_file
+
+if TYPE_CHECKING:
+    from rework.targets import TargetsFile
 
 # The one line both recovery paths log when a reconnect with the new
 # credentials works. It names no value: the URL carries the password.
@@ -28,6 +32,11 @@ CREDENTIALS_RELOADED = "database credentials changed on disk; reconnected"
 
 # The variable Config.from_env actually reads for the database URL.
 DEFAULT_DB_ENV = "REWORK_DB"
+
+# Query parameters that carry credentials. Everything else in a query string
+# (sslmode, connect_timeout, ...) describes the CONNECTION, so a rotation may
+# change only these keys.
+_CREDENTIAL_QUERY_KEYS = frozenset({"user", "password", "passfile"})
 
 # Postgres SQLSTATEs that mean "these credentials are wrong", not "the network
 # died": 28P01 invalid_password, 28000 invalid_authorization_specification.
@@ -77,6 +86,19 @@ def is_auth_error(exc: BaseException) -> bool:
     return False
 
 
+def active_target_name(targets: TargetsFile) -> str | None:
+    """Which target THIS process is on. REWORK_TARGET_NAME is the record of a
+    `--target NAME` launch (resolve_target sets it), so it comes first;
+    REWORK_TARGET is the env-only selector and is the fallback. resolve_name
+    alone cannot express that precedence: it never sees the flag, so it falls
+    back to the file's `default` and a `--target other` process would read the
+    DEFAULT target's variable (a wrong-database write, found in audit)."""
+    recorded = os.environ.get("REWORK_TARGET_NAME")
+    if recorded and recorded in targets.targets:
+        return recorded
+    return targets.resolve_name(env_var=os.environ.get("REWORK_TARGET"))
+
+
 def db_env_vars() -> tuple[str, ...]:
     """The env var names a database URL may live under, in the order a rotated
     value is picked up. REWORK_DB comes first because that is what
@@ -90,7 +112,7 @@ def db_env_vars() -> tuple[str, ...]:
         from rework.targets import load_targets_file
 
         targets = load_targets_file()
-        active = targets.resolve_name(env_var=os.environ.get("REWORK_TARGET"))
+        active = active_target_name(targets)
         target = targets.targets.get(active) if active is not None else None
         if target is not None and target.db_env and target.db_env not in names:
             names.append(target.db_env)
@@ -99,6 +121,31 @@ def db_env_vars() -> tuple[str, ...]:
         # this runs while recovering from a failed connection.
         pass
     return tuple(names)
+
+
+def target_key(url: str) -> tuple[str, str, str, str] | None:
+    """The parts of a URL that say WHICH database it points at: host, port,
+    database name and the non-credential query string (sslmode and friends).
+    A credential rotation changes the user/password only, so two URLs with the
+    same key address the same database. None when the value cannot be read as
+    a postgres URL: this runs on a recovery path, so it never raises."""
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        port = str(parts.port or "")
+        database = parts.path.strip("/")
+        query = "&".join(
+            sorted(
+                pair
+                for pair in parts.query.split("&")
+                if pair and pair.split("=", 1)[0].strip().lower() not in _CREDENTIAL_QUERY_KEYS
+            )
+        )
+    except ValueError:  # a bad port, a broken IPv6 literal, ...
+        return None
+    if not host or not database:
+        return None
+    return (host, port, database, query)
 
 
 def fresh_db_url(
@@ -112,12 +159,25 @@ def fresh_db_url(
     Pure: reads the file only (never os.environ, which still holds the stale
     value), touches no global state, logs nothing. None covers a missing,
     unreadable or malformed file, an empty value, and a value identical to
-    `current_url`, so an unchanged URL can never drive a reconnect loop."""
+    `current_url`, so an unchanged URL can never drive a reconnect loop.
+
+    A fresh value is a ROTATION only when it addresses the SAME database:
+    host, port, database name and any non-credential connection parameter must
+    match `current_url`, with only the user/password changing. A value that
+    moves the target is rejected (None), so a mis-resolved or other-target
+    variable can never redirect this process's writes."""
     values = parse_env_file(env_file)
     current = (current_url or "").strip()
+    # No known current target means "cannot prove it is the same database",
+    # so nothing may be switched: the safe answer is always None.
+    current_key = target_key(current) if current else None
+    if current_key is None:
+        return None
     for name in var_names:
         value = values.get(name, "").strip()
-        if value and value != current:
+        if not value or value == current:
+            continue
+        if target_key(value) == current_key:
             return value
     return None
 

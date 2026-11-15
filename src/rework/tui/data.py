@@ -183,11 +183,20 @@ class TuiData:
             await self.drop_store()
             try:
                 result = await asyncio.wait_for(_maybe_await(call()), QUERY_TIMEOUT_S)
-            except Exception:
-                self._reconnecting_hint = f"{type(first).__name__}: {first}"[:160]
-                if key in self._last_good:
-                    return self._last_good[key]
-                raise
+            except Exception as second:
+                # The reopen is the other place a rotated password can surface:
+                # found live, the socket dies first (idle timeout, DB restart)
+                # and only the RECONNECT meets the new password. Same rule as
+                # above, and still bounded: at most 2 reconnects in total, and
+                # the second one only when the URL actually CHANGED.
+                if not (is_auth_error(second) and await self._reload_credentials()):
+                    self._reconnecting_hint = f"{type(first).__name__}: {first}"[:160]
+                    if key in self._last_good:
+                        return self._last_good[key]
+                    raise
+                await self.drop_store()
+                result = await asyncio.wait_for(_maybe_await(call()), QUERY_TIMEOUT_S)
+                reloaded = True
             if reloaded:
                 log.info(CREDENTIALS_RELOADED)
         self._reconnecting_hint = ""

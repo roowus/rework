@@ -634,3 +634,89 @@ async def test_a_non_auth_error_never_re_reads_the_library_env_file(
     assert got is not None and got.id == "l-one"
     assert made == [second]
     assert store._dsn == "postgresql://fake", "the dsn is never rewritten"
+
+
+# -- the production sequence: the socket dies FIRST, auth fails on reconnect --
+
+
+def _dead_socket_error():
+    import psycopg
+
+    return psycopg.OperationalError("the connection is closed")
+
+
+async def test_a_dead_socket_then_an_auth_failure_on_reconnect_still_recovers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Found in audit, the REAL sequence: an idle timeout or a DB restart kills
+    the socket first, so the operation fails with 'the connection is closed'
+    and only the RECONNECT meets the rotated password. Classifying only the
+    first error left the long-lived `rework library-mcp` retrying the stale dsn
+    forever (reproduced: three calls, three connects, all stale)."""
+    import logging
+
+    from rework.credentials import CREDENTIALS_RELOADED
+    from rework.library import store as store_mod
+
+    stale = "postgresql://postgres:STALEPASS@host:5433/rework_library"
+    fresh = "postgresql://postgres:LIVEHOSTPASS@host:5433/rework_library"
+    _rotated_env(monkeypatch, tmp_path, fresh)
+    monkeypatch.setenv("REWORK_DB", stale)
+    caplog.set_level(logging.DEBUG, logger="rework.library")
+
+    first = _FakeConn()  # dead socket: the non-auth error reaches _run first
+    working = _FakeConn()
+    working.fail = False
+    working.row = _item_row()
+    dsn_seen: list[str] = []
+
+    async def fake_connect(dsn: str) -> _FakeConn:
+        dsn_seen.append(dsn)
+        if len(dsn_seen) == 1:
+            raise _rotated_password_error()  # the reconnect meets the new password
+        return working
+
+    monkeypatch.setattr(store_mod, "_connect", fake_connect)
+    store = store_mod.PostgresLibraryStore(first, dsn=stale)
+
+    got = await store.get_item("l-one")
+    assert got is not None and got.id == "l-one", "recovered instead of offline forever"
+    assert dsn_seen == [stale, fresh], "one attempt on the stale dsn, then exactly one on the new"
+    assert store._dsn == fresh, "the store now holds the rotated dsn"
+    assert store._conn is working and store._op_lock._conn is working
+
+    messages = [r.getMessage() for r in caplog.records if r.name == "rework.library"]
+    assert messages.count(CREDENTIALS_RELOADED) == 1, "exactly one reload line"
+    blob = " ".join(messages) + " ".join(str(r.args) for r in caplog.records)
+    for secret in ("STALEPASS", "LIVEHOSTPASS", stale, fresh):
+        assert secret not in blob, "no password or URL ever reaches the log"
+
+
+async def test_a_dead_socket_then_an_auth_failure_with_unchanged_credentials_is_bounded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Same sequence, but the env file holds the URL we already use: nothing to
+    recover, so it gives up after ONE reconnect (no loop) with a clear error."""
+    import logging
+
+    from rework.credentials import CREDENTIALS_RELOADED
+    from rework.library import store as store_mod
+
+    stale = "postgresql://postgres:STALEPASS@host:5433/rework_library"
+    _rotated_env(monkeypatch, tmp_path, stale)
+    caplog.set_level(logging.DEBUG, logger="rework.library")
+    dsn_seen: list[str] = []
+
+    async def fake_connect(dsn: str) -> _FakeConn:
+        dsn_seen.append(dsn)
+        raise _rotated_password_error()
+
+    monkeypatch.setattr(store_mod, "_connect", fake_connect)
+    store = store_mod.PostgresLibraryStore(_FakeConn(), dsn=stale)
+
+    with pytest.raises(RuntimeError, match="library store unavailable after reconnect"):
+        await store.get_item("l-one")
+    assert dsn_seen == [stale], "exactly one connect attempt, never a second"
+    assert store._dsn == stale
+    messages = [r.getMessage() for r in caplog.records if r.name == "rework.library"]
+    assert CREDENTIALS_RELOADED not in messages, "nothing was reloaded"

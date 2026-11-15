@@ -290,6 +290,15 @@ async def _connect(dsn: str) -> Any:
     return conn
 
 
+# The one clear error a caller sees once a reconnect did not save us. It never
+# carries the dsn (that holds the password), only the failing exception.
+_UNAVAILABLE = "library store unavailable after reconnect: {reason}"
+
+
+def _reason(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
 class PostgresLibraryStore:
     """Deployment-grade library index; same contract as the sqlite impl.
 
@@ -317,11 +326,32 @@ class PostgresLibraryStore:
         self._conn = conn
         self._op_lock = _LibLock(conn)
 
+    async def _reload_credentials(self, current: str) -> bool:
+        """Re-read the env file and keep the fresh dsn; True when it changed.
+        The value is never logged: it carries the password."""
+        try:
+            fresh = await asyncio.to_thread(recover_db_credentials, current_url=current)
+        except Exception:  # pragma: no cover - recovery must never mask the error
+            return False
+        if fresh is None:
+            return False
+        self._dsn = fresh
+        return True
+
     async def _run(self, op: Any) -> Any:
         """Run one operation under the op lock; on a dead connection reconnect
         once and retry exactly once, then surface a clear error. Reconnecting
         closes the old connection first, which discards any half-applied
-        write — no retried statement runs inside a poisoned transaction."""
+        write: no retried statement runs inside a poisoned transaction.
+
+        Stale credentials are picked up wherever they first show: found live,
+        the SOCKET usually dies first (an idle timeout or a restarted DB), so
+        the first error says 'the connection is closed' and only the RECONNECT
+        meets the rotated password. Classifying the reconnect's error too is
+        what keeps this long-lived process (rework library-mcp) alive across a
+        rotation instead of retrying the stale dsn forever. Attempts stay
+        bounded: one reconnect, plus at most one retry with a CHANGED dsn."""
+        reloaded = False
         try:
             async with self._op_lock:
                 return await op(self._conn)
@@ -329,26 +359,35 @@ class PostgresLibraryStore:
             if not self._dsn or not _is_connection_error(first):
                 raise
             if is_auth_error(first):
-                # the Postgres password was rotated: this process still holds
-                # the URL it started with, so reconnecting with it would fail
-                # identically. Re-read the env file and reconnect with the new
-                # URL (never logged: it carries the password).
-                fresh = await asyncio.to_thread(recover_db_credentials, current_url=self._dsn)
-                if fresh is None:
+                reloaded = await self._reload_credentials(self._dsn)
+                if not reloaded:
                     logger.warning("library store connection lost; credentials unchanged")
-                else:
-                    self._dsn = fresh
-                    logger.info(CREDENTIALS_RELOADED)
             else:
                 logger.warning("library store connection lost (%s); reconnecting", first)
         try:
             await self._reconnect()
+        except Exception as reconnect_failed:
+            # The reconnect itself may be the first place the rotated password
+            # shows (dead socket first, auth second). Only a dsn that actually
+            # CHANGED buys one more connect, so an unreachable or unchanged
+            # target cannot turn this into a retry loop.
+            if not is_auth_error(reconnect_failed) or not await self._reload_credentials(self._dsn):
+                raise RuntimeError(_UNAVAILABLE.format(reason=_reason(reconnect_failed))) from (
+                    reconnect_failed
+                )
+            reloaded = True
+            try:
+                await self._reconnect()
+            except Exception as second:
+                raise RuntimeError(_UNAVAILABLE.format(reason=_reason(second))) from second
+        try:
             async with self._op_lock:
-                return await op(self._conn)
+                result = await op(self._conn)
         except Exception as second:
-            raise RuntimeError(
-                f"library store unavailable after reconnect: {type(second).__name__}: {second}"
-            ) from second
+            raise RuntimeError(_UNAVAILABLE.format(reason=_reason(second))) from second
+        if reloaded:
+            logger.info(CREDENTIALS_RELOADED)
+        return result
 
     async def upsert_item(self, item: LibraryItem) -> LibraryItem:
         async def _op(conn: Any) -> LibraryItem:
