@@ -7,6 +7,7 @@ sets REWORK_DB to a tmp file before the app is constructed."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -64,6 +65,57 @@ def db_path() -> str:
 
 def _app() -> ReworkApp:
     return ReworkApp(poll_seconds=0.3)
+
+
+async def _run_chat_tick(work: Any, chat_id: str) -> None:
+    """Run one chat-poll tick to completion, however many times the app's own
+    timer restarts it meanwhile.
+
+    `_tick_chat` is an exclusive worker: a second start (the app polls every
+    0.3 s in these tests) cancels the first, and `Worker.wait()` then raises
+    WorkerCancelled. That is the app doing its job, not a failure, but under CI
+    load it landed inside the awaits below (an intermittent Python 3.12
+    failure). The tick we want is the one that finishes, so retry until a run
+    completes; the cursor logic under test is idempotent by design."""
+    from textual.worker import WorkerCancelled
+
+    for _ in range(20):
+        try:
+            await work._tick_chat(chat_id).wait()
+            return
+        except WorkerCancelled:
+            await asyncio.sleep(0.05)
+    raise AssertionError("the chat poll never completed (cancelled 20 times in a row)")
+
+
+async def test_run_chat_tick_retries_a_cancelled_worker_and_gives_up_loudly() -> None:
+    """A restarted exclusive worker is 'try again', not a failure; a poll that
+    never completes still fails the test instead of hanging or passing."""
+    from textual.worker import WorkerCancelled
+
+    class FakeWork:
+        def __init__(self, cancels: int) -> None:
+            self.cancels = cancels
+            self.calls = 0
+
+        def _tick_chat(self, chat_id: str) -> Any:
+            owner = self
+
+            class Worker:
+                async def wait(self) -> None:
+                    owner.calls += 1
+                    if owner.calls <= owner.cancels:
+                        raise WorkerCancelled("restarted")
+
+            return Worker()
+
+    flaky = FakeWork(cancels=3)
+    await _run_chat_tick(flaky, "c")
+    assert flaky.calls == 4
+    stuck = FakeWork(cancels=10**6)
+    with pytest.raises(AssertionError, match="never completed"):
+        await _run_chat_tick(stuck, "c")
+    assert stuck.calls == 20
 
 
 async def _settle(pilot: Any, t: float = 0.5) -> None:
@@ -840,7 +892,13 @@ async def test_a_live_turn_and_the_poller_do_not_paint_the_same_row_twice(
         assert before == 1, await _diag(app)
 
         # a row lands in the store while a live turn is in flight (this is
-        # exactly what `engine.send` does before `own_chat_ids` knows about it)
+        # exactly what `engine.send` does before `own_chat_ids` knows about it).
+        # The live turn's window opens FIRST, and a poll tick that started before
+        # it (the app polls every 0.3 s here) is let finish while the store still
+        # holds nothing new: a tick already past the guard is a different race,
+        # and it was this test's intermittent CI failure.
+        work._sending = True
+        await _settle(pilot, 0.6)
         store = await _store(env)
         try:
             await store.append_chat_message(
@@ -873,14 +931,18 @@ async def test_a_live_turn_and_the_poller_do_not_paint_the_same_row_twice(
         finally:
             await store.aclose()
 
-        work._sending = True  # the window the live turn holds
         try:
-            await work._tick_chat(chat_id).wait()
+            await _run_chat_tick(work, chat_id)
+            # the app's own timer polls too (every 0.3 s here): let a few more
+            # ticks land INSIDE the window, since the live turn owns the row for
+            # all of it. Clearing the flag earlier lets a late poll legitimately
+            # paint the row, which is exactly what the assertion forbids.
+            await _settle(pilot, 0.8)
+            assert len(app.query(ProposalCard)) == before, (
+                "the poller painted a row the live turn owns\n" + await _diag(app)
+            )
         finally:
             work._sending = False
-        assert len(app.query(ProposalCard)) == before, (
-            "the poller painted a row the live turn owns\n" + await _diag(app)
-        )
         assert not app.swallowed
     store = await _store(env)
     try:
@@ -3086,7 +3148,7 @@ async def test_a_replayed_chat_does_not_duplicate_its_proposal_cards(
         # the transcript is re-reached from a fresh cursor with the log intact
         app.hub.data.own_chat_ids.clear()
         work._chat_cursor = 0
-        await work._tick_chat(chat_id).wait()
+        await _run_chat_tick(work, chat_id)
         await _settle(pilot, 0.6)
         cards = list(app.query(ProposalCard))
         assert len(cards) == 2, (
@@ -3195,7 +3257,7 @@ async def test_a_store_swap_repaints_the_transcript_without_loss_or_duplication(
         finally:
             await store.aclose()
 
-        await work._tick_chat(chat_id).wait()  # the epoch branch of the tick
+        await _run_chat_tick(work, chat_id)  # the epoch branch of the tick
 
         def repainted() -> bool:
             """The replay is DONE, not merely started.
