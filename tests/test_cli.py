@@ -1321,7 +1321,12 @@ def test_main_help_flag_prints_help_and_does_not_start_the_tui(
 
     assert excinfo.value.code == 0
     out = capsys.readouterr().out
-    assert "Usage: rework" in out
+    # launcher-agnostic: click's "Usage: <prog>" prefix is derived from
+    # sys.modules["__main__"].__package__, so under `python -m pytest` it reads
+    # "Usage: python -m pytest.rework". Assert the usage header plus a real help
+    # body line, so an error panel cannot satisfy it either.
+    assert "Usage:" in out
+    assert "COMMAND" in out
     assert "--target" in out  # the real help body, not an error panel
     assert "No such option" not in out
 
@@ -1379,7 +1384,8 @@ def test_main_help_flag_before_a_subcommand_still_prints_help(
 
     assert excinfo.value.code == 0
     captured = capsys.readouterr()
-    assert "Usage: rework" in captured.out
+    assert "Usage:" in captured.out  # launcher-agnostic: see the test above
+    assert "COMMAND" in captured.out
     assert "needs a name" not in captured.out
     assert "needs a name" not in captured.err
 
