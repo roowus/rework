@@ -193,7 +193,10 @@ Launch and Scrap, plus a "Launch all" action on the group.
   and two proposals that are identical settle the oldest of them (they are
   interchangeable). Everything left pending is restored into the engine by
   `Conversation.ensure_engine`, so a reloaded chat shows and can launch all of
-  them.
+  them. Replay is idempotent: the Work view keeps a high-water mark of the
+  `chat_messages` ids it has already rendered, per store connection, so
+  reopening a saved chat or reconnecting the store never paints a pending
+  proposal card twice.
 
 ### The Library
 
