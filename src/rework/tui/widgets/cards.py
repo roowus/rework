@@ -108,8 +108,7 @@ class ProposalCard(Vertical):
             return
         button.display = on
         hint.update(
-            f"[{FAINT}]or reply with changes · “yes” launches all "
-            f"{'of them' if on else ''}[/]"
+            f"[{FAINT}]or reply with changes · “yes” launches all {'of them' if on else ''}[/]"
         )
 
     def set_live(self, live: bool) -> None:

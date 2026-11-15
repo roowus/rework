@@ -324,9 +324,7 @@ class Conversation:
         # a replayed chat can tell WHICH of several proposals from one turn was
         # launched (the note lands at the end of the transcript, so position
         # alone cannot). See items_from_messages / _settle_launched.
-        await self.data.append_chat_note(
-            self.id, launch_note(mission.id, proposal.objective)
-        )
+        await self.data.append_chat_note(self.id, launch_note(mission.id, proposal.objective))
         # Chat.mission_id stays a scalar, and it keeps the FIRST mission this
         # chat launched: it is only a denormalised pointer for the chat list.
         # The real one-chat-to-many-missions link is Mission.chat_id (which is

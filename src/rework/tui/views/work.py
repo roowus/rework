@@ -365,6 +365,13 @@ class WorkView(View):
             if isinstance(widget, ProposalCard):
                 widget.live = item.live
             widgets.append(widget)
+        # a RELOADED chat can hold several pending proposals too: the group
+        # action is offered whenever more than one is live, not only on the turn
+        # that proposed them
+        live = [w for w in widgets if isinstance(w, ProposalCard) and w.live]
+        if len(live) > 1:
+            for widget in live:
+                widget.set_launch_all(True)
         log.add(*widgets)
 
     def _pending_cards(self) -> list[ProposalCard]:
@@ -553,7 +560,7 @@ class WorkView(View):
     # -- proposals & launch -------------------------------------------------------------
 
     def on_proposal_card_launch_all(self, event: ProposalCard.LaunchAll) -> None:
-        """"Launch all": every pending proposal of this chat, in order."""
+        """ "Launch all": every pending proposal of this chat, in order."""
         event.stop()
         if self._sending:
             return
@@ -585,9 +592,7 @@ class WorkView(View):
         card.set_live(False)
         engine = self.convo.engine if self.convo is not None else None
         if engine is not None:
-            engine.proposals = [
-                p for p in engine.proposals if not same_proposal(p, card.proposal)
-            ]
+            engine.proposals = [p for p in engine.proposals if not same_proposal(p, card.proposal)]
 
     def _launch_all_cards(self) -> None:
         """The "Launch all" button: every pending proposal, in transcript order."""
