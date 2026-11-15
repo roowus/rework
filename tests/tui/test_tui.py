@@ -782,6 +782,9 @@ async def test_dashboard_search_filters_and_clears(ids: dict[str, str]) -> None:
         bar = app.query_one("#mission-search", Input)
         assert bar.has_focus, "/ focuses the search bar"
         assert bar.placeholder == "Search missions…  (/ to focus)"
+        # the project-name filter is reachable without a mouse, and says how
+        assert app.query_one("#proj-search", Input).placeholder == "Filter projects…  (tab)"
+        assert ("tab", "project filter") in app.view("dashboard").hints()
         for ch in "flaky":
             await pilot.press(ch)
         await _settle(pilot, 0.8)  # the filter is debounced
@@ -835,7 +838,7 @@ async def test_dashboard_ai_search_ranks_and_opens(
         assert dash.ai_results == [{"id": ids["running"], "reason": "the float tolerance fix"}]
         lst = app.query_one("#mission-list", RowList)
         assert lst.selectable == [ids["running"]]
-        assert "1 ranked" in str(app.query_one("#mission-note").render())
+        assert "✦ top 1 from AI" in str(app.query_one("#mission-note").render())
         row = next(r for r in app.query("#mission-list .row") if r.key == ids["running"])
         assert "float tolerance" in str(row.render()), "the reason rides the row"
 
@@ -953,7 +956,9 @@ async def test_dashboard_ai_search_uses_the_one_list(
         assert len(ranked) == len([r for r in every_row if not r.has_class("-header")])
         # the ranking orders the same set the plain filter feeds
         assert [m.id for m in dash._filtered()] == [ids["waiting"], ids["running"]]
-        assert "2 ranked" in str(app.query_one("#mission-note").render())
+        # the model may only return MAX_RESULTS ids: the list is its picks out
+        # of the matches, and the note says so ("top 2 of 6")
+        assert "✦ top 2 of" in str(app.query_one("#mission-note").render())
 
         # Enter still means "filter": it never re-runs the ranking and keeps the
         # list it was showing
@@ -1061,6 +1066,102 @@ async def test_dashboard_project_search_filters_rows(ids: dict[str, str]) -> Non
         await _settle(pilot, 0.5)
         assert proj.keys == every, "clearing restores every project row"
         assert proj.selected == ids["project"], "and the selection is back"
+        assert app.is_running and not app.swallowed
+
+
+async def test_esc_clears_the_bar_the_user_is_typing_in(ids: dict[str, str]) -> None:
+    """Esc belongs to the focused search bar. With a project-name filter set,
+    pressing esc in the mission bar used to clear the PROJECT filter and leave
+    the query in the box: the wrong bar lost its text."""
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        proj_bar = app.query_one("#proj-search", Input)
+        proj = app.query_one("#proj-list", RowList)
+        mission = app.query_one("#mission-search", Input)
+        mlist = app.query_one("#mission-list", RowList)
+
+        # a project filter is in place for both halves of the test
+        proj_bar.focus()
+        await _settle(pilot, 0.2)
+        for ch in "poly":
+            await pilot.press(ch)
+        await _settle(pilot, 0.5)
+        assert dash.project_query == "poly"
+
+        # (a) mission bar focused, a query typed: esc clears the QUERY and
+        # leaves the project filter alone
+        mission.focus()
+        await _settle(pilot, 0.2)
+        for ch in "flaky":
+            await pilot.press(ch)
+        await _settle(pilot, 0.8)
+        assert dash.query_text == "flaky"
+        assert mlist.selectable == [ids["running"]], mlist.selectable
+        await pilot.press("escape")
+        await _settle(pilot, 0.5)
+        assert mission.value == "" and dash.query_text == ""
+        assert dash.project_query == "poly", "esc cleared the project filter instead"
+        assert proj_bar.value == "poly"
+        assert not mission.has_focus, "esc hands focus back to the list"
+        assert len(mlist.selectable) > 1, "both projects' missions are back"
+
+        # (b) the reverse: a mission query is in the list's filter and the
+        # project bar has focus, so esc clears the PROJECT filter, not the query
+        mission.focus()
+        await _settle(pilot, 0.2)
+        for ch in "dark":
+            await pilot.press(ch)
+        await _settle(pilot, 0.8)
+        proj_bar.focus()
+        await _settle(pilot, 0.2)
+        assert dash.query_text == "dark" and dash.project_query == "poly"
+        await pilot.press("escape")
+        await _settle(pilot, 0.5)
+        assert proj_bar.value == "" and dash.project_query == ""
+        assert dash.query_text == "dark", "esc cleared the mission query instead"
+        assert mission.value == "dark"
+        assert mlist.selectable == [ids["waiting"]], "still filtered by the mission query"
+        assert app.is_running and not app.swallowed
+
+        # (c) the empty state names the filter that emptied the list: the
+        # 'migrate the CI to uv' mission lives in the OTHER project, so under
+        # the polystats filter it is a project miss, not a search miss
+        proj.activate(ids["project"], via_mouse=True)
+        await _settle(pilot, 0.5)
+        assert dash.project == ids["project"] and dash.project_query == ""
+        mission.focus()
+        await _settle(pilot, 0.2)
+        await pilot.press(*["backspace"] * 8)  # long enough to empty the bar
+        for ch in "migrate":
+            await pilot.press(ch)
+        await _settle(pilot, 0.8)
+        assert mlist.selectable == [], "the mission is in the other project"
+        empty = str(app.query_one("#mission-list .rowlist-empty").render())
+        assert "No missions match" in empty, empty
+        assert "polystats" in empty, f"the empty state must name the project: {empty}"
+        # no query at all: the empty state blames the filter, and never a
+        # “query” the user did not type. The rework project now holds only done /
+        # failed missions, so the Active chip alone leaves nothing.
+        mission.focus()
+        await pilot.press(*["backspace"] * 8)  # long enough to empty the bar
+        await _settle(pilot, 0.6)
+        assert mlist.selectable, "the polystats project still has missions"
+        from rework.tui.views.dashboard import ALL
+
+        rework = next(k for k in proj.keys if k not in (ALL, ids["project"]))
+        proj.activate(rework, via_mouse=True)
+        await _settle(pilot, 0.5)
+        dash.filter = "active"  # the Active chip, without hunting for its click
+        dash._paint_overview()
+        await _settle(pilot, 0.6)
+        assert mlist.selectable == [], "no active mission in the rework project"
+        empty = str(app.query_one("#mission-list .rowlist-empty").render())
+        assert "No missions in" in empty and "“”" not in empty and "match" not in empty, empty
+        assert "active" in empty and "project" in empty, empty
         assert app.is_running and not app.swallowed
 
 

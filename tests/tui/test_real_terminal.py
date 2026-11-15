@@ -273,14 +273,14 @@ def test_dashboard_searches_work_in_a_real_terminal(seeded_terminal_env: dict[st
         assert term.wait_for("add dark mode to the settings page", 15)
         plain = term.screen_text()
         assert "add dark mode" in plain and "fix the flaky test" in plain
-        assert "ranked" not in plain, "the plain filter says nothing about ranking"
+        assert "from AI" not in plain, "the plain filter says nothing about ranking"
         assert "Search" in plain and "✦" in plain, "both submit buttons on the one bar"
 
         assert term.click_text("✦"), "the ✦ button is clickable"
-        assert term.wait_for("✦ 2 ranked", 25), "the ranking finished and reports on one line"
+        assert term.wait_for("✦ top 2 from AI", 25), "the ranking finished and reports on one line"
         term.pump(1.0)
         ranked = term.screen_text()
-        assert ranked.count("ranked") == 1, "one status line, not a second one"
+        assert ranked.count("from AI") == 1, "one status line, not a second one"
         assert "closest to the query" in ranked and "also about tests" in ranked
         # the reason is OUR markup: it must paint, never print as literal tags
         assert "[#a394f7]" not in ranked, "the reason's colour is markup, not text"
@@ -292,7 +292,7 @@ def test_dashboard_searches_work_in_a_real_terminal(seeded_terminal_env: dict[st
         term.send(b"\r")
         term.pump(2.0)
         after = term.screen_text()
-        assert "✦ 2 ranked" in after, "enter left the ranking alone"
+        assert "✦ top 2 from AI" in after, "enter left the ranking alone"
         assert "also about tests" in after, "enter kept the same list"
         assert "PROJECTS" in after, "enter did not open a mission page"
         term.backspace()

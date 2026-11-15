@@ -155,7 +155,7 @@ class DashboardView(View):
                 with Horizontal():
                     with Vertical(classes="sidebar", id="dash-side"):
                         yield Label("Projects")
-                        yield Input(placeholder="Filter projects…", id="proj-search")
+                        yield Input(placeholder="Filter projects…  (tab)", id="proj-search")
                         yield RowList(id="proj-list")
                     with Vertical(classes="main"):
                         with Horizontal(classes="subbar"):
@@ -216,7 +216,13 @@ class DashboardView(View):
     def hints(self) -> list[tuple[str, str]]:
         if self.mission_id:
             return [("click", "focus a session"), ("esc", "back"), ("ctrl+c", "copy")]
-        return [("/", "search"), ("click", "open mission"), ("↑↓", "move"), ("enter", "open")]
+        return [
+            ("/", "search"),
+            ("tab", "project filter"),
+            ("click", "open mission"),
+            ("↑↓", "move"),
+            ("enter", "open"),
+        ]
 
     def shown(self) -> None:
         target = "#run-list" if self.mission_id else "#mission-list"
@@ -273,24 +279,26 @@ class DashboardView(View):
     # -- overview -------------------------------------------------------------------
 
     def _filtered(self) -> list[Any]:
-        out = []
-        for m in self.snap.missions:
-            if self.project == NONE and m.project_id:
-                continue
-            if self.project not in (ALL, NONE) and m.project_id != self.project:
-                continue
-            st = status_value(m.status)
-            if self.filter == "active" and st not in actions.ACTIVE:
-                continue
-            if self.filter == "done" and st != "done":
-                continue
-            if self.filter == "failed" and st not in ("failed", "cancelled"):
-                continue
-            out.append(m)
+        out = [m for m in self.snap.missions if self._passes(m)]
         ranked = self._ranking()
         if ranked is not None:
             return self._in_rank_order(out, ranked)
         return search.search_missions(out, self.query_text)
+
+    def _passes(self, mission: Any) -> bool:
+        """Does the project/status filter let this mission into the list?"""
+        if self.project == NONE and mission.project_id:
+            return False
+        if self.project not in (ALL, NONE) and mission.project_id != self.project:
+            return False
+        st = status_value(mission.status)
+        if self.filter == "active" and st not in actions.ACTIVE:
+            return False
+        if self.filter == "done" and st != "done":
+            return False
+        if self.filter == "failed" and st not in ("failed", "cancelled"):
+            return False
+        return True
 
     def _ranking(self) -> list[dict[str, str]] | None:
         """The ✦ ranking, but only while it still answers the query in the box:
@@ -381,13 +389,38 @@ class DashboardView(View):
             for m in group:
                 mrows.append(RowData(m.id, self._mission_row(m)))
         mlist = self.query_one("#mission-list", RowList)
-        # a filtered-empty list must SAY it is a search miss, not "nothing here"
-        if self.query_text.strip():
-            mlist.set_empty(f"[{FAINT}]No missions match “{esc(self.query_text.strip())}”.[/]")
-        else:
+        # an empty list must say WHY it is empty: a search miss, a project/status
+        # filter that left nothing, or a store with no missions yet
+        query = esc(self.query_text.strip())
+        cause = self._filter_label()  # "" when only the text search narrows
+        if missions or not snap.missions:
             mlist.set_empty(f"[{FAINT}]No missions here yet. Start one from Work.[/]")
+        elif query and cause:
+            mlist.set_empty(f"[{FAINT}]No missions match “{query}” in {cause}.[/]")
+        elif query:
+            mlist.set_empty(f"[{FAINT}]No missions match “{query}”.[/]")
+        else:
+            mlist.set_empty(f"[{FAINT}]No missions in {cause}.[/]")
         mlist.set_rows(mrows)
         self._paint_search_note()
+
+    def _scope(self) -> list[Any]:
+        """The missions the project/status chips let through, BEFORE the text
+        search or the ✦ ranking: what a query is answered against."""
+        return [m for m in self.snap.missions if self._passes(m)]
+
+    def _filter_label(self) -> str:
+        """The project/status filter that narrows the list, as words ('project
+        “rework”', 'the failed filter'), or "" when only the text search does."""
+        project = ""
+        if self.project == NONE:
+            project = "the no-project filter"
+        elif self.project != ALL:
+            project = f"project “{esc(self.snap.project_name(self.project))}”"
+        status = f"the {self.filter} filter" if self.filter != "all" else ""
+        if project and status:
+            return f"{status} in {project}"
+        return status or project
 
     def _proj_row(self, name: str, missions: list[Any], dim: bool = False) -> str:
         running = sum(1 for m in missions if status_value(m.status) == "running")
@@ -542,8 +575,12 @@ class DashboardView(View):
         elif self.ai_note:
             note = f"[{WARN}]{esc(self.ai_note)}[/]"
         elif self._ranking() is not None:
+            # the model returns at most MAX_RESULTS ids, so this list is its
+            # picks out of the matches, not the whole match set: say so
             count = len(plain)
-            note = f"[{ACCENT}]✦ {count} ranked[/]  [{FAINT}]esc dismisses the ranking[/]"
+            matched = len(search.search_missions(self._scope(), self.query_text))
+            scope = f"{count} of {matched}" if matched > count else f"{count}"
+            note = f"[{ACCENT}]✦ top {scope} from AI[/]  [{FAINT}]esc clears[/]"
         with self.painting():
             widget = self.query_one("#mission-note", Static)
             widget.update(note)
@@ -782,18 +819,30 @@ class DashboardView(View):
 
     def back(self) -> bool:
         if self._ai_busy:
-            # an in-flight ranking is dismissable state: drop it and stay put
-            self.workers.cancel_group(self, "dash-ai-search")
-            self._ai_busy = False
-            self.ai_results = None
-            self.ai_query = ""
-            self.ai_note = ""
+            # an in-flight ranking is dismissable state: drop it and stay put.
+            # _expire_ranking also bumps _ai_gen, so a worker finishing inside
+            # the cancellation window cannot land stale rows on the list.
+            self._expire_ranking()
             self._apply_search()
             return True
         if self.ai_results is not None or self.ai_note:
             self._dismiss_ai()
             return True
         proj_bar = self.query_one("#proj-search", Input)
+        bar = self.query_one("#mission-search", Input)
+        # esc acts on the bar the user is actually typing in: checking the
+        # project filter first cleared the sidebar filter out from under a query
+        # typed into the mission bar
+        if bar.has_focus:
+            bar.value = ""
+            self.query_text = ""
+            self._expire_ranking()
+            self._apply_search()
+            if self.mission_id:
+                self.query_one("#run-list", RowList).focus()
+            else:
+                self.query_one("#mission-list", RowList).focus()
+            return True
         if proj_bar.has_focus:
             proj_bar.value = ""
             self.project_query = ""
@@ -805,17 +854,6 @@ class DashboardView(View):
             proj_bar.value = ""
             self.project_query = ""
             self._paint_overview()
-            return True
-        bar = self.query_one("#mission-search", Input)
-        if bar.has_focus:
-            bar.value = ""
-            self.query_text = ""
-            self._expire_ranking()
-            self._apply_search()
-            if self.mission_id:
-                self.query_one("#run-list", RowList).focus()
-            else:
-                self.query_one("#mission-list", RowList).focus()
             return True
         if self.run_id:
             self.run_id = None
