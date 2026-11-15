@@ -67,7 +67,7 @@ PLAN_FIX: dict = {
 # has no gate by default but still publishes.
 PLAN_FIX_PR: dict = {"steps": PLAN_FIX["steps"], "gates": [], "publish": "pr"}
 
-PLANS = ("echo", "fix", "fix-pr")
+PLANS = ("echo", "fix", "fix-pr", "draft")
 
 # a derived mission title is a few words for lists (PR titles, `rework ls`,
 # commit subjects): the whole objective is not one (found live: PR #24 was
@@ -110,8 +110,10 @@ def derive_title(objective: str) -> str | None:
     return line or None
 
 
-PLAYBOOK_GATES: dict[str, list[str]] = {"echo": [], "fix": ["ship"], "fix-pr": []}
-PLAYBOOK_PUBLISH: dict[str, str] = {"echo": "", "fix": "", "fix-pr": "pr"}
+# a playbook's FINAL gates. `draft` deliberately has none: its results are
+# the project's files, so there is nothing to push and no PR to open.
+PLAYBOOK_GATES: dict[str, list[str]] = {"echo": [], "fix": ["ship"], "fix-pr": [], "draft": []}
+PLAYBOOK_PUBLISH: dict[str, str] = {"echo": "", "fix": "", "fix-pr": "pr", "draft": ""}
 
 
 def default_budget() -> tuple[float, float]:
@@ -220,6 +222,41 @@ def upload_repo_dir(dir_arg: str, ws_name: str, daemon_url: str | None = None) -
             "Is the daemon running, and is REWORK_DAEMON_URL pointed at it?"
         )
     return str(resp.json()["path"])
+
+
+TRANSPORT_GIT = "git"
+TRANSPORT_UPLOAD = "upload"
+RESULTS_PUSH = "push_branch"
+RESULTS_FETCH = "fetch"
+
+
+def derive_transport(settings: dict[str, Any] | None) -> tuple[str, str]:
+    """(transport, results) derived from a project's settings.
+
+    Repos decide: a project with at least one repo reference travels by git and
+    delivers a pushed branch; a project with none has no VCS to travel by, so
+    it uses the upload transport and `rework project pull` brings the result
+    back. The stored keys are honoured only when they agree with that rule —
+    empty repos can never yield git/push_branch, because a fix mission would
+    then need an origin that does not exist."""
+    stored = settings or {}
+    repos = [r for r in (stored.get("repos") or []) if r]
+    if repos:
+        transport = TRANSPORT_GIT
+        default_results = RESULTS_PUSH
+    else:
+        transport = TRANSPORT_UPLOAD
+        default_results = RESULTS_FETCH
+    results = str(stored.get("results") or default_results)
+    if transport == TRANSPORT_UPLOAD and results == RESULTS_PUSH:
+        # no origin to push to: a repo-less project fetches, always
+        results = default_results
+    return transport, results
+
+
+def project_is_upload(settings: dict[str, Any] | None) -> bool:
+    """True for a repo-less ("upload" transport) project."""
+    return derive_transport(settings)[0] == TRANSPORT_UPLOAD
 
 
 async def resolve_repo(
@@ -340,6 +377,18 @@ def _priority(value: str | None) -> str:
     return check_priority(level)
 
 
+async def _upload_project(project_id: str) -> bool:
+    """True when this project travels by the upload transport (no repo refs)."""
+    from rework.config import Config, open_store_from_config
+
+    store = await open_store_from_config(Config.from_env())
+    try:
+        found = await store.get_project(project_id)
+    finally:
+        await store.aclose()
+    return project_is_upload(found.settings if found else None)
+
+
 async def create_mission(
     objective: str,
     *,
@@ -377,7 +426,16 @@ async def create_mission(
         project_id = await project_for_repo(resolved["repo_origin"] or repo or "")
     if plan not in PLANS:
         raise ValueError(f"unknown plan {plan!r}; plans: {', '.join(PLANS)}")
-    if plan in ("fix", "fix-pr") and not resolved["repo_path"] and not resolved["repo_origin"]:
+    upload_project = project_id is not None and await _upload_project(project_id)
+    # draft needs one too: the deliverables are files written into the project
+    if (
+        plan in ("fix", "fix-pr", "draft")
+        and not resolved["repo_path"]
+        and not resolved["repo_origin"]
+        and not upload_project
+    ):
+        # a repo-less ("upload" transport) project supplies its own workspace
+        # from the daemon's files area, so the repo requirement does not apply
         raise ValueError(f"--plan {plan} requires a repo (URL, path, folder, or project ref)")
     plan_spec: dict | None = None
     if orchestrator_model:
@@ -392,10 +450,16 @@ async def create_mission(
             budget_usd=budget_usd,
             budget_step_usd=budget_step_usd,
         )
-    elif plan in ("fix", "fix-pr"):
+    elif plan in ("fix", "fix-pr", "draft"):
+        # `draft` needs the template as much as fix/fix-pr do: without it
+        # plan_spec stays None, the engine's DEFAULT_PLAN (echo) takes over, and
+        # a programmatic caller silently gets a mission that does nothing.
         template = PLAN_FIX_PR if plan == "fix-pr" else PLAN_FIX
         plan_spec = json.loads(json.dumps(template).replace("$OBJECTIVE", objective))
         plan_spec["kind"] = plan
+        if plan == "draft":
+            # writing in the project's own files: nothing to ship, no PR
+            plan_spec["gates"] = list(PLAYBOOK_GATES["draft"])
         if model:
             # a mission-wide model choice replaces the template's per-step pins
             for step in plan_spec["steps"]:

@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
 from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -45,7 +47,9 @@ from rework.kernel.state.records import (
 )
 from rework.kernel.state.store import StateStore
 from rework.logs import bind
+from rework.missions import project_is_upload
 from rework.nodes.report_sections import accepted_findings_section, mechanical_verdict
+from rework.orchestrator.limits import MissionSlot, RoleLimiter
 from rework.roles.base import EscalationKind, RoleBuildCtx
 from rework.roles.registry import RoleRegistry
 
@@ -144,6 +148,7 @@ class RunSupervisor:
         git_author: tuple[str, str] = ("rework", "rework@rework.local"),
         provider: ModelProvider | None = None,
         library: Any | None = None,
+        limiter: RoleLimiter | None = None,
     ) -> None:
         self._mission = mission
         self._store = store
@@ -155,6 +160,9 @@ class RunSupervisor:
         self._git_author = git_author
         self._provider = provider  # test/di override; None = build from catalog
         self._library = library  # LibraryHandle | None (M5); never breaks a run
+        # daemon-wide cap on concurrently RUNNING roles (REWORK_MAX_ROLES): a
+        # supervisor of its own gets its own limiter, the daemon shares one
+        self.limiter = limiter if limiter is not None else RoleLimiter(1)
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self._closers: list[Callable[[], Awaitable[None]]] = []
         self._ctxs: dict[str, RoleBuildCtx] = {}
@@ -247,8 +255,11 @@ class RunSupervisor:
     async def _execute(self, run: Run, resume_from_checkpoint: bool) -> None:
         """Run one role graph to its next stop: completion or interrupt."""
         bind(mission=self._mission.id, run=run.id, role=run.role)
-        log.info("role %s started%s", run.role, " (resume)" if resume_from_checkpoint else "")
+        # the row stays INTENT (queued) until a role slot is free: that is what
+        # the orchestrator's wait/check_in renders as "queued"
+        await self.limiter.acquire(run.id)
         try:
+            log.info("role %s started%s", run.role, " (resume)" if resume_from_checkpoint else "")
             graph = await self._build_graph(run)
             await self._store.update_run(run.id, status=RunStatus.RUNNING)
             await self._bus.publish(
@@ -290,6 +301,8 @@ class RunSupervisor:
                     payload={"error": f"{type(exc).__name__}: {exc}"},
                 )
             )
+        finally:
+            self.limiter.release(run.id)
 
     def _run_config(self, run: Run) -> dict[str, Any]:
         """Checkpoint thread + a callback that publishes each node start, so a
@@ -355,6 +368,7 @@ class RunSupervisor:
 
     async def _execute_resume(self, run: Run, decision: Any) -> None:
         bind(mission=self._mission.id, run=run.id, role=run.role)
+        await self.limiter.acquire(run.id)
         log.info("role %s resuming with a decision", run.role)
         try:
             graph = await self._build_graph(run)
@@ -373,6 +387,8 @@ class RunSupervisor:
                     payload={"error": f"resume failed: {type(exc).__name__}: {exc}"},
                 )
             )
+        finally:
+            self.limiter.release(run.id)
 
     async def wait_all(self) -> None:
         if self.tasks:
@@ -405,6 +421,8 @@ class MissionRunner:
         git_author: tuple[str, str] = ("rework", "rework@rework.local"),
         provider: ModelProvider | None = None,
         library: Any | None = None,
+        slot: MissionSlot | None = None,
+        limiter: RoleLimiter | None = None,
     ) -> None:
         self._store = store
         self._bus = bus
@@ -420,6 +438,11 @@ class MissionRunner:
         self._gates = GateManager(store, bus)
         self.mission_id = mission_id
         self._supervisor: RunSupervisor | None = None
+        # daemon mission slot (REWORK_CONCURRENCY). None = this runner owns no
+        # slot (tests, evals): the daemon decides, and it is the daemon's
+        # semaphore that a waiting mission gives back.
+        self._slot = slot
+        self._limiter = limiter
 
     async def run(self) -> None:
         bind(mission=self.mission_id)
@@ -442,6 +465,7 @@ class MissionRunner:
             self._git_author,
             self._provider,
             self._library,
+            self._limiter,
         )
         try:
             if (mission.plan or {}).get("orchestrator"):
@@ -454,12 +478,21 @@ class MissionRunner:
             await self._supervisor.aclose()
 
     async def _ensure_repo(self, mission: Mission) -> Mission:
-        """Git transport (ADR 0005): a repo_origin with no path means the
-        daemon clones from origin itself, and the row then carries a path that
-        is real on this machine. Idempotent across restarts: an existing clone
-        is reused, and the row update persists so recovery skips the clone."""
-        if not mission.repo_origin or mission.repo_path:
+        """Materialise the mission's workspace before it goes RUNNING.
+
+        Git transport (ADR 0005): a repo_origin with no path means the daemon
+        clones from origin itself, and the row then carries a path that is real
+        on this machine. Upload transport: a repo-less project has no repo at
+        all, so its persistent files area on this host is copied into the
+        workroot and git-initialised, and THAT becomes the mission's repo_path —
+        roles, worktrees and read_root then need no special case.
+
+        Idempotent across restarts: an existing clone or seeded workspace is
+        reused, and the row update persists so recovery skips the copy."""
+        if mission.repo_path:
             return mission
+        if not mission.repo_origin:
+            return await self._seed_project_files(mission)
         from rework.nodes.git_ops import clone_origin
 
         dest = self._workroot / "missions" / mission.id / "repo"
@@ -478,6 +511,108 @@ class MissionRunner:
             )
         updated = await self._store.update_mission(mission.id, repo_path=str(dest))
         return updated or mission
+
+    async def _seed_project_files(self, mission: Mission) -> Mission:
+        """Upload transport (ADR 0005): copy the project's files area into the
+        mission's workspace and adopt it as repo_path. A project with no files
+        still starts: the workspace is git-initialised empty and the mission can
+        write into it. Missions outside an upload project are untouched."""
+        if mission.project_id is None:
+            return mission
+        project = await self._store.get_project(mission.project_id)
+        if project is None or not project_is_upload(project.settings):
+            return mission
+        from rework.orchestrator.workspace import seed_mission_workspace
+
+        dest = self._workroot / "missions" / mission.id / "repo"
+        try:
+            await asyncio.to_thread(seed_mission_workspace, project.id, dest)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            # a files area that cannot be materialised must not silently run a
+            # mission against an empty workspace: fail loudly, the reason lands
+            # in the mission's own event log
+            await self._bus.publish(
+                EventRecord(
+                    mission_id=mission.id,
+                    type=EventType.INFO,
+                    payload={"error": f"project files unavailable: {exc}"},
+                )
+            )
+            raise
+        await self._bus.publish(
+            EventRecord(
+                mission_id=mission.id,
+                type=EventType.PROGRESS,
+                payload={"note": f"seeded from project {project.id} files (upload transport)"},
+            )
+        )
+        updated = await self._store.update_mission(mission.id, repo_path=str(dest))
+        return updated or mission
+
+    async def _save_project_files(self, mission_id: str, runs: list[Run]) -> tuple[str, str]:
+        """Upload transport (ADR 0005) save-back: copy the mission's new and
+        changed files into the project's files area, commit them there, and
+        return `(updated_note, error_note)` for the report.
+
+        Both are "" when there is nothing to say (git projects, project-less
+        missions, no changes). A FAILED save-back returns a non-empty error
+        note instead of vanishing: the mission still ends DONE (bookkeeping
+        must not fail finished work) but the owner has to see that the files
+        area was not updated, so the report carries "Project files NOT
+        updated: …" and never the success line."""
+        mission = await self._store.get_mission(mission_id)
+        if mission is None or mission.project_id is None:
+            return "", ""
+        if mission.status == MissionStatus.CANCELLED:
+            # an owner cancel (or the burn gate) stops the mission mid-flight:
+            # half-written worktrees must not land in the files area
+            return "", ""
+        project = await self._store.get_project(mission.project_id)
+        if project is None or not project_is_upload(project.settings):
+            return "", ""  # NEVER for git projects: their worktree is the deliverable
+        # OLDEST FIRST: `save_mission_files` copies tree by tree and the LAST
+        # copy of a path wins, so the newest run must come last. `runs` is
+        # created_at-ordered, and the seeded workspace is the state every run
+        # started from, so it goes first. (Newest-first let an earlier coder's
+        # stale revision overwrite the audit-revised FINAL one.)
+        trees = [Path(mission.repo_path)] if mission.repo_path else []
+        for run in runs:
+            worktree = (run.artifact or {}).get("worktree")
+            if worktree:
+                trees.append(Path(str(worktree)))
+        from rework.orchestrator.workspace import save_mission_files
+
+        try:
+            changed = await asyncio.to_thread(
+                save_mission_files,
+                project.id,
+                trees,
+                f"mission {mission_id}: project files updated",
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            # TimeoutError is an OSError, so a 120 s lock timeout lands here
+            # too. Bookkeeping must not fail a finished mission, but a silent
+            # "" told the owner the mission was DONE with files saved when
+            # nothing had been written: report it in the result AND summary.
+            reason = str(exc) or exc.__class__.__name__
+            await self._bus.publish(
+                EventRecord(
+                    mission_id=mission_id,
+                    type=EventType.INFO,
+                    payload={"error": f"project files not updated: {reason}"},
+                )
+            )
+            return "", reason
+        if not changed:
+            return "", ""
+        await self._bus.publish(
+            EventRecord(
+                mission_id=mission_id,
+                type=EventType.INFO,
+                payload={"note": f"project {project.id} files updated ({len(changed)} paths)"},
+            )
+        )
+        return f"Project files updated: {', '.join(changed)}", ""
 
     async def _run_steps(self, mission: Mission) -> None:
         steps = list(_plan_steps(mission))
@@ -580,6 +715,7 @@ class MissionRunner:
         *,
         ask_before_pr: bool = False,
         reason: str = "",
+        gate_category: str = "",
     ) -> tuple[bool | None, str | None]:
         """The plan's fixed final human decisions (ship / open_pr), shared by
         the mechanical runner and the orchestrator (ADR 0007: the model never
@@ -655,7 +791,16 @@ class MissionRunner:
                 verdict = mechanical_verdict(last_audit_artifact)
                 question = f"Open a pull request for this change? audit verdict: {verdict}"
                 if reason:
-                    question += f". Orchestrator asked for review: {reason}"
+                    # the strict gate (issue #36): the category leads, then why
+                    label = gate_category or "unspecified"
+                    question += f". Gate category: {label} — {reason}"
+                elif setting == "always":
+                    # forced by the project setting, no category to show: say so
+                    # instead of printing an empty one
+                    question += (
+                        ". Forced by project setting pr_gate=always; "
+                        "the orchestrator named no category"
+                    )
                 gate = await self._gates.request(
                     mission.id, kind=GateKind.OPEN_PR, question=question
                 )
@@ -908,6 +1053,27 @@ class MissionRunner:
             status = MissionStatus.FAILED
         else:
             status = MissionStatus.DONE
+        # Upload transport only, and ONLY for a mission that ends DONE: a
+        # repo-less project's work lives in its files area, so what the mission
+        # produced is copied back there and named in the report. A cancelled,
+        # failed or ship-rejected mission saves nothing — its worktrees are
+        # half-finished and the area must not change. Git projects deliver a
+        # pushed branch instead.
+        if status == MissionStatus.DONE:
+            files_note, files_error = await self._save_project_files(mission_id, runs)
+            lines: list[str] = []
+            if files_note:
+                result["project_files"] = files_note
+                lines.append(files_note)
+            if files_error:
+                # visible in the mission's own result and in the summary the
+                # owner reads: a failed save-back must never be a silent one
+                result["project_files_error"] = files_error
+                lines.append(f"Project files NOT updated: {files_error}")
+            if lines:
+                extra = "\n\n".join(lines)
+                summary = f"{summary.rstrip()}\n\n{extra}" if summary.strip() else extra
+                result["summary"] = summary
         await self._store.update_mission(mission_id, status=status, result=result)
         log.info("mission %s: %s", mission_id, status.value)
         event = EventType.MISSION_DONE if status == MissionStatus.DONE else EventType.MISSION_FAILED
@@ -935,16 +1101,45 @@ class MissionRunner:
             return {**gate.decision, "approved": approved}
         return approved
 
+    def _waiting(self) -> AbstractAsyncContextManager[None]:
+        """Hold no daemon mission slot while this mission only waits.
+
+        docs/ops.md#rewvis: a mission parked at a gate, waiting for the owner or
+        on hold must not occupy a REWORK_CONCURRENCY slot, or an approved gate
+        waits behind a mission that is doing nothing at all. The slot comes back
+        at the back of the queue before work resumes (MissionSlot.while_waiting).
+        """
+        if self._slot is None:
+            return nullcontext()
+        return self._slot.while_waiting()
+
     async def _gate_decision(self, mission_id: str, gate_id: str) -> bool:
         """Read the decision from the gate ROW (the source of truth). The
         row-update and its event commit separately, so the event log can lag
         the empty-open-gates check by a beat; polling the row closes that race
         (found as a rare CI-only 'ship rejected despite approval')."""
-        while True:
-            gate = await self._store.get_gate(gate_id)
-            if gate is not None and gate.status != GateStatus.OPEN:
-                return gate.status == GateStatus.APPROVED
-            await asyncio.sleep(self._poll)
+        async with self._waiting():
+            while True:
+                gate = await self._store.get_gate(gate_id)
+                if gate is not None and gate.status != GateStatus.OPEN:
+                    decided = gate.status == GateStatus.APPROVED
+                    break
+                await asyncio.sleep(self._poll)
+            # The decision is in: nothing waits for the owner any more. Say so on
+            # the ROW now, before the mission waits for its slot back, or the TUI
+            # keeps listing it under "needs you" with an empty Gates tab.
+            await self._clear_awaiting_gate(mission_id)
+        return decided
+
+    async def _clear_awaiting_gate(self, mission_id: str) -> None:
+        """AWAITING_GATE -> RUNNING once no gate of the mission is open. A
+        mission the owner paused or cancelled meanwhile is left alone."""
+        mission = await self._store.get_mission(mission_id)
+        if mission is None or mission.status != MissionStatus.AWAITING_GATE:
+            return
+        if await self._store.list_open_gates(mission_id):
+            return
+        await self._store.update_mission(mission_id, status=MissionStatus.RUNNING)
 
     async def _dispatch_step(self, mission: Mission, step: dict[str, Any]) -> list[Run]:
         role = str(step["role"])
@@ -1081,22 +1276,23 @@ class MissionRunner:
                 payload={"note": "mission paused by owner; roles stopped, state kept"},
             )
         )
-        while True:
-            mission = await self._store.get_mission(self.mission_id)
-            if mission is None:
-                return "cancelled"
-            if mission.status == MissionStatus.CANCELLED:
-                return "cancelled"
-            if mission.status != MissionStatus.ON_HOLD:
-                await self._bus.publish(
-                    EventRecord(
-                        mission_id=self.mission_id,
-                        type=EventType.INFO,
-                        payload={"note": "mission resumed by owner"},
+        async with self._waiting():
+            while True:
+                mission = await self._store.get_mission(self.mission_id)
+                if mission is None:
+                    return "cancelled"
+                if mission.status == MissionStatus.CANCELLED:
+                    return "cancelled"
+                if mission.status != MissionStatus.ON_HOLD:
+                    await self._bus.publish(
+                        EventRecord(
+                            mission_id=self.mission_id,
+                            type=EventType.INFO,
+                            payload={"note": "mission resumed by owner"},
+                        )
                     )
-                )
-                return "ok"
-            await asyncio.sleep(max(self._poll, 0.2))
+                    return "ok"
+                await asyncio.sleep(max(self._poll, 0.2))
 
     async def _pump_until_terminal(self, runs: list[Run]) -> str:
         """Pump until every run is terminal. Returns "cancelled" when the burn
@@ -1171,10 +1367,11 @@ class MissionRunner:
                 },
             )
         )
-        while True:
-            if not await self._store.list_open_gates(self.mission_id):
-                break
-            await asyncio.sleep(self._poll)
+        async with self._waiting():
+            while True:
+                if not await self._store.list_open_gates(self.mission_id):
+                    break
+                await asyncio.sleep(self._poll)
         decision = await self._gate_decision(self.mission_id, gate.id)
         if not decision:
             await self._store.update_mission(

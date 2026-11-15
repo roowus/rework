@@ -17,8 +17,14 @@ import os
 from collections.abc import Callable
 from pathlib import Path
 
-# the one sentence both processes use, so the hint and the log line agree
+# the one sentence both processes use, so the hint and the log line agree.
+# The daemon cannot reload itself (a running mission must not be dropped for a
+# deploy, finding 28), so it still asks for a restart...
 CODE_CHANGED = "rework updated: restart to load"
+
+# ...while the TUI now restarts ITSELF as soon as its owner is idle (finding
+# 15), so its note says so instead of asking for something it does itself
+CODE_CHANGED_IDLE = "rework updated: will reload when idle"
 
 # a scan must never walk into these: version-control and tool caches are not code
 SKIP_DIRS = frozenset(
@@ -82,6 +88,13 @@ def _git_head(start: Path) -> str | None:
             return None
         directory = directory.parent
     return None
+
+
+def short_commit(start: Path | None = None, length: int = 8) -> str:
+    """The short sha of the code on disk, or "" when there is none (a pip
+    install with no git tree). Read from the git dir, no subprocess."""
+    sha = _git_head(start or Path(__file__).resolve().parent)
+    return sha[:length] if sha else ""
 
 
 def find_repo_root(start: Path | None = None) -> Path | None:

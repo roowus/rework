@@ -2,6 +2,9 @@
 
 ## Status
 
+Status: Accepted — amended 2026-11 (persistent project files for repo-less
+projects; see Amendment).
+
 Accepted and landed (2026-11-04, M4.5, commits `b310c9d`..`db171ac`): the
 projects table (both stores, conformance-tested), the daemon workspace API
 (POST /workspaces, GET /workspaces/results/<mission>, healthz; localhost by
@@ -122,3 +125,53 @@ folders, datasets: things that are not repos).
 - **Git for everything** (turn every project folder into a repo): rejected.
   Documents and datasets do not want commits, and the owner explicitly does
   not want workflow files forced through git.
+
+## Amendment: persistent project files (2026-11)
+
+Repo-less projects now work as this ADR intended. The gap was that the upload
+transport was one-shot *and stateless*: `--repo-dir` packed a folder once, so
+a second mission on the same project started from nothing, and a mission's
+output could only be downloaded per mission (`rework fetch`). A project with
+no repos had nowhere to keep its working files between missions.
+
+Each repo-less project now owns a **files area** on the daemon host at
+`~/.rework/projects/<project-id>/files` (`REWORK_PROJECTS_DIR` overrides the
+root). It is git-initialised on first use — a local version store, so every
+change is an auditable commit — and it has **no remote and is never pushed
+anywhere**. It is not a repository anyone clones; it is the project's own
+working set, on the machine that runs the missions.
+
+Sync stays one-shot and explicit, per decision 3, and is explicitly **not**
+the continuous bidirectional sync this ADR rejected under Alternatives:
+
+- **seed at mission start**: the files area is copied into the mission's
+  workspace before the first role runs (no repo required, `repo_path` becomes
+  the seeded workspace);
+- **save at mission end**: the mission's new and changed files are copied back
+  into the files area, committed there, and named in the mission report
+  (`Project files updated: a.md (new), b.md (changed)`); deletions are not
+  carried back — the save-back is additive by design;
+- **save-back is conditioned on DONE, and its failure is visible**: a
+  cancelled or ship-rejected mission leaves the area untouched, and a failed
+  save-back still ends the mission DONE but reports `Project files NOT
+  updated: <reason>`; two missions of one project must not run concurrently
+  against the same area — the per-operation lock serialises them, so the later
+  mission simply seeds from whatever state the earlier one has reached;
+- **`rework project add-files NAME PATHS...`** puts files from any machine
+  into the area (TUI: the sidebar's "Add files" button or File → "Add project
+  files…");
+- **`rework project pull NAME DEST`** takes the area back to any machine.
+  A mission's own result still comes back with `rework fetch`.
+
+Transport and results are **derived from `repos`**, not taken on trust: a
+project with at least one repo reference is `git`/`push_branch`, and a project
+with none is `upload`/`fetch` with no way to be configured otherwise
+(`derive_transport`/`project_is_upload`, `rework project create` rejects
+`--transport git` without a repo). A repo-less project therefore cannot be
+left needing an origin it does not have.
+
+Decision 3's `upload` transport is unchanged and still available per mission
+(`rework new --repo-dir`). The original scoping rule still holds, and this
+amendment does not move it: **code travels through git only.** The files area
+is for documents and working files; a project that carries code has repos and
+travels by `git`/`push_branch`.

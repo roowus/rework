@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -76,6 +77,31 @@ def default_reports_dir() -> Path:
     ).expanduser()
 
 
+def projects_dir() -> Path:
+    """Where per-project files areas live (upload transport, ADR 0005). This is
+    daemon-side internal state, so it sits under the same state root as the
+    database rather than in the visible deliverables directory."""
+    override = os.environ.get("REWORK_PROJECTS_DIR")
+    if override:
+        return Path(override).expanduser()
+    return DEFAULT_STATE_DIR / "projects"
+
+
+_UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def project_files_dir(project_id: str) -> Path:
+    """A repo-less project's persistent files area: <projects_dir>/<id>/files.
+
+    The id is a path segment, so it is sanitised: a dot is not a legal id
+    character in practice (`new_id` mints `p-<hex>`), but anything that could
+    read as a traversal (".", "..", separators) must never escape the area."""
+    safe = _UNSAFE_ID_CHARS.sub("_", project_id)
+    if not safe.strip("_"):
+        raise ValueError(f"unusable project id for a files area: {project_id!r}")
+    return projects_dir() / safe / "files"
+
+
 def _default_db() -> str:
     return str(DEFAULT_STATE_DIR / "state.sqlite3")
 
@@ -86,6 +112,10 @@ class Config:
     checkpoints_db: str  # sqlite path for role checkpoints (postgres shares db in M4)
     poll_interval_s: float = 0.5
     concurrency: int = 1  # sqlite deployments stay at 1 (docs/design.md)
+    # daemon-wide cap on concurrently RUNNING role runs, across all missions
+    # (REWORK_MAX_ROLES; 0/unset = os.cpu_count(), min 1). Runs beyond the cap
+    # are queued, not dropped: see orchestrator/limits.py
+    max_roles: int = 0
     git_author_name: str = "rework"  # agent commit identity; per-deployment via env
     git_author_email: str = "rework@rework.local"
 
@@ -107,7 +137,8 @@ class Config:
             return cls(
                 db=db,
                 checkpoints_db=db,
-                concurrency=int(os.environ.get("REWORK_CONCURRENCY", "4")),
+                concurrency=_concurrency(),
+                max_roles=_max_roles(),
                 git_author_name=author_name,
                 git_author_email=author_email,
             )
@@ -118,10 +149,45 @@ class Config:
         return cls(
             db=db,
             checkpoints_db=checkpoints,
-            concurrency=int(os.environ.get("REWORK_CONCURRENCY", "1")),
+            concurrency=_concurrency(sqlite_default=1),
+            max_roles=_max_roles(),
             git_author_name=author_name,
             git_author_email=author_email,
         )
+
+
+def _concurrency(sqlite_default: int | None = None) -> int:
+    """REWORK_CONCURRENCY, else a host-aware default: min(cpu_count, 4), min 1.
+    A sqlite deployment keeps its historical 1 unless the env says otherwise."""
+    from rework.nodes import hostlimits
+
+    raw = os.environ.get("REWORK_CONCURRENCY")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    if sqlite_default is not None:
+        return sqlite_default
+    return hostlimits.default_concurrency()
+
+
+def max_roles(config: Config) -> int:
+    """The daemon-wide role cap for this config (REWORK_MAX_ROLES, else CPUs)."""
+    return config.max_roles if config.max_roles > 0 else _max_roles()
+
+
+def _max_roles() -> int:
+    """REWORK_MAX_ROLES, else one role per CPU (min 1)."""
+    from rework.nodes import hostlimits
+
+    raw = os.environ.get("REWORK_MAX_ROLES")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return hostlimits.default_max_roles()
 
 
 def _prepare_sqlite_dir(db: str) -> str:

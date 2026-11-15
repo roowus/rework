@@ -3486,3 +3486,223 @@ async def test_dashboard_escape_dismisses_an_in_flight_ai_search(
         assert dash.ai_note == ""
         assert app.is_running, "esc did not arm quit"
         assert not app.swallowed
+
+
+# -- repo-less (upload) projects -------------------------------------------------
+
+
+async def test_create_project_derives_transport_from_its_repos(env: Path) -> None:
+    """The TUI must never write a settings dict that contradicts itself: no
+    repo means upload/fetch, a repo means git/push_branch."""
+    from rework.tui.data import TuiData
+
+    data = TuiData()
+    try:
+        plain = await data.create_project("p")
+        assert plain.settings["transport"] == "upload"
+        assert plain.settings["results"] == "fetch"
+        assert plain.settings["repos"] == []
+        with_repo = await data.create_project(
+            "p2", [{"name": "r", "kind": "github", "url": "https://github.com/a/b"}]
+        )
+        assert with_repo.settings["transport"] == "git"
+        assert with_repo.settings["results"] == "push_branch"
+    finally:
+        await data.aclose()
+
+
+async def _launch_fix_proposal(
+    app: ReworkApp, pilot: Any, ids: dict[str, str], env: Path, **proposal: Any
+) -> list[Any]:
+    """Type one message, click the proposal's Launch, return the NEW missions."""
+    from rework.tui.widgets.cards import ProposalCard
+
+    store = await _store(env)
+    try:
+        before = {m.id for m in await store.list_missions(limit=100)}
+    finally:
+        await store.aclose()
+    text = proposal.pop("say")
+    for ch in text:
+        await pilot.press(ch if ch != " " else "space")
+    await pilot.press("enter")
+    await _settle(pilot, 1.0)
+    cards = list(app.query(ProposalCard))
+    assert cards, "the proposal must render as a card"
+    await pilot.click(_btn(app, cards[-1], "launch"))
+    await _settle(pilot, 1.0)
+    store = await _store(env)
+    try:
+        return [m for m in await store.list_missions(limit=100) if m.id not in before]
+    finally:
+        await store.aclose()
+
+
+async def test_fix_on_a_repo_less_project_launches_without_a_repo(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fix mission on an upload project supplies its files from the project's
+    files area, so no repo is required and none is invented."""
+    script_provider(
+        monkeypatch,
+        [propose(objective="tidy the notes", plan="fix", project="rework")],
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        new = await _launch_fix_proposal(app, pilot, ids, env, say="tidy the notes")
+        assert not app.swallowed
+    assert len(new) == 1, new
+    mission = new[0]
+    assert mission.project_id == ids["upload_project"]
+    assert not mission.repo_origin and not mission.repo_path, "an upload project names no repo"
+
+
+async def test_a_repo_named_on_an_upload_project_is_dropped(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The project's transport decides: a model that names a repo out of habit
+    must not turn an upload-project mission into a clone of something else."""
+    script_provider(
+        monkeypatch,
+        [
+            propose(
+                objective="tidy the notes",
+                plan="fix",
+                project="rework",
+                repo="https://github.com/x/elsewhere",
+            )
+        ],
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        new = await _launch_fix_proposal(app, pilot, ids, env, say="tidy the notes")
+        assert not app.swallowed
+    assert len(new) == 1, new
+    assert new[0].project_id == ids["upload_project"]
+    assert not new[0].repo_origin and not new[0].repo_path, "the files area supplies the files"
+
+
+async def test_fix_on_a_git_project_still_passes_its_repo_through(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script_provider(
+        monkeypatch,
+        [
+            propose(
+                objective="fix the flaky test",
+                plan="fix",
+                project="polystats",
+                repo="https://github.com/x/polystats",
+            )
+        ],
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        new = await _launch_fix_proposal(app, pilot, ids, env, say="fix the flaky test")
+        assert not app.swallowed
+    assert len(new) == 1, new
+    assert new[0].project_id == ids["project"]
+    assert new[0].repo_origin == "https://github.com/x/polystats"
+
+
+async def test_add_files_pushes_parsed_paths_into_an_upload_project(
+    ids: dict[str, str], env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rework.tui.data import TuiData
+    from rework.tui.widgets.modals import Form
+
+    seen: list[tuple[str, list[str]]] = []
+
+    async def fake(self: Any, project_id: str, paths: list[str]) -> list[str]:
+        seen.append((project_id, paths))
+        return ["notes.md (new)"]
+
+    monkeypatch.setattr(TuiData, "add_project_files", fake)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.action_tab("dashboard")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        dash.project = ids["upload_project"]
+        await pilot.click(_btn(app, dash, "add-files"))
+        await _settle(pilot)
+        form = app.screen
+        assert isinstance(form, Form)
+        form.query_one("#f-paths").text = "~/notes.md\na.md"
+        await pilot.click(_btn(app, form, "submit"))
+        await _settle(pilot, 1.0)
+        assert not app.swallowed
+    assert seen == [(ids["upload_project"], [str(tmp_path / "notes.md"), "a.md"])], seen
+    assert any("1 path(s) added" in text for _, text in app.notifications_sent)
+
+
+async def test_add_files_accepts_a_path_with_a_space(
+    ids: dict[str, str], env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The form split its whole input on spaces, so `My Papers` could not be
+    entered at all: one path per line must survive the spaces."""
+    from rework.tui.data import TuiData
+    from rework.tui.widgets.modals import Form
+
+    seen: list[tuple[str, list[str]]] = []
+    spaced = tmp_path / "My Papers"
+    spaced.mkdir()
+    (spaced / "notes.md").write_text("# n\n")
+
+    async def fake(self: Any, project_id: str, paths: list[str]) -> list[str]:
+        seen.append((project_id, paths))
+        return ["notes.md (new)"]
+
+    monkeypatch.setattr(TuiData, "add_project_files", fake)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.action_tab("dashboard")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        dash.project = ids["upload_project"]
+        await pilot.click(_btn(app, dash, "add-files"))
+        await _settle(pilot)
+        form = app.screen
+        assert isinstance(form, Form)
+        label = str(form.query(".form-label").first().render())
+        assert "one path per line" in label, label
+        form.query_one("#f-paths").text = f"{spaced}\nnotes.md"
+        await pilot.click(_btn(app, form, "submit"))
+        await _settle(pilot, 1.0)
+        assert not app.swallowed
+    assert seen == [(ids["upload_project"], [str(spaced), "notes.md"])], seen
+
+
+async def test_add_files_refuses_a_git_project(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rework.tui.data import TuiData
+    from rework.tui.widgets.modals import Form
+
+    async def fake(self: Any, project_id: str, paths: list[str]) -> list[str]:  # pragma: no cover
+        raise AssertionError("a git project must never reach the files area")
+
+    monkeypatch.setattr(TuiData, "add_project_files", fake)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.view("dashboard").project = ids["project"]  # polystats: git transport
+        # the File menu is the other way in; it lands on the same handler
+        title = next(t for t in app.query(".menu-title") if "File" in str(t.render()))
+        await pilot.click(title)
+        await pilot.pause()
+        entry = next(
+            e for e in app.screen.query(".menu-item") if "Add project files" in str(e.render())
+        )
+        await pilot.click(entry)
+        await _settle(pilot, 0.6)
+        assert not isinstance(app.screen, Form), "no form for a git project"
+        assert not app.swallowed
+    assert any("push a branch instead" in text for _, text in app.notifications_sent)
