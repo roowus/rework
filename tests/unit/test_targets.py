@@ -186,13 +186,14 @@ def test_parse_target_flag_forms() -> None:
     )
 
 
-
 def test_parse_target_flag_keeps_help() -> None:
     """A lone leading flag must survive the scan, so main() does not see "bare rework".
 
     Regression: an empty rest means "open the TUI", so dropping `--help` / `-h`
     here made `rework --help` start the dashboard instead of printing help.
     """
+    from rework.cli import parse_target_flag
+
     assert parse_target_flag(["--help"]) == (None, ["--help"])
     assert parse_target_flag(["-h"]) == (None, ["-h"])
     assert parse_target_flag(["--version"]) == (None, ["--version"])
