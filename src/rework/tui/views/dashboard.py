@@ -99,6 +99,28 @@ def section_for(mission: Any, snap: Snapshot) -> str:
     return "recent"  # done / failed / cancelled (an unknown status stays visible)
 
 
+#: The status whose glyph a section paints when the stored label would paint
+#: another one: a stale `awaiting_gate` (its gate is already decided) is listed
+#: under "running" and must look running, or an amber diamond under a faint
+#: "running" header re-creates the confusion section_for just removed.
+SECTION_GLYPH = {"running": "running", "queued": "pending"}
+
+
+def row_glyph(mission: Any, section: str) -> str:
+    """The overview row's leading icon: the SECTION's glyph, not the raw status.
+
+    `awaiting_gate` is amber (a human is needed) in theme.STATUS, and it stays
+    that way everywhere else: the drill-down header still prints the stored
+    status as diagnostic detail, and the ◆ question note below the row still
+    marks the open gate. What must not happen is an amber diamond on a row filed
+    under "running"/"queued"/"paused"/"recent", because then `$warn` ("a human is
+    needed", DESIGN.md §1) would paint for a mission that needs nobody."""
+    st = status_value(mission.status)
+    if section == "needs you":
+        return glyph(st)  # the row note below carries the ◆ question too
+    return glyph(SECTION_GLYPH.get(section, st))
+
+
 MTABS = [
     ("Trajectory", "traj"),
     ("Graph", "graph"),
@@ -376,8 +398,11 @@ class DashboardView(View):
             return
         self.query_one("#st-running", Stat).set(str(by_section["running"]))
         self.query_one("#st-queued", Stat).set(str(by_section["queued"]))
-        # open gates == the decisions in the Gates tab, and exactly the missions
-        # filed under "needs you"
+        # this counts OPEN GATES, deliberately: it is the same number as the
+        # Gates tab badge (app.py's `TabBar.set_badge("gates", len(snap.gates))`),
+        # and two open gates on one mission really are two decisions waiting.
+        # The "needs you" section HEADER counts missions instead, so a mission
+        # with two open gates shows 2 here and 1 there: gates vs missions.
         self.query_one("#st-gates", Stat).set(str(len(snap.gates)))
         self.query_one("#st-paused", Stat).set(str(by_section["paused"]))
         self.query_one("#st-done", Stat).set(str(done_week))
@@ -416,7 +441,7 @@ class DashboardView(View):
                 )
             )
             for m in group:
-                mrows.append(RowData(m.id, self._mission_row(m)))
+                mrows.append(RowData(m.id, self._mission_row(m, title)))
         mlist = self.query_one("#mission-list", RowList)
         if self.ai_results is not None:
             mrows = self._ai_rows()
@@ -439,7 +464,7 @@ class DashboardView(View):
         label = f"[{MUTED}]{esc(name)}[/]" if dim else esc(name)
         return f"{label}  [{FAINT}]{len(missions)}[/]  " + " ".join(badges)
 
-    def _mission_row(self, m: Any) -> str:
+    def _mission_row(self, m: Any, section: str) -> str:
         st = status_value(m.status)
         bits = []
         if self.project == ALL and m.project_id:
@@ -457,7 +482,7 @@ class DashboardView(View):
         if gates:  # same predicate as "needs you": show what needs deciding
             gate_note = f"\n  [{WARN}]◆ {esc(clip(gates[0].question, 90))}[/]"
         return (
-            f"{glyph(st)} [b]{esc(clip(m.objective, 100))}[/b]\n"
+            f"{row_glyph(m, section)} [b]{esc(clip(m.objective, 100))}[/b]\n"
             f"  [{FAINT}]{esc('  ·  '.join(bits))}[/]{gate_note}"
         )
 

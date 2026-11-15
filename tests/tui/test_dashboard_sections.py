@@ -20,7 +20,8 @@ from textual.app import App, ComposeResult
 
 from rework.kernel.state.records import Gate, GateKind, GateStatus, Mission, MissionStatus
 from rework.tui.hub import Snapshot
-from rework.tui.views.dashboard import DashboardView, section_for
+from rework.tui.theme import ACCENT, WARN
+from rework.tui.views.dashboard import DashboardView, row_glyph, section_for
 from rework.tui.widgets.base import HEADER, RowList, Stat
 
 
@@ -223,6 +224,36 @@ async def test_project_badge_ignores_the_stale_awaiting_gate_label() -> None:
         assert "◆" not in text, f"no open gate, so no needs-you chip: {text!r}"
         assert "● 1" in text, f"it is running, not waiting for the owner: {text!r}"
         assert _headers(view.query_one("#mission-list", RowList)) == {"running": 1}
+
+
+async def test_a_stale_awaiting_gate_row_under_running_paints_no_amber_diamond() -> None:
+    """Audit finding: section_for files a stale `awaiting_gate` (its gate is
+    already decided) under "running", but the row glyph came from the raw stored
+    status, so the row sat under a faint "running" header painting the amber
+    ◆. `$warn` means a human is needed and nothing else is amber (DESIGN §1),
+    so the leading icon now comes from the section. The raw status stays visible
+    in the drill-down header."""
+    view, snap = _overview()
+    app = DashApp(view)
+    async with app.run_test() as pilot:
+        view.snap = snap
+        view._paint_overview()
+        await pilot.pause()
+
+        # the ROW's markup carries the colour (`render()` strips it), so read
+        # the markup the Row was built from, one entry per mission row
+        rows = {r.key: r for r in view.query("#mission-list Row")}
+        first_line = rows[IDS["stale"]]._markup.split("\n")[0]
+        assert f"[{ACCENT}]●[/]" in first_line, f"it looks running: {first_line!r}"
+        assert f"[{WARN}]◆[/]" not in first_line, (
+            f"a mission filed under running must not paint the needs-you diamond: {first_line!r}"
+        )
+        # ... while a mission that really needs you still does
+        assert f"[{WARN}]◆[/]" in rows[IDS["needs"]]._markup.split("\n")[0]
+        # and the rule itself, section by section
+        stale = snap.mission(IDS["stale"])
+        assert row_glyph(stale, "running") == f"[{ACCENT}]●[/]"
+        assert row_glyph(stale, "needs you") == f"[{WARN}]◆[/]"
 
 
 async def test_the_active_tab_keeps_every_live_section_and_search_still_filters() -> None:
