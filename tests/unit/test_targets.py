@@ -186,6 +186,24 @@ def test_parse_target_flag_forms() -> None:
     )
 
 
+def test_subcommand_ignores_everything_after_the_end_of_options_marker() -> None:
+    """The subcommand is the first non-flag token, but never one after `--`.
+
+    `rework -- serve` hands `serve` to click as a POSITIONAL, not as a
+    subcommand, so main() must not treat it as one: base read `--` at rest[0]
+    and took the CLI logging path, and stopping at the marker in _subcommand()
+    keeps that shape.
+    """
+    from rework.cli import _subcommand
+
+    assert _subcommand([]) == ""
+    assert _subcommand(["--help"]) == ""
+    assert _subcommand(["-h"]) == ""
+    assert _subcommand(["--", "serve"]) == ""
+    assert _subcommand(["--help", "serve"]) == "serve"
+    assert _subcommand(["update", "--target", "rewvis"]) == "update"
+
+
 def test_parse_target_flag_keeps_help() -> None:
     """A lone leading flag must survive the scan, so main() does not see "bare rework".
 

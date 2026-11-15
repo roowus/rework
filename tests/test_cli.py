@@ -1393,8 +1393,10 @@ def test_main_update_target_stays_exempt_from_the_guard(
     command itself runs and reports the unknown target (exit 1), never the
     "needs a name" usage error (exit 2).
     """
+    import rework.tui as tui
     from rework.cli import main
 
+    monkeypatch.setattr(tui, "run_tui", _tui_must_not_start)
     monkeypatch.setattr(sys, "argv", ["rework", "update", "--target", "rewvis"])
 
     with pytest.raises(SystemExit) as excinfo:

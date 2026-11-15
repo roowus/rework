@@ -1560,8 +1560,19 @@ def parse_target_flag(argv: list[str]) -> tuple[str | None, list[str]]:
 
 def _subcommand(rest: list[str]) -> str:
     """The first NON-FLAG token of rest: the subcommand itself, or "" when rest
-    is flags only. Leading flags are kept in rest, so rest[0] can be `--help`."""
-    return next((arg for arg in rest if not arg.startswith("-")), "")
+    is flags only. Leading flags are kept in rest, so rest[0] can be `--help`.
+
+    Stops at the `--` end-of-options marker and yields "": every token after
+    `--` is a positional, so none of them can claim to be the subcommand. That
+    is what click resolves (`rework -- serve` runs no `serve` command), so the
+    helper mirrors click instead of reading `serve` out of the operands.
+    """
+    for arg in rest:
+        if arg == "--":
+            return ""
+        if not arg.startswith("-"):
+            return arg
+    return ""
 
 
 def _subcommand_names() -> set[str]:
