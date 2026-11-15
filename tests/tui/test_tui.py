@@ -10,8 +10,9 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import pytest
 from textual.widgets import Input
@@ -85,24 +86,40 @@ async def _wait_for(pilot: Any, condition: Callable[[], bool], *, tries: int = 2
 
 
 async def _diag(app: Any) -> str:
-    """What is on screen and what the store holds, for a failing count."""
+    """What is on screen, in the engine and in the store, for a failing count.
+
+    `engine proposals` is the discriminator: TWO cards with ONE pending engine
+    proposal is a render bug, TWO with TWO means the turn really did propose
+    twice. `rows` carries the chat_messages ids so a duplicate card can be
+    traced to the row it was painted from."""
+    from rework.kernel.state.sqlite import open_sqlite
     from rework.tui.widgets.cards import ProposalCard
 
     work = app.view("work")
     chat_id = getattr(getattr(work, "convo", None), "id", None)
     if not chat_id:
         return "no chat open"
-    objectives = [c.proposal.objective for c in app.query(ProposalCard)]
-    from rework.kernel.state.sqlite import open_sqlite
-
+    cards = [c.proposal.objective for c in app.query(ProposalCard)]
+    engine = getattr(getattr(work, "convo", None), "engine", None)
+    pending = [p.objective for p in getattr(engine, "proposals", [])]
     # a separate connection: this is a failure path, and the app's own handle
     # may be the thing under test
     store = await open_sqlite(db_path())
     try:
         missions = await store.list_missions(limit=100, chat_id=chat_id)
+        rows = await store.chat_messages(chat_id)
     finally:
         await store.aclose()
-    return f"chat {chat_id}: cards {objectives}, store missions {[m.objective for m in missions]}"
+    marks = (
+        f"cursor {work._chat_cursor} painted {work._rendered_max_id}"
+        f" own {sorted(app.hub.data.own_chat_ids)} sending {work._sending}"
+        f" loading {work._loading_chat}"
+    )
+    return (
+        f"chat {chat_id}: cards {cards}, engine proposals {pending},"
+        f" store missions {[m.objective for m in missions]},"
+        f" rows {[(int(m.id or 0), m.role, m.display) for m in rows]}, {marks}"
+    )
 
 
 def _btn(app: ReworkApp, root: Any, action: str) -> Btn:
@@ -2626,7 +2643,23 @@ async def test_a_store_swap_repaints_the_transcript_without_loss_or_duplication(
             await store.aclose()
 
         await work._tick_chat(chat_id).wait()  # the epoch branch of the tick
-        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 3)
+
+        def repainted() -> bool:
+            """The replay is DONE, not merely started.
+
+            The two cards from the turn are on screen while the epoch replay
+            paints, so `>= 3` is satisfied the instant the foreign proposal
+            lands, mid-repaint (5 cards: the replayed pair painted on top of the
+            pair already there). The repaint has finished only when the count,
+            the epoch and both pointers agree."""
+            return (
+                len(app.query(ProposalCard)) == 3
+                and work._store_epoch == app.hub.data.store_epoch
+                and work._chat_cursor < 10_000
+                and work._rendered_max_id < 10_000
+            )
+
+        await _wait_for(pilot, repainted)
 
         def shown() -> str:
             return "\n".join(str(s.render()) for s in app.query("#chat-log Step"))

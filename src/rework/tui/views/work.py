@@ -356,6 +356,14 @@ class WorkView(View):
         cursor = max((int(m.id or 0) for m in messages), default=0)
         if self._loading_chat != chat_id:
             return
+        if self._sending:
+            # a live turn owns the log right now and paints its own rows. This
+            # replay read the transcript BEFORE those rows were committed, so
+            # painting it now would place the same proposal twice (one live
+            # card from `_send`, one replayed). Drop it: `_rendered_max_id`
+            # still marks what is on screen and the next tick pages in the
+            # rest, so no row is lost.
+            return
         self.convo = convo
         self._chat_cursor = cursor
         # the replay below clears the log and paints exactly these rows, so the
