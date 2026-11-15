@@ -199,8 +199,9 @@ tailnet once pulled 3 MB/s, 17.5 GB in 1h40m, from
   reset by every `on_snapshot`): the dashboard overview rows, the open mission
   (header, runs, tabs), the gates list and the selected gate, the Work mission
   cards and the Work chat list, and the Library list and reader line. Nothing
-  else repaints on a tick. Static timestamps (Cost, artifact wall time) do not
-  move and are not repainted.
+  else repaints on a tick. Absolute values (Cost, and the artifact line, which shows a fixed
+  run duration `wall_s` and no relative time) do not move and are not
+  repainted.
 - *Idle backoff.* The app timer ticks every `poll_seconds` (2 s). A tick polls
   when `now - last_poll >= interval`, less one tenth of `poll_seconds` for
   timer jitter, where `interval` is `poll_interval()`: `poll_seconds` while the
@@ -216,7 +217,8 @@ tailnet once pulled 3 MB/s, 17.5 GB in 1h40m, from
   false, or `_closing` set first thing in `on_unmount`) polls nothing.
 - *Failed full-row fetch.* If `get_mission` fails for an open mission or a
   Work card, the header shows the light facts and "could not load plan/result
-  (retrying)". The retry backs off (2 s, 4 s, ... capped at 30 s, the
+  (retrying)". The same notice is appended to a stale full row when a refetch
+  fails after a successful open (the old plan stays visible, marked stale). The retry backs off (2 s, 4 s, ... capped at 30 s, the
   `Hub._next_try` idiom) so an unreadable row is not re-SELECTed on every
   tick, and recovers on its own when the fetch succeeds.
 

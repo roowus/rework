@@ -1023,6 +1023,9 @@ class DashboardView(View):
             )
         end = time.time() if st in actions.ACTIVE else mission.updated_at
         bits.append(f"started {ago(mission.created_at)} · {duration(end - mission.created_at)}")
+        if self.full_failed:
+            # a refetch failed after this row was fetched: it is stale, say so
+            bits.append("could not load plan/result (retrying)")
         header.update(
             f"[b]{esc(mission.objective)}[/b]\n{status_text(st)}  [{MUTED}]"
             + esc("  ·  ".join(bits))
