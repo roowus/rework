@@ -109,21 +109,24 @@ def new(
         # is create_mission's error to raise, one place)
         template = mechanical
         store = None
-        if template and budget is None:
-            typer.echo("budget: no cap (a template plan runs uncapped unless --budget)", err=True)
-            cap, why = None, ""
-        else:
-            store = await open_store_from_config(Config.from_env())
-            cap, why = await _opening_budget(store, objective, budget)
-            # stderr on purpose: stdout is the bare mission id, so `rework new
-            # ...` in a script keeps printing exactly one machine-readable line
-            typer.echo(f"budget: ${cap:.2f} ({why})", err=True)
-
-        orch_model = None
-        if not mechanical:
-            orch_model = orchestrator or default_orchestrator_model()
-        project_id = await resolve_project(project)
         try:
+            if template and budget is None:
+                typer.echo(
+                    "budget: no cap (a template plan runs uncapped unless --budget)", err=True
+                )
+                cap, why = None, ""
+            else:
+                store = await open_store_from_config(Config.from_env())
+                # a refused cap raises HERE, before any mission row exists
+                cap, why = await _opening_budget(store, objective, budget)
+                # stderr on purpose: stdout is the bare mission id, so `rework
+                # new ...` in a script prints exactly one machine-readable line
+                typer.echo(f"budget: ${cap:.2f} ({why})", err=True)
+
+            orch_model = None
+            if not mechanical:
+                orch_model = orchestrator or default_orchestrator_model()
+            project_id = await resolve_project(project)
             mission = await create_mission(
                 objective,
                 repo=repo,
@@ -138,6 +141,8 @@ def new(
                 store=store,
             )
         finally:
+            # ALWAYS, including the refused-budget path: an open sqlite handle
+            # keeps the process alive after the error is printed
             if store is not None:
                 await store.aclose()
         return mission.id
@@ -159,9 +164,15 @@ async def _opening_budget(store: Any, objective: str, budget: float | None) -> t
     The estimate is calibrated with what finished missions actually cost here
     (`typical_finished_cost`), which only nudges it inside its own band."""
     from rework.budget_policy import typical_finished_cost
+    from rework.missions import BUDGET_ERROR, _cap_usd
 
     if budget is not None:
-        return float(budget), "from --budget"
+        usd = _cap_usd(budget)
+        if usd is None:
+            # refuse BEFORE the mission is created: a NaN/inf/-3 cap persisted
+            # into plan["budget"] is a mission `ledger.py` can never cap
+            raise ValueError(f"--budget {budget:g}: {BUDGET_ERROR}")
+        return usd, "from --budget"
     history: float | None = None
     if (objective or "").strip():
         try:  # a slow/unreadable ledger must not block creating a mission
@@ -171,12 +182,9 @@ async def _opening_budget(store: Any, objective: str, budget: float | None) -> t
     usd, why = estimate_budget(objective, cost_history=history)
     import os as _os
 
-    configured = _os.environ.get("REWORK_BUDGET_USD")
-    if not (objective or "").strip() and configured:
-        try:
-            return float(configured), "REWORK_BUDGET_USD, the deployment default (no task text)"
-        except ValueError:
-            pass  # a broken env var must not block creating the mission
+    configured = _cap_usd(_os.environ.get("REWORK_BUDGET_USD"))
+    if not (objective or "").strip() and configured is not None:
+        return configured, "REWORK_BUDGET_USD, the deployment default (no task text)"
     if history:
         why = f"{why}; nudged by typical finished-mission cost ${history:.2f}"
     return usd, why

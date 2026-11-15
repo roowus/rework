@@ -9,6 +9,7 @@ fix/fix-pr plans are the canned investigate -> code -> audit pipelines.
 from __future__ import annotations
 
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -111,17 +112,41 @@ def derive_title(objective: str) -> str | None:
 
 
 PLAYBOOK_GATES: dict[str, list[str]] = {"echo": [], "fix": ["ship"], "fix-pr": []}
+
+DEFAULT_BUDGET_USD = 2.0  # what a deployment gets when nothing usable is set
 PLAYBOOK_PUBLISH: dict[str, str] = {"echo": "", "fix": "", "fix-pr": "pr"}
+
+
+BUDGET_ERROR = "budget must be a finite number greater than 0"
+
+
+def _cap_usd(value: Any) -> float | None:
+    """A usable cap, or None: NaN / inf / non-numeric / bool / <= 0 are "not a
+    budget the owner said" and must never reach `plan["budget"]`."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None
 
 
 def default_budget() -> tuple[float, float]:
     """(max_usd, ask_every_usd): $2 then ask again every $2 unless the
-    deployment says otherwise (REWORK_BUDGET_USD / REWORK_BUDGET_STEP_USD)."""
+    deployment says otherwise (REWORK_BUDGET_USD / REWORK_BUDGET_STEP_USD).
+
+    An env value that is not a finite, positive number (`inf`, `nan`, `0`,
+    `-3`, a typo) is ignored and the default applies: `orchestrated_plan`
+    stamps this into `original_max_usd` for EVERY caller that omits a budget,
+    and `spent > NaN` is False for ever, i.e. no cap at all."""
     import os
 
-    cap = float(os.environ.get("REWORK_BUDGET_USD", "2"))
-    step = float(os.environ.get("REWORK_BUDGET_STEP_USD", str(cap)))
-    return cap, step
+    cap = _cap_usd(os.environ.get("REWORK_BUDGET_USD"))
+    if cap is None:
+        cap = DEFAULT_BUDGET_USD
+    step = _cap_usd(os.environ.get("REWORK_BUDGET_STEP_USD"))
+    return cap, (cap if step is None else step)
 
 
 def budget_rail(max_usd: float, step_usd: float | None = None) -> dict[str, Any]:
@@ -130,13 +155,24 @@ def budget_rail(max_usd: float, step_usd: float | None = None) -> dict[str, Any]
 
     Shared by every plan that carries a cap: `orchestrated_plan` hands its
     rail to ADR 0007 orchestrator missions and `create_mission` to a template
-    plan that was created WITH a budget, so both read the same keys."""
+    plan that was created WITH a budget, so both read the same keys.
+
+    THIS is the write sink, so it validates: a NaN / inf / `<= 0` cap raises
+    instead of being written. `ledger.py` enforces the cap with `spent >
+    max_usd`, which is False for ever against NaN, so one poisoned cap is a
+    mission that spends with NO cap at all. A bad `step_usd` is forgiving (it
+    falls back to the cap): it only decides when to ask again, not how much
+    may be spent."""
+    cap = _cap_usd(max_usd)
+    if cap is None:
+        raise ValueError(BUDGET_ERROR)
+    step = _cap_usd(step_usd)
     return {
-        "max_usd": float(max_usd),
-        "ask_every_usd": float(max_usd if step_usd is None else step_usd),
+        "max_usd": cap,
+        "ask_every_usd": cap if step is None else step,
         # the raise policy's baseline: automatic raises are capped at
         # original_max_usd * ceiling_factor, so the ceiling cannot creep
-        "original_max_usd": float(max_usd),
+        "original_max_usd": cap,
         "auto_raises": 0,
         "raises": [],
     }
@@ -379,9 +415,16 @@ async def create_mission(
     connection is opened and closed here (CLI behavior).
 
     `model` and `effort` are the mission-level defaults the TUI exposes: they
-    land in the plan, so every step without its own override uses them."""
+    land in the plan, so every step without its own override uses them.
+
+    A `budget_usd` that is not a finite number > 0 (`nan`, `inf`, `-3`, `0`)
+    raises ValueError before ANY row is written: this is the one public way in,
+    so a poisoned cap must not become a mission that can never be capped
+    (`ledger.py` compares `spent_usd > max_usd`, False for ever against NaN)."""
     from rework.config import Config, open_store_from_config
 
+    if budget_usd is not None and _cap_usd(budget_usd) is None:
+        raise ValueError(BUDGET_ERROR)
     mission_id = new_id("m")
     resolved = await resolve_repo(
         repo=repo, repo_dir=repo_dir, project_id=project_id, mission_id=mission_id

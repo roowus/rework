@@ -42,6 +42,17 @@ def rework_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return db
 
 
+def _missions(db: Path) -> list[Mission]:
+    async def go() -> list[Mission]:
+        store = await open_sqlite(str(db))
+        try:
+            return await store.list_missions()
+        finally:
+            await store.aclose()
+
+    return asyncio.run(go())
+
+
 def _seed_mission(db: Path, *, mission_id: str, objective: str, title: str | None = None) -> None:
     async def go() -> None:
         store = await open_sqlite(str(db))
@@ -1274,6 +1285,48 @@ def test_new_is_sized_from_what_finished_missions_really_cost(
     mission = _get_mission(rework_db, result.stdout.strip())
     assert mission is not None
     assert (mission.plan or {})["budget"]["max_usd"] == 4.5
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-3", "0"])
+def test_new_refuses_a_cap_that_could_never_bind(
+    value: str, rework_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--budget nan` used to print `budget: $nan (from --budget)`, create the
+    mission and persist max_usd = nan — and `spent_usd > nan` is False for
+    ever, so the mission spent with NO cap at all. `-3` was already spent
+    through. Now the CLI refuses before anything is written."""
+    monkeypatch.delenv("REWORK_BUDGET_USD", raising=False)
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(app, ["new", "fix the typo", "--repo", url, "--budget", value])
+
+    assert result.exit_code != 0, result.output
+    assert result.exit_code == 2, "a typer.BadParameter is a usage error"
+    assert "finite number greater than 0" in result.output
+    assert "--budget" in result.output, "the message names the option to fix"
+    assert "Traceback" not in result.output
+    assert result.stdout.strip().startswith("m-") is False, "no mission id may be printed"
+    assert _missions(rework_db) == [], "no mission may be created"
+
+
+@pytest.mark.parametrize("value", ["inf", "nan", "-3", "0"])
+def test_new_ignores_a_poisoned_env_default_for_an_empty_objective(
+    value: str, rework_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No task text: REWORK_BUDGET_USD is the fallback, and `inf` there used to
+    be persisted as the cap (and as original_max_usd). An unusable value falls
+    back to the normal default instead."""
+    monkeypatch.setenv("REWORK_BUDGET_USD", value)
+    monkeypatch.delenv("REWORK_BUDGET_STEP_USD", raising=False)
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(app, ["new", "  ", "--repo", url, "--plan", "fix"])
+
+    assert result.exit_code == 0, result.output
+    assert "budget: $2.00 (" in result.stderr
+    mission = _get_mission(rework_db, result.stdout.strip())
+    assert mission is not None
+    budget = (mission.plan or {})["budget"]
+    assert budget["max_usd"] == 2.0
+    assert budget["original_max_usd"] == 2.0
 
 
 def test_template_plan_carries_an_explicit_budget(rework_db: Path) -> None:

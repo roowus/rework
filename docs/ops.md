@@ -573,7 +573,15 @@ to the estimate, so a proposal always carries a budget and a one-line reason.
   created with. An unparseable or `<= 0` value keeps the previous number.
 - `rework new "…" --budget 6` overrides the estimate, and it says which rule
   won on stderr (`budget: $6.00 (from --budget)`). An explicit budget always
-  wins.
+  wins — but it has to BE a budget: `--budget nan|inf|-3|0` is refused before
+  anything is written (`Error: --budget nan: budget must be a finite number
+  greater than 0`) and no mission is created. `plan["budget"]` is validated at
+  the sink (`missions.budget_rail`, `create_mission`), not only at the callers,
+  because the ledger enforces the cap with `spent > max_usd` — False for ever
+  against NaN, i.e. no cap at all. An unparseable `REWORK_BUDGET_USD`
+  (`inf`, `nan`, `0`, `-3`) is likewise ignored and the normal default applies,
+  in `default_budget()` (every orchestrated mission's opening cap) as well as
+  in the CLI fallback.
 - Otherwise the ESTIMATE is the cap. `REWORK_BUDGET_USD` is NOT a blanket
   default any more: it is only the fallback for a mission with no task text to
   size (an empty objective), reported as `budget: $4.00 (REWORK_BUDGET_USD,

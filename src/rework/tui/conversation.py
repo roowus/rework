@@ -44,14 +44,20 @@ def args_text(arguments: Any) -> str:
     return str(arguments or "")
 
 
-def proposal_from_args(args: dict[str, Any]) -> Any:
+def proposal_from_args(args: dict[str, Any], *, cost_history: float | None = None) -> Any:
     """A stored propose_mission call rebuilt as a Proposal: a replayed card must
     show the same budget the live one did, including the estimate fallback for
-    arguments saved before the model could price a mission."""
+    arguments saved before the model could price a mission.
+
+    `cost_history` is what the live path passes (`typical_finished_cost`), and
+    it only matters for an UNPRICED proposal: the estimate's band is nudged by
+    it, so a replay without it would show — and then stamp at launch — a
+    different cap than the live card. A caller that has no store (a pure
+    replay test) may omit it and gets the keyword estimate."""
     from rework.orchestrator.chat import Proposal, proposal_budget
 
     objective = str(args.get("objective", "")).strip()
-    budget_usd, budget_reason = proposal_budget(args, objective)
+    budget_usd, budget_reason = proposal_budget(args, objective, cost_history=cost_history)
     return Proposal(
         objective=objective,
         title=str(args.get("title", "")).strip(),
@@ -68,8 +74,11 @@ def proposal_from_args(args: dict[str, Any]) -> Any:
 LAUNCH_PREFIX = "launched "
 
 
-def items_from_messages(messages: list[Any]) -> list[Item]:
-    """Stored ChatMessages -> renderable items (tool calls included)."""
+def items_from_messages(messages: list[Any], *, cost_history: float | None = None) -> list[Item]:
+    """Stored ChatMessages -> renderable items (tool calls included).
+
+    `cost_history` is forwarded to `proposal_from_args` so a replayed proposal
+    card is priced exactly like the live one (see that function)."""
     items: list[Item] = []
     for msg in messages:
         body = msg.body or {}
@@ -111,7 +120,7 @@ def items_from_messages(messages: list[Any]) -> list[Item]:
                 except (ValueError, TypeError):
                     args = {}
                 if name == "propose_mission":
-                    proposal = proposal_from_args(args)
+                    proposal = proposal_from_args(args, cost_history=cost_history)
                 elif name == "ask":
                     asked = str(args.get("question") or "")
             text = str(body.get("content") or "").strip()
@@ -182,7 +191,19 @@ class Conversation:
         return str(self.chat.id)
 
     async def items(self) -> list[Item]:
-        return items_from_messages(await self.data.chat_messages(self.id))
+        return items_from_messages(
+            await self.data.chat_messages(self.id), cost_history=await self.cost_history()
+        )
+
+    async def cost_history(self) -> float | None:
+        """What finished missions really cost here, for pricing a replayed
+        proposal: the same number the live path uses, so both cards agree."""
+        try:
+            from rework.budget_policy import typical_finished_cost
+
+            return await typical_finished_cost(await self.data.store())
+        except Exception:  # a replay must never die for lack of a ledger
+            return None
 
     async def ensure_engine(self, snap: Snapshot, on_turn: Any) -> Any:
         """(Re)build the OrchestratorChat for the chat's current model/effort.

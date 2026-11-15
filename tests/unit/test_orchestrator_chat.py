@@ -569,3 +569,31 @@ async def test_a_replayed_proposal_card_keeps_its_budget() -> None:
     expected, expected_reason = estimate_budget("fix the typo in the readme")
     assert legacy.budget_usd == expected > 0
     assert legacy.budget_reason == expected_reason
+
+
+async def test_a_replayed_card_is_priced_like_the_live_one(store: Any) -> None:
+    """Parity with the live path: `chat.py` sizes a proposal with
+    `typical_finished_cost(store)`, so a replay that SKIPPED it showed (and then
+    stamped at launch) a different cap for the same stored arguments.
+
+    A dear shop: the $3-5 feature band is nudged to $4.50 live, and the replay
+    from the same stored args must land on exactly that number."""
+    from rework.budget_policy import typical_finished_cost
+    from rework.kernel.state.records import Charge, MissionStatus
+    from rework.kernel.state.records import Mission as M
+    from rework.tui.conversation import proposal_from_args
+
+    for mid, cost in (("m-done1", 2.0), ("m-done2", 4.0)):
+        await store.create_mission(M(id=mid, objective="earlier", status=MissionStatus.DONE))
+        await store.charge(
+            Charge(mission_id=mid, model="m", input_tokens=10, output_tokens=10, cost_usd=cost)
+        )
+    live_history = await typical_finished_cost(store)
+    assert live_history == 3.0
+    args = {"objective": "add a feature to the parser, " * 20, "plan": "fix"}
+    live = proposal_from_args(args, cost_history=live_history)
+    assert live.budget_usd == 4.5
+
+    blind = proposal_from_args(args)  # a caller with no store: keyword estimate only
+    assert blind.budget_usd == 5.0, "without the history the band's ceiling is used"
+    assert live.budget_usd != blind.budget_usd, "the history is what this test is about"

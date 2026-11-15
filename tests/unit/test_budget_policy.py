@@ -24,6 +24,7 @@ from rework.budget_policy import (
     try_auto_raise,
 )
 from rework.kernel.state.records import EventType, GateStatus, Mission
+from rework.missions import budget_rail, create_mission, default_budget
 
 
 @pytest.fixture(autouse=True)
@@ -73,6 +74,17 @@ def test_invalid_values_are_ignored_not_raised(
     monkeypatch.setenv("REWORK_BUDGET_AUTO_RAISES", "4")
     monkeypatch.setenv("REWORK_BUDGET_CEILING_FACTOR", "2.5")
     assert budget_policy(settings) == (4, 2.5)
+
+
+@pytest.mark.parametrize("factor", ["inf", float("inf"), "-inf", "nan", 0, -2, "lots"])
+def test_a_non_finite_ceiling_factor_is_ignored(
+    factor: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`inf` (or NaN) as the ceiling factor makes `cap > original * factor`
+    never true, i.e. the auto-raise ceiling bounds nothing: fall back."""
+    monkeypatch.setenv("REWORK_BUDGET_CEILING_FACTOR", str(factor))
+    assert budget_policy(None) == (DEFAULT_MAX_AUTO_RAISES, DEFAULT_CEILING_FACTOR)
+    assert budget_policy({"budget_ceiling_factor": factor})[1] == DEFAULT_CEILING_FACTOR
 
 
 def test_zero_auto_raises_is_valid_and_disables(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -242,3 +254,63 @@ async def test_record_raise_keeps_manual_raises_in_the_summary(store: Any) -> No
     assert raises_summary(plan) == (
         "Earlier raises: $2.00 -> $6.00: owner said yes. Original budget $2.00."
     )
+
+
+# -- the write sink: no cap that can never bind -----------------------------
+
+
+@pytest.mark.parametrize("cap", [float("nan"), float("inf"), -3.0, 0.0, -0.0, "nan", "0"])
+def test_budget_rail_rejects_a_cap_that_could_never_bind(cap: Any) -> None:
+    """`ledger.py` enforces the cap with `spent > max_usd`, which is False for
+    ever against NaN (and can never be reached against inf, and is already
+    exceeded against -3): `budget_rail` is the write sink, so it refuses."""
+    with pytest.raises(ValueError, match="finite number greater than 0"):
+        budget_rail(cap)
+
+
+def test_budget_rail_is_forgiving_about_the_ask_again_step() -> None:
+    """A broken step only decides when to ASK again, not how much may be
+    spent, so it falls back to the cap instead of failing the mission."""
+    for step in (float("nan"), float("inf"), -1.0, 0.0):
+        rail = budget_rail(2.0, step)
+        assert rail["max_usd"] == 2.0
+        assert rail["ask_every_usd"] == 2.0
+        assert rail["original_max_usd"] == 2.0
+    assert budget_rail(2.0, 1.0)["ask_every_usd"] == 1.0
+
+
+@pytest.mark.parametrize("env", ["inf", "nan", "-3", "0", "lots"])
+def test_default_budget_ignores_a_non_finite_or_non_positive_env(
+    env: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`orchestrated_plan` stamps default_budget() into `original_max_usd` for
+    every caller that omits a budget (the evals harness does), so a poisoned
+    env var must not reach it."""
+    monkeypatch.setenv("REWORK_BUDGET_USD", env)
+    monkeypatch.delenv("REWORK_BUDGET_STEP_USD", raising=False)
+    cap, step = default_budget()
+    assert (cap, step) == (2.0, 2.0)
+    monkeypatch.setenv("REWORK_BUDGET_STEP_USD", env)
+    assert default_budget() == (2.0, 2.0)
+
+
+async def test_create_mission_refuses_a_poisoned_cap_before_writing(store: Any) -> None:
+    """No public caller — CLI, TUI, evals harness, a future one — may persist a
+    cap that the ledger can never enforce."""
+    from rework.kernel.state.records import MissionStatus
+
+    for cap in (float("nan"), float("inf"), -3.0, 0.0):
+        with pytest.raises(ValueError, match="finite number greater than 0"):
+            await create_mission(
+                "fix the typo",
+                repo="https://github.com/example/repo.git",
+                orchestrator_model="flash",
+                budget_usd=cap,
+                store=store,
+            )
+        # the ECHO plan never stamps plan["budget"], so this case is refused by
+        # create_mission itself and not by budget_rail further down
+        with pytest.raises(ValueError, match="finite number greater than 0"):
+            await create_mission("fix the typo", plan="echo", budget_usd=cap, store=store)
+    assert await store.list_missions(status=MissionStatus.PENDING) == []
+    assert await store.list_missions() == []

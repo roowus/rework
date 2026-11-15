@@ -75,14 +75,18 @@ def _count(value: Any) -> int | None:
 
 
 def _factor(value: Any) -> float | None:
-    """A ceiling factor, or None when the value is not one (>= 1.0)."""
+    """A ceiling factor, or None when the value is not one (finite, >= 1.0).
+
+    Non-finite included: `REWORK_BUDGET_CEILING_FACTOR=inf` (or a project
+    setting of inf) would make `cap > original * factor` never true, so the
+    auto-raise ceiling would stop bounding anything."""
     if value is None or isinstance(value, bool):
         return None
     try:
         number = float(value)
     except (TypeError, ValueError):
         return None
-    if number != number or number < 1.0:  # NaN or below the original cap
+    if not math.isfinite(number) or number < 1.0:  # NaN/inf or below the original
         return None
     return number
 
