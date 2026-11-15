@@ -25,6 +25,7 @@ from rework.tui.conversation import (
     args_text,
     default_model,
     items_from_messages,
+    same_proposal,
 )
 from rework.tui.hub import Snapshot
 from rework.tui.theme import (
@@ -88,9 +89,23 @@ class WorkView(View):
         self._streamed: list[Step] = []
         self._loading_chat: str | None = None
         # cursor for the open transcript: the highest chat_messages.id already
-        # rendered. The table is append-only, so a tick only has to ask for
+        # fetched. The table is append-only, so a tick only has to ask for
         # rows newer than this (indexed, O(log n)) and append those.
         self._chat_cursor: int = 0
+        # The cursor is only the QUERY boundary; this is the RENDER authority,
+        # and the two differ because of `_send`. The engine persists the turn's
+        # rows (and `TuiData` records them as our own) inside `engine.send`,
+        # while the live render runs after it returns. A tick landing in that
+        # window sees rows it must not paint, and the old code pruned the
+        # own-id set at the same moment, so a later replay from a fresh cursor
+        # (a reopened chat, a swapped store) could paint that assistant
+        # tool_calls row again and mint a second card for every
+        # `propose_mission` in it. Nothing at or below this mark is ever
+        # painted twice.
+        self._rendered_max_id: int = 0
+        # which store connection the mark above belongs to: chat_messages ids
+        # are only comparable within one connection
+        self._store_epoch: int = 0
         # where the next message goes: None = the chat orchestrator (proposes
         # missions); a mission id = that mission's orchestrator (ADR 0007)
         self.target: str | None = None
@@ -205,6 +220,26 @@ class WorkView(View):
     @work(exclusive=True, group="chat-poll")
     async def _tick_chat(self, chat_id: str) -> None:
         data = self.hub.data
+        if data.store_epoch != self._store_epoch:
+            # the connection (possibly the whole store) was swapped under us, so
+            # the ids in `_chat_cursor` and `_rendered_max_id` no longer line up
+            # with what the store holds. Re-read the transcript instead, which
+            # re-seeds both from the rows it paints; rows written while we were
+            # disconnected are included, and nothing already on screen repeats.
+            self._store_epoch = data.store_epoch
+            # scheduled, not awaited: `_load_chat` returns a Textual Worker,
+            # which is not awaitable (`await` on it raises TypeError). The
+            # exclusive `load-chat` group keeps a second load from starting on
+            # top of this one, and the replay it paints clears the log first,
+            # so a tick that runs in the meantime cannot duplicate a row.
+            # `open_chat` schedules it the same way.
+            self._load_chat(chat_id)
+            return
+        if self._sending:
+            # a live turn paints its own rows; polling here would paint the
+            # same chat_messages row a second time (own_chat_ids is only
+            # populated after the row is committed)
+            return
         head = await self.hub.guard(partial(data.chat_messages_max_id, chat_id), None)
         if head is None or head <= self._chat_cursor:
             return  # None = the probe failed; <= means nothing new
@@ -220,9 +255,18 @@ class WorkView(View):
         # rows THIS instance wrote (a streaming turn, a note) are already on
         # screen, rendered live; only foreign rows are new to this view. This
         # holds during our own turn too, so it also covers a tick that was in
-        # flight while we persisted.
+        # flight while we persisted. The mark is the authority: a row at or
+        # below it is already placed, whatever `own_chat_ids` says by now.
         own = data.own_chat_ids
-        fresh = [m for m in messages if int(m.id or 0) not in own]
+        fresh = [
+            m
+            for m in messages
+            if int(m.id or 0) > self._rendered_max_id and int(m.id or 0) not in own
+        ]
+        # everything fetched is accounted for at this point: the foreign rows
+        # are painted below and the own ones were (or are about to be) painted
+        # by the live render, so no later replay may paint them again
+        self._rendered_max_id = self._chat_cursor
         own.difference_update(i for i in list(own) if i <= self._chat_cursor)
         items = items_from_messages(fresh)
         if items:
@@ -351,8 +395,20 @@ class WorkView(View):
         cursor = max((int(m.id or 0) for m in messages), default=0)
         if self._loading_chat != chat_id:
             return
+        if self._sending:
+            # a live turn owns the log right now and paints its own rows. This
+            # replay read the transcript BEFORE those rows were committed, so
+            # painting it now would place the same proposal twice (one live
+            # card from `_send`, one replayed). Drop it: `_rendered_max_id`
+            # still marks what is on screen and the next tick pages in the
+            # rest, so no row is lost.
+            return
         self.convo = convo
         self._chat_cursor = cursor
+        # the replay below clears the log and paints exactly these rows, so the
+        # mark can start from them: anything newer polls in, nothing repeats
+        self._rendered_max_id = cursor
+        self._store_epoch = self.hub.data.store_epoch
         self._target_auto = True
         self.project_id = chat.project_id
         self.model_id = chat.model_id or self.model_id
@@ -373,6 +429,7 @@ class WorkView(View):
     def new_chat(self) -> None:
         self.convo = None
         self._chat_cursor = 0
+        self._rendered_max_id = 0
         self._target_auto = True
         self.target = None
         self.query_one("#chat-log", Trajectory).clear()
@@ -384,24 +441,44 @@ class WorkView(View):
     # -- rendering ------------------------------------------------------------------
 
     def _render_items(self, items: list[Item], *, replay: bool = False) -> None:
+        """One card per proposal, each independently live or settled.
+
+        `items_from_messages` already decided which proposals are still pending
+        (see `_settle_launched`), so the card just carries that flag: several
+        proposals from one request each get their own Launch / Scrap."""
         log = self.query_one("#chat-log", Trajectory)
         widgets: list[Any] = []
-        last_proposal = None
-        launched_after = False
-        for item in items:
-            if item.kind == "proposal":
-                last_proposal = item
-                launched_after = False
-            elif item.kind == "mission":
-                launched_after = True
         for item in items:
             widget = self._item_widget(item)
             if widget is None:
                 continue
             if isinstance(widget, ProposalCard):
-                widget.live = item is last_proposal and not launched_after
+                widget.live = item.live
             widgets.append(widget)
         log.add(*widgets)
+        # a RELOADED chat can hold several pending proposals too: the group
+        # action is offered whenever more than one is pending, not only on the
+        # turn that proposed them
+        self._sync_launch_all([w for w in widgets if isinstance(w, ProposalCard)])
+
+    def _pending_cards(self) -> list[ProposalCard]:
+        """The proposal cards still waiting for a decision, in transcript order."""
+        return [card for card in self.query(ProposalCard) if card.live]
+
+    def _sync_launch_all(self, extra: list[Any] | None = None) -> None:
+        """One source of truth for the group action.
+
+        "Launch all" is offered exactly when MORE THAN ONE proposal is still
+        pending: with a lone survivor it would only repeat that card's own
+        Launch, and once nothing is pending it is dead. `extra` covers cards
+        that are about to be mounted, which `self.query` cannot see yet."""
+        pending: list[ProposalCard] = self._pending_cards()
+        for card in extra or []:
+            if isinstance(card, ProposalCard) and card.live and card not in pending:
+                pending.append(card)
+        offer = len(pending) > 1
+        for card in [*self.query(ProposalCard), *pending]:
+            card.set_launch_all(offer)
 
     def _item_widget(self, item: Item) -> Any:
         if item.kind == "user":
@@ -434,6 +511,18 @@ class WorkView(View):
     def _retire_proposals(self) -> None:
         for card in self.query(ProposalCard):
             card.set_live(False)
+        self._sync_launch_all()
+
+    def _settle_stale_proposals(self, proposals: list[Any]) -> None:
+        """Settle the cards an EARLIER turn proposed.
+
+        The engine REPLACES its pending list on a proposing turn (chat.py: the
+        newest turn's proposals ARE the pending ones), so a card left from a
+        previous turn can no longer be launched: leaving it live would let the
+        transcript offer a mission the orchestrator has withdrawn."""
+        for card in self._pending_cards():
+            if not any(same_proposal(card.proposal, p) for p in proposals):
+                card.set_live(False)
 
     # -- sending ----------------------------------------------------------------------
 
@@ -481,6 +570,11 @@ class WorkView(View):
                 )
                 self.convo = Conversation(self.hub.data, chat)
                 log.clear()
+                # a brand new chat has no transcript: nothing is placed yet, so
+                # neither mark may carry over from the chat we just left
+                self._chat_cursor = 0
+                self._rendered_max_id = 0
+                self._store_epoch = self.hub.data.store_epoch
                 self._show_chat(True)
                 self._paint_head()
             convo = self.convo
@@ -516,15 +610,24 @@ class WorkView(View):
                 # error line is in the chat; give the owner their text back
                 prompt.text = text  # never lose input
                 return
-            if engine.launched and engine.proposal is not None:
-                await self._launch(engine.proposal)
+            if result.launched_all and result.proposals:
+                # a typed "yes" with proposals pending means launch them ALL.
+                # The engine has ALREADY emptied its pending list for a yes, so
+                # hand those proposals back before launching: `Conversation.
+                # launch` only runs a proposal that is still pending, which is
+                # what stops a second click from creating a second mission
+                if self.convo is not None and self.convo.engine is not None:
+                    self.convo.engine.proposals = list(result.proposals)
+                await self._launch_all(result.proposals)
                 return
-            if result.proposal is not None:
-                self._retire_proposals()
+            if result.proposals:
+                # the engine replaced its pending list with THIS turn's
+                # proposals, so anything an earlier turn proposed is withdrawn
+                self._settle_stale_proposals(result.proposals)
                 log.add(assistant_step(result.reply or "Here's what I'd run."))
-                log.add(ProposalCard(result.proposal))
+                log.add(*self._proposal_cards(result.proposals))
             elif result.reply:
-                if result.reply.startswith("Scrapped"):
+                if result.scrapped_all:
                     self._retire_proposals()
                 log.add(assistant_step(result.reply))
             elapsed = time.monotonic() - started
@@ -584,21 +687,94 @@ class WorkView(View):
 
     # -- proposals & launch -------------------------------------------------------------
 
+    def on_proposal_card_launch_all(self, event: ProposalCard.LaunchAll) -> None:
+        """ "Launch all": every pending proposal of this chat, in order."""
+        event.stop()
+        if self._sending:
+            return
+        # claim the slot BEFORE scheduling: a per-card Launch and a Launch all
+        # dispatched in one event-loop batch would both pass a read-only gate
+        self._sending = True
+        try:
+            self._launch_all_cards()
+        except Exception:
+            self._sending = False
+            raise
+
+    def _proposal_cards(self, proposals: list[Any]) -> list[ProposalCard]:
+        """One card per proposal, plus ONE "Launch all" for the group when there
+        is more than one (with a single proposal it would just duplicate it)."""
+        cards = [ProposalCard(proposal) for proposal in proposals]
+        self._sync_launch_all(cards)
+        return cards
+
     def on_proposal_card_decided(self, event: ProposalCard.Decided) -> None:
         event.stop()
         if self._sending:
             return
         if event.launch:
+            # as above: set synchronously, a double click arrives as two
+            # messages before either worker has started
+            self._sending = True
             self._launch_worker(event.card.proposal)
         else:
-            event.card.set_live(False)
-            if self.convo and self.convo.engine is not None:
-                self.convo.engine.proposal = None
+            self._scrap(event.card)
             self.query_one("#chat-log", Trajectory).add(
                 Step(f"[{FAINT}]proposal scrapped. Tell the orchestrator what to change[/]")
             )
 
-    @work(group="send")
+    def _scrap(self, card: Any) -> None:
+        """Scrap ONE proposal: only that card settles, the rest stay pending."""
+        card.set_live(False)
+        engine = self.convo.engine if self.convo is not None else None
+        if engine is not None:
+            engine.proposals = [p for p in engine.proposals if not same_proposal(p, card.proposal)]
+        self._sync_launch_all()
+
+    def _launch_all_cards(self) -> None:
+        """The "Launch all" button: every pending proposal, in transcript order."""
+        cards = self._pending_cards()
+        if not cards:
+            self._sending = False
+            return
+        self._launch_all_worker([card.proposal for card in cards], cards)
+
+    @work(group="send", exclusive=True)
+    async def _launch_all_worker(self, proposals: list[Any], cards: list[Any]) -> None:
+        self._sending = True
+        try:
+            await self._launch_all(proposals, cards)
+        finally:
+            self._sending = False
+
+    async def _launch_all(self, proposals: list[Any], cards: list[Any] | None = None) -> None:
+        """One mission per proposal, through the same `Conversation.launch` path
+        a single Launch uses. A proposal that cannot launch (no repo) is left
+        pending, so the owner can fix it without losing the others."""
+        if cards is None:
+            cards = [
+                card
+                for card in self._pending_cards()
+                if any(same_proposal(card.proposal, p) for p in proposals)
+            ]
+        launched: list[Any] = []
+        for proposal in list(proposals):
+            mission = await self._launch(proposal, settle=False)
+            if mission is None:
+                continue
+            launched.append(mission)
+            for card in cards:
+                if same_proposal(card.proposal, proposal):
+                    card.set_live(False)
+        self._sync_launch_all()
+        if launched:
+            self.toast(
+                f"Launched {len(launched)} mission{'s' if len(launched) != 1 else ''}",
+                title="Launched",
+            )
+            await self.hub.refresh()
+
+    @work(group="send", exclusive=True)
     async def _launch_worker(self, proposal: Any) -> None:
         self._sending = True
         try:
@@ -606,10 +782,14 @@ class WorkView(View):
         finally:
             self._sending = False
 
-    async def _launch(self, proposal: Any) -> None:
+    async def _launch(self, proposal: Any, *, settle: bool = True) -> Any:
+        """Create one mission. Returns it, or None when it could not launch.
+
+        `settle=False` leaves the other cards alone (a batch settles them as it
+        goes); a single Launch settles just its own card."""
         log = self.query_one("#chat-log", Trajectory)
         if self.convo is None:
-            return
+            return None
         try:
             mission = await self.convo.launch(self.snap, proposal)
         except ValueError as exc:
@@ -620,15 +800,31 @@ class WorkView(View):
                     kind="gate",
                 )
             )
-            return
+            return None
         except Exception as exc:
             log.add(Step(f"[{DANGER}]✗ launch failed: {esc(clip(str(exc), 300))}[/]"))
-            return
-        self._retire_proposals()
+            return None
+        if mission is None:
+            # the proposal is no longer pending (a racing click already launched
+            # or scrapped it): nothing was created, so just settle the card
+            self._settle_card(proposal)
+            return None
+        if settle:
+            self._settle_card(proposal)
         card = MissionCard(mission.id)
         log.add(card)
-        self.toast(f"Mission {mission.id} launched", title="Launched")
-        await self.hub.refresh()
+        if settle:
+            self.toast(f"Mission {mission.id} launched", title="Launched")
+            await self.hub.refresh()
+        return mission
+
+    def _settle_card(self, proposal: Any) -> None:
+        """Settle only the card this proposal belongs to: its siblings stay
+        pending, which is the whole point of several proposals per chat."""
+        for card in self.query(ProposalCard):
+            if same_proposal(card.proposal, proposal):
+                card.set_live(False)
+        self._sync_launch_all()
 
     # -- live mission cards -------------------------------------------------------------
 

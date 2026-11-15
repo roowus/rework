@@ -83,6 +83,12 @@ class TuiData:
     def __init__(self) -> None:
         self._store: StateStore | None = None
         self.own_chat_ids: set[int] = set()
+        # Bumped every time the connection is thrown away or reopened. A view
+        # caches chat_messages ids (a cursor, a rendered high-water mark) and
+        # those are only comparable inside one connection: a reopened store can
+        # hand out the same ids again, so the owner of such a cache has to
+        # re-read when this changes instead of trusting the numbers.
+        self.store_epoch: int = 0
         self._index: LibraryStore | None = None
         self._git: GitLibrary | None = None
         # the last successful result per query, used while the daemon is
@@ -96,6 +102,7 @@ class TuiData:
             store = await open_store_from_config(Config.from_env())
             self._track_own_chat_writes(store)
             self._store = store
+            self.store_epoch += 1
         return self._store
 
     def _track_own_chat_writes(self, store: StateStore) -> None:
@@ -122,6 +129,7 @@ class TuiData:
             with contextlib.suppress(Exception):
                 await self._store.aclose()
             self._store = None
+            self.store_epoch += 1
 
     async def _call(self, fn: Any) -> Any:
         """One query against the (possibly reopened) store."""

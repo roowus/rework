@@ -7,7 +7,11 @@ sets REWORK_DB to a tmp file before the app is constructed."""
 
 from __future__ import annotations
 
+import asyncio
+import json
+import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -55,12 +59,119 @@ async def _store(db: Path) -> Any:
     return await open_sqlite(str(db))
 
 
+def db_path() -> str:
+    return os.environ["REWORK_DB"]
+
+
 def _app() -> ReworkApp:
     return ReworkApp(poll_seconds=0.3)
 
 
+async def _run_chat_tick(work: Any, chat_id: str) -> None:
+    """Run one chat-poll tick to completion, however many times the app's own
+    timer restarts it meanwhile.
+
+    `_tick_chat` is an exclusive worker: a second start (the app polls every
+    0.3 s in these tests) cancels the first, and `Worker.wait()` then raises
+    WorkerCancelled. That is the app doing its job, not a failure, but under CI
+    load it landed inside the awaits below (an intermittent Python 3.12
+    failure). The tick we want is the one that finishes, so retry until a run
+    completes; the cursor logic under test is idempotent by design."""
+    from textual.worker import WorkerCancelled
+
+    for _ in range(20):
+        try:
+            await work._tick_chat(chat_id).wait()
+            return
+        except WorkerCancelled:
+            await asyncio.sleep(0.05)
+    raise AssertionError("the chat poll never completed (cancelled 20 times in a row)")
+
+
+async def test_run_chat_tick_retries_a_cancelled_worker_and_gives_up_loudly() -> None:
+    """A restarted exclusive worker is 'try again', not a failure; a poll that
+    never completes still fails the test instead of hanging or passing."""
+    from textual.worker import WorkerCancelled
+
+    class FakeWork:
+        def __init__(self, cancels: int) -> None:
+            self.cancels = cancels
+            self.calls = 0
+
+        def _tick_chat(self, chat_id: str) -> Any:
+            owner = self
+
+            class Worker:
+                async def wait(self) -> None:
+                    owner.calls += 1
+                    if owner.calls <= owner.cancels:
+                        raise WorkerCancelled("restarted")
+
+            return Worker()
+
+    flaky = FakeWork(cancels=3)
+    await _run_chat_tick(flaky, "c")
+    assert flaky.calls == 4
+    stuck = FakeWork(cancels=10**6)
+    with pytest.raises(AssertionError, match="never completed"):
+        await _run_chat_tick(stuck, "c")
+    assert stuck.calls == 20
+
+
 async def _settle(pilot: Any, t: float = 0.5) -> None:
     await pilot.pause(t)
+
+
+async def _wait_for(pilot: Any, condition: Callable[[], bool], *, tries: int = 200) -> None:
+    """Poll `condition` for up to ~10 s and return on the first true.
+
+    A fixed `pause` before a count assertion is a race: on a loaded machine the
+    scripted turn can still be mid-flight when the sleep elapses, and the count
+    then sees a half-painted screen (one run in ten failed with `2 cards` for a
+    single proposal). Polling is both faster in the normal case and
+    deterministic. On expiry this returns too, so the CALLER's assertion fails
+    with its own diagnostic message rather than a generic timeout."""
+    for _ in range(tries):
+        if condition():
+            return
+        await pilot.pause(0.05)
+
+
+async def _diag(app: Any) -> str:
+    """What is on screen, in the engine and in the store, for a failing count.
+
+    `engine proposals` is the discriminator: TWO cards with ONE pending engine
+    proposal is a render bug, TWO with TWO means the turn really did propose
+    twice. `rows` carries the chat_messages ids so a duplicate card can be
+    traced to the row it was painted from."""
+    from rework.kernel.state.sqlite import open_sqlite
+    from rework.tui.widgets.cards import ProposalCard
+
+    work = app.view("work")
+    chat_id = getattr(getattr(work, "convo", None), "id", None)
+    if not chat_id:
+        return "no chat open"
+    cards = [c.proposal.objective for c in app.query(ProposalCard)]
+    engine = getattr(getattr(work, "convo", None), "engine", None)
+    pending = [p.objective for p in getattr(engine, "proposals", [])]
+    # a separate connection: this is a failure path, and the app's own handle
+    # may be the thing under test
+    store = await open_sqlite(db_path())
+    try:
+        missions = await store.list_missions(limit=100, chat_id=chat_id)
+        rows = await store.chat_messages(chat_id)
+    finally:
+        await store.aclose()
+    marks = (
+        f"cursor {work._chat_cursor} painted {work._rendered_max_id}"
+        f" own {sorted(app.hub.data.own_chat_ids)} sending {work._sending}"
+        f" loading {work._loading_chat}"
+    )
+    return (
+        f"chat {chat_id}: cards {cards}, engine proposals {pending},"
+        f" store missions {[m.objective for m in missions]},"
+        f" rows {[(int(m.id or 0), m.role, m.display) for m in rows]}, {marks}"
+    )
 
 
 def _btn(app: ReworkApp, root: Any, action: str) -> Btn:
@@ -84,6 +195,20 @@ def propose(**args: Any) -> ChatResult:
         text="Here's what I'd run.",
         tool_calls=[ToolCall(id="p1", name="propose_mission", arguments=args)],
         usage=Usage(input_tokens=900, output_tokens=60),
+    )
+
+
+def propose_many(*specs: dict[str, Any]) -> ChatResult:
+    """ONE turn proposing several missions: one `propose_mission` call per spec
+    in the same ChatResult, in call order. It must be one turn (a later
+    proposing turn REPLACES the pending list by design)."""
+    return ChatResult(
+        text="Two separate pieces of work.",
+        tool_calls=[
+            ToolCall(id=f"p{n}", name="propose_mission", arguments=spec)
+            for n, spec in enumerate(specs, start=1)
+        ],
+        usage=Usage(input_tokens=1200, output_tokens=90),
     )
 
 
@@ -213,6 +338,30 @@ async def test_status_bar_counts_open_gates(ids: dict[str, str]) -> None:
 
 
 # -- resilience ----------------------------------------------------------------
+
+
+def test_a_launch_note_round_trips_every_field_and_its_separator() -> None:
+    """The note is the only record of WHICH proposal launched, so it parses back
+    to exactly what it carried, including an objective that contains the
+    separator the note itself uses. Legacy shapes keep their old meaning: two
+    fields mean the objective (old notes never carried a plan) and a bare note
+    means neither."""
+    from rework.tui.conversation import NOTE_SEP, launch_note, parse_launch_note
+
+    tricky = f"fix the parser{NOTE_SEP}it drops · and · also / colons"
+    note = launch_note("m-1", "thorough", tricky)
+    assert note == f"launched m-1{NOTE_SEP}thorough{NOTE_SEP}{tricky}"
+    parsed = parse_launch_note(note)
+    assert (parsed.mission_id, parsed.plan, parsed.objective) == ("m-1", "thorough", tricky)
+    # a plan with no objective still anchors the plan (field count, not content)
+    plan_only = parse_launch_note(launch_note("m-2", "echo"))
+    assert (plan_only.mission_id, plan_only.plan, plan_only.objective) == ("m-2", "echo", "")
+    # legacy two fields: the second one is the OBJECTIVE, never a plan
+    legacy = parse_launch_note(f"launched m-3{NOTE_SEP}fix it")
+    assert (legacy.mission_id, legacy.plan, legacy.objective) == ("m-3", "", "fix it")
+    # legacy bare note (what tests/tui/seed.py writes)
+    bare = parse_launch_note("launched m-4")
+    assert (bare.mission_id, bare.plan, bare.objective) == ("m-4", "", "")
 
 
 def test_target_label_names_the_database(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -473,6 +622,657 @@ async def test_typing_yes_launches(
     store = await _store(env)
     try:
         assert any(m.objective == "ping" for m in await store.list_missions(limit=100))
+    finally:
+        await store.aclose()
+
+
+async def test_a_turn_proposing_two_missions_renders_two_cards(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One owner request can span separate pieces of work: every
+    `propose_mission` call in the turn gets its own card, in call order."""
+    script_provider(
+        monkeypatch,
+        [
+            propose_many(
+                {"objective": "say hello", "plan": "echo", "title": "Greeting"},
+                {"objective": "say goodbye", "plan": "echo", "title": "Farewell"},
+            )
+        ],
+    )
+    from rework.tui.widgets.cards import ProposalCard
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        for ch in "hello and goodbye":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 2)
+        cards = list(app.query(ProposalCard))
+        assert len(cards) == 2, [c.proposal.objective for c in cards]
+        assert [c.proposal.objective for c in cards] == ["say hello", "say goodbye"]
+        assert all(card.live for card in cards), "both are still waiting for a decision"
+        # with more than one pending each card offers the group action
+        assert all(card.query_one(".pc-allbtn", Btn).display for card in cards)
+        assert not app.swallowed
+    store = await _store(env)
+    try:
+        assert not any(
+            m.objective in {"say hello", "say goodbye"}
+            for m in await store.list_missions(limit=100)
+        ), "nothing runs until Launch"
+    finally:
+        await store.aclose()
+
+
+async def test_launching_one_card_leaves_its_sibling_pending(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Per-card Launch creates exactly ONE mission; the other proposal stays a
+    live card and can still launch on its own."""
+    script_provider(
+        monkeypatch,
+        [
+            propose_many(
+                {"objective": "say hello", "plan": "echo", "title": "Greeting"},
+                {"objective": "say goodbye", "plan": "echo", "title": "Farewell"},
+            )
+        ],
+    )
+    from rework.tui.widgets.cards import ProposalCard
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        for ch in "hello and goodbye":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 2)
+        cards = list(app.query(ProposalCard))
+        assert len(cards) == 2
+        await pilot.click(_btn(app, cards[0], "launch"))
+        await _settle(pilot, 1.0)
+        assert not cards[0].live, "the launched proposal is settled"
+        assert cards[1].live, "its sibling is untouched"
+        assert cards[1].query_one(".card-actions").display
+        chat_id = app.view("work").convo.id
+        await pilot.click(_btn(app, cards[1], "launch"))
+        await _settle(pilot, 1.0)
+        assert not cards[1].live
+        assert not app.swallowed
+    store = await _store(env)
+    try:
+        missions = await store.list_missions(limit=100, chat_id=chat_id)
+        assert sorted(m.objective for m in missions) == ["say goodbye", "say hello"]
+        chat = await store.get_chat(chat_id)
+        assert chat is not None and chat.mission_id is not None
+        notes = [m.display for m in await store.chat_messages(chat_id) if m.role == "note"]
+        launched = [n for n in notes if n.startswith("launched ")]
+        assert len(launched) == 2, notes
+        # the note names the PLAN as well as the objective, so a replayed chat
+        # can tell two proposals that share an objective apart
+        from rework.tui.conversation import NOTE_SEP
+
+        assert any(n.endswith(f"{NOTE_SEP}echo{NOTE_SEP}say hello") for n in launched), launched
+        assert any(n.endswith(f"{NOTE_SEP}echo{NOTE_SEP}say goodbye") for n in launched), launched
+    finally:
+        await store.aclose()
+
+
+async def test_launch_all_creates_one_mission_per_proposal(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ "Launch all" runs the group: two proposals, two missions, and every card
+    settles."""
+    script_provider(
+        monkeypatch,
+        [
+            propose_many(
+                {"objective": "say hello", "plan": "echo", "title": "Greeting"},
+                {"objective": "say goodbye", "plan": "echo", "title": "Farewell"},
+            )
+        ],
+    )
+    from rework.tui.widgets.cards import ProposalCard
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        for ch in "hello and goodbye":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 2)
+        cards = list(app.query(ProposalCard))
+        assert len(cards) == 2
+        await pilot.click(_btn(app, cards[0], "launch-all"))
+        await _settle(pilot, 1.5)
+        assert not any(card.live for card in cards), "a launched batch settles every card"
+        chat_id = app.view("work").convo.id
+        assert not app.swallowed
+    store = await _store(env)
+    try:
+        missions = await store.list_missions(limit=100, chat_id=chat_id)
+        assert sorted(m.objective for m in missions) == ["say goodbye", "say hello"]
+        assert {m.title for m in missions} == {"Greeting", "Farewell"}
+    finally:
+        await store.aclose()
+
+
+async def test_a_second_proposing_turn_retires_the_first_turns_card(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The engine REPLACES its pending list on a proposing turn: the card the
+    earlier turn proposed is withdrawn, cannot launch, and is never part of a
+    "Launch all"."""
+    script_provider(
+        monkeypatch,
+        [
+            propose_many({"objective": "say hello", "plan": "echo", "title": "Greeting"}),
+            propose_many(
+                {"objective": "say goodbye", "plan": "echo", "title": "Farewell"},
+                {"objective": "say thanks", "plan": "echo", "title": "Thanks"},
+            ),
+        ],
+    )
+    from rework.tui.widgets.cards import ProposalCard
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        for ch in "hello":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 1)
+        first = list(app.query(ProposalCard))
+        assert [c.proposal.objective for c in first] == ["say hello"]
+        assert first[0].live
+        for ch in "goodbye and thanks":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 3)
+        cards = list(app.query(ProposalCard))
+        assert [c.proposal.objective for c in cards] == ["say hello", "say goodbye", "say thanks"]
+        assert not cards[0].live, "the superseded proposal is settled"
+        assert cards[0].query_one(".card-actions").display is False
+        assert cards[1].live and cards[2].live, "the new turn's proposals are the pending ones"
+        chat_id = app.view("work").convo.id
+        # the withdrawn proposal is inert: its Launch finds nothing pending, so
+        # no mission is created for it
+        app.view("work").on_proposal_card_decided(ProposalCard.Decided(cards[0], True))
+        await _settle(pilot, 1.0)
+        # "Launch all" runs only the new turn's proposals
+        await pilot.click(_btn(app, cards[1], "launch-all"))
+        await _settle(pilot, 2.0)
+        assert not any(card.live for card in cards)
+        assert not app.swallowed
+    store = await _store(env)
+    try:
+        missions = await store.list_missions(limit=100, chat_id=chat_id)
+        assert sorted(m.objective for m in missions) == ["say goodbye", "say thanks"]
+    finally:
+        await store.aclose()
+
+
+async def test_double_launch_creates_one_mission(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two clicks on one card's Launch arrive as two messages in one batch: the
+    second must not create a second mission for the same proposal."""
+    script_provider(
+        monkeypatch, [propose_many({"objective": "say hello", "plan": "echo", "title": "Greeting"})]
+    )
+    from rework.tui.widgets.cards import ProposalCard
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        for ch in "say hello":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 1)
+        cards = list(app.query(ProposalCard))
+        assert len(cards) == 1, await _diag(app)
+        launch = cards[0].query_one(Btn)
+        assert launch.action == "launch"
+        # a double click delivers both presses as two messages in ONE batch,
+        # before either worker has started (a pilot.click awaits a pause first,
+        # which would let the first launch finish and hide the race)
+        launch.post_message(Btn.Pressed(launch))
+        launch.post_message(Btn.Pressed(launch))
+        await _settle(pilot, 2.0)
+        chat_id = app.view("work").convo.id
+        assert not app.swallowed
+    store = await _store(env)
+    try:
+        missions = await store.list_missions(limit=100, chat_id=chat_id)
+        assert [m.objective for m in missions] == ["say hello"], "exactly one mission"
+    finally:
+        await store.aclose()
+
+
+async def test_a_live_turn_and_the_poller_do_not_paint_the_same_row_twice(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 0.3 s transcript poller must not paint a row the live turn is
+    painting itself.
+
+    `_send` awaits `engine.send(...)`, which persists the assistant row and only
+    then registers its id in `own_chat_ids`. A tick that runs inside that window
+    sees the row above `_rendered_max_id`, does not find it among `own_chat_ids`
+    and renders it -- and `_send` renders the same proposal again on top. The
+    observed symptom was two identical cards for ONE engine proposal and ONE
+    stored assistant row. The tick therefore has to stand down while a live turn
+    is in flight; this drives that tick directly, because catching the real
+    window from a test would be a race, not a regression test.
+    """
+    script_provider(
+        monkeypatch,
+        [propose_many({"objective": "say hello", "plan": "echo", "title": "Greeting"})],
+    )
+    from rework.kernel.state.records import ChatMessage
+    from rework.tui.widgets.cards import ProposalCard
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        work = app.view("work")
+        # a fresh chat, the way the turn tests make one: the seeded chat already
+        # carries a proposal of its own, which would muddy the count
+        for ch in "say hello":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        for _ in range(60):  # wait for the scripted turn, not for a fixed time
+            await _settle(pilot, 0.1)
+            if len(app.query(ProposalCard)) >= 1 and not work._sending:
+                break
+        await _settle(pilot, 0.3)
+        chat_id = work.convo.id
+        before = len(app.query(ProposalCard))
+        assert before == 1, await _diag(app)
+
+        # a row lands in the store while a live turn is in flight (this is
+        # exactly what `engine.send` does before `own_chat_ids` knows about it).
+        # The live turn's window opens FIRST, and a poll tick that started before
+        # it (the app polls every 0.3 s here) is let finish while the store still
+        # holds nothing new: a tick already past the guard is a different race,
+        # and it was this test's intermittent CI failure.
+        work._sending = True
+        await _settle(pilot, 0.6)
+        store = await _store(env)
+        try:
+            await store.append_chat_message(
+                ChatMessage(
+                    chat_id=chat_id,
+                    role="assistant",
+                    body={
+                        "role": "assistant",
+                        "content": "Two separate pieces of work.",
+                        "tool_calls": [
+                            {
+                                "id": "p1",
+                                "type": "function",
+                                "function": {
+                                    "name": "propose_mission",
+                                    "arguments": json.dumps(
+                                        {
+                                            "objective": "say hello",
+                                            "plan": "echo",
+                                            "title": "Greeting",
+                                        }
+                                    ),
+                                },
+                            }
+                        ],
+                    },
+                    display="Two separate pieces of work.",
+                )
+            )
+        finally:
+            await store.aclose()
+
+        try:
+            await _run_chat_tick(work, chat_id)
+            # the app's own timer polls too (every 0.3 s here): let a few more
+            # ticks land INSIDE the window, since the live turn owns the row for
+            # all of it. Clearing the flag earlier lets a late poll legitimately
+            # paint the row, which is exactly what the assertion forbids.
+            await _settle(pilot, 0.8)
+            assert len(app.query(ProposalCard)) == before, (
+                "the poller painted a row the live turn owns\n" + await _diag(app)
+            )
+        finally:
+            work._sending = False
+        assert not app.swallowed
+    store = await _store(env)
+    try:
+        assert [m.objective for m in await store.list_missions(limit=100, chat_id=chat_id)] == []
+    finally:
+        await store.aclose()
+
+
+async def test_a_single_remaining_card_does_not_offer_launch_all(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two proposals offer the group action; once one launches and only one is
+    pending, the survivor's "Launch all" would just repeat its own Launch."""
+    script_provider(
+        monkeypatch,
+        [
+            propose_many(
+                {"objective": "say hello", "plan": "echo", "title": "Greeting"},
+                {"objective": "say goodbye", "plan": "echo", "title": "Farewell"},
+            )
+        ],
+    )
+    from rework.tui.widgets.cards import ProposalCard
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        for ch in "hello and goodbye":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 2)
+        cards = list(app.query(ProposalCard))
+        assert len(cards) == 2
+        assert all(card.query_one(".pc-allbtn", Btn).display for card in cards)
+        await pilot.click(_btn(app, cards[0], "launch"))
+        await _settle(pilot, 1.0)
+        assert not cards[0].live
+        assert cards[1].live
+        assert not cards[1].query_one(".pc-allbtn", Btn).display, "no dead group action"
+        assert not app.swallowed
+    store = await _store(env)
+    try:
+        missions = await store.list_missions(limit=100)
+        assert sorted(m.objective for m in missions if m.objective.startswith("say ")) == [
+            "say hello"
+        ]
+    finally:
+        await store.aclose()
+
+
+# same objective, two plans: exactly the pair the system prompt steers a
+# re-proposal into when the owner changes their mind
+OBJECTIVE = "check the parser output"
+MISSION = "m-twin0000000a"
+
+KIND_PLAN = {
+    "objective": OBJECTIVE,
+    "plan": "echo",
+    "title": "Quick check",
+}
+DRAFT_PLAN = {"objective": OBJECTIVE, "plan": "draft", "title": "Draft it"}
+
+
+def _propose_call(call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": "propose_mission", "arguments": json.dumps(args)},
+    }
+
+
+async def test_a_replayed_chat_settles_the_launched_proposal_not_its_twin(
+    ids: dict[str, str], env: Path
+) -> None:
+    """Two proposals in one transcript share an objective and differ only in
+    plan, and the SECOND one was launched. The note must settle that exact twin:
+    matching the objective alone settles the first one instead and leaves the
+    launched proposal live, so a later bare "yes" starts the same work twice."""
+    import time as _time
+
+    from rework.kernel.state.records import Chat, ChatMessage, Mission, MissionStatus
+    from rework.tui.widgets.cards import ProposalCard
+    from rework.tui.widgets.prompt import Prompt
+
+    store = await _store(env)
+    try:
+        chat = await store.create_chat(Chat(title="same objective, two plans", model_id="flash"))
+        await store.create_mission(
+            Mission(
+                id=MISSION,
+                objective=OBJECTIVE,
+                plan={"kind": "draft"},
+                # finished, not running: a live mission would become the
+                # prompt's target, and the bare "yes" would go to ITS
+                # orchestrator instead of this chat
+                status=MissionStatus.DONE,
+                chat_id=chat.id,
+                created_at=_time.time(),
+            )
+        )
+        await store.append_chat_message(
+            ChatMessage(
+                chat_id=chat.id,
+                role="user",
+                body={"role": "user", "content": "check the parser"},
+                display="check the parser",
+            )
+        )
+        await store.append_chat_message(
+            ChatMessage(
+                chat_id=chat.id,
+                role="assistant",
+                body={
+                    "role": "assistant",
+                    "content": "Here's what I'd run.",
+                    "tool_calls": [
+                        _propose_call("c1", KIND_PLAN),
+                        _propose_call("c2", DRAFT_PLAN),
+                    ],
+                },
+                display="Here's what I'd run.",
+            )
+        )
+        await store.append_chat_message(
+            ChatMessage(chat_id=chat.id, role="user", body={}, display="yes")
+        )
+        await store.append_chat_message(
+            ChatMessage(
+                chat_id=chat.id,
+                role="note",
+                body={},
+                display=f"launched {MISSION} · draft · {OBJECTIVE}",
+            )
+        )
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.query_one("#chat-list", RowList).activate(chat.id, via_mouse=True)
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 2)
+        assert app.view("work").convo.id == chat.id
+        cards = list(app.query(ProposalCard))
+        assert [c.proposal.plan for c in cards] == ["echo", "draft"]
+        assert cards[0].live, "the plan=echo twin was never launched"
+        assert not cards[1].live, "the plan=draft twin is the one the note names"
+        # a bare "yes" launches the ONE proposal still pending: the work that is
+        # already a mission (the plan=draft twin) must not be started again
+        prompt = app.query_one("#prompt", Prompt)
+        prompt.focus()
+        await pilot.press("y", "e", "s", "enter")
+        await _settle(pilot, 2.0)
+        assert prompt.text == "", "the yes was typed into the prompt"
+        assert not cards[1].live
+        assert not app.swallowed
+    chat_id = chat.id
+    store = await _store(env)
+    try:
+        ours = [
+            m
+            for m in await store.list_missions(limit=100, chat_id=chat_id)
+            if m.objective == OBJECTIVE
+        ]
+
+        # an orchestrated mission records the chosen plan as its playbook
+        def chosen(m: Any) -> str:
+            return str(m.plan.get("playbook") or m.plan.get("kind"))
+
+        plans = sorted(chosen(m) for m in ours)
+        assert plans == ["draft", "echo"], f"one mission per live proposal, got {plans}"
+        assert [m.id for m in ours if chosen(m) == "draft"] == [MISSION], (
+            "the launched twin ran exactly once"
+        )
+    finally:
+        await store.aclose()
+
+
+async def test_a_legacy_bare_launch_note_still_settles_the_oldest(
+    ids: dict[str, str], env: Path
+) -> None:
+    """Notes written before the plan was recorded carry only a mission id. One
+    of those settles the OLDEST pending proposal, which is all it can mean."""
+    from rework.kernel.state.records import Chat, ChatMessage
+    from rework.tui.widgets.cards import ProposalCard
+
+    store = await _store(env)
+    try:
+        chat = await store.create_chat(Chat(title="legacy note", model_id="flash"))
+        await store.append_chat_message(
+            ChatMessage(
+                chat_id=chat.id,
+                role="user",
+                body={"role": "user", "content": "hello and goodbye, separately"},
+                display="hello and goodbye, separately",
+            )
+        )
+        await store.append_chat_message(
+            ChatMessage(
+                chat_id=chat.id,
+                role="assistant",
+                body={
+                    "role": "assistant",
+                    "content": "Two separate pieces of work.",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {
+                                "name": "propose_mission",
+                                "arguments": json.dumps(
+                                    {"objective": "say hello", "plan": "echo", "title": "Greeting"}
+                                ),
+                            },
+                        },
+                        {
+                            "id": "c2",
+                            "type": "function",
+                            "function": {
+                                "name": "propose_mission",
+                                "arguments": json.dumps(
+                                    {
+                                        "objective": "say goodbye",
+                                        "plan": "echo",
+                                        "title": "Farewell",
+                                    }
+                                ),
+                            },
+                        },
+                    ],
+                },
+                display="Two separate pieces of work.",
+            )
+        )
+        await store.append_chat_message(
+            ChatMessage(chat_id=chat.id, role="note", body={}, display="launched " + ids["running"])
+        )
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.query_one("#chat-list", RowList).activate(chat.id, via_mouse=True)
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 2)
+        cards = list(app.query(ProposalCard))
+        assert [c.proposal.objective for c in cards] == ["say hello", "say goodbye"]
+        assert not cards[0].live, "a bare note settles the oldest pending proposal"
+        assert cards[1].live
+        assert sum(1 for c in cards if c.live) == 1
+        assert not app.swallowed
+
+
+async def test_a_saved_chat_with_two_unlaunched_proposals_shows_and_launches_both(
+    ids: dict[str, str], env: Path
+) -> None:
+    """Replay: both pending proposals come back as live cards (nothing was ever
+    launched), and the group action launches both."""
+    from rework.kernel.state.records import Chat, ChatMessage
+    from rework.tui.widgets.cards import ProposalCard
+
+    store = await _store(env)
+    try:
+        chat = await store.create_chat(Chat(title="two things at once", model_id="flash"))
+        await store.append_chat_message(
+            ChatMessage(
+                chat_id=chat.id,
+                role="user",
+                body={"role": "user", "content": "hello and goodbye, separately"},
+                display="hello and goodbye, separately",
+            )
+        )
+        await store.append_chat_message(
+            ChatMessage(
+                chat_id=chat.id,
+                role="assistant",
+                body={
+                    "role": "assistant",
+                    "content": "Two separate pieces of work.",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {
+                                "name": "propose_mission",
+                                "arguments": json.dumps(
+                                    {"objective": "say hello", "plan": "echo", "title": "Greeting"}
+                                ),
+                            },
+                        },
+                        {
+                            "id": "c2",
+                            "type": "function",
+                            "function": {
+                                "name": "propose_mission",
+                                "arguments": json.dumps(
+                                    {
+                                        "objective": "say goodbye",
+                                        "plan": "echo",
+                                        "title": "Farewell",
+                                    }
+                                ),
+                            },
+                        },
+                    ],
+                },
+                display="Two separate pieces of work.",
+            )
+        )
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.query_one("#chat-list", RowList).activate(chat.id, via_mouse=True)
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 2)
+        assert app.view("work").convo.id == chat.id
+        cards = list(app.query(ProposalCard))
+        assert [c.proposal.objective for c in cards] == ["say hello", "say goodbye"]
+        assert all(card.live for card in cards), "nothing launched, so both are pending"
+        assert all(card.query_one(".pc-allbtn", Btn).display for card in cards)
+        await pilot.click(_btn(app, cards[0], "launch-all"))
+        await _settle(pilot, 1.5)
+        assert not any(card.live for card in cards)
+        assert not app.swallowed
+    store = await _store(env)
+    try:
+        missions = await store.list_missions(limit=100, chat_id=chat.id)
+        assert sorted(m.objective for m in missions) == ["say goodbye", "say hello"]
     finally:
         await store.aclose()
 
@@ -2303,6 +3103,200 @@ async def test_foreign_row_written_during_own_turn_is_rendered_once(
         text = shown()
         assert text.count("foreign from A") == 1
         assert "own row from B" not in text, "own rows are never replayed by the poll"
+        assert not app.swallowed
+
+
+async def test_a_replayed_chat_does_not_duplicate_its_proposal_cards(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replay must place every stored row ONCE, however it was reached.
+
+    The poller and the live render of `_send` can both see the rows this
+    process wrote (the engine persists them before `_send` paints them), and a
+    replay can start from a fresh cursor (a reopened chat, a swapped store).
+    Rendering therefore has to be idempotent per chat_messages id: before the
+    high-water mark, re-reaching the proposing row put every `propose_mission`
+    in it on screen a second time, which is the duplicate-card symptom
+    (`4 cards` for one two-proposal turn).
+    """
+    script_provider(
+        monkeypatch,
+        [
+            propose_many(
+                {"objective": "say hello", "plan": "echo", "title": "Greeting"},
+                {"objective": "say goodbye", "plan": "echo", "title": "Farewell"},
+            )
+        ],
+    )
+    from rework.tui.widgets.cards import ProposalCard
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        work = app.view("work")
+        for ch in "hello and goodbye":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 2)
+        assert len(app.query(ProposalCard)) == 2, await _diag(app)
+        chat_id = work.convo.id
+        messages = await app.hub.data.chat_messages(chat_id)
+        row_ids = [int(m.id or 0) for m in messages]
+        assert work._rendered_max_id == max(row_ids), (work._rendered_max_id, row_ids)
+
+        # the reopen path: this process no longer knows which rows it wrote, and
+        # the transcript is re-reached from a fresh cursor with the log intact
+        app.hub.data.own_chat_ids.clear()
+        work._chat_cursor = 0
+        await _run_chat_tick(work, chat_id)
+        await _settle(pilot, 0.6)
+        cards = list(app.query(ProposalCard))
+        assert len(cards) == 2, (
+            f"{len(cards)} cards after a replay of rows {row_ids}"
+            f" with cursor {work._chat_cursor} and mark {work._rendered_max_id}"
+        )
+        assert [c.proposal.objective for c in cards] == ["say hello", "say goodbye"]
+        assert not app.swallowed
+
+
+async def test_a_store_swap_repaints_the_transcript_without_loss_or_duplication(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The RECONNECT path, through the real epoch counter.
+
+    A swapped store invalidates the row ids the view is holding, so the tick
+    cannot page on from its cursor: it has to re-read the whole transcript.
+    This drives the actual `TuiData.drop_store()` epoch bump (not a hand-set
+    field), writes a plain row and a foreign proposing row while the view holds
+    the dead handle, and then ticks once. What must hold: nothing written
+    during the outage is lost, and every proposal already on screen comes back
+    exactly once, in transcript order.
+    """
+    script_provider(
+        monkeypatch,
+        [
+            propose_many(
+                {"objective": "say hello", "plan": "echo", "title": "Greeting"},
+                {"objective": "say goodbye", "plan": "echo", "title": "Farewell"},
+            )
+        ],
+    )
+    from rework.kernel.state.records import ChatMessage
+    from rework.tui.widgets.cards import ProposalCard
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        work = app.view("work")
+        # a fresh chat, the way the duplicate test makes one: the seeded chat
+        # already carries a proposal of its own, which would muddy the count
+        for ch in "hello and goodbye":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        for _ in range(60):  # wait for the scripted turn, not for a fixed time
+            await _settle(pilot, 0.1)
+            if len(app.query(ProposalCard)) >= 2 and not work._sending:
+                break
+        await _settle(pilot, 0.5)
+        assert [c.proposal.objective for c in app.query(ProposalCard)] == [
+            "say hello",
+            "say goodbye",
+        ]
+        chat_id = work.convo.id  # the chat this process created with the turn
+        # A swapped connection hands back ids from a DIFFERENT sequence (another
+        # database, a re-created row), so the pointers the view kept can land
+        # above everything the store now holds. Paging on from them could never
+        # reach these rows again, which is exactly what the epoch re-read is
+        # for; without it the assertions below cannot pass.
+        work._chat_cursor = work._rendered_max_id = 10_000
+        epoch_before = app.hub.data.store_epoch
+
+        await app.hub.data.drop_store()  # the real swap: closes the handle, bumps the epoch
+        assert app.hub.data.store_epoch == epoch_before + 1
+        assert app.hub.data.store_epoch != work._store_epoch, "the view is stale now"
+
+        # another instance writes while this one holds the dead handle: a plain
+        # row and a proposing one, both of which the replay has to pick up
+        store = await _store(env)
+        try:
+            await store.append_chat_message(
+                ChatMessage(
+                    chat_id=chat_id,
+                    role="user",
+                    body={"role": "user", "content": "while you were swapped"},
+                    display="while you were swapped",
+                )
+            )
+            await store.append_chat_message(
+                ChatMessage(
+                    chat_id=chat_id,
+                    role="assistant",
+                    body={
+                        "role": "assistant",
+                        "content": "One more thing.",
+                        "tool_calls": [
+                            {
+                                "id": "c3",
+                                "type": "function",
+                                "function": {
+                                    "name": "propose_mission",
+                                    "arguments": json.dumps(
+                                        {
+                                            "objective": "say thanks",
+                                            "plan": "echo",
+                                            "title": "Thanks",
+                                        }
+                                    ),
+                                },
+                            }
+                        ],
+                    },
+                    display="One more thing.",
+                )
+            )
+        finally:
+            await store.aclose()
+
+        await _run_chat_tick(work, chat_id)  # the epoch branch of the tick
+
+        def repainted() -> bool:
+            """The replay is DONE, not merely started.
+
+            The two cards from the turn are on screen while the epoch replay
+            paints, so `>= 3` is satisfied the instant the foreign proposal
+            lands, mid-repaint (5 cards: the replayed pair painted on top of the
+            pair already there). The repaint has finished only when the count,
+            the epoch and both pointers agree."""
+            return (
+                len(app.query(ProposalCard)) == 3
+                and work._store_epoch == app.hub.data.store_epoch
+                and work._chat_cursor < 10_000
+                and work._rendered_max_id < 10_000
+            )
+
+        await _wait_for(pilot, repainted)
+
+        def shown() -> str:
+            return "\n".join(str(s.render()) for s in app.query("#chat-log Step"))
+
+        cards = list(app.query(ProposalCard))
+        # three proposals are in the transcript (the two from the turn plus the
+        # one written during the outage) and NOT four: 4 would be the replayed
+        # pair painted on top of the pair already on screen
+        assert len(cards) == 3, await _diag(app)
+        assert [c.proposal.objective for c in cards] == [
+            "say hello",
+            "say goodbye",
+            "say thanks",
+        ]  # the two originals survive, in order, and the foreign one follows
+        # nothing was launched, so every replayed card must still be launchable:
+        # a replay that settled them would tell the owner the work already ran
+        assert all(card.live for card in cards), "the replayed proposals are still pending"
+        assert "while you were swapped" in shown(), "the row written during the outage was lost"
+        # the view consumed the swap and re-seeded its pointers from the rows,
+        # instead of keeping the stale ones it held across the reconnect
+        assert work._store_epoch == app.hub.data.store_epoch
+        assert work._chat_cursor < 10_000 and work._rendered_max_id < 10_000
         assert not app.swallowed
 
 

@@ -47,7 +47,11 @@ def _tail_line(ev: Any) -> str | None:
 
 
 class ProposalCard(Vertical):
-    """The orchestrator's proposal. Nothing exists until Launch."""
+    """The orchestrator's proposal. Nothing exists until Launch.
+
+    One card per proposal: a request that spans several separate pieces of work
+    gets several of these, each launching its own mission. When there is more
+    than one pending, every card also offers "Launch all"."""
 
     class Decided(Message):
         def __init__(self, card: ProposalCard, launch: bool) -> None:
@@ -55,10 +59,18 @@ class ProposalCard(Vertical):
             self.card = card
             self.launch = launch
 
+    class LaunchAll(Message):
+        """The group action: launch every pending proposal of this chat."""
+
+        def __init__(self, card: ProposalCard) -> None:
+            super().__init__()
+            self.card = card
+
     def __init__(self, proposal: Any, *, live: bool = True) -> None:
         super().__init__(classes="card -accent proposal")
         self.proposal = proposal
         self.live = live
+        self.launch_all = False
 
     def compose(self) -> ComposeResult:
         p = self.proposal
@@ -82,10 +94,25 @@ class ProposalCard(Vertical):
         with Horizontal(classes="card-actions"):
             yield Btn("Launch", "launch", variant="primary")
             yield Btn("Scrap", "scrap", variant="ghost")
-            yield Static(f"[{FAINT}]or reply with changes · “yes” launches[/]", classes="spacer")
+            yield Btn("Launch all", "launch-all", variant="primary", classes="pc-allbtn")
+            yield Static("", classes="spacer pc-hint")
 
     def on_mount(self) -> None:
         self.set_live(self.live)
+        self.set_launch_all(self.launch_all)
+
+    def set_launch_all(self, on: bool) -> None:
+        """Offer the group action: more than one proposal is pending."""
+        self.launch_all = on
+        try:
+            button = self.query_one(".pc-allbtn", Btn)
+            hint = self.query_one(".pc-hint", Static)
+        except Exception:  # not composed yet: on_mount applies it
+            return
+        button.display = on
+        hint.update(
+            f"[{FAINT}]or reply with changes · “yes” launches all {'of them' if on else ''}[/]"
+        )
 
     def set_live(self, live: bool) -> None:
         self.live = live
@@ -95,7 +122,9 @@ class ProposalCard(Vertical):
 
     def on_btn_pressed(self, event: Btn.Pressed) -> None:
         event.stop()
-        if event.action in ("launch", "scrap"):
+        if event.action == "launch-all":
+            self.post_message(self.LaunchAll(self))
+        elif event.action in ("launch", "scrap"):
             self.post_message(self.Decided(self, event.action == "launch"))
 
 

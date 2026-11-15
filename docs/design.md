@@ -129,10 +129,14 @@ specified in `docs/tui/DESIGN.md`; every view is built from that kit.
 
 - **Work**: Claude-Code-style conversation with the orchestrator. Saved chats
   on the left (persisted in the store, synced across devices); the transcript
-  shows your messages, the orchestrator's tool calls and results live, proposal
-  cards (Launch / Scrap; nothing runs until you confirm, or type "yes") and
-  live mission cards (status, last steps, inline gate answers, pause/cancel).
-  Project / model / effort knobs under the prompt. Opens with no chat selected.
+  shows your messages, the orchestrator's tool calls and results live, one
+  proposal card per proposed mission (each with its own Launch and Scrap, so a
+  request that spans separate pieces of work never has to squeeze all of it
+  through one card), a "Launch all" action on the group, and live mission cards
+  (status, last steps, inline gate answers, pause/cancel). Nothing runs until
+  you confirm: typing "yes" launches every pending proposal and "no" scraps
+  every one of them. Project / model / effort knobs under the prompt. Opens
+  with no chat selected.
 - **Dashboard**: overview (stats strip, projects, missions grouped needs-you →
   running → paused → recent) and a mission drill-down: header + flow strip,
   sessions (one per run) on the left, and Trajectory / Graph (LangGraph-style
@@ -223,6 +227,45 @@ tailnet once pulled 3 MB/s, 17.5 GB in 1h40m, from
   tick, and recovers on its own when the fetch succeeds.
 
 `scripts/measure_poll_bytes.py` prints bytes per poll before and after.
+
+### Several missions from one conversation
+
+One owner request can span separate pieces of work (a bug in one repo, a doc in
+another), so the orchestrator may call `propose_mission` more than once in one
+turn. The Work tab then shows one proposal card per call, each with its own
+Launch and Scrap, plus a "Launch all" action on the group.
+
+- `OrchestratorChat.proposals` is the pending list, in call order. A later turn
+  that proposes REPLACES the pending list (`self.proposal` remains a
+  compatibility view of the first entry).
+- A typed "yes" launches every pending proposal and a typed "no" scraps every
+  pending one; `ChatResult.launched_all` / `ChatResult.scrapped_all` carry that
+  signal so the UI never has to re-derive which proposal was meant.
+- Launching or scrapping ONE card settles only that card; its siblings stay
+  pending. Each launch still goes through `Conversation.launch` ->
+  `missions.create_mission`, so the per-mission kwargs are unchanged.
+- `Chat.mission_id` stays a scalar and keeps the FIRST mission the chat
+  launched (a non-NULL value is never overwritten). It is only the denormalised
+  pointer the chat list uses for a status glyph; `Mission.chat_id` is the real
+  one-chat-to-many-missions link that `WorkView.active_missions()` queries.
+- Proposals have no table of their own: they ride in `chat_messages.body` as the
+  assistant message's `tool_calls`, so several proposals replay from one stored
+  message with no migration. A launch note reads
+  `launched <mission id> · <plan> · <objective>`; on replay a proposal is settled
+  when such a note names its plan AND its objective (an objective alone cannot
+  tell two proposals apart, and a chat may hold two with the same objective and
+  a different plan because the model re-proposes when the owner changes their
+  mind). A note with only two fields is a legacy `launched <id> · <objective>`
+  note: its second field is the objective, so it settles on the objective alone.
+  A legacy bare `launched <id>` note settles the OLDEST still-pending proposal.
+  In every case a note that matches nothing settles the oldest pending proposal,
+  and two proposals that are identical settle the oldest of them (they are
+  interchangeable). Everything left pending is restored into the engine by
+  `Conversation.ensure_engine`, so a reloaded chat shows and can launch all of
+  them. Replay is idempotent: the Work view keeps a high-water mark of the
+  `chat_messages` ids it has already rendered, per store connection, so
+  reopening a saved chat or reconnecting the store never paints a pending
+  proposal card twice.
 
 ### The Library
 
