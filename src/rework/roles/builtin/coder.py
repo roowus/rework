@@ -30,6 +30,7 @@ from rework.nodes.git_ops import (
 from rework.nodes.toolloop import make_toolloop_node
 from rework.nodes.tools import ComplaintAwareExecutor, LazyExecutor
 from rework.roles.base import RoleBuildCtx, RoleSpec
+from rework.web.tools import web_executor
 
 if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
@@ -67,7 +68,8 @@ class CoderSpec(RoleSpec):
     name = "coder"
     description = (
         "Implements a change in an isolated worktree + branch, self-checks"
-        " with real test runs, hands off a mechanical diff."
+        " with real test runs, hands off a mechanical diff. Can search the public"
+        " web (`web_search`) and read pages (`fetch_url`)."
     )
     goal = (
         "Fulfill the task completely and make the code work reliably and well:"
@@ -235,15 +237,17 @@ class CoderSpec(RoleSpec):
             provider=ctx.provider,
             catalog=ctx.catalog,
             catalog_id=catalog_id,
-            executor=library_executor(
-                ctx,
-                ComplaintAwareExecutor(
-                    EscalationAwareExecutor(executor, ctx),
-                    ctx.store,
-                    ctx.mission.id,
-                    ctx.run.id,
-                    self.name,
-                ),
+            executor=web_executor(
+                library_executor(
+                    ctx,
+                    ComplaintAwareExecutor(
+                        EscalationAwareExecutor(executor, ctx),
+                        ctx.store,
+                        ctx.mission.id,
+                        ctx.run.id,
+                        self.name,
+                    ),
+                )
             ),
             system_prompt=with_library_menu(ctx, system_prompt),
             store=ctx.store,

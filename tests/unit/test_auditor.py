@@ -162,6 +162,11 @@ async def test_auditor_reads_context_and_reports(audit_ctx: RoleBuildCtx) -> Non
     first = fake.requests[0]
     assert "Mission brief" in first.messages[0]["content"]
     assert "```diff" in first.messages[0]["content"]
+    # the auditor reads the workspace; it must NOT gain outbound web access
+    # (investigator and coder have web_search/fetch_url, the auditor does not)
+    offered = {s.name for s in first.tools}
+    assert "read_file" in offered
+    assert offered.isdisjoint({"web_search", "fetch_url"})
     assert "GOAL:" in first.system
     tool_messages = [m for m in final["messages"] if m.get("role") == "tool"]
     assert any("def add" in m["content"] for m in tool_messages)
