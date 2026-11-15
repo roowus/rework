@@ -100,9 +100,31 @@ describe the change. The orchestrator proposes; Launch starts it. The local
 daemon clones `github.com/roowus/rework`, runs the roles in
 `~/.rework/work/`, and — after a clean audited `done` — pushes the last coder's
 branch and opens the PR with your local `gh` login. **No gate by default**: the
-audit rail already guarantees the change was reviewed. The orchestrator can ask
-for one (`finish(ask_before_pr=true, reason=...)`) when the change is risky or
-unusual, and a project setting controls it globally:
+audit rail already guarantees the change was reviewed, and most fixes —
+especially ones you asked for — ship without a gate. A gate is only for the most
+crucial cases.
+
+Asking for a gate is strict (owner decision, 2026-11-14). The orchestrator may
+pass `finish(ask_before_pr=true, gate_category=..., reason=...)` ONLY when the
+change falls in one of four high-stakes categories, and the `reason` should name
+that category. What the engine mechanically enforces is narrower: a non-empty
+`reason` and a `gate_category` from the list below. Your gate question shows
+both — the category first, then the reason — so you can judge the request.
+Anything else is refused with a tool error telling the orchestrator to open the
+PR without a gate; a change you asked for is never gated for being large,
+unusual, or touching many files, and audit findings the orchestrator accepted
+belong in the finish `summary` — which becomes the PR body you read before
+merging.
+
+| `gate_category` | the change does... |
+| --- | --- |
+| `data_loss` | data loss or a destructive data migration |
+| `security` | security, credentials, auth or permissions |
+| `money` | money (billing, payments, paid resources) |
+| `production_infrastructure` | irreversible or production infrastructure (deploys, DNS, cloud resources, deleting user files) |
+
+The gate question then leads with the category and the orchestrator's reason
+("Gate category: security — ..."), so you can decide from the inbox.
 
 Only a plan that publishes (`"publish": "pr"` — the `fix-pr` playbook; older
 plans carrying `"gates": ["open_pr"]` count too) pushes a branch or opens a PR
@@ -111,7 +133,7 @@ at all. `echo` and `fix` missions deliver their result and stop.
 | project `settings.pr_gate` | effect |
 | --- | --- |
 | `auto` (default) | gate only when the orchestrator asks (or the plan lists `open_pr`) |
-| `always` | always gate before opening the PR |
+| `always` | always gate before opening the PR (overrides the orchestrator) |
 | `never` | never gate; an `ask_before_pr` is noted and overridden |
 
 Merging is always the owner's decision; no agent merges.

@@ -602,6 +602,7 @@ class MissionRunner:
         *,
         ask_before_pr: bool = False,
         reason: str = "",
+        gate_category: str = "",
     ) -> tuple[bool | None, str | None]:
         """The plan's fixed final human decisions (ship / open_pr), shared by
         the mechanical runner and the orchestrator (ADR 0007: the model never
@@ -677,7 +678,16 @@ class MissionRunner:
                 verdict = mechanical_verdict(last_audit_artifact)
                 question = f"Open a pull request for this change? audit verdict: {verdict}"
                 if reason:
-                    question += f". Orchestrator asked for review: {reason}"
+                    # the strict gate (issue #36): the category leads, then why
+                    label = gate_category or "unspecified"
+                    question += f". Gate category: {label} — {reason}"
+                elif setting == "always":
+                    # forced by the project setting, no category to show: say so
+                    # instead of printing an empty one
+                    question += (
+                        ". Forced by project setting pr_gate=always; "
+                        "the orchestrator named no category"
+                    )
                 gate = await self._gates.request(
                     mission.id, kind=GateKind.OPEN_PR, question=question
                 )
