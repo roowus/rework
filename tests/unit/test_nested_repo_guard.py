@@ -5,6 +5,8 @@ role's own rework scratch dir (follow-up to PR #22)."""
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from rework.nodes.git_ops import stage_all, unstage_nested_repos
 
 
@@ -62,7 +64,9 @@ def test_the_auditor_gets_the_complete_file_list() -> None:
     assert changed_files(diff) == ["src/x.py", "origin.git/HEAD"]
 
 
-async def test_the_roles_rework_scratch_dir_never_reaches_the_commit(tmp_path: Path) -> None:
+async def test_the_roles_rework_scratch_dir_never_reaches_the_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Follow-up to PR #22: role_env used to put rework's per-run state in
     `<workdir>/.rework-scratch`, and a coder's workdir IS its worktree, so the
     handoff's `git add -A` committed logs/targets/run registry into the PR.
@@ -81,9 +85,16 @@ async def test_the_roles_rework_scratch_dir_never_reaches_the_commit(tmp_path: P
     wt = run_dir / "worktree"  # coder.py's <run_dir>/worktree
     git(repo, "worktree", "add", "-q", "-b", "rework/x", str(wt))
 
-    # REWORK_RUN_DIR is pinned by the _isolated_command_registry fixture, so
-    # locate the scratch dir through REWORK_LOG_DIR (same dir).
+    # role_env only *defaults* these paths, so any of them inherited from the
+    # caller's environment (a coder's own run has all four) silently moves the
+    # scratch dir this test is about — and the log-isolation fixture pins
+    # REWORK_LOG_DIR too. Drop them so role_env derives its scratch dir here.
+    # REWORK_RUN_DIR stays: it is the in-process command registry's dir, pinned
+    # by the _isolated_command_registry fixture so no test writes ~/.rework/run.
+    for var in ("REWORK_LOG_DIR", "REWORK_TARGETS", "REWORK_ENV_FILE", "REWORK_TUI_SETTINGS"):
+        monkeypatch.delenv(var, raising=False)
     scratch = Path(role_env(wt)["REWORK_LOG_DIR"]).parent
+    assert scratch.name == ".rework-scratch", scratch
     assert not scratch.is_relative_to(wt), "scratch dir must be outside the worktree"
 
     # the role's own rework invocation, run through the real jail
