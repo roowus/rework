@@ -155,6 +155,41 @@ notifications are configurable (`REWORK_NOTIFY=toast,bell,os|none`, or File ›
 Settings). What the TUI still needs from the engine is tracked in
 `docs/plans/m7-dogfood-loop.md`.
 
+**What a poll carries.** The poll is small on purpose (one open TUI over a
+tailnet once pulled 3 MB/s, 17.5 GB in 1h40m, from
+`SELECT * FROM missions ... LIMIT 200` every 2 s):
+
+- *Slim mission list.* The snapshot's missions come from
+  `StateStore.list_missions_light` (sqlite and postgres): id, title, objective
+  clipped to 200 chars, status, project_id, chat_id, priority, created_at,
+  updated_at, repo_path. `plan` and `result` are not selected; on those rows
+  `Mission.light` is True and both are `None` (never a silent `{}`). `repo_path`
+  stays because the PR preview default reads it off the snapshot. Same
+  filters, order and limit as `list_missions`, which still returns full rows.
+- *Full row on demand.* A view that needs `plan` or `result` calls
+  `TuiData.get_mission`: the dashboard when a mission is opened (kept on
+  `full_mission`, refetched only when the row's `updated_at` moves, which any
+  plan or result write bumps), the Work view's mission cards, and the Gates
+  view when a gate is selected. Never per keypress or per tick.
+- *List row.* The dashboard's mission row no longer shows the plan label
+  (`fix`, `auto orchestrated`): that was the one list-level read of `plan`.
+  The label is still in the mission header and on Work cards.
+- *Gates are left alone.* A gate record carries only bounded fields (question,
+  decision, note, spec); the diff and audit verdict are fetched per selection.
+- *Repaint skip.* `Hub` compares missions, gates, projects, chats, spend and
+  the online/error state with the previous broadcast and skips the broadcast
+  when nothing changed (the first refresh always broadcasts). Views get
+  `on_tick` instead, so live detail polls (events, steps, shared chats) keep
+  running without repainting the lists.
+- *Idle backoff.* After `reload.IDLE_SECONDS` (30 s) with no key, no modal and
+  no chat turn, the app polls every `IDLE_POLL_SECONDS` (10 s) instead of
+  `poll_seconds` (2 s). The timer keeps ticking every `poll_seconds`; `_kick`
+  skips the ticks that are not due. Any key refreshes at once and restores the
+  fast rate. The offline backoff in `Hub.refresh` composes with it (it only
+  ever delays a poll further).
+
+`scripts/measure_poll_bytes.py` prints bytes per poll before and after.
+
 ### The Library
 
 Items (skills/tools/reports/memories) live as files in a dedicated git repo (canonical

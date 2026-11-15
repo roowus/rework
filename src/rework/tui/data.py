@@ -176,8 +176,11 @@ class TuiData:
         return await self._resilient("projects", lambda: self._call(lambda s: s.list_projects()))
 
     async def missions(self, limit: int = 60) -> list[Mission]:
+        """The slim mission list the poll carries: no plan, no result, objective
+        clipped (`Mission.light` is True). A view that needs them calls
+        get_mission for the full row."""
         return await self._resilient(
-            f"missions:{limit}", lambda: self._call(lambda s: s.list_missions(limit=limit))
+            f"missions:{limit}", lambda: self._call(lambda s: s.list_missions_light(limit=limit))
         )
 
     async def open_gates(self, mission_id: str | None = None) -> list[Any]:

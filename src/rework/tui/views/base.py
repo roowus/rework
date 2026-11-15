@@ -59,6 +59,10 @@ class View(Container):
     def on_snapshot(self, snap: Snapshot) -> None:
         pass
 
+    def on_tick(self, snap: Snapshot) -> None:
+        """A refresh found the data unchanged: no repaint, but a view that polls
+        live detail (events, steps, a shared chat) keeps doing it here."""
+
     def shown(self) -> None:
         pass
 

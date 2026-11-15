@@ -254,6 +254,9 @@ class LibraryView(View):
             return
         self._recheck()
 
+    def on_tick(self, snap: Snapshot) -> None:
+        self.on_snapshot(snap)
+
     @work(exclusive=True, group="lib-recheck")
     async def _recheck(self) -> None:
         if self._searching:

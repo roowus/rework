@@ -60,6 +60,18 @@ class StateStore(Protocol):
         chat_id: str | None = None,
     ) -> list[Mission]: ...
 
+    async def list_missions_light(
+        self,
+        status: MissionStatus | None = None,
+        limit: int = 200,
+        chat_id: str | None = None,
+    ) -> list[Mission]:
+        """list_missions without the heavy columns, for the TUI poll: plan and
+        result are NOT selected (None, `light=True`) and objective is clipped to
+        LIGHT_OBJECTIVE_CHARS. Same filters, order and limit as list_missions.
+        Use get_mission for the full row."""
+        ...
+
     async def next_pending_missions(self, limit: int = 100) -> list[Mission]:
         """Pending missions in PICKUP order: priority high first, then oldest
         first within a level. Not the browse order of list_missions (created_at

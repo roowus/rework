@@ -46,6 +46,14 @@ ERROR_STORM_WINDOW = 5.0
 # off the 2s heartbeat: its own slow interval.
 CODE_CHECK_SECONDS = 60.0
 
+# The hub poll interval while the owner is active (the settings value, tui.json
+# `poll_seconds`, overrides it), and the slower one once they have been away for
+# reload.IDLE_SECONDS: nobody is looking at a screen that sat untouched for 30s,
+# and a left-open TUI over a tailnet is the expensive case. Any key goes back to
+# the fast rate (App.poll_interval).
+POLL_SECONDS = 2.0
+IDLE_POLL_SECONDS = 10.0
+
 # How often the shell asks origin whether main moved (finding 28: the
 # checkout can be behind the code the owner expects). A `git fetch` is
 # slower than the stat walk above, so it gets its own slow interval and
@@ -154,7 +162,8 @@ class ReworkApp(App[None]):
         self.theme = "rework"
         self.settings = Settings.load()
         self.hub = hub or Hub()
-        self.poll_seconds = poll_seconds or float(self.settings.poll_seconds or 2.0)
+        self.poll_seconds = poll_seconds or float(self.settings.poll_seconds or POLL_SECONDS)
+        self._last_poll = 0.0  # monotonic time of the last refresh kick
         self.active_tab = "work"
         self._esc_armed_at = 0.0
         self._seen_gates: set[str] | None = None  # None until the first load
@@ -224,6 +233,7 @@ class ReworkApp(App[None]):
 
         asyncio.get_running_loop().set_exception_handler(asyncio_exception_handler)
         self.hub.subscribe(self._on_snapshot)
+        self.hub.subscribe_tick(self._on_tick)
         self.query_one(TabBar).set_active("work")
         self.query_one(MenuBar).set_status(online=True, gates=0, spend_today=0.0, connecting=True)
         self._paint_hints()
@@ -253,7 +263,10 @@ class ReworkApp(App[None]):
         if isinstance(event, events.Key) and not event.is_forwarded:
             # ONE place records "the owner is here": every reload decision
             # reads this stamp, so a reload can never land mid-sentence
+            was_idle = self.poll_interval() > self.poll_seconds
             self._last_input = time.monotonic()
+            if was_idle:  # the owner is back: refresh now, then poll at full rate
+                self._kick()
             tab = OPTION_KEYS.get(event.key)
             if tab is not None:
                 self.action_tab(tab)
@@ -271,13 +284,36 @@ class ReworkApp(App[None]):
         database froze every key and click until it returned (rewvis offline =
         a dead TUI). Single-flight is the Hub's job; exclusive=False keeps a
         hung refresh from being cancelled mid-query by the next tick."""
+        now = time.monotonic()
+        # the timer ticks every poll_seconds; an idle owner is polled less often
+        # (half a tick of slack so timer jitter never skips a due poll)
+        if now - self._last_poll < self.poll_interval() - self.poll_seconds / 2:
+            return
+        self._last_poll = now
         self.run_worker(self._tick(), group="hub", exclusive=False)
+
+    def poll_interval(self) -> float:
+        """Seconds between refreshes right now: poll_seconds while the owner is
+        active, IDLE_POLL_SECONDS once they have been away (same idle test as the
+        reload: no input for reload.IDLE_SECONDS, no modal, no chat turn). Any key
+        stamps `_last_input` and drops this back to poll_seconds."""
+        if self.idle_for_reload():
+            return max(self.poll_seconds, IDLE_POLL_SECONDS)
+        return self.poll_seconds
 
     async def _tick(self) -> None:
         try:
             await self.hub.refresh()
         except Exception as exc:  # belt and braces: refresh already guards
             log.warning("tick failed: %s", exc)
+
+    def _on_tick(self, snap: Snapshot) -> None:
+        """A refresh found nothing new: no repaint, only the live detail polls."""
+        for view in self.views():
+            try:
+                view.on_tick(snap)
+            except Exception as exc:
+                self._swallow(exc)
 
     def _on_snapshot(self, snap: Snapshot) -> None:
         try:

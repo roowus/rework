@@ -159,6 +159,13 @@ class WorkView(View):
         self._refresh_cards()
         self._poll_chat()
 
+    def on_tick(self, snap: Snapshot) -> None:
+        self.snap = snap
+        cards = list(self.query(MissionCard))
+        if cards:
+            self._poll_cards(cards)
+        self._poll_chat()
+
     def _poll_chat(self) -> None:
         """Another instance's turns are persisted to the shared store; an
         already-open transcript has to re-read them. Cheap max-id probe first,
@@ -603,15 +610,37 @@ class WorkView(View):
         if not cards:
             return
         for card in cards:
-            mission = self.snap.mission(card.mission_id)
-            if mission is not None:
-                card.update_from(mission, self.snap.gates_for(card.mission_id))
+            row = self.snap.mission(card.mission_id)
+            if row is None:
+                continue
+            if getattr(row, "light", False):
+                # a light row has no plan or result: keep the full mission the
+                # card already holds while it is current, else _poll_cards
+                # fetches it (never paint the light row over a full one)
+                if self._card_is_current(card, row):
+                    card.update_from(card.mission, self.snap.gates_for(card.mission_id))
+            else:
+                card.update_from(row, self.snap.gates_for(card.mission_id))
         self._poll_cards(cards)
+
+    def _card_is_current(self, card: MissionCard, row: Any) -> bool:
+        """Does the card hold a full mission at the snapshot row's updated_at?"""
+        have = card.mission
+        return (
+            have is not None
+            and not getattr(have, "light", False)
+            and have.updated_at == row.updated_at
+        )
 
     @work(exclusive=True, group="cards")
     async def _poll_cards(self, cards: list[MissionCard]) -> None:
         for card in cards:
-            if card.mission is None:
+            row = self.snap.mission(card.mission_id)
+            if card.mission is None or (
+                row is not None
+                and getattr(row, "light", False)
+                and not self._card_is_current(card, row)
+            ):
                 mission = await self.hub.guard(
                     partial(self.hub.data.get_mission, card.mission_id), None
                 )

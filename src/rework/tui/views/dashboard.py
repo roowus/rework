@@ -142,6 +142,10 @@ class DashboardView(View):
         self._ai_gen = 0
         self._debounce: Timer | None = None
         self.mission_id: str | None = None
+        # the open mission's FULL row (plan, result): the snapshot only carries
+        # light rows, so _poll_mission fetches this once per open and again only
+        # when the mission's updated_at moves
+        self.full_mission: Any = None
         self.run_id: str | None = None
         self.mtab = "traj"
         # mission page state
@@ -265,6 +269,14 @@ class DashboardView(View):
             self._enrich()
         if self.mission_id:
             self._paint_mission_static()
+            self._poll_mission()
+
+    def on_tick(self, snap: Snapshot) -> None:
+        self.snap = snap
+        if time.time() - self._enriched_at > 15:
+            self._enriched_at = time.time()
+            self._enrich()
+        if self.mission_id:
             self._poll_mission()
 
     @work(exclusive=True, group="dash-enrich")
@@ -391,7 +403,6 @@ class DashboardView(View):
         bits = []
         if self.project == ALL and m.project_id:
             bits.append(self.snap.project_name(m.project_id))
-        bits.append(plan_label(m.plan))
         role = self.mission_role.get(m.id)
         if role and st in actions.ACTIVE:
             bits.append(role)
@@ -777,6 +788,7 @@ class DashboardView(View):
             self.budget = None
             self.run_cost = {}
             self.mission_gates = []
+            self.full_mission = None
             self.report_loaded_for = None
             self.query_one("#m-traj", Trajectory).clear()
             self.query_one("#run-list", RowList).set_rows([])
@@ -791,6 +803,7 @@ class DashboardView(View):
 
     def close_mission(self) -> None:
         self.mission_id = None
+        self.full_mission = None
         self.run_id = None
         self.query_one("#dash-pages", ContentSwitcher).current = "dash-overview"
         self._paint_overview()
@@ -845,6 +858,9 @@ class DashboardView(View):
         if not mission_id:
             return
         data = self.hub.data
+        await self._load_full_mission(mission_id)
+        if self.mission_id != mission_id:
+            return
         fresh = await self.hub.guard(lambda: data.mission_events(mission_id, self.last_seq), [])
         if self.mission_id != mission_id:
             return
@@ -880,10 +896,38 @@ class DashboardView(View):
         except NoMatches:
             return
 
+    async def _load_full_mission(self, mission_id: str) -> None:
+        """Fetch the open mission's full row (plan, result) off the light
+        snapshot row. Once per open, then only when updated_at moves (any plan or
+        result write bumps it); a snapshot row that is already full is used as is."""
+        row = self.snap.mission(mission_id)
+        if row is not None and not getattr(row, "light", False):
+            self.full_mission = row
+            return
+        have = self.full_mission
+        if (
+            have is not None
+            and have.id == mission_id
+            and (row is None or have.updated_at == row.updated_at)
+        ):
+            return
+        data = self.hub.data
+        got = await self.hub.guard(lambda: data.get_mission(mission_id), None)
+        if got is not None and self.mission_id == mission_id:
+            self.full_mission = got
+
+    def _detail_mission(self) -> Any:
+        """The open mission for plan/result reads: the full row once fetched,
+        else the snapshot's light row (plan and result are None on it)."""
+        full = self.full_mission
+        if full is not None and full.id == self.mission_id:
+            return full
+        return self.snap.mission(self.mission_id)
+
     def _paint_mission_static(self) -> None:
-        mission = self.snap.mission(self.mission_id)
+        mission = self._detail_mission()
         header = self.query_one("#m-header", Static)
-        if mission is None:
+        if mission is None or getattr(mission, "light", False):
             header.update(f"[{FAINT}]loading {esc(self.mission_id)}…[/]")
             return
         st = status_value(mission.status)
@@ -933,7 +977,7 @@ class DashboardView(View):
         rows = [RowData(ALL, f"[b]All activity[/b]\n[{FAINT}]{len(self.events)} events[/]")]
         orch_id = self._orchestrator_id()
         if orch_id:
-            mission = self.snap.mission(self.mission_id)
+            mission = self._detail_mission()
             st = status_value(mission.status) if mission else "running"
             model = ((mission.plan or {}).get("orchestrator") or {}).get("model") if mission else ""
             cost = self.run_cost.get(orch_id, 0.0)
@@ -960,7 +1004,7 @@ class DashboardView(View):
 
     def _orchestrator_id(self) -> str | None:
         """The orchestrator's pseudo run id (its events and charges carry it)."""
-        mission = self.snap.mission(self.mission_id)
+        mission = self._detail_mission()
         if mission is None or not (mission.plan or {}).get("orchestrator"):
             return None
         return f"{mission.id}:orchestrate:orchestrator:1"
@@ -985,8 +1029,8 @@ class DashboardView(View):
     # -- detail tabs ----------------------------------------------------------------------------
 
     def _paint_detail_tabs(self) -> None:
-        mission = self.snap.mission(self.mission_id)
-        if mission is None:
+        mission = self._detail_mission()
+        if mission is None or getattr(mission, "light", False):
             return
         tab = self.mtab
         if tab == "graph":
