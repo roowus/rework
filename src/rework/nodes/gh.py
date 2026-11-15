@@ -13,7 +13,7 @@ import asyncio
 import os
 from pathlib import Path
 
-from rework.nodes.failure_text import HTTP_5XX, marker_regex, scrub
+from rework.nodes.failure_text import HTTP_5XX, RATE_LIMIT, marker_regex, scrub
 
 PR_ATTEMPTS = 3
 PR_BACKOFF_S: tuple[float, ...] = (1.0, 2.0, 4.0)
@@ -79,6 +79,8 @@ def pr_failure_is_transient(output: str) -> bool:
     """Is this `gh pr create` failure worth another attempt? Conservative on
     purpose: only a timeout or a 5xx, never "already exists" or an auth error."""
     text = scrub(output)
+    if RATE_LIMIT.search(text):  # a 403-shaped "slow down", not a permission denial
+        return True
     if _PR_DEFINITIVE_RE.search(text):
         return False
     if HTTP_5XX.search(text):

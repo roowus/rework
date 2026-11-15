@@ -11,7 +11,7 @@ import contextlib
 import re
 from pathlib import Path
 
-from rework.nodes.failure_text import HTTP_5XX, marker_regex, scrub
+from rework.nodes.failure_text import HTTP_5XX, RATE_LIMIT, marker_regex, scrub
 from rework.nodes.tools import ToolExecutor
 
 
@@ -45,14 +45,21 @@ async def _run(repo: Path, *args: str, timeout_s: float = 60.0) -> tuple[int, st
         if not chunk:
             break
         chunks.append(chunk)
+    if not timed_out:
+        # EOF only means the pipe closed: git can close it and keep running, so
+        # the exit-code wait spends what is left of the SAME deadline.
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=max(deadline - loop.time(), 0.001))
+        except TimeoutError:
+            timed_out = True
     text = b"".join(chunks).decode(errors="replace").strip()
     if timed_out:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
-        await proc.wait()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(proc.wait(), timeout=5)
         note = f"(git timeout after {timeout_s:g}s)"
         return 124, f"{text}\n{note}" if text else note
-    await proc.wait()
     return proc.returncode or 0, text
 
 
@@ -334,6 +341,10 @@ def push_failure_is_transient(output: str, code: int = 1) -> bool:
     if code == 124:  # git was killed on timeout: no answer is a transient answer
         return True
     text = scrub(output)
+    # GitHub answers a secondary rate limit / abuse detection with a 403, the
+    # permission status: it is a "wait and retry", so it is checked first
+    if RATE_LIMIT.search(text):
+        return True
     if _PUSH_REJECTION_RE.search(text):
         return False
     if any(pattern.search(text) for pattern in _PUSH_REJECTION_PATTERNS):

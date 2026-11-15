@@ -39,3 +39,9 @@ def marker_regex(markers: Iterable[str]) -> re.Pattern[str]:
 # A 5xx status in git/gh output: `HTTP 503`, `status: 502`, and the bare curl
 # form `The requested URL returned error: 503`. Shared by both classifiers.
 HTTP_5XX = re.compile(r"\b(?:http|status|error|returned error)[/:\s.\d]*\b5\d\d\b")
+
+# GitHub's primary/secondary rate limit and abuse detection: often HTTP 403 (the
+# permission status) but a "wait and retry", never a rejection to fix.
+RATE_LIMIT = marker_regex(
+    ("secondary rate limit", "rate limit", "rate limited", "abuse detection", "too many requests")
+)

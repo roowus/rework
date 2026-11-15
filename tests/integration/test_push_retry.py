@@ -965,3 +965,59 @@ def test_weak_words_are_not_definitive_non_retry_markers() -> None:
     assert pr_failure_is_transient("gh: Authentication failed (HTTP 401)") is False
     assert pr_failure_is_transient("GraphQL: Resource not accessible: forbidden") is False
     assert pr_failure_is_transient("remote: error: GH006: Protected branch update failed") is False
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "remote: You have exceeded a secondary rate limit. Please wait a few minutes.\n"
+        "fatal: unable to access 'https://github.com/o/r.git/':"
+        " The requested URL returned error: 403",
+        "remote: You have triggered an abuse detection mechanism.\n"
+        "error: The requested URL returned error: 403",
+        "error: The requested URL returned error: 429 Too Many Requests",
+    ],
+)
+def test_a_rate_limit_403_is_retryable_for_push_and_pr(output: str) -> None:
+    assert push_failure_is_transient(output) is True
+    assert pr_failure_is_transient(output) is True
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "remote: Permission to o/r.git denied to someone.\n"
+        "fatal: unable to access 'https://github.com/o/r.git/':"
+        " The requested URL returned error: 403",
+        "error: The requested URL returned error: 403",
+        "remote: error: GH006: Protected branch update failed for refs/heads/main.",
+    ],
+)
+def test_a_plain_permission_403_is_still_not_retried(output: str) -> None:
+    assert push_failure_is_transient(output) is False
+
+
+async def test_git_that_closes_its_pipes_and_keeps_running_is_still_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """EOF on the pipe is not process exit: a git that writes a line, closes
+    stdout/stderr and then keeps running must still hit the deadline (the
+    post-EOF wait used to be unbounded and wedged the caller forever)."""
+    import time
+
+    import rework.nodes.git_ops as git_ops
+
+    bindir = tmp_path / "closebin"
+    bindir.mkdir()
+    shim = bindir / "git"
+    shim.write_text("#!/bin/sh\necho 'last words'\nexec 1>&- 2>&-\nsleep 30\n")
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+
+    started = time.monotonic()
+    code, out = await asyncio.wait_for(git_ops._run(tmp_path, "push", timeout_s=1), timeout=10)
+
+    assert time.monotonic() - started < 3
+    assert code == 124
+    assert out.splitlines()[0] == "last words"
+    assert out.splitlines()[-1] == "(git timeout after 1s)"
