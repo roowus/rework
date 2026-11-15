@@ -1746,6 +1746,45 @@ async def test_a_finished_card_shows_its_cost(ids: dict[str, str], env: Path) ->
         assert card.spend > 0, "a finished card must still show what it cost"
 
 
+async def test_a_finished_card_whose_backfill_is_cancelled_still_gets_its_cost(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The card poll is an exclusive worker: the next poll cancels it at any
+    await. When that landed on the spend fetch, the card was already marked
+    filled and stayed at $0 forever (an intermittent CI failure). A cancelled
+    backfill must leave the card unfilled so the next poll finishes the job."""
+    import asyncio
+
+    from rework.kernel.state.records import MissionStatus
+    from rework.tui.widgets.cards import MissionCard
+
+    store = await _store(env)
+    try:
+        await store.update_mission(ids["running"], status=MissionStatus.DONE)
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        real = app.hub.data.mission_spend
+        calls = {"n": 0}
+
+        async def cancelled_once(mission_id: str) -> float:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise asyncio.CancelledError  # the next poll cancelled this worker
+            return await real(mission_id)
+
+        monkeypatch.setattr(app.hub.data, "mission_spend", cancelled_once)
+        app.query_one("#chat-list", RowList).activate(ids["chat"], via_mouse=True)
+        await _settle(pilot, 2.5)
+        card = app.query_one(MissionCard)
+        assert calls["n"] >= 2, "a cancelled backfill is retried by the next poll"
+        assert card.tail_filled
+        assert card.spend > 0, "the retry fetched the cost"
+
+
 # -- preview a PR (Mission menu) ---------------------------------------------
 
 
