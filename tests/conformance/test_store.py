@@ -707,3 +707,125 @@ async def test_next_pending_missions_orders_high_then_oldest(store: StateStore) 
     # the browse order the TUI uses is untouched: newest first
     browse = [m.id for m in await store.list_missions(limit=10)]
     assert browse[0] == newest_normal.id
+
+
+# -- the slim mission list (TUI poll) ---------------------------------------
+
+
+async def _seed_light(store: StateStore) -> list[Mission]:
+    """Five missions with distinct created_at, mixed status/chat; one carries a
+    huge plan and result (what the TUI used to pull on every poll)."""
+    big = {"summary": "x" * 200_000, "log": ["line " * 40] * 200}
+    made: list[Mission] = []
+    for i in range(5):
+        m = Mission(
+            id=new_id("m"),
+            objective=("long objective " * 40) if i == 0 else f"objective {i}",
+            repo_path=f"/repo/{i}",
+            project_id="proj-a" if i % 2 else None,
+            chat_id="chat-1" if i < 2 else None,
+            title=f"title {i}",
+            priority="high" if i == 1 else "normal",
+            created_at=1000.0 + i,
+        )
+        await store.create_mission(m)
+        made.append(m)
+    await store.update_mission(
+        made[0].id,
+        status=MissionStatus.DONE,
+        plan={"kind": "fix", "orchestrator": {"model": "pro"}, "steps": ["s"] * 50},
+        result=big,
+    )
+    await store.update_mission(made[1].id, status=MissionStatus.RUNNING, plan={"kind": "fix"})
+    return made
+
+
+async def test_list_missions_light_drops_plan_and_result(store: StateStore) -> None:
+    made = await _seed_light(store)
+    rows = await store.list_missions_light(limit=10)
+    assert len(rows) == 5
+    for row in rows:
+        assert row.light is True
+        assert row.plan is None and row.result is None  # never a silent {}
+        # the marker is not part of the record's serialized form
+        assert "light" not in row.model_dump() and '"light"' not in row.model_dump_json()
+    # the full reads are untouched
+    full = await store.get_mission(made[0].id)
+    assert full is not None and full.light is False
+    assert full.plan is not None and full.plan["orchestrator"] == {"model": "pro"}
+    assert full.result is not None and len(full.result["summary"]) == 200_000
+    assert all(not m.light for m in await store.list_missions(limit=10))
+
+
+async def test_list_missions_light_keeps_what_the_dashboard_reads(store: StateStore) -> None:
+    made = await _seed_light(store)
+    by_id = {m.id: m for m in await store.list_missions_light(limit=10)}
+    for src in made:
+        row = by_id[src.id]
+        assert row.title == src.title
+        assert row.project_id == src.project_id
+        assert row.chat_id == src.chat_id
+        assert row.priority == src.priority
+        assert row.repo_path == src.repo_path  # the PR preview default reads it
+        assert row.created_at == src.created_at
+    assert by_id[made[0].id].status == MissionStatus.DONE
+    assert by_id[made[1].id].status == MissionStatus.RUNNING
+    assert by_id[made[1].id].updated_at > by_id[made[1].id].created_at
+    # objective is clipped for the list, whole on the full row
+    assert len(by_id[made[0].id].objective) == 200
+    assert by_id[made[0].id].objective == made[0].objective[:200]
+    assert by_id[made[2].id].objective == "objective 2"
+    full = await store.get_mission(made[0].id)
+    assert full is not None and full.objective == made[0].objective
+
+
+async def test_list_missions_light_orders_filters_and_limits_like_list_missions(
+    store: StateStore,
+) -> None:
+    await _seed_light(store)
+    for kwargs in (
+        {"limit": 10},
+        {"limit": 3},
+        {"limit": 10, "status": MissionStatus.PENDING},
+        {"limit": 10, "status": MissionStatus.DONE},
+        {"limit": 10, "chat_id": "chat-1"},
+        {"limit": 10, "status": MissionStatus.RUNNING, "chat_id": "chat-1"},
+        {"limit": 10, "chat_id": "nope"},
+    ):
+        full = [m.id for m in await store.list_missions(**kwargs)]  # type: ignore[arg-type]
+        light = [m.id for m in await store.list_missions_light(**kwargs)]  # type: ignore[arg-type]
+        assert light == full, kwargs
+    newest_first = [m.created_at for m in await store.list_missions_light(limit=10)]
+    assert newest_first == sorted(newest_first, reverse=True)
+    assert len(await store.list_missions_light(limit=3)) == 3
+
+
+async def test_list_missions_light_payload_is_dramatically_smaller(store: StateStore) -> None:
+    await _seed_light(store)
+    full_bytes = sum(len(m.model_dump_json()) for m in await store.list_missions(limit=200))
+    light_bytes = sum(len(m.model_dump_json()) for m in await store.list_missions_light(limit=200))
+    ratio = full_bytes / light_bytes
+    print(f"poll payload: full {full_bytes} B, light {light_bytes} B, {ratio:.0f}x smaller")
+    assert full_bytes > 200_000  # the big result really is in the full payload
+    assert light_bytes < 5_000
+    assert ratio > 50
+
+
+async def test_list_missions_light_objective_clip_bounds_what_search_can_see(
+    store: StateStore,
+) -> None:
+    """The list clips the objective at 200 chars, and the TUI searches the clipped
+    text: a token inside the first 200 chars is found, one at char 201 is not
+    (documented in docs/design.md; the full row still has it)."""
+    from rework.tui.search import search_missions
+
+    objective = "nearqq " + "a" * 193 + "zzfarzz"  # nearqq at char 1, zzfarzz at char 201
+    assert objective.index("zzfarzz") == 200
+    m = Mission(id=new_id("m"), objective=objective)
+    await store.create_mission(m)
+    rows = await store.list_missions_light(limit=10)
+    assert [r.objective for r in rows] == [objective[:200]]
+    assert [r.id for r in search_missions(rows, "nearqq")] == [m.id]
+    assert search_missions(rows, "zzfarzz") == []
+    full = await store.list_missions(limit=10)  # the unclipped read does find it
+    assert [r.id for r in search_missions(full, "zzfarzz")] == [m.id]

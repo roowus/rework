@@ -178,8 +178,63 @@ def test_parse_target_flag_forms() -> None:
     assert parse_target_flag(["--target", "--help"]) == (None, ["--target", "--help"])
     assert parse_target_flag(["--target"]) == (None, ["--target"])
     assert parse_target_flag(["--target="]) == (None, [])
-    # other global flags are skipped without eating their neighbours
-    assert parse_target_flag(["--help", "--target", "sandbox", "ls"]) == ("sandbox", ["ls"])
+    # other leading flags are KEPT (never dropped: an empty rest means "open
+    # the TUI", so dropping `--help` started the dashboard instead of help)
+    assert parse_target_flag(["--help", "--target", "sandbox", "ls"]) == (
+        "sandbox",
+        ["--help", "ls"],
+    )
+
+
+def test_parse_target_flag_keeps_a_glued_short_option_in_rest() -> None:
+    """A glued short option like `-n3` is kept in rest like any foreign flag.
+
+    It is neither dropped nor skipped together with its glued value: typer is
+    the one that decides what `-n3` means (`rework logs -n3`), so the parser
+    hands the token over untouched. Dropping it turned `rework -n3 ls` into a
+    bare `rework` and opened the TUI instead of running the command.
+    """
+    from rework.cli import parse_target_flag
+
+    assert parse_target_flag(["-n3", "ls"]) == (None, ["-n3", "ls"])
+    assert parse_target_flag(["-n3", "--target", "sandbox", "ls"]) == (
+        "sandbox",
+        ["-n3", "ls"],
+    )
+
+
+def test_subcommand_ignores_everything_after_the_end_of_options_marker() -> None:
+    """The subcommand is the first non-flag token, but never one after `--`.
+
+    `rework -- serve` hands `serve` to click as a POSITIONAL, not as a
+    subcommand, so main() must not treat it as one: base read `--` at rest[0]
+    and took the CLI logging path, and stopping at the marker in _subcommand()
+    keeps that shape.
+    """
+    from rework.cli import _subcommand
+
+    assert _subcommand([]) == ""
+    assert _subcommand(["--help"]) == ""
+    assert _subcommand(["-h"]) == ""
+    assert _subcommand(["--", "serve"]) == ""
+    assert _subcommand(["--help", "serve"]) == "serve"
+    assert _subcommand(["update", "--target", "rewvis"]) == "update"
+
+
+def test_parse_target_flag_keeps_help() -> None:
+    """A lone leading flag must survive the scan, so main() does not see "bare rework".
+
+    Regression: an empty rest means "open the TUI", so dropping `--help` / `-h`
+    here made `rework --help` start the dashboard instead of printing help.
+    """
+    from rework.cli import parse_target_flag
+
+    assert parse_target_flag(["--help"]) == (None, ["--help"])
+    assert parse_target_flag(["-h"]) == (None, ["-h"])
+    assert parse_target_flag(["--version"]) == (None, ["--version"])
+    flag, rest = parse_target_flag(["--help"])
+    assert flag is None
+    assert rest  # non-empty: main() must reach the typer app, not run_tui()
 
 
 def test_sqlite_db_path_forms() -> None:

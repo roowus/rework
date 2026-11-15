@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from textual.containers import Container
 from textual.css.query import NoMatches
+
+# How often an unchanged snapshot still repaints the text that carries time
+# ("3m ago", "waiting 2h"). The data repaint is skipped on an unchanged poll, so
+# without this a stuck agent's row would read "just now" for hours.
+TIME_REPAINT_SECONDS = 20.0
 
 if TYPE_CHECKING:
     from rework.tui.app import ReworkApp
@@ -24,6 +30,7 @@ class View(Container):
 
     def __init__(self) -> None:
         super().__init__(id=f"view-{self.TAB}", classes="view")
+        self._time_painted_at = time.monotonic()
 
     @property
     def rw(self) -> ReworkApp:
@@ -58,6 +65,36 @@ class View(Container):
 
     def on_snapshot(self, snap: Snapshot) -> None:
         pass
+
+    def tick(self, frame: str, now: float) -> None:
+        """Called by the app's ONE animation timer with the current frame.
+
+        `frame` comes from the shared clock (spinner.frame_for), never from a
+        counter stored on a view: every store poll rebuilds the row markup from
+        fresh data, so a stored frame would be reset. Views that show running
+        work override this; the default is a no-op, which is what lets the app
+        fan the tick to `self.current` with no isinstance checks.
+
+        An override must do nothing when it has nothing running, and must wrap
+        its paint in `self.painting()` (teardown races)."""
+        pass
+
+    def on_tick(self, snap: Snapshot) -> None:
+        """A refresh found the data unchanged: no repaint, but a view that polls
+        live detail (events, steps, a shared chat) keeps doing it here."""
+
+    def mark_time_painted(self) -> None:
+        """A full repaint just ran, so the time text is fresh."""
+        self._time_painted_at = time.monotonic()
+
+    def time_repaint_due(self) -> bool:
+        """True (and the stamp moves) once TIME_REPAINT_SECONDS have passed since
+        the time-bearing text was last painted. Cheap: a monotonic compare."""
+        now = time.monotonic()
+        if now - self._time_painted_at < TIME_REPAINT_SECONDS:
+            return False
+        self._time_painted_at = now
+        return True
 
     def shown(self) -> None:
         pass

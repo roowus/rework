@@ -128,7 +128,7 @@ class TuiData:
         store = await self.store()
         return await fn(store)
 
-    async def _resilient(self, key: str, call: Any) -> Any:
+    async def _resilient(self, key: str, call: Any, *, stale_ok: bool = True) -> Any:
         """Run one query; if the connection died, reconnect once and retry.
 
         The TUI reads a Postgres over the tailnet. A laptop sleeping, a
@@ -137,7 +137,11 @@ class TuiData:
         unhandled one used to take the WHOLE app down with a traceback screen
         (owner's screenshot). Stale data with a visible 'offline' note is the
         right failure mode for a dashboard, and the last good result keeps the
-        table populated instead of blanking it."""
+        table populated instead of blanking it.
+
+        `stale_ok=False` opts a query out of the last-good fallback: it raises
+        instead, for a value where an old answer would be a false claim (the
+        spinner's event stamps: a stale stamp reads as "silent for 7m")."""
         try:
             result = await asyncio.wait_for(_maybe_await(call()), QUERY_TIMEOUT_S)
         except Exception as first:
@@ -148,11 +152,12 @@ class TuiData:
                 result = await asyncio.wait_for(_maybe_await(call()), QUERY_TIMEOUT_S)
             except Exception:
                 self._reconnecting_hint = f"{type(first).__name__}: {first}"[:160]
-                if key in self._last_good:
+                if stale_ok and key in self._last_good:
                     return self._last_good[key]
                 raise
         self._reconnecting_hint = ""
-        self._last_good[key] = result
+        if stale_ok:
+            self._last_good[key] = result
         return result
 
     async def library(self) -> tuple[LibraryStore, GitLibrary]:
@@ -176,8 +181,11 @@ class TuiData:
         return await self._resilient("projects", lambda: self._call(lambda s: s.list_projects()))
 
     async def missions(self, limit: int = 60) -> list[Mission]:
+        """The slim mission list the poll carries: no plan, no result, objective
+        clipped (`Mission.light` is True). A view that needs them calls
+        get_mission for the full row."""
         return await self._resilient(
-            f"missions:{limit}", lambda: self._call(lambda s: s.list_missions(limit=limit))
+            f"missions:{limit}", lambda: self._call(lambda s: s.list_missions_light(limit=limit))
         )
 
     async def open_gates(self, mission_id: str | None = None) -> list[Any]:
@@ -191,6 +199,58 @@ class TuiData:
             f"events:{mission_id}:{since}",
             lambda: self._call(lambda s: s.events_since(since, mission_id=mission_id, limit=limit)),
         )
+
+    async def recent_event_stamps(
+        self, mission_id: str, limit: int = 40, deep_limit: int = 400
+    ) -> dict[str, float]:
+        """Newest event epoch for a mission and for each run seen in its newest
+        `limit` events: {mission_id: ts, run_id: ts, ...}. Empty = nothing seen.
+
+        ONE store query (the newest `limit` events), then a scan in Python.
+
+        A busy interleaved mission can push a quiet run's newest event out of
+        that window. Only a SATURATED window (it returned `limit` rows) can hide
+        a run, so only then: one `list_runs`, and if a running run has no key,
+        one wider read of `deep_limit` events to find it. Worst case is 3
+        queries for a mission, 1 for most. A run still unseen after that has NO
+        key, which the caller treats as unknown and animates (never a borrowed
+        mission stamp).
+
+        One wrapper with its own key and NO last-good fallback: on a store
+        failure this raises (the caller treats that as "unknown", which
+        animates) instead of replaying an old stamp that would claim the run
+        has been silent."""
+
+        def _fold(rows: list[Any], out: dict[str, float]) -> None:
+            # the store returns a window oldest-first, so take the max per key
+            # instead of relying on order
+            for row in rows:
+                if not row.ts:
+                    continue
+                ts = float(row.ts)
+                for key in (mission_id, str(row.run_id) if row.run_id else None):
+                    if key is not None and ts > out.get(key, 0.0):
+                        out[key] = ts
+
+        async def _window(n: int) -> list[Any]:
+            return await self._call(
+                lambda s: s.events_since(0, mission_id=mission_id, limit=n, newest_first=True)
+            )
+
+        async def _q() -> dict[str, float]:
+            rows = await _window(limit)
+            out: dict[str, float] = {}
+            _fold(rows, out)
+            if len(rows) >= limit:
+                runs = await self._call(lambda s: s.list_runs(mission_id))
+                live = [
+                    r.id for r in runs if str(getattr(r.status, "value", r.status)) == "running"
+                ]
+                if any(rid not in out for rid in live):
+                    _fold(await _window(deep_limit), out)
+            return out
+
+        return await self._resilient(f"stamps:{mission_id}", _q, stale_ok=False)
 
     async def mission_runs(self, mission_id: str) -> list[Run]:
         return await self._resilient(
@@ -323,6 +383,16 @@ class TuiData:
 
     async def resume_mission(self, mission_id: str) -> Any:
         return await self.set_mission_status(mission_id, "running")
+
+    async def retry_pr(self, mission_id: str) -> tuple[bool, str]:
+        """Retry push+PR for a finished mission whose delivery failed. Shares
+        `rework.orchestrator.delivery.retry_pr` with `rework mission retry-pr`,
+        so the button and the command can never disagree."""
+        from rework.kernel.events.bus import InProcessEventBus
+        from rework.orchestrator.delivery import retry_pr
+
+        store = await self.store()
+        return await retry_pr(store, InProcessEventBus(store), mission_id)
 
     async def prioritize_mission(self, mission_id: str, priority: str = "high") -> Any:
         """Pickup priority (normal | high): the daemon reads the row, so this

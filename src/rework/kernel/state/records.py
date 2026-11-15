@@ -101,6 +101,22 @@ class Mission(BaseModel):
     result: dict[str, Any] | None = None
     created_at: float = Field(default_factory=now)
     updated_at: float = Field(default_factory=now)
+    # True on rows from StateStore.list_missions_light: plan and result were
+    # NOT fetched (they stay None, never a silent {}) and objective is clipped.
+    # Anything that needs them must load the full row with get_mission.
+    light: bool = Field(default=False, exclude=True)
+
+
+# The slim list the TUI polls: every column a list/search/header reads, and
+# none of the unbounded JSON ones (plan, result). Clipped in SQL so the long
+# text never leaves the database. repo_path stays: the PR preview default and
+# the preview dialog read it off the snapshot.
+LIGHT_OBJECTIVE_CHARS = 200
+MISSION_LIGHT_COLUMNS = (
+    f"id, title, substr(objective, 1, {LIGHT_OBJECTIVE_CHARS}) AS objective, "
+    "status, project_id, "
+    "chat_id, priority, created_at, updated_at, repo_path"
+)
 
 
 # Pickup priority levels: "high" missions are picked before "normal" ones.

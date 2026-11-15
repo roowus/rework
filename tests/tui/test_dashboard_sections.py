@@ -14,12 +14,14 @@ the rule is pure data, so the tests do not need a database to be load-bearing.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from textual.app import App, ComposeResult
 
 from rework.kernel.state.records import Gate, GateKind, GateStatus, Mission, MissionStatus
 from rework.tui.hub import Snapshot
+from rework.tui.spinner import FRAMES
 from rework.tui.theme import ACCENT, WARN
 from rework.tui.views.dashboard import DashboardView, row_glyph, section_for
 from rework.tui.widgets.base import HEADER, RowList, Stat
@@ -145,6 +147,18 @@ def _overview() -> tuple[DashboardView, Snapshot]:
     return DashboardView(), _snap(missions, [_gate(IDS["needs"], "g-need")], [project])
 
 
+def _plain(text: str) -> str:
+    """Rich markup stripped: the running tile and chip now lead with the spinner
+    frame (`[#a394f7]⠋[/] 2`), so a test reads the text, not the markup."""
+    return re.sub(r"\[[^\]]*\]", "", text)
+
+
+def _running_count_shows(text: str, n: int) -> bool:
+    """A frame (or the idle glyph) followed by the count: `⠋ 2`."""
+    plain = _plain(text)
+    return any(f"{mark} {n}" in plain for mark in (*FRAMES, "◌"))
+
+
 def _headers(rlst: RowList) -> dict[str, int]:
     """section title -> row count under it, read off the painted rows."""
     out: dict[str, int] = {}
@@ -189,14 +203,16 @@ async def test_the_painted_sections_and_the_counters_agree() -> None:
 
         assert stat("st-gates") == "1", "the needs-you count is open gates, not labels"
         assert stat("st-queued") == "1"
-        assert stat("st-running") == "2", "running means running-only (pending excluded)"
+        assert _running_count_shows(stat("st-running"), 2), (
+            "running means running-only (pending excluded): " + stat("st-running")
+        )
         assert stat("st-paused") == "1"
 
         # the per-project chip must tell the same story as the sections
         prow = next(r for r in view.query("#proj-list Row") if r.key == "p-one")
         text = str(prow.render())
         assert "◆ 1" in text, f"one project needs you: {text!r}"
-        assert "● 2" in text, f"two of its missions are running: {text!r}"
+        assert _running_count_shows(text, 2), f"two of its missions are running: {text!r}"
         assert "○ 1" in text, f"one of its missions is queued: {text!r}"
 
         # ... and the row note: the ◆ line appears on the mission with the open
@@ -222,7 +238,7 @@ async def test_project_badge_ignores_the_stale_awaiting_gate_label() -> None:
         prow = next(r for r in view.query("#proj-list Row") if r.key == "p-two")
         text = str(prow.render())
         assert "◆" not in text, f"no open gate, so no needs-you chip: {text!r}"
-        assert "● 1" in text, f"it is running, not waiting for the owner: {text!r}"
+        assert _running_count_shows(text, 1), f"it is running, not waiting for the owner: {text!r}"
         assert _headers(view.query_one("#mission-list", RowList)) == {"running": 1}
 
 
