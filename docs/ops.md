@@ -571,7 +571,7 @@ ssh ubuntu@100.107.125.118 "docker exec rework-dev-pg psql -U postgres -d rework
 
 Tests never touch `rework_state`. Postgres tests use the dedicated
 `rework_test` database:
-`REWORK_TEST_POSTGRES=postgresql://postgres:rework@100.107.125.118:5433/rework_test`.
+`REWORK_TEST_POSTGRES=postgresql://postgres:<password>@<host>:5433/rework_test`.
 
 ## Preview a PR
 
