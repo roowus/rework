@@ -203,6 +203,7 @@ async def test_live_dashboard_row_and_tail_animate(env: Path) -> None:
     changes on its own, and the trajectory tail shows "working"."""
     ids = await seed(str(env), history_days=20)
     await _append_fresh_event(env, ids["running"])
+    await _decide_question_gate(env, ids)
     async with ReworkApp(poll_seconds=0.3).run_test(size=SIZE) as pilot:
         app = pilot.app
         await pilot.pause(0.5)
@@ -247,11 +248,26 @@ def _assert_running_surfaces_have_a_frame(dash, ids) -> None:  # type: ignore[no
     assert "[#" not in tile and "[/]" not in tile
 
 
+async def _decide_question_gate(env: Path, ids: dict[str, str]) -> None:
+    """The seeded running mission holds an open question gate, so the Dashboard
+    files it under "needs you" and counts it there, not in the running tile or
+    the project chip. These tests are about those running surfaces, so decide
+    the gate first: the mission is then running and nobody owes an answer."""
+    from rework.kernel.state.sqlite import open_sqlite
+
+    store = await open_sqlite(str(env))
+    try:
+        await store.decide_gate(ids["question_gate"], approved=True)
+    finally:
+        await store.aclose()
+
+
 async def test_poll_path_paints_a_frame_never_a_blank(env: Path) -> None:
     """The store poll paints with NO frame argument. It must still render a real
     one-cell frame (not a coloured empty span), focused or not."""
     ids = await seed(str(env), history_days=20)
     await _append_fresh_event(env, ids["running"])
+    await _decide_question_gate(env, ids)
     async with ReworkApp(poll_seconds=30).run_test(size=SIZE) as pilot:
         app = pilot.app
         await pilot.pause(0.5)

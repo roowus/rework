@@ -1,7 +1,7 @@
 """Dashboard: every project and mission at a glance, then drill down.
 
 Overview: stats strip · projects (left) · missions grouped by what matters
-(needs you → running → paused → recent). Click a mission to open it.
+(needs you → queued → running → paused → recent). Click a mission to open it.
 
 Mission: header + flow strip · runs (left: one row per role session) · tabs
 for the live Trajectory, the LangGraph-style Graph, each role's Output, the
@@ -70,12 +70,57 @@ NONE = "-"
 #: blown deadline comes back as a clean "timed out" rather than an instant 0s call
 _MIN_BUDGET = 0.5
 
-SECTIONS = [
-    ("needs you", {"awaiting_gate"}),
-    ("running", {"running", "pending"}),
-    ("paused", {"on_hold"}),
-    ("recent", {"done", "failed", "cancelled"}),
-]
+#: The overview's mission sections, in display order. This list only fixes
+#: ORDER (and "needs you" is the amber one); which section a mission belongs to
+#: is `section_for`'s decision alone, so grouping, counts and the project
+#: badges below can never disagree.
+SECTIONS = ["needs you", "queued", "running", "paused", "recent"]
+
+
+def section_for(mission: Any, snap: Snapshot) -> str:
+    """The ONE rule that puts a mission in a Dashboard section.
+
+    "needs you" comes from the snapshot's OPEN gates, never from the stored
+    status label: an `awaiting_gate` mission whose gate was already decided is
+    not waiting for the owner (it is running), so the Dashboard can no longer
+    list a mission under "needs you" while the Gates tab is empty (found live
+    2026-11-14). `Snapshot.gates` holds open gates only, so this needs no I/O.
+
+    The stats strip, the project badges and the section headers all call this,
+    so one gate cannot be counted twice differently."""
+    if snap.gates_for(mission.id):
+        return "needs you"
+    st = status_value(mission.status)
+    if st == "pending":
+        return "queued"  # waiting for a runner slot, not for the owner
+    if st in ("running", "awaiting_gate"):
+        return "running"
+    if st == "on_hold":
+        return "paused"
+    return "recent"  # done / failed / cancelled (an unknown status stays visible)
+
+
+#: The status whose glyph a section paints when the stored label would paint
+#: another one: a stale `awaiting_gate` (its gate is already decided) is listed
+#: under "running" and must look running, or an amber diamond under a faint
+#: "running" header re-creates the confusion section_for just removed.
+SECTION_GLYPH = {"running": "running", "queued": "pending"}
+
+
+def row_glyph(mission: Any, section: str) -> str:
+    """The overview row's leading icon: the SECTION's glyph, not the raw status.
+
+    `awaiting_gate` is amber (a human is needed) in theme.STATUS, and it stays
+    that way everywhere else: the drill-down header still prints the stored
+    status as diagnostic detail, and the ◆ question note below the row still
+    marks the open gate. What must not happen is an amber diamond on a row filed
+    under "running"/"queued"/"paused"/"recent", because then `$warn` ("a human is
+    needed", DESIGN.md §1) would paint for a mission that needs nobody."""
+    st = status_value(mission.status)
+    if section == "needs you":
+        return glyph(st)  # the row note below carries the ◆ question too
+    return glyph(SECTION_GLYPH.get(section, st))
+
 
 MTABS = [
     ("Trajectory", "traj"),
@@ -192,6 +237,7 @@ class DashboardView(View):
             with Vertical(id="dash-overview"):
                 with Horizontal(id="dash-stats"):
                     yield Stat("running", id="st-running")
+                    yield Stat("queued", id="st-queued")
                     yield Stat("need you", id="st-gates")
                     yield Stat("paused", id="st-paused")
                     yield Stat("done · 7d", id="st-done")
@@ -324,6 +370,14 @@ class DashboardView(View):
             lambda: data.spend_history(bucket="total", since=time.time() - 7 * 86400), []
         )
         self.spend_week = sum(float(r.get("cost_usd") or 0) for r in week)
+        # NOTE: this selection still keys off `actions.ACTIVE` while the
+        # sections key off `section_for`, so the one divergent case below has no
+        # role/cost chip: a TERMINAL mission (cancelled/failed/done) that still
+        # holds an open gate lands under "needs you" but is not ACTIVE, so
+        # neither `visible` nor the role branch reaches it. Aligning it with
+        # `section_for` would also drop the [:12] cap for every non-recent row
+        # (cost chips would appear on rows that never had one), so the chips
+        # are deliberately left alone.
         visible = [m for m in self._filtered() if status_value(m.status) in actions.ACTIVE]
         visible += [m for m in self._filtered() if m not in visible][:12]
         for mission in visible:
@@ -361,7 +415,9 @@ class DashboardView(View):
         if self.project not in (ALL, NONE) and mission.project_id != self.project:
             return False
         st = status_value(mission.status)
-        if self.filter == "active" and st not in actions.ACTIVE:
+        # Active is exactly "everything the Dashboard does not file under
+        # recent": needs you + queued + running + paused.
+        if self.filter == "active" and section_for(mission, self.snap) == "recent":
             return False
         if self.filter == "done" and st != "done":
             return False
@@ -398,9 +454,14 @@ class DashboardView(View):
 
     def _paint_overview(self) -> None:
         snap = self.snap
-        counts: dict[str, int] = {}
+        # the strip counts SECTIONS over the WHOLE snapshot, ignoring the
+        # current filter and project selection, so a number here need NOT match
+        # the rows painted below it (filter="done" shows #st-running = 2 and no
+        # running rows); the rows are the filtered view of these same buckets
+        by_section: dict[str, int] = dict.fromkeys(SECTIONS, 0)
         for m in snap.missions:
-            counts[status_value(m.status)] = counts.get(status_value(m.status), 0) + 1
+            title = section_for(m, snap)
+            by_section[title] = by_section.get(title, 0) + 1
         week_ago = time.time() - 7 * 86400
         done_week = sum(
             1 for m in snap.missions if status_value(m.status) == "done" and m.updated_at > week_ago
@@ -409,12 +470,26 @@ class DashboardView(View):
             # owner screenshot: zeros everywhere looked like real data while the
             # first refresh was still pending (or the database was unreachable)
             note = "offline" if not snap.online else "connecting…"
-            for sid in ("st-running", "st-gates", "st-paused", "st-done", "st-today", "st-week"):
+            for sid in (
+                "st-running",
+                "st-queued",
+                "st-gates",
+                "st-paused",
+                "st-done",
+                "st-today",
+                "st-week",
+            ):
                 self.query_one(f"#{sid}", Stat).set("—", note)
             return
         self._paint_running_tile()
+        self.query_one("#st-queued", Stat).set(str(by_section["queued"]))
+        # this counts OPEN GATES, deliberately: it is the same number as the
+        # Gates tab badge (app.py's `TabBar.set_badge("gates", len(snap.gates))`),
+        # and two open gates on one mission really are two decisions waiting.
+        # The "needs you" section HEADER counts missions instead, so a mission
+        # with two open gates shows 2 here and 1 there: gates vs missions.
         self.query_one("#st-gates", Stat).set(str(len(snap.gates)))
-        self.query_one("#st-paused", Stat).set(str(counts.get("on_hold", 0)))
+        self.query_one("#st-paused", Stat).set(str(by_section["paused"]))
         self.query_one("#st-done", Stat).set(str(done_week))
         self.query_one("#st-today", Stat).set(money(snap.spend_today))
         self.query_one("#st-week", Stat).set(
@@ -435,9 +510,11 @@ class DashboardView(View):
 
         # missions, grouped
         missions = self._filtered()
+        groups: dict[str, list[Any]] = {title: [] for title in SECTIONS}
+        for m in missions:
+            groups.setdefault(section_for(m, snap), []).append(m)
         mrows: list[RowData] = []
-        for title, statuses in SECTIONS:
-            group = [m for m in missions if status_value(m.status) in statuses]
+        for title, group in groups.items():
             if not group:
                 continue
             colour = WARN if title == "needs you" else FAINT
@@ -449,7 +526,7 @@ class DashboardView(View):
                 )
             )
             for m in group:
-                mrows.append(RowData(m.id, self._mission_row(m)))
+                mrows.append(RowData(m.id, self._mission_row(m, title)))
         mlist = self.query_one("#mission-list", RowList)
         # an empty list must say WHY it is empty: a search miss, a project/status
         # filter that left nothing, or a store with no missions yet
@@ -517,11 +594,24 @@ class DashboardView(View):
         clock = time.time() if now is None else now
         return run_mark(spinner.is_stalled(clock, last), frame)
 
+    def _row_mark(
+        self, mission: Any, section: str, frame: str | None = None, now: float | None = None
+    ) -> str:
+        """A mission row's leading icon: the spinner (or the idle glyph) for a
+        mission whose STORED status is running, wherever the section filed it (a
+        running mission with an open gate sits under "needs you" and is still
+        working, so it keeps animating); every other row takes the SECTION's
+        glyph (a stale awaiting_gate filed under running must not paint amber)."""
+        status = status_value(mission.status)
+        if status == "running":
+            return self._mark(status, self._stamp(mission.id), frame, now)
+        return row_glyph(mission, section)
+
     def _paint_running_tile(self, frame: str | None = None, now: float | None = None) -> None:
         """The dashboard "running" tile. ONE rendering shared by the poll and the
         tick, so the tile cannot alternate between two texts."""
         stat = self.query_one("#st-running", Stat)
-        running = sum(1 for m in self.snap.missions if status_value(m.status) == "running")
+        running = sum(1 for m in self.snap.missions if section_for(m, self.snap) == "running")
         if not running:
             stat.set("0")
             return
@@ -549,8 +639,8 @@ class DashboardView(View):
     def _tick_overview(self, frame: str, now: float) -> None:
         missions = self._filtered()
         mrows: list[RowData] = []
-        for title, statuses in SECTIONS:
-            group = [m for m in missions if status_value(m.status) in statuses]
+        for title in SECTIONS:
+            group = [m for m in missions if section_for(m, self.snap) == title]
             if not group:
                 continue
             colour = WARN if title == "needs you" else FAINT
@@ -562,7 +652,7 @@ class DashboardView(View):
                 )
             )
             for m in group:
-                mrows.append(RowData(m.id, self._mission_row(m, frame=frame, now=now)))
+                mrows.append(RowData(m.id, self._mission_row(m, title, frame=frame, now=now)))
         if self.ai_results is not None:
             mrows = self._ai_rows(frame=frame, now=now)
         # the same key list as the poll's paint, so set_rows takes the cheap
@@ -608,22 +698,36 @@ class DashboardView(View):
         frame: str | None = None,
         now: float | None = None,
     ) -> str:
-        running = sum(1 for m in missions if status_value(m.status) == "running")
-        waiting = sum(1 for m in missions if status_value(m.status) == "awaiting_gate")
+        # the chips use section_for exactly like the sections, or a project
+        # could show ◆ while none of its missions sits under "needs you"
+        sections = [section_for(m, self.snap) for m in missions]
+        running = sections.count("running")
+        queued = sections.count("queued")
+        waiting = sections.count("needs you")
         badges = []
         if running:
             # the project badge is the second running glyph on the overview
             last = self._stamp("*")
             mark = self._mark("running", last, frame, now)
             badges.append(f"{mark} {running}")
+        if queued:
+            badges.append(f"[{MUTED}]○ {queued}[/]")
         if waiting:
             badges.append(f"[{WARN}]◆ {waiting}[/]")
         label = f"[{MUTED}]{esc(name)}[/]" if dim else esc(name)
         return f"{label}  [{FAINT}]{len(missions)}[/]  " + " ".join(badges)
 
-    def _mission_row(self, m: Any, *, frame: str | None = None, now: float | None = None) -> str:
+    def _mission_row(
+        self,
+        m: Any,
+        section: str | None = None,
+        *,
+        frame: str | None = None,
+        now: float | None = None,
+    ) -> str:
+        # callers that already grouped pass the section; a lone row works it out
+        section = section or section_for(m, self.snap)
         st = status_value(m.status)
-        last = self._stamp(m.id)
         bits = []
         if self.project == ALL and m.project_id:
             bits.append(self.snap.project_name(m.project_id))
@@ -635,17 +739,16 @@ class DashboardView(View):
         bits.append(ago(m.created_at))
         bits.append(m.id)
         gate_note = ""
-        if st == "awaiting_gate":
-            gates = self.snap.gates_for(m.id)
-            if gates:
-                gate_note = f"\n  [{WARN}]◆ {esc(clip(gates[0].question, 90))}[/]"
+        gates = self.snap.gates_for(m.id)
+        if gates:  # same predicate as "needs you": show what needs deciding
+            gate_note = f"\n  [{WARN}]◆ {esc(clip(gates[0].question, 90))}[/]"
         meta = f"[{FAINT}]{esc('  ·  '.join(bits))}[/]"
         # the ✦ reason is OUR markup, not mission text: escaping it with the
         # rest of the line printed "[#a394f7]closest to the query[/]" literally
         reason = esc(clip(self._reason(m.id), 120))
         if reason:
             meta += f"  [{ACCENT}]{reason}[/]"
-        mark = self._mark(st, last, frame, now)
+        mark = self._row_mark(m, section, frame, now)
         return f"{mark} [b]{esc(clip(m.objective, 100))}[/b]\n  {meta}{gate_note}"
 
     def _ai_rows(self, *, frame: str | None = None, now: float | None = None) -> list[RowData]:
@@ -656,9 +759,9 @@ class DashboardView(View):
             mission = self.snap.mission(hit["id"])
             if mission is None:
                 continue
-            st = status_value(mission.status)
+            section = section_for(mission, self.snap)
             reason = esc(hit.get("reason") or "")
-            mark = self._mark(st, self._stamp(mission.id), frame, now)
+            mark = self._row_mark(mission, section, frame, now)
             rows.append(
                 RowData(
                     mission.id,

@@ -1566,6 +1566,53 @@ async def test_dashboard_drill_down_and_back(ids: dict[str, str]) -> None:
         assert app.is_running, "esc inside a drill-down navigates, never arms quit"
 
 
+async def test_dashboard_sections_follow_open_gates_not_the_status_label(
+    ids: dict[str, str],
+) -> None:
+    """The live bug (2026-11-14): the Dashboard listed a mission under "needs
+    you" while the Gates tab was empty, because the stored status still said
+    `awaiting_gate`. Sections are derived from the snapshot's OPEN gates now, so
+    the two surfaces cannot disagree. This runs the whole path (store ->
+    list_open_gates -> Hub -> Dashboard) on the seed: the seed's RUNNING mission
+    deliberately carries an open question gate, so it belongs under "needs you"
+    and not under "running"."""
+    from rework.tui.widgets.base import HEADER, Stat
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        rlst = app.query_one("#mission-list", RowList)
+
+        sections: dict[str, list[str]] = {}
+        current = ""
+        for key in rlst.keys:
+            if key.startswith(HEADER):
+                current = key.removeprefix(HEADER)
+                sections[current] = []
+            elif current:
+                sections[current].append(key)
+
+        open_gates = dash.snap.gates
+        needs = {g.mission_id for g in open_gates}
+        assert set(sections.get("needs you", [])) == needs, (
+            "needs you == missions with an open gate"
+        )
+        assert ids["running"] in sections["needs you"], "its question gate is open"
+        assert ids["waiting"] in sections["needs you"], "its ship gate is open"
+        # (no assertion about which sections the OTHER seed missions land in:
+        # that is a property of tests/tui/seed.py, not of the Dashboard, and it
+        # would fail here with a message that reads like a Dashboard bug.)
+        assert str(app.query_one("#st-gates", Stat)._value) == str(len(open_gates))
+        # the Gates tab lists exactly those gates: one story, two surfaces
+        await pilot.press("alt+3")
+        await _settle(pilot)
+        gate_rows = set(app.query_one("#gate-list", RowList).selectable)
+        assert gate_rows == {g.id for g in open_gates}
+
+
 async def test_dashboard_search_filters_and_clears(ids: dict[str, str]) -> None:
     """The search bar above the mission list: "/" focuses it, typing filters
     live (debounced), esc clears it and hands focus back to the list."""

@@ -138,9 +138,18 @@ specified in `docs/tui/DESIGN.md`; every view is built from that kit.
   every one of them. Project / model / effort knobs under the prompt. Opens
   with no chat selected.
 - **Dashboard**: overview (stats strip, projects, missions grouped needs-you →
-  running → paused → recent) and a mission drill-down: header + flow strip,
+  queued → running → paused → recent) and a mission drill-down: header + flow strip,
   sessions (one per run) on the left, and Trajectory / Graph (LangGraph-style
   node view, click a node to focus its run) / Output / Diff / Report / Gates.
+  A section is derived from the store, never from a remembered label: **needs
+  you** means the mission has an OPEN gate (any status), **running** means
+  status `running` or `awaiting_gate` with no open gate left (its gate was
+  already decided, so nobody owes an answer), **queued** means status `pending`
+  (waiting for a runner slot, not for you), **paused** means `on_hold`, and
+  **recent** collects `done`, `failed` and `cancelled`. The stats strip and the
+  per-project badges count those same sections through one helper, so the
+  Dashboard cannot list a mission under "needs you" while the Gates tab is
+  empty.
 - **Gates**: inbox oldest-first with full decision context (mission, the run it
   unblocks, the diff + audit verdict for ship gates, recent steps) and an answer
   box; the typed answer reaches the paused role as `Gate.decision`.
