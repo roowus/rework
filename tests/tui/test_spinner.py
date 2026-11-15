@@ -572,3 +572,73 @@ async def test_work_card_is_judged_by_its_own_mission_not_the_aggregate(env: Pat
         work.snap.last_event = {"m-busy": now - STALL_SECONDS - 9, "*": now - STALL_SECONDS - 9}
         work.tick(FRAMES[6], now)
         assert FRAMES[6] in head("m-new"), "borrowed the stale aggregate"
+
+
+async def test_work_card_goes_idle_on_a_poll_alone_after_a_tick(env: Path) -> None:
+    """The unfocused false-claim path: the card ticked once (so the old code froze
+    its clock and last-event stamp), then the terminal lost focus (no more ticks)
+    and the mission went silent. Only store polls run now, and they alone must
+    flip the card to the idle marker."""
+    import sqlite3
+
+    from textual.widgets import Static
+
+    ids = await seed(str(env), history_days=20)
+    mid = ids["running"]
+    await _append_fresh_event(env, mid)
+    async with ReworkApp(poll_seconds=0.3).run_test(size=SIZE) as pilot:
+        app = pilot.app
+        await pilot.pause(0.5)
+        app.action_tab("work")
+        work = app.view("work")
+        card = MissionCard(mid)
+        await work.mount(card)
+        await pilot.pause(0.8)  # a poll fills the card, real ticks animate it
+
+        def head() -> str:
+            return str(card.query_one(".mc-head", Static).render())
+
+        assert card._frame is not None, "the card never ticked"
+        assert _has_frame(head()) and "working" in head(), head()
+
+        app.app_focus = False
+        await pilot.pause(0.3)  # let any in-flight tick land
+        con = sqlite3.connect(str(env))
+        try:
+            with con:
+                con.execute(
+                    "UPDATE events SET ts = ts - ? WHERE mission_id = ?",
+                    (STALL_SECONDS + 600, mid),
+                )
+        finally:
+            con.close()
+        await pilot.pause(1.5)  # several polls, zero ticks
+        assert "◌" in head() and "idle" in head(), head()
+        assert not _has_frame(head()) and "working" not in head(), head()
+
+
+async def test_poll_clears_the_tail_while_another_detail_tab_is_open(env: Path) -> None:
+    """With the run list (not the trajectory) selected, a run that finishes must
+    not leave the hidden tail holding its old "working" claim."""
+    from rework.kernel.state.sqlite import open_sqlite
+
+    ids = await seed(str(env), history_days=20)
+    await _append_fresh_event(env, ids["running"])
+    async with ReworkApp(poll_seconds=0.3).run_test(size=SIZE) as pilot:
+        app = pilot.app
+        await pilot.pause(0.5)
+        app.action_tab("dashboard")
+        dash = app.view("dashboard")
+        dash.open_mission(ids["running"])
+        await pilot.pause(0.8)
+        traj = dash.query_one("#m-traj", Trajectory)
+        assert traj._spinner is not None and "working" in str(traj._spinner.render())
+
+        dash.mtab = "runs"  # the trajectory is no longer the selected detail tab
+        store = await open_sqlite(str(env))
+        try:
+            await store.update_run(f"{ids['running']}:code:coder:1", status=RunStatus.COMPLETED)
+        finally:
+            await store.aclose()
+        await pilot.pause(1.5)
+        assert traj._spinner is None, "hidden tail kept its stale 'working' claim"

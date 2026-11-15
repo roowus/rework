@@ -996,10 +996,9 @@ class DashboardView(View):
             self._paint_mission_static()
             self._paint_runs()
             self._paint_detail_tabs()
-            if self.mtab == "traj":
-                # the poll supplies correctness (also while unfocused, when no
-                # tick runs); the tick supplies the motion
-                self._paint_traj_tail()
+            # the poll supplies correctness (also while unfocused, when no tick
+            # runs, and whichever detail tab is open); the tick supplies motion
+            self._paint_traj_tail()
         except NoMatches:
             return
 

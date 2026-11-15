@@ -175,7 +175,7 @@ class WorkView(View):
         with self.painting():
             for card in cards:
                 last = stamps.get(card.mission_id)
-                card.tick(frame, now, last)
+                card.tick(frame, last)
 
     def _poll_chat(self) -> None:
         """Another instance's turns are persisted to the shared store; an
@@ -623,7 +623,11 @@ class WorkView(View):
         for card in cards:
             mission = self.snap.mission(card.mission_id)
             if mission is not None:
-                card.update_from(mission, self.snap.gates_for(card.mission_id))
+                card.update_from(
+                    mission,
+                    self.snap.gates_for(card.mission_id),
+                    self.snap.last_event.get(card.mission_id),
+                )
         self._poll_cards(cards)
 
     @work(exclusive=True, group="cards")
@@ -635,7 +639,11 @@ class WorkView(View):
                 )
                 if mission is not None:
                     with self.painting():  # the app can close during the await above
-                        card.update_from(mission, self.snap.gates_for(card.mission_id))
+                        card.update_from(
+                            mission,
+                            self.snap.gates_for(card.mission_id),
+                            self.snap.last_event.get(card.mission_id),
+                        )
             if card.status not in actions.ACTIVE:
                 # Finished (done/failed/cancelled): nothing more will arrive,
                 # so the card is never polled again. Whatever lines it had

@@ -122,7 +122,6 @@ class MissionCard(Vertical):
         self.active_role = ""
         # spinner state: the frame comes from the app's shared clock every tick
         self._frame: str | None = None
-        self._now: float | None = None
         self._last_event: float | None = None
         # a finished card backfills its tail once, then is never polled again
         self.tail_filled = False
@@ -149,8 +148,12 @@ class MissionCard(Vertical):
     def status(self) -> str:
         return status_value(self.mission.status) if self.mission is not None else ""
 
-    def update_from(self, mission: Any, gates: list[Any]) -> None:
+    def update_from(self, mission: Any, gates: list[Any], last_event: float | None = None) -> None:
+        """Take the poll's snapshot. `last_event` is this mission's newest event
+        stamp from THAT snapshot (None = unknown), so a poll alone can flip a
+        silent card to idle even while the app is unfocused and no tick runs."""
         self.mission = mission
+        self._last_event = last_event
         self.gate = gates[0] if gates else None
         self.paint()
 
@@ -181,15 +184,15 @@ class MissionCard(Vertical):
             self.last_seq = max(self.last_seq, max(int(ev.seq or 0) for ev in events))
         self.paint()
 
-    def tick(self, frame: str, now: float, last_event: float | None) -> None:
+    def tick(self, frame: str, last_event: float | None) -> None:
         """Repaint the card head with the current spinner frame (surface d).
 
         Nothing but a genuinely running mission animates; the frame itself comes
         from the shared clock, so a store poll repainting the card cannot reset
-        it."""
+        it. The tick supplies motion only: the stall clock is read at paint."""
         if self.status != "running":
             return
-        self._frame, self._now, self._last_event = frame, now, last_event
+        self._frame, self._last_event = frame, last_event
         self.paint()
 
     def paint(self) -> None:
@@ -203,8 +206,9 @@ class MissionCard(Vertical):
         else:
             status = status_value(m.status)
             # a running card always paints a real frame (computed now when no
-            # tick has supplied one), never an empty span
-            clock = time.time() if self._now is None else self._now
+            # tick has supplied one), never an empty span. The stall clock is
+            # read NOW on every paint, never frozen at the last tick.
+            clock = time.time()
             stalled = spinner.is_stalled(clock, self._last_event)
             mark = run_mark(stalled, self._frame) if status == "running" else ""
             if mark and stalled:

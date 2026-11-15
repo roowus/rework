@@ -76,16 +76,19 @@ live in `tui/spinner.py`.
 What "idle" means depends on the surface, because every run event also counts
 as an event of its mission:
 
-- **Run level** (a run row, the orchestrator row, a Work tab card, a dashboard
-  mission row, the trajectory tail with a run selected) is judged by THAT
-  entity's own newest event only. A wedged run shows `◌ idle 7m` even while a
-  sibling run or the orchestrator keeps the mission busy. Stamps are never
-  merged with a max and never borrowed from another entity.
-- **Mission level** (the drill-down header, the trajectory tail with no run
-  selected) is judged by the newest event of the whole mission, so it stays
-  animated while anything in the mission works. It is not allowed to hide a
-  silent run: the header adds `tester idle 7m` next to `working` for each
-  running run past the threshold, and the run rows carry the per-run truth.
+- **Run level** (a run row, the orchestrator row, the trajectory tail with a
+  run selected) is judged by THAT entity's own newest event only. A wedged run
+  shows `◌ idle 7m` even while a sibling run or the orchestrator keeps the
+  mission busy. Stamps are never merged with a max and never borrowed from
+  another entity.
+- **Mission level** (the Work tab card, the dashboard mission row, the
+  drill-down header, the trajectory tail with no run selected) represents the
+  whole mission, so it is judged by the newest event of that mission and stays
+  animated while anything in the mission works. Neither the card nor the mission
+  row carries a per-run annotation: a silent run among active siblings is
+  visible through the drill-down header, which adds `tester idle 7m` next to
+  `working` for each running run past the threshold, and through the per-run
+  rows, which carry the per-run truth.
 - **Aggregate** (the running stats tile and the project badge) uses the newest
   event across all running missions; it reads idle only when every one is.
 
