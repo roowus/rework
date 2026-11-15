@@ -503,3 +503,134 @@ async def test_a_store_without_a_dsn_never_reconnects(monkeypatch) -> None:
 
     with pytest.raises(psycopg.OperationalError):
         await store.get_item("l-one")
+
+
+# -- rotating the Postgres password: the store re-reads the env file --
+
+
+def _rotated_env(monkeypatch: pytest.MonkeyPatch, tmp_path, url: str):
+    """Point REWORK_ENV_FILE at a tmp env file, as a real rotation edits it."""
+    env_file = tmp_path / "rework.env"
+    env_file.write_text(f"REWORK_DB={url}\n")
+    monkeypatch.setenv("REWORK_ENV_FILE", str(env_file))
+    return env_file
+
+
+def _rotated_password_error():
+    import psycopg
+
+    return psycopg.OperationalError('FATAL:  password authentication failed for user "postgres"')
+
+
+async def test_a_rotated_password_reconnects_with_the_new_dsn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Found live: after the Postgres password was rotated, every reconnect
+    reused the URL this process started with and failed with 28P01 forever.
+    An AUTH failure must re-read the env file and reconnect with the NEW dsn,
+    exactly once, without ever logging the URL (it carries the password)."""
+    import logging
+
+    from rework.credentials import CREDENTIALS_RELOADED
+    from rework.library import store as store_mod
+
+    stale = "postgresql://postgres:STALEPASS@host:5433/rework_library"
+    fresh = "postgresql://postgres:LIVEHOSTPASS@host:5433/rework_library"
+    _rotated_env(monkeypatch, tmp_path, fresh)
+    monkeypatch.setenv("REWORK_DB", stale)
+    caplog.set_level(logging.DEBUG, logger="rework.library")
+
+    class _AuthFailedConn(_FakeConn):
+        def __init__(self) -> None:
+            super().__init__()
+            self._err = _rotated_password_error()
+
+    first = _AuthFailedConn()
+    second = _FakeConn()
+    second.fail = False
+    second.row = _item_row()
+    made: list[_FakeConn] = []
+    dsn_seen: list[str] = []
+
+    async def fake_connect(dsn: str) -> _FakeConn:
+        dsn_seen.append(dsn)
+        conn = [second][len(made)]
+        made.append(conn)
+        return conn
+
+    monkeypatch.setattr(store_mod, "_connect", fake_connect)
+    store = store_mod.PostgresLibraryStore(first, dsn=stale)
+
+    got = await store.get_item("l-one")
+    assert got is not None and got.id == "l-one", "real data after the rotation"
+    assert store._dsn == fresh, "the store now holds the rotated dsn"
+    assert dsn_seen == [fresh], "the reconnect used the NEW dsn, not the stale one"
+    assert store._conn is second and store._op_lock._conn is second
+
+    messages = [r.getMessage() for r in caplog.records if r.name == "rework.library"]
+    assert CREDENTIALS_RELOADED in messages
+    blob = " ".join(messages) + " ".join(str(r.args) for r in caplog.records)
+    for secret in ("STALEPASS", "LIVEHOSTPASS", stale, fresh):
+        assert secret not in blob, "no password or URL ever reaches the log"
+
+
+async def test_an_auth_failure_with_unchanged_credentials_reconnects_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The env file still holds the URL we already use: nothing to recover, so
+    the old behaviour stands (warn, one reconnect, no second retry, no loop)
+    and the reload line is NOT logged."""
+    import logging
+
+    from rework.credentials import CREDENTIALS_RELOADED
+    from rework.library import store as store_mod
+
+    dsn = "postgresql://postgres:STALEPASS@host:5433/rework_library"
+    _rotated_env(monkeypatch, tmp_path, dsn)
+    caplog.set_level(logging.DEBUG, logger="rework.library")
+
+    class _AuthFailedConn(_FakeConn):
+        def __init__(self) -> None:
+            super().__init__()
+            self._err = _rotated_password_error()
+
+    first = _AuthFailedConn()
+    second = _FakeConn()
+    second.fail = False
+    second.row = _item_row()
+
+    async def connecting(_dsn: str) -> _FakeConn:
+        # unchanged credentials -> the SAME dsn is retried (today's behaviour)
+        return second
+
+    monkeypatch.setattr(store_mod, "_connect", connecting)
+    store = store_mod.PostgresLibraryStore(first, dsn=dsn)
+    got = await store.get_item("l-one")
+    assert got is not None and got.id == "l-one"
+    assert store._dsn == dsn, "the dsn is untouched when the file holds the same URL"
+    messages = [r.getMessage() for r in caplog.records if r.name == "rework.library"]
+    assert CREDENTIALS_RELOADED not in messages, "nothing was reloaded"
+
+
+async def test_a_non_auth_error_never_re_reads_the_library_env_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """A dead socket must keep exactly today's behaviour: no env file read."""
+    from rework.library import store as store_mod
+
+    _rotated_env(monkeypatch, tmp_path, "postgresql://postgres:new@host:5433/l")
+
+    def must_not_run(**_kwargs: object) -> None:
+        pytest.fail("the env file must not be re-read for a non-auth failure")
+
+    monkeypatch.setattr(store_mod, "recover_db_credentials", must_not_run)
+    first = _FakeConn()  # raises OperationalError("the connection is closed")
+    second = _FakeConn()
+    second.fail = False
+    second.row = _item_row()
+    store, made = _postgres_with_fake(monkeypatch, first, [second])
+
+    got = await store.get_item("l-one")
+    assert got is not None and got.id == "l-one"
+    assert made == [second]
+    assert store._dsn == "postgresql://fake", "the dsn is never rewritten"
