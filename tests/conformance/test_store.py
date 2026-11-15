@@ -747,6 +747,8 @@ async def test_list_missions_light_drops_plan_and_result(store: StateStore) -> N
     for row in rows:
         assert row.light is True
         assert row.plan is None and row.result is None  # never a silent {}
+        # the marker is not part of the record's serialized form
+        assert "light" not in row.model_dump() and '"light"' not in row.model_dump_json()
     # the full reads are untouched
     full = await store.get_mission(made[0].id)
     assert full is not None and full.light is False
@@ -807,3 +809,23 @@ async def test_list_missions_light_payload_is_dramatically_smaller(store: StateS
     assert full_bytes > 200_000  # the big result really is in the full payload
     assert light_bytes < 5_000
     assert ratio > 50
+
+
+async def test_list_missions_light_objective_clip_bounds_what_search_can_see(
+    store: StateStore,
+) -> None:
+    """The list clips the objective at 200 chars, and the TUI searches the clipped
+    text: a token inside the first 200 chars is found, one at char 201 is not
+    (documented in docs/design.md; the full row still has it)."""
+    from rework.tui.search import search_missions
+
+    objective = "nearqq " + "a" * 193 + "zzfarzz"  # nearqq at char 1, zzfarzz at char 201
+    assert objective.index("zzfarzz") == 200
+    m = Mission(id=new_id("m"), objective=objective)
+    await store.create_mission(m)
+    rows = await store.list_missions_light(limit=10)
+    assert [r.objective for r in rows] == [objective[:200]]
+    assert [r.id for r in search_missions(rows, "nearqq")] == [m.id]
+    assert search_missions(rows, "zzfarzz") == []
+    full = await store.list_missions(limit=10)  # the unclipped read does find it
+    assert [r.id for r in search_missions(full, "zzfarzz")] == [m.id]

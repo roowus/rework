@@ -102,7 +102,7 @@ class Mission(BaseModel):
     # True on rows from StateStore.list_missions_light: plan and result were
     # NOT fetched (they stay None, never a silent {}) and objective is clipped.
     # Anything that needs them must load the full row with get_mission.
-    light: bool = False
+    light: bool = Field(default=False, exclude=True)
 
 
 # The slim list the TUI polls: every column a list/search/header reads, and

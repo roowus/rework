@@ -237,3 +237,49 @@ async def test_idle_poll_never_beats_a_slower_configured_rate(env: Path) -> None
         await pilot.pause(0.2)
         app._last_input = time.monotonic() - 3600
         assert app.poll_interval() == 30.0
+
+
+# -- a failed full-row fetch does not leave the header on "loading" -----------
+
+
+async def test_a_failed_full_fetch_shows_the_light_facts_and_recovers(
+    ids: dict[str, str],
+) -> None:
+    from textual.widgets import Static
+
+    mid = ids["running"]
+    app = ReworkApp(poll_seconds=0.2)
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause(0.5)
+        data = app.hub.data
+        real = data.get_mission
+        broken = True
+
+        async def flaky(mission_id: str) -> Any:
+            if broken:
+                raise RuntimeError("store unreachable")
+            return await real(mission_id)
+
+        data.get_mission = flaky  # type: ignore[method-assign]
+        app.open_mission(mid)
+        header = app.query_one("#m-header", Static)
+        dash = app.view("dashboard")
+        row = dash.snap.mission(mid)
+        for _ in range(30):
+            await pilot.pause(0.1)
+            if "could not load" in str(header.render()):
+                break
+        text = str(header.render())
+        assert "loading" not in text, text
+        assert "could not load plan/result" in text, text
+        assert row.objective in text, "the light objective is shown"
+        assert "started" in text
+        # the store comes back: the next poll fetches the row and the header is full
+        broken = False
+        for _ in range(40):
+            await pilot.pause(0.1)
+            if "could not load" not in str(header.render()):
+                break
+        assert dash.full_mission is not None and not dash.full_failed
+        assert "could not load" not in str(header.render())
+        assert "running  fix" in str(header.render()), "the plan label is back"

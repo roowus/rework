@@ -146,6 +146,7 @@ class DashboardView(View):
         # light rows, so _poll_mission fetches this once per open and again only
         # when the mission's updated_at moves
         self.full_mission: Any = None
+        self.full_failed = False  # the last full-row fetch came back empty
         self.run_id: str | None = None
         self.mtab = "traj"
         # mission page state
@@ -262,6 +263,7 @@ class DashboardView(View):
 
     def on_snapshot(self, snap: Snapshot) -> None:
         self.snap = snap
+        self.mark_time_painted()
         self._paint_overview()
         self._paint_head()
         if time.time() - self._enriched_at > 15:
@@ -273,6 +275,12 @@ class DashboardView(View):
 
     def on_tick(self, snap: Snapshot) -> None:
         self.snap = snap
+        if self.time_repaint_due():
+            # the data is unchanged but `ago(...)` text is not: repaint only what
+            # carries time (the list rows, the open mission's header)
+            self._paint_overview()
+            if self.mission_id:
+                self._paint_mission_static()
         if time.time() - self._enriched_at > 15:
             self._enriched_at = time.time()
             self._enrich()
@@ -789,6 +797,7 @@ class DashboardView(View):
             self.run_cost = {}
             self.mission_gates = []
             self.full_mission = None
+            self.full_failed = False
             self.report_loaded_for = None
             self.query_one("#m-traj", Trajectory).clear()
             self.query_one("#run-list", RowList).set_rows([])
@@ -804,6 +813,7 @@ class DashboardView(View):
     def close_mission(self) -> None:
         self.mission_id = None
         self.full_mission = None
+        self.full_failed = False
         self.run_id = None
         self.query_one("#dash-pages", ContentSwitcher).current = "dash-overview"
         self._paint_overview()
@@ -913,7 +923,10 @@ class DashboardView(View):
             return
         data = self.hub.data
         got = await self.hub.guard(lambda: data.get_mission(mission_id), None)
-        if got is not None and self.mission_id == mission_id:
+        if self.mission_id != mission_id:
+            return
+        self.full_failed = got is None  # offline or a store error: say so, retry next poll
+        if got is not None:
             self.full_mission = got
 
     def _detail_mission(self) -> Any:
@@ -927,8 +940,22 @@ class DashboardView(View):
     def _paint_mission_static(self) -> None:
         mission = self._detail_mission()
         header = self.query_one("#m-header", Static)
-        if mission is None or getattr(mission, "light", False):
+        if mission is None or (getattr(mission, "light", False) and not self.full_failed):
             header.update(f"[{FAINT}]loading {esc(self.mission_id)}…[/]")
+            return
+        if getattr(mission, "light", False):
+            # the full row could not be fetched: show the light facts we hold
+            # and say what is missing, instead of a permanent "loading"
+            st = status_value(mission.status)
+            end = time.time() if st in actions.ACTIVE else mission.updated_at
+            header.update(
+                f"[b]{esc(mission.objective)}[/b]\n{status_text(st)}  [{MUTED}]"
+                + esc(
+                    f"started {ago(mission.created_at)} · {duration(end - mission.created_at)}"
+                    "  ·  could not load plan/result (retrying)"
+                )
+                + "[/]"
+            )
             return
         st = status_value(mission.status)
         plan = mission.plan or {}

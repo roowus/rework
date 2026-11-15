@@ -154,6 +154,7 @@ class GatesView(View):
 
     def on_snapshot(self, snap: Snapshot) -> None:
         self.snap = snap
+        self.mark_time_painted()
         if self.mode == "open":
             self._paint_list(sorted(snap.gates, key=lambda g: float(g.created_at or 0)))
             if self.selected is not None and self.selected.status.value == "open":
@@ -176,6 +177,12 @@ class GatesView(View):
 
     def on_tick(self, snap: Snapshot) -> None:
         self.snap = snap
+        if self.time_repaint_due():
+            # unchanged data, but "waiting 2h" and "5m ago" keep moving
+            if self.mode == "open":
+                self._paint_list(sorted(snap.gates, key=lambda g: float(g.created_at or 0)))
+            if self.selected is not None:
+                self._paint_detail()
         if self.mode != "open":
             self._load_history()
         if self.selected is not None and self._steps_ready_for == self.selected.id:

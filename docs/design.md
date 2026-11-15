@@ -166,6 +166,11 @@ tailnet once pulled 3 MB/s, 17.5 GB in 1h40m, from
   `Mission.light` is True and both are `None` (never a silent `{}`). `repo_path`
   stays because the PR preview default reads it off the snapshot. Same
   filters, order and limit as `list_missions`, which still returns full rows.
+  `Mission.light` is excluded from serialization, so it never reaches an API
+  payload or persisted JSON. Because the objective is clipped, dashboard search
+  matches only the first 200 characters of the objective in the list: a token
+  that appears only after character 200 is not found (the full row, opened,
+  still has all of it).
 - *Full row on demand.* A view that needs `plan` or `result` calls
   `TuiData.get_mission`: the dashboard when a mission is opened (kept on
   `full_mission`, refetched only when the row's `updated_at` moves, which any
@@ -180,7 +185,11 @@ tailnet once pulled 3 MB/s, 17.5 GB in 1h40m, from
   the online/error state with the previous broadcast and skips the broadcast
   when nothing changed (the first refresh always broadcasts). Views get
   `on_tick` instead, so live detail polls (events, steps, shared chats) keep
-  running without repainting the lists.
+  running without repainting the lists. `on_tick` also repaints only the text
+  that carries time (list rows, the open mission header, gate waiting time,
+  mission cards) every `TIME_REPAINT_SECONDS` (20 s, a monotonic stamp in
+  `View.time_repaint_due`), so "3m ago" keeps advancing on an idle night
+  without a 2 s repaint of everything.
 - *Idle backoff.* After `reload.IDLE_SECONDS` (30 s) with no key, no modal and
   no chat turn, the app polls every `IDLE_POLL_SECONDS` (10 s) instead of
   `poll_seconds` (2 s). The timer keeps ticking every `poll_seconds`; `_kick`

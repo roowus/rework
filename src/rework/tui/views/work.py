@@ -153,6 +153,7 @@ class WorkView(View):
 
     def on_snapshot(self, snap: Snapshot) -> None:
         self.snap = snap
+        self.mark_time_painted()
         self._paint_chat_list()
         self._paint_head()
         self._paint_knobs()
@@ -162,6 +163,9 @@ class WorkView(View):
     def on_tick(self, snap: Snapshot) -> None:
         self.snap = snap
         cards = list(self.query(MissionCard))
+        if self.time_repaint_due():
+            for card in cards:  # "started 3m ago" on each live card
+                card.paint()
         if cards:
             self._poll_cards(cards)
         self._poll_chat()

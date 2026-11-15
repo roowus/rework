@@ -13,7 +13,7 @@ import time
 from typing import Any, ClassVar
 
 from textual import events
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, ScreenStackError
 from textual.binding import Binding, BindingType
 from textual.css.query import NoMatches
 from textual.notifications import SeverityLevel
@@ -287,7 +287,11 @@ class ReworkApp(App[None]):
         now = time.monotonic()
         # the timer ticks every poll_seconds; an idle owner is polled less often
         # (half a tick of slack so timer jitter never skips a due poll)
-        if now - self._last_poll < self.poll_interval() - self.poll_seconds / 2:
+        try:
+            interval = self.poll_interval()
+        except (ScreenStackError, NoMatches):
+            return  # a timer firing during teardown: the screens are already gone
+        if now - self._last_poll < interval - self.poll_seconds / 2:
             return
         self._last_poll = now
         self.run_worker(self._tick(), group="hub", exclusive=False)
