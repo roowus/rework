@@ -293,6 +293,7 @@ class ReworkApp(App[None]):
             # still reaches Hub._broadcast, which logs it with a traceback.
             return
         self._notify_new_gates(snap)
+        self._notify_budget_raises(snap)
         for view in self.views():
             try:
                 view.on_snapshot(snap)
@@ -315,6 +316,23 @@ class ReworkApp(App[None]):
             mission = snap.mission(gate.mission_id)
             where = clip(mission.objective, 60) if mission else gate.mission_id
             self.announce(f"{clip(gate.question, 120)}", title=f"Gate · {where}")
+
+    def _notify_budget_raises(self, snap: Snapshot) -> None:
+        """A budget raise the policy took (or the owner approved) is worth a
+        toast: money moved without anybody watching. History lives in
+        `raises` on the plan and in the gate list."""
+        for event in getattr(snap, "budget_raises", []):
+            mission = snap.mission(event.mission_id)
+            where = clip(mission.objective, 60) if mission else (event.mission_id or "")
+            payload = event.payload or {}
+            tag = "auto" if payload.get("auto") else "approved"
+            self.notify(
+                f"Budget ${float(payload.get('old') or 0):.2f} -> "
+                f"${float(payload.get('new') or 0):.2f} ({tag})",
+                title=f"Budget · {where}",
+                severity="information",
+                timeout=8,
+            )
 
     def notify(
         self,

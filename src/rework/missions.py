@@ -139,6 +139,7 @@ def orchestrated_plan(
     and the budget rail. `model` / `effort` are the default role model the
     orchestrator may override per spawn."""
     cap, step = default_budget()
+    max_usd = cap if budget_usd is None else budget_usd
     spec: dict[str, Any] = {
         "kind": "auto",
         "playbook": playbook,
@@ -146,8 +147,13 @@ def orchestrated_plan(
         "gates": list(PLAYBOOK_GATES.get(playbook, [])),
         "publish": PLAYBOOK_PUBLISH.get(playbook, ""),
         "budget": {
-            "max_usd": cap if budget_usd is None else budget_usd,
+            "max_usd": max_usd,
             "ask_every_usd": step if budget_step_usd is None else budget_step_usd,
+            # the raise policy's baseline: automatic raises are capped at
+            # original_max_usd * ceiling_factor, so the ceiling cannot creep
+            "original_max_usd": max_usd,
+            "auto_raises": 0,
+            "raises": [],
         },
     }
     if model:

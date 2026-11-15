@@ -81,6 +81,9 @@ class EventType(StrEnum):
     CANCELLED = "cancelled"
     INFO = "info"
     OWNER_MESSAGE = "owner_message"  # the owner talking to a running mission
+    # the mission's budget cap moved (auto or owner-approved): payload old/new/
+    # reason/auto. Drives the TUI toast, so a raise is never silent.
+    BUDGET_RAISED = "budget_raised"
 
 
 class Mission(BaseModel):

@@ -19,6 +19,7 @@ from typing import Any
 
 from textual.css.query import NoMatches
 
+from rework.kernel.state.records import EventType
 from rework.tui.data import TuiData
 
 log = logging.getLogger("rework.tui")
@@ -36,6 +37,7 @@ class Snapshot:
     projects: list[Any] = field(default_factory=list)
     chats: list[Any] = field(default_factory=list)
     spend_today: float = 0.0
+    budget_raises: list[Any] = field(default_factory=list)  # new BUDGET_RAISED events
     online: bool = True
     error: str = ""
     loaded: bool = False  # False until the first successful refresh
@@ -70,6 +72,9 @@ class Hub:
         self._failures = 0
         self._next_try = 0.0
         self._on_offline: Callable[[str], None] | None = None
+        # cursor for the budget-raise tail; primed to "now" on the first poll so
+        # a fresh shell does not re-announce yesterday's raises
+        self._budget_seq: int | None = None
         # set by aclose() BEFORE its first await. A refresh that was already in
         # flight resumes on the closed store; without this it logged a false
         # 'offline:' and broadcast a stale snapshot into a half-torn-down DOM
@@ -106,6 +111,7 @@ class Hub:
                 snap.projects = await self.data.projects()
                 snap.chats = await self._chats()
                 snap.spend_today = await self._spend_today()
+                snap.budget_raises = await self._budget_raises()
                 snap.online = not self.data._reconnecting_hint
                 snap.error = self.data._reconnecting_hint
                 snap.loaded = True
@@ -140,6 +146,18 @@ class Hub:
             return []
         # a mission orchestrator's own conversation is machinery, not a chat
         return [c for c in chats if not str(c.id).startswith("orch-")]
+
+    async def _budget_raises(self) -> list[Any]:
+        try:
+            if self._budget_seq is None:
+                self._budget_seq = await self.data.newest_event_seq()
+                return []
+            events = await self.data.events_after(self._budget_seq)
+        except Exception:  # a missing tail must not cost the whole snapshot
+            return []
+        if events:  # advance over the WHOLE batch: a burst of other events
+            self._budget_seq = max(int(e.seq or 0) for e in events)
+        return [e for e in events if e.type == EventType.BUDGET_RAISED]
 
     async def _spend_today(self) -> float:
         try:

@@ -334,8 +334,11 @@ async def test_needs_model_exhausted_opens_gate(
 
 
 async def test_burn_gate_holds_then_continues(
-    world: dict[str, Any], registry: RoleRegistry
+    world: dict[str, Any], registry: RoleRegistry, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # the FIRST raise is automatic under the default budget policy (see
+    # tests/unit/test_budget_policy.py); this test is about the gate itself
+    monkeypatch.setenv("REWORK_BUDGET_AUTO_RAISES", "0")
     store: SqliteStore = world["store"]
     cap = 0.01
     await store.create_mission(
