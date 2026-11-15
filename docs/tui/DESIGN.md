@@ -71,7 +71,11 @@ A running mission or run shows the spinner only while it is producing events.
 With no event for 5 minutes (`spinner.STALL_SECONDS`, 300s) the spinner stops
 and the row shows the static idle marker `◌` plus `idle 7m`, so a wedged run
 cannot look busy. Pending, on hold and awaiting-gate states never animate.
-The frame set and the 5 minute rule live in `tui/spinner.py`.
+The frame set and the 5 minute rule live in `tui/spinner.py`. With no event
+data at all (a store hiccup, a failed query) the running marker animates rather
+than claiming idle, so a store hiccup never falsely reports silence. Every
+paint, the store poll included, computes a real frame; an unfocused terminal
+shows a still frame, not a blank.
 
 Trajectory glyphs (Claude-Code familiar):
 

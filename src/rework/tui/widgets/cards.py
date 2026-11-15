@@ -3,6 +3,7 @@ mission (status, last steps, its gate with answer buttons, controls)."""
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from textual.app import ComposeResult
@@ -120,8 +121,8 @@ class MissionCard(Vertical):
         self.tail: list[str] = []
         self.active_role = ""
         # spinner state: the frame comes from the app's shared clock every tick
-        self._frame = ""
-        self._now = 0.0
+        self._frame: str | None = None
+        self._now: float | None = None
         self._last_event: float | None = None
         # a finished card backfills its tail once, then is never polled again
         self.tail_filled = False
@@ -201,16 +202,14 @@ class MissionCard(Vertical):
             head.update(f"[{MUTED}]mission {esc(self.mission_id)} · loading…[/]")
         else:
             status = status_value(m.status)
-            mark = (
-                run_mark(spinner.is_stalled(self._now, self._last_event), self._frame)
-                if status == "running" and self._frame
-                else ""
-            )
-            if mark and spinner.is_stalled(self._now, self._last_event):
+            # a running card always paints a real frame (computed now when no
+            # tick has supplied one), never an empty span
+            clock = time.time() if self._now is None else self._now
+            stalled = spinner.is_stalled(clock, self._last_event)
+            mark = run_mark(stalled, self._frame) if status == "running" else ""
+            if mark and stalled:
                 mark += f" [{FAINT}]idle"
-                mark += (
-                    f" {spinner.human_duration(spinner.silence(self._now, self._last_event))}[/]"
-                )
+                mark += f" {spinner.human_duration(spinner.silence(clock, self._last_event))}[/]"
             elif mark:
                 mark += f" [{FAINT}]working[/]"
             bits = [esc(self.mission_id), esc(plan_label(m.plan))]

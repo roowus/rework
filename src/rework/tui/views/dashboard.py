@@ -332,7 +332,7 @@ class DashboardView(View):
             for sid in ("st-running", "st-gates", "st-paused", "st-done", "st-today", "st-week"):
                 self.query_one(f"#{sid}", Stat).set("—", note)
             return
-        self.query_one("#st-running", Stat).set(str(counts.get("running", 0)))
+        self._paint_running_tile()
         self.query_one("#st-gates", Stat).set(str(len(snap.gates)))
         self.query_one("#st-paused", Stat).set(str(counts.get("on_hold", 0)))
         self.query_one("#st-done", Stat).set(str(done_week))
@@ -385,13 +385,36 @@ class DashboardView(View):
             seen = [stamps["*"]]
         return max(seen) if seen else None
 
-    def _mark(self, status: Any, last: float | None, frame: str, now: float) -> str:
+    def _mark(
+        self, status: Any, last: float | None, frame: str | None = None, now: float | None = None
+    ) -> str:
         """The marker for a status: a frame when it is genuinely running, the
         static idle glyph when it is a zombie. Everything else keeps the
-        existing status glyph (pending/on_hold/gate never animate)."""
+        existing status glyph (pending/on_hold/gate never animate).
+
+        `frame`/`now` of None mean "compute it now": the store poll paints
+        without a tick, and it must still render a real one-cell frame (never
+        an empty span), also while the terminal is unfocused and no tick runs."""
         if status_value(status) != "running":
             return glyph(status)
-        return run_mark(spinner.is_stalled(now, last), frame)
+        clock = time.time() if now is None else now
+        return run_mark(spinner.is_stalled(clock, last), frame)
+
+    def _paint_running_tile(self, frame: str | None = None, now: float | None = None) -> None:
+        """The dashboard "running" tile. ONE rendering shared by the poll and the
+        tick, so the tile cannot alternate between two texts."""
+        stat = self.query_one("#st-running", Stat)
+        running = sum(1 for m in self.snap.missions if status_value(m.status) == "running")
+        if not running:
+            stat.set("0")
+            return
+        clock = time.time() if now is None else now
+        last = self._last_event("*")
+        if spinner.is_stalled(clock, last):
+            human = spinner.human_duration(spinner.silence(clock, last))
+            stat.set(str(running), f"idle {human}")
+        else:
+            stat.set(f"{run_mark(False, frame)} {running}", "working", markup=True)
 
     def tick(self, frame: str, now: float) -> None:
         """Repaint only the rows that carry a running marker (10fps).
@@ -429,15 +452,7 @@ class DashboardView(View):
         # in-place path instead of remounting the list
         self.query_one("#mission-list", RowList).set_rows(mrows)
         self.query_one("#proj-list", RowList).set_rows(self._proj_rows(frame, now))
-        running = sum(1 for m in self.snap.missions if status_value(m.status) == "running")
-        if running:
-            last = self._last_event("*")
-            mark = run_mark(spinner.is_stalled(now, last), frame)
-            if spinner.is_stalled(now, last):
-                human = spinner.human_duration(spinner.silence(now, last))
-                self.query_one("#st-running", Stat).set(str(running), f"idle {human}")
-            else:
-                self.query_one("#st-running", Stat).set(f"{mark} {running}", "working", markup=True)
+        self._paint_running_tile(frame, now)
 
     def _tick_mission(self, frame: str, now: float) -> None:
         mission = self.snap.mission(self.mission_id)
@@ -450,7 +465,7 @@ class DashboardView(View):
         if self.mtab == "traj":
             self._paint_traj_tail(last, frame, now)
 
-    def _proj_rows(self, frame: str = "", now: float = 0.0) -> list[RowData]:
+    def _proj_rows(self, frame: str | None = None, now: float | None = None) -> list[RowData]:
         """The project pane's rows. Split out so the spinner tick and the poll
         build them the same way (and with the same keys)."""
         snap = self.snap
@@ -471,8 +486,8 @@ class DashboardView(View):
         missions: list[Any],
         dim: bool = False,
         *,
-        frame: str = "",
-        now: float = 0.0,
+        frame: str | None = None,
+        now: float | None = None,
     ) -> str:
         running = sum(1 for m in missions if status_value(m.status) == "running")
         waiting = sum(1 for m in missions if status_value(m.status) == "awaiting_gate")
@@ -480,14 +495,14 @@ class DashboardView(View):
         if running:
             # the project badge is the second running glyph on the overview
             last = self._last_event("*")
-            mark = run_mark(spinner.is_stalled(now, last), frame) if frame else glyph("running")
+            mark = self._mark("running", last, frame, now)
             badges.append(f"{mark} {running}")
         if waiting:
             badges.append(f"[{WARN}]◆ {waiting}[/]")
         label = f"[{MUTED}]{esc(name)}[/]" if dim else esc(name)
         return f"{label}  [{FAINT}]{len(missions)}[/]  " + " ".join(badges)
 
-    def _mission_row(self, m: Any, *, frame: str = "", now: float = 0.0) -> str:
+    def _mission_row(self, m: Any, *, frame: str | None = None, now: float | None = None) -> str:
         st = status_value(m.status)
         last = self._last_event(m.id)
         bits = []
@@ -511,7 +526,7 @@ class DashboardView(View):
             f"  [{FAINT}]{esc('  ·  '.join(bits))}[/]{gate_note}"
         )
 
-    def _ai_rows(self, *, frame: str = "", now: float = 0.0) -> list[RowData]:
+    def _ai_rows(self, *, frame: str | None = None, now: float | None = None) -> list[RowData]:
         """The ✦ ranking: one row per ranked mission, objective + its reason.
         Built from the snapshot so a mission that vanished mid-search drops."""
         rows: list[RowData] = []
@@ -983,7 +998,7 @@ class DashboardView(View):
         except NoMatches:
             return
 
-    def _paint_mission_static(self, *, frame: str = "", now: float = 0.0) -> None:
+    def _paint_mission_static(self, *, frame: str | None = None, now: float | None = None) -> None:
         mission = self.snap.mission(self.mission_id)
         header = self.query_one("#m-header", Static)
         if mission is None:
@@ -1011,9 +1026,9 @@ class DashboardView(View):
         last = self._last_event(mission.id, [r.id for r in self.runs])
         # "working" or "idle 7m" next to the frame: the owner must be able to
         # read a wedged mission off the header without waiting for a poll
-        stalled = st == "running" and spinner.is_stalled(now or time.time(), last)
+        clock = time.time() if now is None else now
+        stalled = st == "running" and spinner.is_stalled(clock, last)
         if st == "running":
-            clock = now or time.time()
             if stalled:
                 head = (
                     f"{self._mark(st, last, frame, clock)} "
@@ -1045,7 +1060,7 @@ class DashboardView(View):
             bits.append(money(self.run_cost[run.id]))
         return " · ".join(bits)
 
-    def _run_rows(self, frame: str = "", now: float = 0.0) -> list[RowData]:
+    def _run_rows(self, frame: str | None = None, now: float | None = None) -> list[RowData]:
         """The sessions list. Split out so the spinner tick and the poll build
         the same rows (same keys, in-place update)."""
         rows = [RowData(ALL, f"[b]All activity[/b]\n[{FAINT}]{len(self.events)} events[/]")]
@@ -1085,7 +1100,7 @@ class DashboardView(View):
         lst.set_rows(self._run_rows())
         lst.select(self.run_id or ALL)
 
-    def _paint_traj_tail(self, last: float | None, frame: str, now: float) -> None:
+    def _paint_traj_tail(self, last: float | None, frame: str | None, now: float) -> None:
         """The ONE trailing spinner step on the trajectory (surface c).
 
         It is a single Step updated in place: `update()` with a new markup is a

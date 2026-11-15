@@ -213,16 +213,20 @@ async def test_live_dashboard_row_and_tail_animate(env: Path) -> None:
             rows = dash.query_one("#mission-list", RowList).query(Row)
             return next(r._markup for r in rows if r.key == ids["running"])
 
-        seen = set()
-        for _ in range(8):
+        seen: set[str] = set()
+        tile_seen: set[str] = set()
+        for _ in range(14):
             text = row_text()
+            tile = str(dash.query_one("#st-running", Stat).render())
+            # every single sample, poll repaints included, carries a frame
+            assert _has_frame(text), f"blank running row: {text!r}"
+            assert _has_frame(tile) and "working" in tile, f"tile flipped: {tile!r}"
+            assert "[#" not in tile and "[/]" not in tile, f"raw markup leaked: {tile!r}"
             seen |= {f for f in FRAMES if f in text}
-            await pilot.pause(0.17)
+            tile_seen |= {f for f in FRAMES if f in tile}
+            await pilot.pause(0.07)
         assert len(seen) >= 2, f"the running glyph never changed: {seen}"
-
-        tile = str(dash.query_one("#st-running", Stat).render())
-        assert "[#" not in tile and "[/]" not in tile, f"raw markup leaked: {tile!r}"
-        assert _has_frame(tile) and "working" in tile
+        assert len(tile_seen) >= 2, f"the running tile never changed: {tile_seen}"
 
         dash.open_mission(ids["running"])
         await pilot.pause(0.6)
@@ -231,9 +235,159 @@ async def test_live_dashboard_row_and_tail_animate(env: Path) -> None:
         assert _has_frame(str(tail.render()))
 
 
+def _assert_running_surfaces_have_a_frame(dash, ids) -> None:  # type: ignore[no-untyped-def]
+    rows = dash.query_one("#mission-list", RowList).query(Row)
+    row = next(r._markup for r in rows if r.key == ids["running"])
+    assert _has_frame(row), f"running row has no frame: {row!r}"
+    projs = " ".join(r._markup for r in dash.query_one("#proj-list", RowList).query(Row))
+    assert _has_frame(projs), f"project badge has no frame: {projs!r}"
+    tile = str(dash.query_one("#st-running", Stat).render())
+    assert _has_frame(tile) and "working" in tile, f"tile has no frame: {tile!r}"
+    assert "[#" not in tile and "[/]" not in tile
+
+
+async def test_poll_path_paints_a_frame_never_a_blank(env: Path) -> None:
+    """The store poll paints with NO frame argument. It must still render a real
+    one-cell frame (not a coloured empty span), focused or not."""
+    ids = await seed(str(env), history_days=20)
+    await _append_fresh_event(env, ids["running"])
+    async with ReworkApp(poll_seconds=30).run_test(size=SIZE) as pilot:
+        app = pilot.app
+        await pilot.pause(0.5)
+        app.action_tab("dashboard")
+        await pilot.pause(0.3)
+        dash = app.view("dashboard")
+        for _ in range(5):
+            dash._paint_overview()  # the poll path: no frame, no now
+            _assert_running_surfaces_have_a_frame(dash, ids)
+            await pilot.pause(0.05)
+        # no empty coloured span anywhere in the running row
+        assert "[#a394f7][/]" not in str(
+            [r._markup for r in dash.query_one("#mission-list", RowList).query(Row)]
+        )
+
+        # unfocused: the tick stops, the still frame from the poll stays visible
+        app.app_focus = False
+        await pilot.pause(0.3)
+        dash._paint_overview()
+        _assert_running_surfaces_have_a_frame(dash, ids)
+        await pilot.pause(0.3)
+        _assert_running_surfaces_have_a_frame(dash, ids)
+
+
+async def test_poll_path_mission_header_has_a_frame(env: Path) -> None:
+    ids = await seed(str(env), history_days=20)
+    await _append_fresh_event(env, ids["running"])
+    async with ReworkApp(poll_seconds=30).run_test(size=SIZE) as pilot:
+        app = pilot.app
+        await pilot.pause(0.5)
+        app.action_tab("dashboard")
+        dash = app.view("dashboard")
+        dash.open_mission(ids["running"])
+        await pilot.pause(0.6)
+        app.app_focus = False
+        dash._paint_mission_static()  # poll path
+        from textual.widgets import Static
+
+        header = str(dash.query_one("#m-header", Static).render())
+        assert _has_frame(header) and "working" in header, header
+        runs = " ".join(r._markup for r in dash.query_one("#run-list", RowList).query(Row))
+        assert _has_frame(runs), runs
+
+
+def test_run_mark_without_a_frame_is_never_blank() -> None:
+    from rework.tui.theme import run_mark
+
+    for frame in (None, ""):
+        out = run_mark(False, frame)
+        assert _has_frame(out) and "[#a394f7][/]" not in out
+
+
 def test_marker_helper_is_consistent() -> None:
     now = 5000.0
     glyph, animated = spinner.marker(now, now - 1, t=0.0)
     assert animated and glyph in FRAMES
     glyph, animated = spinner.marker(now, now - STALL_SECONDS - 1)
     assert not animated and glyph == spinner.IDLE_GLYPH
+
+
+# -- the stamp sweep ----------------------------------------------------------
+
+
+class _FakeStore:
+    """Counts events_since calls; can be told to die like a dropped connection."""
+
+    def __init__(self, events: list[EventRecord]) -> None:
+        self.events = events
+        self.calls: list[dict] = []  # type: ignore[type-arg]
+        self.fail = False
+
+    async def events_since(self, seq, mission_id=None, limit=500, *, newest_first=False):  # type: ignore[no-untyped-def]
+        self.calls.append({"mission_id": mission_id, "limit": limit})
+        if self.fail:
+            raise ConnectionError("server closed the connection")
+        rows = [e for e in self.events if e.mission_id == mission_id]
+        # mirror the real store: newest window, handed back oldest-first
+        return rows[-limit:]
+
+
+def _ev(mission: str, run: str | None, ts: float, seq: int) -> EventRecord:
+    return EventRecord(
+        seq=seq, mission_id=mission, run_id=run, type=EventType.PROGRESS, payload={}, ts=ts
+    )
+
+
+def _data_with(store: _FakeStore):  # type: ignore[no-untyped-def]
+    from rework.tui.data import TuiData
+
+    data = TuiData()
+
+    async def _store() -> _FakeStore:
+        return store
+
+    async def _drop() -> None:
+        return None
+
+    data.store = _store  # type: ignore[method-assign,assignment]
+    data.drop_store = _drop  # type: ignore[method-assign]
+    return data
+
+
+async def test_event_stamps_are_one_small_query_per_running_mission() -> None:
+    from rework.tui.hub import EVENT_WINDOW, STAMP_MISSIONS, Hub, Snapshot
+
+    now = time.time()
+    events = []
+    for n in range(40):
+        events.append(_ev(f"m{n}", f"m{n}:code:coder:1", now - 10 - n, 2 * n))
+        events.append(_ev(f"m{n}", f"m{n}:test:tester:1", now - 100 - n, 2 * n + 1))
+    store = _FakeStore(events)
+    hub = Hub(_data_with(store))  # type: ignore[arg-type]
+    snap = Snapshot()
+    snap.missions = [_mission(f"m{n}", MissionStatus.RUNNING) for n in range(40)]
+    await hub._event_stamps(snap)
+    assert len(store.calls) == STAMP_MISSIONS, "one query per mission, capped"
+    assert all(c["limit"] == EVENT_WINDOW <= 50 for c in store.calls)
+    # newest per mission AND per run come out of that single result
+    assert snap.last_event["m0"] == pytest.approx(now - 10)
+    assert snap.last_event["m0:test:tester:1"] == pytest.approx(now - 100)
+    assert snap.last_event["*"] == pytest.approx(now - 10)
+
+
+async def test_event_stamp_failure_is_unknown_not_a_stale_stamp() -> None:
+    from rework.tui.hub import Hub, Snapshot
+
+    now = time.time()
+    store = _FakeStore([_ev("m1", "m1:code:coder:1", now - 2000, 1)])
+    hub = Hub(_data_with(store))  # type: ignore[arg-type]
+    snap = Snapshot()
+    snap.missions = [_mission("m1", MissionStatus.RUNNING)]
+    await hub._event_stamps(snap)
+    assert snap.last_event["m1"] == pytest.approx(now - 2000)  # a good read first
+
+    store.fail = True  # then the store dies: the old stamp must NOT be replayed
+    snap2 = Snapshot()
+    snap2.missions = snap.missions
+    await hub._event_stamps(snap2)
+    assert snap2.last_event == {}
+    assert not is_stalled(now, snap2.last_event.get("m1"))  # unknown animates

@@ -108,15 +108,17 @@ STATUS: dict[str, tuple[str, str]] = {
 IDLE_GLYPH, IDLE_COLOUR = spinner.IDLE_GLYPH, FAINT
 
 
-def run_mark(stalled: bool, frame: str) -> str:
+def run_mark(stalled: bool, frame: str | None = None) -> str:
     """Rich markup for the marker on something that is RUNNING.
 
-    `frame` comes from spinner.frame_for(t) (or spinner.marker). Stalled runs
-    get the idle marker in FAINT, so a dead-but-running mission reads at a
-    glance differently from a working one."""
+    `frame` comes from spinner.frame_for(t) (or spinner.marker); None or empty
+    means "compute it now", so a caller that has no tick (the store poll, an
+    unfocused terminal) still paints a real one-cell frame and never an empty
+    coloured span. Stalled runs get the idle marker in FAINT, so a
+    dead-but-running mission reads at a glance differently from a working one."""
     if stalled:
         return f"[{IDLE_COLOUR}]{IDLE_GLYPH}[/]"
-    return f"[{ACCENT}]{frame}[/]"
+    return f"[{ACCENT}]{frame or spinner.frame_for(time.monotonic())}[/]"
 
 
 STATUS_LABEL: dict[str, str] = {

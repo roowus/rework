@@ -23,6 +23,11 @@ from rework.tui.data import TuiData
 
 log = logging.getLogger("rework.tui")
 
+# the spinner stamp sweep: at most this many running missions per poll, each one
+# small query of this many newest events
+STAMP_MISSIONS = 24
+EVENT_WINDOW = 40
+
 
 def midnight() -> float:
     lt = time.localtime()
@@ -139,33 +144,23 @@ class Hub:
             self._busy = False
 
     async def _event_stamps(self, snap: Snapshot) -> None:
-        """Newest event ts per run for the missions that are actually running.
+        """Newest event ts per running mission and per run, for the spinner.
 
-        Carries the previous stamps forward for runs that are still active, so
-        the map does not empty between events. Bounded on purpose: one query per
-        running mission per poll, and the timestamp is only used to decide
-        "animating frame" vs "idle 7m"."""
+        Cost, honestly: ONE store query per running mission per poll (the newest
+        EVENT_WINDOW events, no payload-heavy 200-row reads, no per-run queries)
+        for at most STAMP_MISSIONS missions, so at most 24 small queries. Runs
+        are read out of that one window in Python. A failed query leaves that
+        mission without a stamp ("unknown"), which animates; it never replays an
+        old stamp. The stamp only decides "animating frame" vs "idle 7m"."""
         stamps: dict[str, float] = {}
         active = [
             m for m in snap.missions if str(getattr(m.status, "value", m.status)) == "running"
         ]
-        for mission in active[:24]:
+        for mission in active[:STAMP_MISSIONS]:
             try:
-                newest = await self.data.latest_event_ts(mission.id)
-            except Exception:  # offline, old store: no note, just no stamps
+                stamps.update(await self.data.recent_event_stamps(mission.id, limit=EVENT_WINDOW))
+            except Exception:  # offline, old store: no stamps for it, never stale ones
                 continue
-            if newest:
-                stamps[mission.id] = newest
-            try:
-                runs = await self.data.mission_runs(mission.id)
-            except Exception:
-                continue
-            for run in runs:
-                if run.id in stamps:
-                    continue
-                ts = await self.data.latest_event_ts(mission.id, run.id)
-                if ts:
-                    stamps[run.id] = ts
         if stamps:
             stamps["*"] = max(stamps.values())
         snap.last_event = stamps

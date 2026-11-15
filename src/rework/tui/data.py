@@ -128,7 +128,7 @@ class TuiData:
         store = await self.store()
         return await fn(store)
 
-    async def _resilient(self, key: str, call: Any) -> Any:
+    async def _resilient(self, key: str, call: Any, *, stale_ok: bool = True) -> Any:
         """Run one query; if the connection died, reconnect once and retry.
 
         The TUI reads a Postgres over the tailnet. A laptop sleeping, a
@@ -137,7 +137,11 @@ class TuiData:
         unhandled one used to take the WHOLE app down with a traceback screen
         (owner's screenshot). Stale data with a visible 'offline' note is the
         right failure mode for a dashboard, and the last good result keeps the
-        table populated instead of blanking it."""
+        table populated instead of blanking it.
+
+        `stale_ok=False` opts a query out of the last-good fallback: it raises
+        instead, for a value where an old answer would be a false claim (the
+        spinner's event stamps: a stale stamp reads as "silent for 7m")."""
         try:
             result = await asyncio.wait_for(_maybe_await(call()), QUERY_TIMEOUT_S)
         except Exception as first:
@@ -148,11 +152,12 @@ class TuiData:
                 result = await asyncio.wait_for(_maybe_await(call()), QUERY_TIMEOUT_S)
             except Exception:
                 self._reconnecting_hint = f"{type(first).__name__}: {first}"[:160]
-                if key in self._last_good:
+                if stale_ok and key in self._last_good:
                     return self._last_good[key]
                 raise
         self._reconnecting_hint = ""
-        self._last_good[key] = result
+        if stale_ok:
+            self._last_good[key] = result
         return result
 
     async def library(self) -> tuple[LibraryStore, GitLibrary]:
@@ -192,22 +197,36 @@ class TuiData:
             lambda: self._call(lambda s: s.events_since(since, mission_id=mission_id, limit=limit)),
         )
 
-    async def latest_event_ts(self, mission_id: str, run_id: str | None = None) -> float | None:
-        """Newest event epoch for a mission (or one run). None = never seen.
+    async def recent_event_stamps(self, mission_id: str, limit: int = 40) -> dict[str, float]:
+        """Newest event epoch for a mission and for each run seen in its newest
+        `limit` events: {mission_id: ts, run_id: ts, ...}. Empty = nothing seen.
 
-        Reads ONE row backwards (the store's newest_first), so the spinner's
-        zombie rule costs a single indexed query per running mission per poll."""
+        ONE store query (the newest `limit` events), then a scan in Python.
+        A run that has been silent for longer than the window simply has no key,
+        and the caller falls back to the mission stamp.
 
-        async def _q() -> float | None:
-            # one run's events are interleaved with its siblings' and with the
-            # orchestrator's, so a run filter has to look at a window
-            rows = await self.events_newest(mission_id, limit=1 if run_id is None else 200)
+        One wrapper with its own key and NO last-good fallback: on a store
+        failure this raises (the caller treats that as "unknown", which
+        animates) instead of replaying an old stamp that would claim the run
+        has been silent."""
+
+        async def _q() -> dict[str, float]:
+            rows = await self._call(
+                lambda s: s.events_since(0, mission_id=mission_id, limit=limit, newest_first=True)
+            )
+            out: dict[str, float] = {}
+            # the store returns the window oldest-first, so take the max per key
+            # instead of relying on order
             for row in rows:
-                if run_id is None or row.run_id == run_id:
-                    return float(row.ts) if row.ts else None
-            return None
+                if not row.ts:
+                    continue
+                ts = float(row.ts)
+                for key in (mission_id, str(row.run_id) if row.run_id else None):
+                    if key is not None and ts > out.get(key, 0.0):
+                        out[key] = ts
+            return out
 
-        return await self._resilient(f"last_event:{mission_id}:{run_id}", _q)
+        return await self._resilient(f"stamps:{mission_id}", _q, stale_ok=False)
 
     async def events_newest(self, mission_id: str, limit: int = 1) -> list[Any]:
         return await self._resilient(
