@@ -19,13 +19,27 @@ VERBS = {
     "pause": ("pause_mission", "Paused", "Pausing stops the roles; everything stays resumable."),
     "resume": ("resume_mission", "Resumed", ""),
     "cancel": ("cancel_mission", "Cancelled", ""),
+    # handled by `retry_pr` below; listed so every verb has one registry entry
+    "retry-pr": ("", "PR delivered", "Re-runs push + PR from the recorded delivery state."),
 }
+
+# "Finished, but the PR was never delivered": the state the delivery helper
+# writes into mission.result when a push/`gh pr create` fails for good.
+PENDING_KEY = "pr_pending"
+
+
+def delivery_pending(result: dict[str, Any] | None) -> bool:
+    return bool((result or {}).get(PENDING_KEY))
+
 
 ACTIVE = {"pending", "running", "awaiting_gate", "on_hold"}
 
 
-def can(verb: str, status: str) -> bool:
-    """Which controls make sense for a mission status."""
+def can(verb: str, status: str, result: dict[str, Any] | None = None) -> bool:
+    """Which controls make sense for a mission status (and, for `retry-pr`,
+    its recorded delivery state)."""
+    if verb == "retry-pr":
+        return status == "done" and delivery_pending(result) and not (result or {}).get("pr_url")
     if verb == "pause":
         return status in {"pending", "running", "awaiting_gate"}
     if verb == "resume":
@@ -40,6 +54,8 @@ def can(verb: str, status: str) -> bool:
 async def control(app: ReworkApp, mission_id: str, verb: str) -> bool:
     if verb == "fetch":
         return await fetch(app, mission_id)
+    if verb == "retry-pr":
+        return await retry_pr(app, mission_id)
     if verb not in VERBS:
         app.notify(f"Unknown action {verb}", severity="error")
         return False
@@ -74,6 +90,24 @@ async def prioritize(app: ReworkApp, mission_id: str, current: str = "") -> bool
     return True
 
 
+async def retry_pr(app: ReworkApp, mission_id: str) -> bool:
+    """Re-deliver a finished mission's PR. Same helper as
+    `rework mission retry-pr`; the full error is shown, never a clipped one."""
+    app.notify(f"Retrying PR for {mission_id}…", timeout=3)
+    try:
+        ok, detail = await app.hub.data.retry_pr(mission_id)
+    except Exception as exc:
+        app.notify(f"Retry PR failed: {exc}", severity="error", timeout=10)
+        return False
+    if not ok:
+        app.notify(f"PR still not delivered: {detail}", severity="error", timeout=12)
+        await app.hub.refresh()
+        return False
+    app.notify(f"PR opened: {detail}", title="Retry PR", timeout=8)
+    await app.hub.refresh()
+    return True
+
+
 async def fetch(app: ReworkApp, mission_id: str) -> bool:
     app.notify(f"Fetching {mission_id}…", timeout=3)
     try:
@@ -96,11 +130,14 @@ async def decide(
     *,
     note: str | None = None,
     decision: dict[str, Any] | None = None,
+    send_back: bool = False,
 ) -> bool:
     """Answer a gate. Verified by re-reading: a gate that silently stays open is
     the worst failure this UI has had, so a False result is shown loudly."""
     try:
-        ok = await app.hub.data.decide_gate(gate_id, approved, note=note, decision=decision)
+        ok = await app.hub.data.decide_gate(
+            gate_id, approved, note=note, decision=decision, send_back=send_back
+        )
     except Exception as exc:
         app.notify(f"Could not answer gate: {exc}", severity="error", timeout=10)
         return False
@@ -112,7 +149,7 @@ async def decide(
         )
         await app.hub.refresh()
         return False
-    app.notify("Approved" if approved else "Rejected", timeout=2)
+    app.notify("Sent back" if send_back else ("Approved" if approved else "Rejected"), timeout=2)
     await app.hub.refresh()
     return True
 

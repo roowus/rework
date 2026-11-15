@@ -252,7 +252,14 @@ async def test_orchestrator_resumes_after_a_kill(world: dict[str, Any]) -> None:
                 call("spawn_role", "k3", role="auditor", step="audit", brief="review the fix"),
                 call("wait", "k4"),
             ),
-            turn(call("finish", "k5", outcome="done", summary="fixed after restart")),
+            turn(
+                call(
+                    "finish",
+                    "k5",
+                    outcome="done",
+                    summary="fixed the reload bug so a restart keeps the shell alive",
+                )
+            ),
         ],
     )
     provider.route("Find issues", _auditor_script(AUDIT_CLEAN))
@@ -294,7 +301,9 @@ async def test_orchestrator_resumes_after_a_kill(world: dict[str, Any]) -> None:
     )
     mission = await store.get_mission("mo")
     assert mission is not None and mission.status == MissionStatus.DONE
-    assert (mission.result or {}).get("summary") == "fixed after restart"
+    assert (mission.result or {}).get("summary") == (
+        "fixed the reload bug so a restart keeps the shell alive"
+    )
 
 
 async def test_owner_cancel_stops_the_orchestrator(world: dict[str, Any]) -> None:
@@ -361,7 +370,7 @@ async def test_a_role_question_is_answered_by_the_orchestrator(world: dict[str, 
                 ),
                 call("wait", "a4"),
             ),
-            turn(call("finish", "a5", outcome="failed", summary="investigation only")),
+            turn(call("finish", "a5", outcome="failed", summary="investigated only the parser")),
         ],
     )
     provider.route("Investigate any brief", asking_investigator("which file matters?"))
@@ -397,7 +406,7 @@ async def test_a_role_question_forwarded_to_the_owner_as_a_choice(world: dict[st
                 ),
                 call("wait", "b4"),
             ),
-            turn(call("finish", "b5", outcome="failed", summary="owner chose")),
+            turn(call("finish", "b5", outcome="failed", summary="owner picked the new parser")),
         ],
     )
     provider.route("Investigate any brief", asking_investigator("old or new parser?"))
@@ -462,7 +471,7 @@ async def test_redirect_and_owner_message_reach_their_targets(world: dict[str, A
                 ),
                 call("wait", "r4"),
             ),
-            turn(call("finish", "r5", outcome="failed", summary="done")),
+            turn(call("finish", "r5", outcome="failed", summary="redirected the investigator")),
         ],
     )
     world["provider"] = provider
@@ -509,7 +518,7 @@ async def test_revision_coder_continues_the_previous_branch(world: dict[str, Any
                 call("spawn_role", "v3", role="coder", step="code", brief="also tidy it"),
                 call("wait", "v4"),
             ),
-            turn(call("finish", "v5", outcome="failed", summary="two coders")),
+            turn(call("finish", "v5", outcome="failed", summary="two coders ran the parser fix")),
         ],
     )
     provider.route("Fulfill the task", _coder_script("first") + _coder_script("second"))
@@ -544,7 +553,7 @@ async def test_turn_budget_stops_a_role(world: dict[str, Any]) -> None:
                 ),
                 call("wait", "t2"),
             ),
-            turn(call("finish", "t3", outcome="failed", summary="budgeted")),
+            turn(call("finish", "t3", outcome="failed", summary="budget spent on the parser fix")),
         ],
     )
     reads = [
@@ -614,7 +623,7 @@ async def test_ship_pushes_the_branch_for_a_git_origin_mission(
                     call("spawn_role", "s3", role="auditor", step="audit", brief="review the fix"),
                     call("wait", "s4"),
                 ),
-                turn(call("finish", "s5", outcome="done", summary="fixed")),
+                turn(call("finish", "s5", outcome="done", summary="pinned the add() fix")),
             ],
         )
         provider.route("Fulfill the task", _coder_script("tests pass"))
@@ -654,7 +663,7 @@ async def test_restart_after_finish_goes_straight_to_the_gate(world: dict[str, A
                 call("spawn_role", "f1", role="auditor", step="audit", brief="review the branch"),
                 call("wait", "f2"),
             ),
-            turn(call("finish", "f3", outcome="done", summary="all good")),
+            turn(call("finish", "f3", outcome="done", summary="add() now adds correctly")),
         ],
     )
     provider.route("Find issues", _auditor_script(AUDIT_CLEAN))
@@ -673,7 +682,7 @@ async def test_restart_after_finish_goes_straight_to_the_gate(world: dict[str, A
     assert len(provider.requests) == calls_before, "no model call after a recorded finish"
     mission = await store.get_mission("mo")
     assert mission is not None and mission.status == MissionStatus.DONE
-    assert (mission.result or {}).get("summary") == "all good"
+    assert (mission.result or {}).get("summary") == "add() now adds correctly"
 
 
 async def test_spawn_refuses_a_model_whose_provider_keeps_failing(world: dict[str, Any]) -> None:
@@ -710,7 +719,14 @@ async def test_spawn_refuses_a_model_whose_provider_keeps_failing(world: dict[st
             turn(
                 call("spawn_role", "x1", role="investigator", step="look", brief="b", model="pro")
             ),
-            turn(call("finish", "x2", outcome="failed", summary="stopped")),
+            turn(
+                call(
+                    "finish",
+                    "x2",
+                    outcome="failed",
+                    summary="stopped before spawning on the dead model",
+                )
+            ),
         ],
     )
     await asyncio.wait_for(runner(world).run(), timeout=30)
@@ -754,6 +770,29 @@ async def test_the_catalog_shows_each_model_s_provider_and_endpoint(
     assert "opus: anthropic (https://api.anthropic.com)" in catalog
     assert "glm: openai-compatible (https://api.z.ai/api/v4)" in catalog
     assert "tier 3" in catalog and "per Mtok" in catalog, "the rest of the line is intact"
+
+
+async def test_the_roles_block_names_the_web_tools_without_the_draft_playbook(
+    world: dict[str, Any],
+) -> None:
+    """A fix mission's planner must still learn that investigators and coders can
+    reach the public web: before this, web_search/fetch_url were named only in
+    PLAYBOOKS["draft"], so `fix`/`fix-pr` missions never heard of them."""
+    from rework.orchestrator.agent import PLAYBOOKS, MissionOrchestrator
+
+    world["mission"].plan = {**(world["mission"].plan or {}), "playbook": "fix"}
+    prompt = await MissionOrchestrator(runner(world), world["mission"])._system_prompt()
+    roles = prompt.split("ROLES:")[1].split("Automatic wiring:")[0]
+    lines = {ln.split(":")[0].strip("- "): ln for ln in roles.splitlines() if ln.startswith("- ")}
+    for role in ("investigator", "coder"):
+        line = lines[role]
+        assert "web_search" in line, f"the {role} entry does not mention web_search: {line}"
+        assert "fetch_url" in line, f"the {role} entry does not mention fetch_url: {line}"
+    assert "web_search" not in lines["auditor"], "the auditor must not gain web access"
+    # and the proof it does not come from the playbook text
+    playbook_text = prompt.split("PLAYBOOK (fix):")[1].split("ROLES:")[0]
+    assert "web_search" not in playbook_text and "fetch_url" not in playbook_text
+    assert "web_search" in PLAYBOOKS["draft"], "the draft playbook still names them too"
 
 
 async def test_the_rules_say_to_retry_on_another_provider_and_not_a_pricier_tier(
@@ -826,7 +865,14 @@ async def test_request_budget_raises_the_real_cap(world: dict[str, Any]) -> None
         MARKER,
         [
             turn(call("request_budget", "b1", max_usd=5, reason="one more coder")),
-            turn(call("finish", "b2", outcome="failed", summary="checked budget")),
+            turn(
+                call(
+                    "finish",
+                    "b2",
+                    outcome="failed",
+                    summary="checked budget before the third coder",
+                )
+            ),
         ],
     )
     task = asyncio.create_task(runner(world).run())
@@ -921,7 +967,19 @@ async def test_the_orchestrator_switches_its_own_model_when_it_fails(
     """Found live: the orchestrator's own model (kimi-k3) timed out three times
     and the mission failed, one step from its PR, while flash was healthy."""
     scripted: ScriptedProvider = world["provider"]
-    scripted.route(MARKER, [turn(call("finish", "f1", outcome="failed", summary="on flash"))])
+    scripted.route(
+        MARKER,
+        [
+            turn(
+                call(
+                    "finish",
+                    "f1",
+                    outcome="failed",
+                    summary="finished on flash after pro timed out",
+                )
+            )
+        ],
+    )
 
     class PickyProvider:
         def __init__(self) -> None:
@@ -952,7 +1010,7 @@ async def test_a_stalled_turn_uses_the_fallback_then_returns_to_the_chosen_model
         [
             turn(call("message_owner", "a", text="answered by flash")),
             turn(call("message_owner", "b", text="back on pro")),
-            turn(call("finish", "c", outcome="failed", summary="done")),
+            turn(call("finish", "c", outcome="failed", summary="messaged the owner twice")),
         ],
     )
 
@@ -977,7 +1035,7 @@ async def test_three_failed_turns_switch_the_orchestrator_for_good(world: dict[s
     scripted.route(
         MARKER,
         [turn(call("message_owner", f"m{i}", text=str(i))) for i in range(3)]
-        + [turn(call("finish", "f", outcome="failed", summary="done"))],
+        + [turn(call("finish", "f", outcome="failed", summary="messaged the owner three times"))],
     )
 
     class DeadPro:
@@ -1028,7 +1086,8 @@ async def test_an_outage_waits_instead_of_failing_the_mission(
     monkeypatch.setattr(agent, "OUTAGE_WAITS_S", (0.01, 0.01, 0.01))
     scripted: ScriptedProvider = world["provider"]
     scripted.route(
-        MARKER, [turn(call("finish", "f", outcome="failed", summary="after the outage"))]
+        MARKER,
+        [turn(call("finish", "f", outcome="failed", summary="waited out the outage"))],
     )
 
     class Outage:
@@ -1136,7 +1195,7 @@ async def test_strictness_reaches_the_auditor_prompt(world: dict[str, Any]) -> N
                 ),
                 call("wait", "u4"),
             ),
-            turn(call("finish", "u5", outcome="failed", summary="audited only")),
+            turn(call("finish", "u5", outcome="failed", summary="audited in both modes only")),
         ],
     )
     provider.route("Find issues", _auditor_script(AUDIT_CLEAN) * 2)
@@ -1175,7 +1234,9 @@ async def test_finish_done_is_refused_without_a_fresh_audit(world: dict[str, Any
                 call("spawn_role", "n1", role="coder", step="code", brief="fix add()"),
                 call("wait", "n2"),
             ),
-            turn(call("finish", "n3", outcome="done", summary="shipping")),  # no audit yet
+            turn(
+                call("finish", "n3", outcome="done", summary="shipping the add fix")
+            ),  # no audit yet
             turn(
                 call("spawn_role", "n4", role="auditor", step="audit", brief="review"),
                 call("wait", "n5"),
@@ -1184,8 +1245,10 @@ async def test_finish_done_is_refused_without_a_fresh_audit(world: dict[str, Any
                 call("spawn_role", "n6", role="coder", step="code", brief="one more change"),
                 call("wait", "n7"),
             ),
-            turn(call("finish", "n8", outcome="done", summary="shipping again")),  # unaudited
-            turn(call("finish", "n9", outcome="failed", summary="stopped, not shipping")),
+            turn(
+                call("finish", "n8", outcome="done", summary="shipping the add fix again")
+            ),  # unaudited
+            turn(call("finish", "n9", outcome="failed", summary="stopped, nothing ships")),
         ],
     )
     provider.route("Fulfill the task", _coder_script("first") + _coder_script("second"))
@@ -1229,10 +1292,16 @@ async def test_finish_done_needs_every_open_finding_accepted(world: dict[str, An
                 call("spawn_role", "q3", role="auditor", step="audit", brief="review"),
                 call("wait", "q4"),
             ),
-            turn(call("finish", "q5", outcome="done", summary="shipping")),  # no acceptance
+            turn(
+                call("finish", "q5", outcome="done", summary="shipping the add fix")
+            ),  # no acceptance
             turn(
                 call(
-                    "finish", "q6", outcome="done", summary="shipping", accepted_findings=[full[0]]
+                    "finish",
+                    "q6",
+                    outcome="done",
+                    summary="shipping the add fix",
+                    accepted_findings=[full[0]],
                 )
             ),  # partial
             turn(
@@ -1240,7 +1309,7 @@ async def test_finish_done_needs_every_open_finding_accepted(world: dict[str, An
                     "finish",
                     "q7",
                     outcome="done",
-                    summary="shipping knowingly",
+                    summary="shipping with both findings accepted on purpose",
                     accepted_findings=full,
                 )
             ),
@@ -1283,6 +1352,146 @@ async def test_finish_done_needs_every_open_finding_accepted(world: dict[str, An
     assert (mission.result or {}).get("accepted_findings") == full, (
         "the reasons travel into the mission result (report/PR data)"
     )
+
+
+async def finish_turn(orch: Any, cid: str, **args: Any) -> str:
+    """One orchestrator turn that calls finish, recorded the way `_think` does
+    (the assistant message with its tool_calls, then the tool reply), and the
+    reply text back."""
+    await orch._append(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": cid, "name": "finish", "arguments": args}],
+        }
+    )
+    await orch._execute_calls([call("finish", cid, **args)])
+    reply = orch.history[-1]
+    assert reply.get("tool_call_id") == cid
+    return str(reply.get("content") or "")
+
+
+async def test_a_status_note_summary_is_refused_so_the_mission_stays_open(
+    world: dict[str, Any],
+) -> None:
+    """Found live (PR #34): the orchestrator finished the mission with
+    "FINISHED ALREADY.", and that status note became the whole PR body. With no
+    earlier substantive summary to fall back on, the rail refuses it."""
+    from rework.orchestrator.agent import MissionOrchestrator
+
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    await orch._load()
+    reply = await finish_turn(orch, "x1", outcome="failed", summary="FINISHED ALREADY.")
+
+    assert reply.startswith("error:"), reply
+    assert "summary must say what changed for the owner" in reply
+    assert orch.finished is None, "a status note cannot end the mission"
+
+
+async def test_a_blank_summary_is_refused(world: dict[str, Any]) -> None:
+    from rework.orchestrator.agent import MissionOrchestrator
+
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    await orch._load()
+    reply = await finish_turn(orch, "b1", outcome="failed", summary="   ")
+
+    assert reply.startswith("error:"), reply
+    assert "summary must say what changed for the owner" in reply
+    assert orch.finished is None
+
+
+async def test_a_second_finish_keeps_the_summary_the_first_one_gave(
+    world: dict[str, Any],
+) -> None:
+    """The PR #34 scenario: a restart re-ran the finish with a status note. The
+    recorded summary is the earlier substantive one, not the status note."""
+    from rework.orchestrator.agent import MissionOrchestrator
+
+    first = "fixed the reload bug so re-exec keeps the shell alive"
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    await orch._load()
+    assert await finish_turn(orch, "d1", outcome="failed", summary=first) == "finished"
+    assert orch.finished == ("failed", first)
+
+    # the daemon restarted: the mission comes back up, reads the finish it had
+    # already recorded out of the persisted history (_load does that), and only
+    # then re-runs the finish with a status note (PR #34)
+    restarted = MissionOrchestrator(runner(world), world["mission"])
+    await restarted._load()
+    assert restarted._resumed_finish_summary == first, "the pre-restart summary was captured"
+    restarted.finished = restarted._recorded_finish()  # what run() does on a reloaded history
+    assert restarted.finished == ("failed", first), "the restart resumes the recorded finish"
+    restarted.finished = None  # ...and then re-finished the mission
+    assert await finish_turn(restarted, "d2", outcome="failed", summary="FINISHED ALREADY.") == (
+        "finished"
+    )
+    assert restarted.finished == ("failed", first), "the status note did not overwrite the story"
+
+
+async def test_a_thin_finish_from_this_run_is_not_promoted_by_a_later_one(
+    world: dict[str, Any],
+) -> None:
+    """The rail's reuse is bounded by the restart boundary. A finish accepted
+    earlier in THIS run is an intermediate note, not a mission summary: when the
+    orchestrator later finishes with "FINISHED ALREADY.", the thin middle note
+    must not become the PR body -- the finish is refused instead."""
+    from rework.orchestrator.agent import MissionOrchestrator
+
+    thin = "shipping the add fix"
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    await orch._load()
+    assert orch._resumed_finish_summary is None, "nothing was recorded before this run"
+    assert await finish_turn(orch, "i1", outcome="failed", summary=thin) == "finished"
+    assert orch.finished == ("failed", thin)
+
+    reply = await finish_turn(orch, "i2", outcome="failed", summary="FINISHED ALREADY.")
+    assert reply.startswith("error:"), reply
+    assert "summary must say what changed for the owner" in reply
+    assert orch.finished == ("failed", thin), "the refused finish changed nothing"
+
+
+async def test_a_short_but_descriptive_summary_finishes_the_mission(
+    world: dict[str, Any],
+) -> None:
+    """The rail must not be a length rule: 24 characters that name the change
+    are accepted all the way to the shipped mission result (and the 53-char
+    ORCH_SUMMARY of tests/integration/test_open_pr.py stays well clear)."""
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+    summary = "add() now adds correctly"
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call("spawn_role", "w1", role="auditor", step="audit", brief="review the branch"),
+                call("wait", "w2"),
+            ),
+            turn(call("finish", "w3", outcome="done", summary=summary)),
+        ],
+    )
+    provider.route("Find issues", _auditor_script(AUDIT_CLEAN))
+    task = asyncio.create_task(runner(world).run())
+    await approve_next_gate(world)
+    await asyncio.wait_for(task, timeout=30)
+
+    mission = await store.get_mission("mo")
+    assert mission is not None and mission.status == MissionStatus.DONE
+    assert (mission.result or {}).get("summary") == summary
+
+
+def test_the_summary_rail_tells_status_notes_from_real_changes() -> None:
+    from rework.orchestrator.agent import _reads_like_status_note, _substantive_summary
+
+    for note in ("FINISHED ALREADY.", "done!", "all good", "  "):
+        assert not _substantive_summary(note), note
+        assert _reads_like_status_note(note) or not note.strip(), note
+    for real in (
+        "add() now adds correctly",
+        "ORCHESTRATOR_FINISH_SUMMARY: add() now adds correctly",
+        "fixed the reload bug so re-exec keeps the shell alive",
+    ):
+        assert _substantive_summary(real), real
+        assert not _reads_like_status_note(real), real
 
 
 async def test_pr_body_describes_the_mission_not_the_last_coder_line(
@@ -1441,6 +1650,12 @@ async def test_a_coder_that_finished_after_the_audit_started_is_unaudited(
 # -- a reply cut off at the output limit is not idleness ----------------------
 
 
+SUMMARY = (
+    "Retries a cut-off thinking reply with more room instead of counting it idle, "
+    "so the mission reaches its tool call."
+)
+
+
 def cut_off() -> ChatResult:
     """A reply that spent its whole output budget thinking: no text, no tool call."""
     return ChatResult(
@@ -1464,12 +1679,13 @@ async def test_a_cut_off_thinking_reply_is_retried_not_counted_idle(
     await set_orchestrator_effort(world, "high")
     provider: ScriptedProvider = world["provider"]
     provider.route(
-        MARKER, [cut_off(), turn(call("finish", "f", outcome="failed", summary="all done"))]
+        MARKER,
+        [cut_off(), turn(call("finish", "f", outcome="failed", summary=SUMMARY))],
     )
     await asyncio.wait_for(runner(world).run(), timeout=30)
     mission = await world["store"].get_mission("mo")
     result = (mission.result if mission else None) or {}
-    assert result.get("summary") == "all done"
+    assert result.get("summary") == SUMMARY
     assert "stopped calling tools" not in str(result)
     first, second = provider.requests
     assert first.effort == "high" and second.effort == "high"
@@ -1488,12 +1704,17 @@ async def test_three_cut_offs_in_a_row_still_reach_the_tool_call(world: dict[str
     provider: ScriptedProvider = world["provider"]
     provider.route(
         MARKER,
-        [cut_off(), cut_off(), cut_off(), turn(call("finish", "f", outcome="failed", summary="d"))],
+        [
+            cut_off(),
+            cut_off(),
+            cut_off(),
+            turn(call("finish", "f", outcome="failed", summary=SUMMARY)),
+        ],
     )
     await asyncio.wait_for(runner(world).run(), timeout=30)
     mission = await world["store"].get_mission("mo")
     result = (mission.result if mission else None) or {}
-    assert result.get("summary") == "d"
+    assert result.get("summary") == SUMMARY
     efforts = [r.effort for r in provider.requests]
     # 1st try, retry with a bigger budget, retry at a lower effort, then the idle nudge
     assert efforts == ["high", "high", "medium", "medium"]
@@ -1509,7 +1730,7 @@ async def test_cut_off_overrides_do_not_leak_into_later_turns(world: dict[str, A
         [
             cut_off(),
             turn(call("message_owner", "m", text="hi")),
-            turn(call("finish", "f", outcome="failed", summary="all done")),
+            turn(call("finish", "f", outcome="failed", summary=SUMMARY)),
         ],
     )
     await asyncio.wait_for(runner(world).run(), timeout=30)

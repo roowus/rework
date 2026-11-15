@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from textual.widgets import Input
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -763,6 +764,544 @@ async def test_dashboard_drill_down_and_back(ids: dict[str, str]) -> None:
         await pilot.pause()
         assert dash.mission_id is None
         assert app.is_running, "esc inside a drill-down navigates, never arms quit"
+
+
+async def test_dashboard_search_filters_and_clears(ids: dict[str, str]) -> None:
+    """The search bar above the mission list: "/" focuses it, typing filters
+    live (debounced), esc clears it and hands focus back to the list."""
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        lst = app.query_one("#mission-list", RowList)
+        before = len(lst.selectable)
+        assert before > 1
+
+        await pilot.press("slash")
+        bar = app.query_one("#mission-search", Input)
+        assert bar.has_focus, "/ focuses the search bar"
+        assert bar.placeholder == "Search missions…  (/ to focus)"
+        # the project-name filter is reachable without a mouse. The hint says
+        # "cycle focus", not "project filter": tab is Textual's global
+        # focus_next, so it takes more than one press to land in the box and the
+        # hint must not promise a one-press shortcut to it.
+        assert app.query_one("#proj-search", Input).placeholder == "Filter projects…  (tab ⇥)"
+        assert ("tab ⇥", "cycle focus") in app.view("dashboard").hints()
+        for ch in "flaky":
+            await pilot.press(ch)
+        await _settle(pilot, 0.8)  # the filter is debounced
+        dash = app.view("dashboard")
+        after = lst.selectable
+        assert after == [ids["running"]], after
+        assert dash.query_text == "flaky"
+        # the other filters still combine with the text
+        assert len(after) < before
+
+        await pilot.press("escape")
+        await _settle(pilot, 0.8)
+        assert bar.value == "" and not bar.has_focus
+        assert len(lst.selectable) == before, "esc clears the search"
+        assert lst.has_focus
+        assert app.is_running, "esc in the search bar must not arm quit"
+        assert not app.swallowed
+
+
+async def test_dashboard_ai_search_ranks_and_opens(
+    ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """✦ ranks missions through a provider and the ranked rows open missions."""
+    provider = script_provider(
+        monkeypatch,
+        [
+            ChatResult(
+                text=(
+                    "Sure — best first:\n```json\n"
+                    f'[{{"id": "{ids["running"]}", "reason": "the float tolerance fix"}}]\n'
+                    "```"
+                ),
+                usage=Usage(input_tokens=200, output_tokens=40),
+            )
+        ],
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        await pilot.press("slash")
+        for ch in "flaky":
+            await pilot.press(ch)
+        await _settle(pilot, 0.5)
+        await pilot.click(_btn(app, dash, "ai-search"))
+        await _settle(pilot, 1.5)
+        assert provider.requests, "the ✦ search asked the model"
+        assert "flaky" in provider.requests[0].messages[0]["content"]
+        assert dash.ai_results == [{"id": ids["running"], "reason": "the float tolerance fix"}]
+        lst = app.query_one("#mission-list", RowList)
+        assert lst.selectable == [ids["running"]]
+        assert "✦ top 1 from AI" in str(app.query_one("#mission-note").render())
+        # the boundary clamp holds even if a pick somehow names a non-match: the
+        # ranking reorders the query's hits, it never widens them
+        assert dash._in_rank_order(dash._scope(), [{"id": ids["waiting"], "reason": "x"}]) == []
+        row = next(r for r in app.query("#mission-list .row") if r.key == ids["running"])
+        assert "float tolerance" in str(row.render()), "the reason rides the row"
+
+        lst.activate(ids["running"], via_mouse=True)
+        await _settle(pilot, 0.8)
+        assert dash.mission_id == ids["running"], "a ranked row opens its mission"
+
+        await pilot.press("escape")
+        await _settle(pilot, 0.5)
+        assert dash.ai_results is None
+        await pilot.press("escape")
+        await _settle(pilot, 0.5)
+        assert dash.mission_id is None
+        assert app.is_running
+        assert not app.swallowed
+
+
+def _row_texts(app: ReworkApp, selector: str = "#mission-list") -> list[str]:
+    """What the list actually RENDERS, row by row (not internal state). Section
+    headers are not rows a search produced, so they are left out."""
+    return [
+        str(row.render()) for row in app.query(f"{selector} .row") if not row.has_class("-header")
+    ]
+
+
+async def test_dashboard_search_shows_only_real_matches(ids: dict[str, str]) -> None:
+    """A query isolates the list: matching missions are rendered, non-matching
+    ones are not, and a short query no longer returns everything (finding #44)."""
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        lst = app.query_one("#mission-list", RowList)
+        every = _row_texts(app)
+        assert len(every) > 3
+
+        await pilot.press("slash")
+        for ch in "flaky":
+            await pilot.press(ch)
+        await _settle(pilot, 0.8)
+        shown = _row_texts(app)
+        assert any("flaky test in test_rolling_mean" in t for t in shown), shown
+        assert not any("dark mode to the settings page" in t for t in shown), shown
+        assert not any("migrate the CI to uv" in t for t in shown), shown
+        assert [k for k in lst.selectable if not k.startswith("§")] == [ids["running"]]
+
+        # a one-letter query is a substring filter now, not "everything"
+        await pilot.press("backspace", "backspace", "backspace", "backspace", "backspace")
+        await pilot.press("z")
+        await _settle(pilot, 0.8)
+        assert _row_texts(app) == [], "a letter nothing contains shows nothing"
+        assert app.query_one("#mission-list .rowlist-empty").display
+        assert "No missions match" in str(app.query_one("#mission-list .rowlist-empty").render())
+        assert lst.selectable == []
+
+        # and a subsequence that is not a substring is a miss too
+        await pilot.press("backspace")
+        for ch in "tst":
+            await pilot.press(ch)
+        await _settle(pilot, 0.8)
+        assert _row_texts(app) == [], "'tst' must not match '…test…' any more"
+
+        await pilot.press("escape")
+        await _settle(pilot, 0.8)
+        assert _row_texts(app) == every, "clearing restores the full list"
+        assert not app.query_one("#mission-list .rowlist-empty").display
+        assert app.is_running and not app.swallowed
+
+
+async def test_dashboard_ai_search_uses_the_one_list(
+    ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """✦ answers the SAME query into the SAME list: no parallel rows, and Enter
+    means the same thing before and after pressing it."""
+    provider = script_provider(
+        monkeypatch,
+        [
+            ChatResult(
+                text=f'[{{"id": "{ids["waiting"]}", "reason": "closest"}}, '
+                f'{{"id": "{ids["running"]}", "reason": "also close"}}]',
+                usage=Usage(input_tokens=200, output_tokens=40),
+            )
+        ],
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        bar = app.query_one("#mission-search", Input)
+        lst = app.query_one("#mission-list", RowList)
+        await pilot.press("slash")
+        for ch in "the":
+            await pilot.press(ch)
+        await _settle(pilot, 0.8)
+        plain = _row_texts(app)
+        assert len(plain) > 2, plain
+
+        await pilot.click(_btn(app, dash, "ai-search"))
+        await _settle(pilot, 1.5)
+        assert provider.requests, "the ✦ search asked the model"
+        assert bar.value == "the", "it ran on the query already in the box"
+        assert "the" in provider.requests[0].messages[0]["content"]
+        ranked = _row_texts(app)
+        assert len(ranked) == 2, ranked
+        assert "dark mode" in ranked[0] and "closest" in ranked[0], ranked
+        assert "flaky" in ranked[1] and "also close" in ranked[1], ranked
+        # one list, one row per mission: nothing is rendered in a second list
+        assert lst.selectable == [ids["waiting"], ids["running"]]
+        # one row per mission in the ONE list: the only other rows are its
+        # section headers, never a second parallel result set
+        every_row = app.query("#mission-list .row")
+        assert len(ranked) == len([r for r in every_row if not r.has_class("-header")])
+        # the ranking orders the same set the plain filter feeds
+        assert [m.id for m in dash._filtered()] == [ids["waiting"], ids["running"]]
+        # the model may only return MAX_RESULTS ids: the list is its picks out
+        # of the matches, and the note says so ("top 2 of 6")
+        assert "✦ top 2 of" in str(app.query_one("#mission-note").render())
+
+        # Enter still means "filter": it never re-runs the ranking and keeps the
+        # list it was showing
+        before = len(provider.requests)
+        await pilot.press("enter")
+        await _settle(pilot, 0.8)
+        assert len(provider.requests) == before, "enter never means 'rank'"
+        assert dash.ai_results is not None
+        assert _row_texts(app) == ranked
+
+        # typing a different query drops the AI order: no stale ranked rows
+        await pilot.press("s")
+        await _settle(pilot, 0.8)
+        assert dash.ai_results is None
+        assert str(app.query_one("#mission-note").render()) == ""
+        assert _row_texts(app) == [], "'thes' matches nothing, and nothing is stale"
+        assert lst.selectable == []
+
+        await pilot.press("backspace")
+        await _settle(pilot, 0.8)
+        assert _row_texts(app) == plain, "back to the plain filter's rows"
+        assert str(app.query_one("#mission-note").render()) == ""
+
+        # Enter before pressing ✦ means exactly the same thing
+        await pilot.press("enter")
+        await _settle(pilot, 0.8)
+        assert _row_texts(app) == plain
+        assert len(provider.requests) == before
+        assert app.is_running and not app.swallowed
+
+
+async def test_dashboard_ai_search_never_resurrects_a_zero_match_query(
+    ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """✦ on a query nothing matches keeps the empty state: no model call, no
+    rows, and no status line claiming a ranking (it said "top 2 from AI" while
+    showing non-matching missions)."""
+    provider = script_provider(
+        monkeypatch,
+        [
+            ChatResult(
+                text=f'[{{"id": "{ids["waiting"]}", "reason": "looks recent"}}, '
+                f'{{"id": "{ids["running"]}", "reason": "also recent"}}]',
+                usage=Usage(input_tokens=200, output_tokens=40),
+            )
+        ],
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        lst = app.query_one("#mission-list", RowList)
+
+        await pilot.press("slash")
+        for ch in "zzz":
+            await pilot.press(ch)
+        await _settle(pilot, 0.8)
+        assert _row_texts(app) == []
+        empty = app.query_one("#mission-list .rowlist-empty")
+        assert empty.display and "No missions match" in str(empty.render())
+
+        await pilot.click(_btn(app, dash, "ai-search"))
+        await _settle(pilot, 1.5)
+
+        # nothing was asked of the model: there is no match to rank
+        assert provider.requests == [], "a zero-match query never calls the model"
+        assert dash.ai_results is None
+        # the list is still empty and still says why
+        assert _row_texts(app) == [], "no non-matching mission row appeared"
+        assert lst.selectable == []
+        empty = app.query_one("#mission-list .rowlist-empty")
+        assert empty.display
+        assert "No missions match “zzz”" in str(empty.render())
+        # and the status line does not claim a ranking it never ran
+        note = str(app.query_one("#mission-note").render())
+        assert "top" not in note, note
+        assert "from AI" not in note, note
+        assert "nothing to rank" in note, note
+        assert not dash._ai_busy, "the bar is not left spinning"
+        assert app.is_running and not app.swallowed
+
+
+async def test_dashboard_ai_search_drops_picks_that_do_not_match(
+    ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The general form: the model may reorder the query's strict matches, never
+    add to them. A returned id that is not a match is dropped."""
+    # the first pick does NOT match "flaky"; the second does
+    provider = script_provider(
+        monkeypatch,
+        [
+            ChatResult(
+                text=f'[{{"id": "{ids["waiting"]}", "reason": "unrelated"}}, '
+                f'{{"id": "{ids["running"]}", "reason": "the flaky test"}}]',
+                usage=Usage(input_tokens=200, output_tokens=40),
+            )
+        ],
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        lst = app.query_one("#mission-list", RowList)
+
+        await pilot.press("slash")
+        for ch in "flaky":
+            await pilot.press(ch)
+        await _settle(pilot, 0.8)
+        strict = [k for k in lst.selectable if not k.startswith("§")]
+        assert strict == [ids["running"]], strict
+
+        await pilot.click(_btn(app, dash, "ai-search"))
+        await _settle(pilot, 1.5)
+        assert provider.requests, "a matching query does call the model"
+        # the model was only offered the strict match
+        prompt = provider.requests[0].messages[0]["content"]
+        assert ids["running"] in prompt
+        assert ids["waiting"] not in prompt, "a non-match is never a candidate"
+
+        ranked = _row_texts(app)
+        assert len(ranked) == 1, ranked
+        assert "fix the flaky test in test_rolling_mean" in ranked[0], ranked
+        assert not any("dark mode to the settings page" in t for t in ranked), ranked
+        assert [k for k in lst.selectable if not k.startswith("§")] == [ids["running"]]
+        assert "unrelated" not in " ".join(ranked), "a dropped pick leaves no reason behind"
+        # every match came back ranked, so the note does not narrow with "of M"
+        assert "✦ top 1 from AI" in str(app.query_one("#mission-note").render())
+        # the boundary clamp holds even if a pick somehow names a non-match: the
+        # ranking reorders the query's hits, it never widens them
+        assert dash._in_rank_order(dash._scope(), [{"id": ids["waiting"], "reason": "x"}]) == []
+        assert app.is_running and not app.swallowed
+
+
+async def test_dashboard_project_search_filters_rows(ids: dict[str, str]) -> None:
+    """The Projects sidebar has a plain name filter: substring only, pinned
+    'All projects' always there, clearing restores the list."""
+    from rework.tui.views.dashboard import ALL
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        proj = app.query_one("#proj-list", RowList)
+        every = proj.keys
+        assert ids["project"] in every and len(every) >= 3
+        assert "All projects" in " ".join(_row_texts(app, "#proj-list"))
+        assert "rework" in " ".join(_row_texts(app, "#proj-list"))
+
+        bar = app.query_one("#proj-search", Input)
+        bar.focus()
+        await _settle(pilot, 0.2)
+        assert bar.has_focus, "keyboard focus can reach the project filter"
+        for ch in "poly":
+            await pilot.press(ch)
+        await _settle(pilot, 0.5)
+        shown = _row_texts(app, "#proj-list")
+        assert any("polystats" in t for t in shown), shown
+        assert not any("rework" in t for t in shown), shown
+        assert "All projects" in " ".join(shown), "the pinned row survives filtering"
+        # pinned rows survive: 'All projects' always, 'No project' while loose
+        # missions exist (the seeded 'rework' mission has no project)
+        assert proj.selectable[:2] == [ALL, ids["project"]]
+        assert "All projects" in str(shown[0])
+
+        # plain substring, not fuzzy: the letters in order are a miss
+        bar.value = ""
+        await _settle(pilot, 0.3)
+        for ch in "plsts":
+            await pilot.press(ch)
+        await _settle(pilot, 0.5)
+        assert not any("polystats" in t for t in _row_texts(app, "#proj-list"))
+
+        # 'All projects' still works while a filter is on
+        bar.value = ""
+        await _settle(pilot, 0.3)
+        for ch in "rewo":
+            await pilot.press(ch)
+        await _settle(pilot, 0.5)
+        proj.activate(ALL, via_mouse=True)
+        await _settle(pilot, 0.5)
+        assert dash.project == ALL
+        missions = _row_texts(app)
+        assert any("flaky" in t for t in missions), missions
+        assert any("dark mode" in t for t in missions), missions
+
+        # selecting a project and then filtering it out of view never crashes
+        # and never silently breaks the mission filter
+        proj.activate(ids["project"], via_mouse=True)
+        await _settle(pilot, 0.5)
+        assert dash.project == ids["project"]
+        bar.focus()
+        await _settle(pilot, 0.2)
+        for ch in "rewo":
+            await pilot.press(ch)
+        await _settle(pilot, 0.5)
+        assert ids["project"] not in proj.keys, "the selected project is filtered out"
+        assert dash.project == ids["project"], "the mission filter is not silently reset"
+        # the mission list is still filtered by the selected project (both of
+        # these are polystats missions), and rework's mission is still gone
+        assert any("flaky" in t for t in _row_texts(app))
+        assert any("dark mode" in t for t in _row_texts(app))
+        assert not any("migrate the CI" in t for t in _row_texts(app)), "still project-filtered"
+
+        bar.value = ""
+        await _settle(pilot, 0.5)
+        assert proj.keys == every, "clearing restores every project row"
+        assert proj.selected == ids["project"], "and the selection is back"
+        assert app.is_running and not app.swallowed
+
+
+async def test_esc_clears_the_bar_the_user_is_typing_in(ids: dict[str, str]) -> None:
+    """Esc belongs to the focused search bar. With a project-name filter set,
+    pressing esc in the mission bar used to clear the PROJECT filter and leave
+    the query in the box: the wrong bar lost its text."""
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        proj_bar = app.query_one("#proj-search", Input)
+        proj = app.query_one("#proj-list", RowList)
+        mission = app.query_one("#mission-search", Input)
+        mlist = app.query_one("#mission-list", RowList)
+
+        # a project filter is in place for both halves of the test
+        proj_bar.focus()
+        await _settle(pilot, 0.2)
+        for ch in "poly":
+            await pilot.press(ch)
+        await _settle(pilot, 0.5)
+        assert dash.project_query == "poly"
+
+        # (a) mission bar focused, a query typed: esc clears the QUERY and
+        # leaves the project filter alone
+        mission.focus()
+        await _settle(pilot, 0.2)
+        for ch in "flaky":
+            await pilot.press(ch)
+        await _settle(pilot, 0.8)
+        assert dash.query_text == "flaky"
+        assert mlist.selectable == [ids["running"]], mlist.selectable
+        await pilot.press("escape")
+        await _settle(pilot, 0.5)
+        assert mission.value == "" and dash.query_text == ""
+        assert dash.project_query == "poly", "esc cleared the project filter instead"
+        assert proj_bar.value == "poly"
+        assert not mission.has_focus, "esc hands focus back to the list"
+        assert len(mlist.selectable) > 1, "both projects' missions are back"
+
+        # (b) the reverse: a mission query is in the list's filter and the
+        # project bar has focus, so esc clears the PROJECT filter, not the query
+        mission.focus()
+        await _settle(pilot, 0.2)
+        for ch in "dark":
+            await pilot.press(ch)
+        await _settle(pilot, 0.8)
+        proj_bar.focus()
+        await _settle(pilot, 0.2)
+        assert dash.query_text == "dark" and dash.project_query == "poly"
+        await pilot.press("escape")
+        await _settle(pilot, 0.5)
+        assert proj_bar.value == "" and dash.project_query == ""
+        assert dash.query_text == "dark", "esc cleared the mission query instead"
+        assert mission.value == "dark"
+        assert mlist.selectable == [ids["waiting"]], "still filtered by the mission query"
+        assert app.is_running and not app.swallowed
+
+        # (c) the empty state names the filter that emptied the list: the
+        # 'migrate the CI to uv' mission lives in the OTHER project, so under
+        # the polystats filter it is a project miss, not a search miss
+        proj.activate(ids["project"], via_mouse=True)
+        await _settle(pilot, 0.5)
+        assert dash.project == ids["project"] and dash.project_query == ""
+        mission.focus()
+        await _settle(pilot, 0.2)
+        await pilot.press(*["backspace"] * 8)  # long enough to empty the bar
+        for ch in "migrate":
+            await pilot.press(ch)
+        await _settle(pilot, 0.8)
+        assert mlist.selectable == [], "the mission is in the other project"
+        empty = str(app.query_one("#mission-list .rowlist-empty").render())
+        assert "No missions match" in empty, empty
+        assert "polystats" in empty, f"the empty state must name the project: {empty}"
+        # no query at all: the empty state blames the filter, and never a
+        # “query” the user did not type. The rework project now holds only done /
+        # failed missions, so the Active chip alone leaves nothing.
+        mission.focus()
+        await pilot.press(*["backspace"] * 8)  # long enough to empty the bar
+        await _settle(pilot, 0.6)
+        assert mlist.selectable, "the polystats project still has missions"
+        from rework.tui.views.dashboard import ALL
+
+        rework = next(k for k in proj.keys if k not in (ALL, ids["project"]))
+        proj.activate(rework, via_mouse=True)
+        await _settle(pilot, 0.5)
+        dash.filter = "active"  # the Active chip, without hunting for its click
+        dash._paint_overview()
+        await _settle(pilot, 0.6)
+        assert mlist.selectable == [], "no active mission in the rework project"
+        empty = str(app.query_one("#mission-list .rowlist-empty").render())
+        assert "No missions in" in empty and "“”" not in empty and "match" not in empty, empty
+        assert "active" in empty and "project" in empty, empty
+        assert app.is_running and not app.swallowed
+
+
+async def test_dashboard_ai_search_without_credentials_says_so(
+    ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No key for any catalog model: a clean notice, never a crash."""
+    monkeypatch.setenv(
+        "REWORK_MODELS",
+        '[{"id":"haiku","provider":"anthropic","model":"claude-haiku-4-5","tier":1}]',
+    )
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        await pilot.press("slash")
+        await pilot.press("x")
+        await _settle(pilot, 0.5)
+        await pilot.click(_btn(app, dash, "ai-search"))
+        await _settle(pilot, 1.0)
+        assert dash.ai_results is None
+        assert "AI search unavailable: no model with credentials" in dash.ai_note
+        assert "no model with credentials" in str(app.query_one("#mission-note").render())
+        assert app.is_running
+        assert not app.swallowed
 
 
 async def test_dashboard_graph_and_tabs_render(ids: dict[str, str]) -> None:
@@ -3146,15 +3685,26 @@ async def test_dashboard_graph_owner_sequence_rounds(env: Path) -> None:
         coder6 = next(n for n in nodes if n.key == "m-ownerflow01:code:coder:6")
         assert "coders 5-6" in coder6.sub and "continues coder #5" in coder6.sub, coder6.sub
 
-        # the review verdict labels the edge into each round's audit
-        # an edge renders '│\n▼' plus its label on the last line, when it has one
+        # the review verdict labels BOTH sides of each audit at mission level:
+        # into the audit the findings ('approve with fixes: 2 high'), out of it
+        # the direction toward the next coder revision or the mission's gates
+        # ('request changes' -> 'approve'). An unlabelled edge is just '│\n▼';
+        # a labelled one carries the label on its last line.
         edge_labels = [str(e.render()).splitlines()[-1].strip() for e in app.query(".gedge")]
         assert len(edge_labels) == 9, edge_labels
         assert [label for label in edge_labels if label != "▼"] == [
-            "approve with fixes: 2 high",
-            "request changes: 1 critical",
-            "approve",
+            "approve with fixes: 2 high",  # into auditor 1
+            "approve with fixes",  # auditor 1 -> coder #3 (revision)
+            "request changes: 1 critical",  # into auditor 2
+            "request changes",  # auditor 2 -> coder #5 (revision)
+            "approve",  # into auditor 3
+            "approve",  # auditor 3 -> the mission proceeds to its gate
         ], edge_labels
+
+        # a labelled edge is tall enough to be seen: '│', '▼', label (3 rows)
+        for edge in app.query(".gedge"):
+            rows = str(edge.render()).splitlines()
+            assert edge.size.height >= len(rows), (edge.size, rows)
 
         # 3 review rounds is under the collapse threshold: the loop stays visible
         assert not [n for n in nodes if n.expandable], keys
@@ -3263,3 +3813,467 @@ async def test_dashboard_graph_collapsed_rounds_toggle(env: Path) -> None:
         assert keys() == folded, keys()
 
         assert not app.swallowed
+
+
+async def test_dashboard_ai_search_deadline_covers_the_run_fetch(
+    ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hung run fetch must not outlive the search budget: the ranking still
+    happens (summaries without run output) and the bar never sticks on ✦."""
+    import asyncio
+
+    from rework.tui import search
+
+    class _Provider:
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        async def complete(self, request: Any) -> ChatResult:
+            self.requests.append(request)
+            return ChatResult(
+                text=f'[{{"id": "{ids["running"]}", "reason": "still the closest"}}]',
+                usage=Usage(input_tokens=200, output_tokens=20),
+            )
+
+    provider = _Provider()
+    import rework.kernel.llm.adapters as adapters
+
+    monkeypatch.setattr(adapters, "build_provider", lambda entry, extra=None: provider)
+    monkeypatch.setattr(search, "TIMEOUT_S", 0.6)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+
+        async def hung(mission_id: str) -> list[Any]:
+            await asyncio.sleep(30)
+            return []
+
+        monkeypatch.setattr(dash.hub.data, "mission_runs", hung, raising=False)
+        await pilot.press("slash")
+        for ch in "flaky":
+            await pilot.press(ch)
+        await _settle(pilot, 0.5)
+        started = asyncio.get_running_loop().time()
+        await pilot.click(_btn(app, dash, "ai-search"))
+        await _settle(pilot, 2.0)
+        assert asyncio.get_running_loop().time() - started < 4.0, "the budget held"
+        assert provider.requests, "a hung fetch still reaches the model"
+        assert dash.ai_results == [{"id": ids["running"], "reason": "still the closest"}]
+        assert dash._ai_busy is False
+        assert "searching" not in str(app.query_one("#mission-note").render())
+        assert app.is_running
+
+
+async def test_dashboard_escape_dismisses_an_in_flight_ai_search(
+    ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """esc while ✦ is still running dismisses it — it never arms app quit."""
+    import asyncio
+
+    class _Slow:
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        async def complete(self, request: Any) -> ChatResult:
+            self.requests.append(request)
+            await asyncio.sleep(3)
+            return ChatResult(text=f'[{{"id": "{ids["running"]}", "reason": "late"}}]')
+
+    provider = _Slow()
+    import rework.kernel.llm.adapters as adapters
+
+    monkeypatch.setattr(adapters, "build_provider", lambda entry, extra=None: provider)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        await pilot.press("slash")
+        for ch in "flaky":
+            await pilot.press(ch)
+        await _settle(pilot, 0.5)
+        await pilot.click(_btn(app, dash, "ai-search"))
+        await _settle(pilot, 0.4)
+        assert dash._ai_busy is True, "the search is in flight"
+        await pilot.press("escape")
+        await _settle(pilot, 0.6)
+        assert dash._ai_busy is False
+        assert dash.ai_results is None
+        assert dash.ai_note == ""
+        assert app.is_running, "esc did not arm quit"
+        assert not app.swallowed
+
+
+# -- repo-less (upload) projects -------------------------------------------------
+
+
+async def test_create_project_derives_transport_from_its_repos(env: Path) -> None:
+    """The TUI must never write a settings dict that contradicts itself: no
+    repo means upload/fetch, a repo means git/push_branch."""
+    from rework.tui.data import TuiData
+
+    data = TuiData()
+    try:
+        plain = await data.create_project("p")
+        assert plain.settings["transport"] == "upload"
+        assert plain.settings["results"] == "fetch"
+        assert plain.settings["repos"] == []
+        with_repo = await data.create_project(
+            "p2", [{"name": "r", "kind": "github", "url": "https://github.com/a/b"}]
+        )
+        assert with_repo.settings["transport"] == "git"
+        assert with_repo.settings["results"] == "push_branch"
+    finally:
+        await data.aclose()
+
+
+async def _launch_fix_proposal(
+    app: ReworkApp, pilot: Any, ids: dict[str, str], env: Path, **proposal: Any
+) -> list[Any]:
+    """Type one message, click the proposal's Launch, return the NEW missions."""
+    from rework.tui.widgets.cards import ProposalCard
+
+    store = await _store(env)
+    try:
+        before = {m.id for m in await store.list_missions(limit=100)}
+    finally:
+        await store.aclose()
+    text = proposal.pop("say")
+    for ch in text:
+        await pilot.press(ch if ch != " " else "space")
+    await pilot.press("enter")
+    await _settle(pilot, 1.0)
+    cards = list(app.query(ProposalCard))
+    assert cards, "the proposal must render as a card"
+    await pilot.click(_btn(app, cards[-1], "launch"))
+    await _settle(pilot, 1.0)
+    store = await _store(env)
+    try:
+        return [m for m in await store.list_missions(limit=100) if m.id not in before]
+    finally:
+        await store.aclose()
+
+
+async def test_fix_on_a_repo_less_project_launches_without_a_repo(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fix mission on an upload project supplies its files from the project's
+    files area, so no repo is required and none is invented."""
+    script_provider(
+        monkeypatch,
+        [propose(objective="tidy the notes", plan="fix", project="rework")],
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        new = await _launch_fix_proposal(app, pilot, ids, env, say="tidy the notes")
+        assert not app.swallowed
+    assert len(new) == 1, new
+    mission = new[0]
+    assert mission.project_id == ids["upload_project"]
+    assert not mission.repo_origin and not mission.repo_path, "an upload project names no repo"
+
+
+async def test_a_repo_named_on_an_upload_project_is_dropped(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The project's transport decides: a model that names a repo out of habit
+    must not turn an upload-project mission into a clone of something else."""
+    script_provider(
+        monkeypatch,
+        [
+            propose(
+                objective="tidy the notes",
+                plan="fix",
+                project="rework",
+                repo="https://github.com/x/elsewhere",
+            )
+        ],
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        new = await _launch_fix_proposal(app, pilot, ids, env, say="tidy the notes")
+        assert not app.swallowed
+    assert len(new) == 1, new
+    assert new[0].project_id == ids["upload_project"]
+    assert not new[0].repo_origin and not new[0].repo_path, "the files area supplies the files"
+
+
+async def test_fix_on_a_git_project_still_passes_its_repo_through(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script_provider(
+        monkeypatch,
+        [
+            propose(
+                objective="fix the flaky test",
+                plan="fix",
+                project="polystats",
+                repo="https://github.com/x/polystats",
+            )
+        ],
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        new = await _launch_fix_proposal(app, pilot, ids, env, say="fix the flaky test")
+        assert not app.swallowed
+    assert len(new) == 1, new
+    assert new[0].project_id == ids["project"]
+    assert new[0].repo_origin == "https://github.com/x/polystats"
+
+
+async def test_add_files_pushes_parsed_paths_into_an_upload_project(
+    ids: dict[str, str], env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rework.tui.data import TuiData
+    from rework.tui.widgets.modals import Form
+
+    seen: list[tuple[str, list[str]]] = []
+
+    async def fake(self: Any, project_id: str, paths: list[str]) -> list[str]:
+        seen.append((project_id, paths))
+        return ["notes.md (new)"]
+
+    monkeypatch.setattr(TuiData, "add_project_files", fake)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.action_tab("dashboard")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        dash.project = ids["upload_project"]
+        await pilot.click(_btn(app, dash, "add-files"))
+        await _settle(pilot)
+        form = app.screen
+        assert isinstance(form, Form)
+        form.query_one("#f-paths").text = "~/notes.md\na.md"
+        await pilot.click(_btn(app, form, "submit"))
+        await _settle(pilot, 1.0)
+        assert not app.swallowed
+    assert seen == [(ids["upload_project"], [str(tmp_path / "notes.md"), "a.md"])], seen
+    assert any("1 path(s) added" in text for _, text in app.notifications_sent)
+
+
+async def test_add_files_accepts_a_path_with_a_space(
+    ids: dict[str, str], env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The form split its whole input on spaces, so `My Papers` could not be
+    entered at all: one path per line must survive the spaces."""
+    from rework.tui.data import TuiData
+    from rework.tui.widgets.modals import Form
+
+    seen: list[tuple[str, list[str]]] = []
+    spaced = tmp_path / "My Papers"
+    spaced.mkdir()
+    (spaced / "notes.md").write_text("# n\n")
+
+    async def fake(self: Any, project_id: str, paths: list[str]) -> list[str]:
+        seen.append((project_id, paths))
+        return ["notes.md (new)"]
+
+    monkeypatch.setattr(TuiData, "add_project_files", fake)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.action_tab("dashboard")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        dash.project = ids["upload_project"]
+        await pilot.click(_btn(app, dash, "add-files"))
+        await _settle(pilot)
+        form = app.screen
+        assert isinstance(form, Form)
+        label = str(form.query(".form-label").first().render())
+        assert "one path per line" in label, label
+        form.query_one("#f-paths").text = f"{spaced}\nnotes.md"
+        await pilot.click(_btn(app, form, "submit"))
+        await _settle(pilot, 1.0)
+        assert not app.swallowed
+    assert seen == [(ids["upload_project"], [str(spaced), "notes.md"])], seen
+
+
+async def test_add_files_refuses_a_git_project(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rework.tui.data import TuiData
+    from rework.tui.widgets.modals import Form
+
+    async def fake(self: Any, project_id: str, paths: list[str]) -> list[str]:  # pragma: no cover
+        raise AssertionError("a git project must never reach the files area")
+
+    monkeypatch.setattr(TuiData, "add_project_files", fake)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.view("dashboard").project = ids["project"]  # polystats: git transport
+        # the File menu is the other way in; it lands on the same handler
+        title = next(t for t in app.query(".menu-title") if "File" in str(t.render()))
+        await pilot.click(title)
+        await pilot.pause()
+        entry = next(
+            e for e in app.screen.query(".menu-item") if "Add project files" in str(e.render())
+        )
+        await pilot.click(entry)
+        await _settle(pilot, 0.6)
+        assert not isinstance(app.screen, Form), "no form for a git project"
+        assert not app.swallowed
+    assert any("push a branch instead" in text for _, text in app.notifications_sent)
+
+
+def _send_back_btn(app: ReworkApp) -> Btn:
+    return next(b for b in app.view("gates").query(Btn) if b.action == "send-back")
+
+
+async def _open_gate_view(app: ReworkApp, pilot: Any, gate_id: str) -> None:
+    await _settle(pilot)
+    await pilot.press("alt+3")
+    await _settle(pilot, 0.8)
+    app.query_one("#gate-list", RowList).activate(gate_id, via_mouse=True)
+    await _settle(pilot, 0.8)
+
+
+async def test_send_back_button_is_offered_only_on_ship_and_open_pr_gates(
+    ids: dict[str, str], env: Path
+) -> None:
+    store = await _store(env)
+    try:
+        await store.create_gate(
+            Gate(
+                id="gate-openpr0001",
+                mission_id=ids["waiting"],
+                kind=GateKind.OPEN_PR,
+                question="Open the PR?",
+            )
+        )
+        await store.create_gate(
+            Gate(
+                id="gate-quest0003",
+                mission_id=ids["running"],
+                kind=GateKind.QUESTION,
+                question="Which file?",
+            )
+        )
+    finally:
+        await store.aclose()
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+3")
+        await _settle(pilot, 0.8)
+        shown = {}
+        for gate_id in (ids["gate"], "gate-openpr0001", "gate-quest0003", ids["question_gate"]):
+            app.query_one("#gate-list", RowList).activate(gate_id, via_mouse=True)
+            await _settle(pilot, 0.6)
+            shown[gate_id] = _send_back_btn(app).display
+        assert shown == {
+            ids["gate"]: True,  # ship
+            "gate-openpr0001": True,  # open_pr
+            "gate-quest0003": False,  # question
+            ids["question_gate"]: False,  # generic
+        }
+
+
+async def test_send_back_routes_a_send_back_decision_with_the_typed_feedback(
+    ids: dict[str, str], env: Path
+) -> None:
+    from textual.widgets import TextArea
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _open_gate_view(app, pilot, ids["gate"])
+        # no feedback typed: refused, the gate stays open
+        await pilot.press("alt+b")
+        await _settle(pilot, 0.6)
+        store = await _store(env)
+        try:
+            assert (await store.get_gate(ids["gate"])).status.value == "open"  # type: ignore[union-attr]
+        finally:
+            await store.aclose()
+        app.query_one("#gate-text", TextArea).text = "also cover the empty-input case"
+        await pilot.click(_send_back_btn(app))
+        await _settle(pilot, 0.8)
+    store = await _store(env)
+    try:
+        gate = await store.get_gate(ids["gate"])
+        assert gate is not None and gate.status.value == "sent_back"
+        assert gate.decision_note == "also cover the empty-input case"
+        assert (gate.decision or {}).get("feedback") == "also cover the empty-input case"
+    finally:
+        await store.aclose()
+
+
+async def test_send_back_is_refused_on_other_gate_kinds(ids: dict[str, str], env: Path) -> None:
+    from textual.widgets import TextArea
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _open_gate_view(app, pilot, ids["question_gate"])
+        app.query_one("#gate-text", TextArea).text = "send this back"
+        await pilot.press("alt+b")
+        await _settle(pilot, 0.8)
+    store = await _store(env)
+    try:
+        gate = await store.get_gate(ids["question_gate"])
+        assert gate is not None and gate.status.value == "open"
+    finally:
+        await store.aclose()
+
+
+async def test_dashboard_open_mission_sends_a_message_through_the_shared_publisher(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The open mission accepts a message whatever chat it belongs to, and the
+    text goes through rework.missions.send_owner_message (not a TUI copy)."""
+    from textual.widgets import Input
+
+    import rework.missions as missions
+
+    calls: list[tuple[str, str]] = []
+    real = missions.send_owner_message
+
+    async def spy(mission_id: str, text: str, **kwargs: Any) -> Any:
+        calls.append((mission_id, text))
+        return await real(mission_id, text, **kwargs)
+
+    monkeypatch.setattr(missions, "send_owner_message", spy)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        dash.open_mission(ids["running"])
+        await _settle(pilot, 0.6)
+        box = dash.query_one("#m-msg", Input)
+        box.focus()
+        box.value = "please also run the linter"
+        await pilot.press("enter")
+        await _settle(pilot, 0.8)
+        assert box.value == "", "cleared once delivered"
+        # the Send button does the same thing
+        box.value = "second note"
+        await pilot.click(_btn(app, dash, "msg-send"))
+        await _settle(pilot, 0.8)
+    assert calls == [
+        (ids["running"], "please also run the linter"),
+        (ids["running"], "second note"),
+    ]
+    store = await _store(env)
+    try:
+        events = await store.events_since(0, mission_id=ids["running"], limit=500)
+        owner = [e.payload["text"] for e in events if e.type.value == "owner_message"]
+        assert owner == ["please also run the linter", "second note"]
+    finally:
+        await store.aclose()

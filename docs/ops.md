@@ -100,9 +100,31 @@ describe the change. The orchestrator proposes; Launch starts it. The local
 daemon clones `github.com/roowus/rework`, runs the roles in
 `~/.rework/work/`, and — after a clean audited `done` — pushes the last coder's
 branch and opens the PR with your local `gh` login. **No gate by default**: the
-audit rail already guarantees the change was reviewed. The orchestrator can ask
-for one (`finish(ask_before_pr=true, reason=...)`) when the change is risky or
-unusual, and a project setting controls it globally:
+audit rail already guarantees the change was reviewed, and most fixes —
+especially ones you asked for — ship without a gate. A gate is only for the most
+crucial cases.
+
+Asking for a gate is strict (owner decision, 2026-11-14). The orchestrator may
+pass `finish(ask_before_pr=true, gate_category=..., reason=...)` ONLY when the
+change falls in one of four high-stakes categories, and the `reason` should name
+that category. What the engine mechanically enforces is narrower: a non-empty
+`reason` and a `gate_category` from the list below. Your gate question shows
+both — the category first, then the reason — so you can judge the request.
+Anything else is refused with a tool error telling the orchestrator to open the
+PR without a gate; a change you asked for is never gated for being large,
+unusual, or touching many files, and audit findings the orchestrator accepted
+belong in the finish `summary` — which becomes the PR body you read before
+merging.
+
+| `gate_category` | the change does... |
+| --- | --- |
+| `data_loss` | data loss or a destructive data migration |
+| `security` | security, credentials, auth or permissions |
+| `money` | money (billing, payments, paid resources) |
+| `production_infrastructure` | irreversible or production infrastructure (deploys, DNS, cloud resources, deleting user files) |
+
+The gate question then leads with the category and the orchestrator's reason
+("Gate category: security — ..."), so you can decide from the inbox.
 
 Only a plan that publishes (`"publish": "pr"` — the `fix-pr` playbook; older
 plans carrying `"gates": ["open_pr"]` count too) pushes a branch or opens a PR
@@ -111,7 +133,7 @@ at all. `echo` and `fix` missions deliver their result and stop.
 | project `settings.pr_gate` | effect |
 | --- | --- |
 | `auto` (default) | gate only when the orchestrator asks (or the plan lists `open_pr`) |
-| `always` | always gate before opening the PR |
+| `always` | always gate before opening the PR (overrides the orchestrator) |
 | `never` | never gate; an `ask_before_pr` is noted and overridden |
 
 Merging is always the owner's decision; no agent merges.
@@ -140,6 +162,79 @@ offers models whose key is present (`ModelEntry.has_credentials`).
 Stop the daemon with ctrl+c in its terminal. Never leave a local daemon
 running against the deployment DB: it holds the leader lock and idle
 transactions that block migrations (this happened once, for 1d20h).
+
+## Repo-less projects (documents, no code repo)
+
+A project with no repo is an **upload** project: `rework` keeps its working
+files itself, on the daemon host, so missions on it need no repo at all (ADR
+0005, Amendment). Create one by leaving `--repo` off:
+
+```bash
+rework project create applications   # -> transport=upload, results=fetch
+rework project ls                    # verify: transport=upload results=fetch
+```
+
+In the TUI: **File > New project...** and leave the repo field empty — the
+form says rework keeps the project's files itself and results are fetched, not
+pushed. (A project created *with* a repo is `git`/`push_branch`; the transport
+and results are derived from the repos and cannot be set against them.)
+
+Put files in from any machine, any number of times, before or between
+missions:
+
+```bash
+rework project add-files applications ./docs ./notes.md
+```
+
+In the TUI: the dashboard project sidebar's **Add files** button, or **File >
+Add project files...**, takes one local path per line (a path containing
+spaces is fine; home-relative `~` is expanded). It refuses a git project: for
+those, push a branch.
+
+Run a mission on it — no `--repo` needed:
+
+```bash
+rework new --plan fix --project applications "tidy the applications folder"
+```
+
+In the TUI, a chat proposal that names an upload project launches the same
+mission (a repo the model names is dropped). The mission starts from the
+project's files and saves its new/changed files back when it finishes; the
+mission report then ends with a line naming them, e.g. `Project files
+updated: a.md (new), b.md (changed)`. Deletions are not carried back: the
+save-back adds and updates only.
+
+Files are saved back **only when the mission ends DONE**: a cancelled or
+ship-rejected mission leaves the area untouched (its worktree is half-finished,
+not a deliverable). If the save-back itself fails, the mission still ends DONE
+but its report says `Project files NOT updated: <reason>` — never a silent
+success.
+
+Do **not** run two missions of the same project against the same files at the
+same time. The area is locked per operation, so they serialise rather than
+corrupt each other, but the later mission seeds from the state the earlier one
+has left so far, i.e. it starts from a mix of the two.
+
+Get results back on whichever machine you work from:
+
+```bash
+rework project pull applications ./out    # the whole project files area
+rework fetch m-0d75f495121a               # one mission's own final worktree
+```
+
+The files area lives on the **daemon host** (rewvis) at
+`~/.rework/projects/<project-id>/files`; `REWORK_PROJECTS_DIR` overrides the
+root. It is a plain directory and a git repository (local history, no remote),
+so back it up like any data directory — copy or archive it:
+
+```bash
+ssh ubuntu@100.107.125.118 'tar czf ~/backups/projects-$(date +%F).tar.gz -C ~/.rework projects'
+```
+
+Files are **never pushed anywhere**: the area has no remote and nothing ever
+uploads it. Code still travels through git only — a project that carries code
+gets a repo and the git/push_branch transport, and its deliverable is a pushed
+branch, not this area.
 
 ## Logs
 
@@ -330,6 +425,141 @@ it the command says so and exits 1).
 A `DaemonLocked` right after a restart is benign: the old heartbeat is still
 fresh; systemd's restart retry wins after one stale window.
 
+### rework cannot overload its host
+
+rewvis is 2 CPUs, 12 GB of RAM, 4 GB of swap, and it is shared: sshd,
+tailscaled, Postgres (`rework-dev-pg`), journald and the daemon all live on it.
+rework therefore bounds itself. Three knobs, all optional, all in
+`~/.rework/rework.env`:
+
+| variable | default | what it caps |
+| --- | --- | --- |
+| `REWORK_MAX_ROLES` | one per CPU (`os.cpu_count()`, min 1) — 2 on rewvis | roles RUNNING at the same time, across all missions |
+| `REWORK_ROLE_MEMORY_MAX` | 60% of RAM | the memory one role's command tree may use before the kernel kills it |
+| `REWORK_CONCURRENCY` | `min(cpu_count, 4)` — 2 on rewvis | working MISSIONS at the same time |
+
+`REWORK_MAX_ROLES` is daemon-wide: every `spawn_role` counts, whichever mission
+it belongs to. Runs beyond the cap are not refused, they queue — the run row
+stays `intent` and the orchestrator sees `queued (waiting for a free role
+slot, cap N)` in `wait` / `check_in`, so a queue never looks like a hung role.
+
+`REWORK_ROLE_MEMORY_MAX` accepts `4G`, `512M`, `60%` or raw bytes (a percentage
+is that share of total RAM, resolved once at startup). rework applies it through
+a chain of mechanisms and uses the FIRST one that works on the box, so a single
+runaway `pytest`/`mypy` dies on its own instead of taking the box (or the
+daemon) down:
+
+1. a systemd transient USER scope with `MemoryMax=` (`systemd-run --user
+   --scope`) — interactive, user-managed installs;
+2. a systemd transient SYSTEM scope with `MemoryMax=` (`systemd-run --system
+   --scope --uid=<uid>`, plus `MemoryAccounting=yes` and `--collect`) — this is
+   the one in force on rewvis: a transient user scope needs a user bus, and
+   `rework.service` has none (`systemd-run --user` there fails with "Failed to
+   connect to bus: No medium found" even though lingering is enabled for
+   ubuntu), whereas the system bus is there and `--uid` runs the command as the
+   owner, not root. It is only attempted when `/run/systemd/private` exists and
+   it fails soft (3 s probe, cached once per process);
+3. a hard `ulimit -v` in the wrapper shell (`/bin/sh -c 'ulimit -v <kB>
+   2>/dev/null; exec <command>'`) — no systemd, no cgroup, no privileges
+   needed, and it still turns swap-thrashing into an allocation failure. It
+   only affects the wrapper's children, never the daemon;
+4. no memory limit at all, if `REWORK_ROLE_MEMORY_MAX` is unset or unparseable
+   and no RAM could be read.
+
+Role commands are deprioritized on every path so the work rework does stays
+behind sshd, tailscaled and Postgres: `nice -n 10`, and the IO IDLE class —
+`ionice -c3` in the fallback and `IOSchedulingClass=idle` in a scope. rework
+says which mechanism is actually in force in ONE daemon log record at the first
+command (`role commands run in a systemd system scope with MemoryMax=5G: …`, or
+`… with MemoryMax=5G (no systemd scope available: applying ulimit -v instead;
+…)`, or `… with NO memory limit`). Check it with `rework logs daemon -g 'role
+commands run'`.
+
+`REWORK_CONCURRENCY` caps WORKING missions only. A mission that is waiting — at
+a gate, for the owner, or on hold — gives its slot back and takes a new one
+before it works again, AHEAD of missions that never started
+(`PrioritySlots`; order is FIFO inside each class). Before that, with
+`REWORK_CONCURRENCY=1`, an approved `open_pr` gate could sit for hours behind a
+mission that was merely parked at its own gate, and on 2026-11-14 behind every
+never-started mission even at 5 slots (the mission also kept saying
+`awaiting_gate` while the Gates tab was empty). The engine now sets the mission
+back to `running` the moment its last gate is decided, and the daemon corrects
+any `awaiting_gate` row with no open gate on every poll (a log line and an INFO
+event say so).
+
+A sqlite deployment keeps its historical concurrency of 1 unless the env says
+otherwise; Postgres deployments get the host-aware default.
+
+#### The 2026-11-13 incident
+
+The reason all three exist. The kernel OOM killer fired three times — Nov 12
+19:23, Nov 13 06:23 and 06:58 UTC — the last killing a role's `mypy` at 790 MB
+*inside* `rework.service`, which took the service itself down. From about
+16:20 UTC the box was swap-thrashing instead: journald wrote its lines out of
+order, no OOM kill came, and nothing answered until a hard reboot at 17:02.
+
+The load that did it: between 15:57 and 16:24 UTC four missions ran at once,
+one of them a batch mission running four investigators in parallel — 6-7 roles
+at a time, each running `pytest`, `mypy` and `uv sync` on 2 CPUs and 12 GB.
+`REWORK_CONCURRENCY=1` was the stopgap until the caps above existed.
+
+Look for OOM kills before blaming the network, a bad deploy or a hung daemon;
+they are logged by the kernel, not by rework:
+
+```bash
+ssh ubuntu@100.107.125.118 "journalctl -k | grep -i oom"          # every OOM kill
+ssh ubuntu@100.107.125.118 "journalctl -u rework --since '2026-11-13 06:00'"  # died too?
+ssh ubuntu@100.107.125.118 "free -h; uptime; systemctl is-active rework"
+```
+
+A `rework.service` that died without a Python traceback is an OOM kill, not a
+bug: look for `Killed process ... (python3)` in the kernel log and lower
+`REWORK_MAX_ROLES` (1 is the floor and it is a legitimate setting).
+
+#### Boot recovery: `rework-dev-pg` comes up with no network
+
+`rework-dev-pg` publishes its port on the Tailscale address
+`100.107.125.118:5433`, not on `0.0.0.0`. After a reboot Docker started before
+tailscaled had assigned that address, the port bind failed with `cannot assign
+requested address`, and the container came up with no network at all — which
+looks exactly like a dead database from the Mac:
+
+```bash
+ssh ubuntu@100.107.125.118 "docker inspect -f '{{json .NetworkSettings.Ports}}' rework-dev-pg"
+ssh ubuntu@100.107.125.118 "docker logs --tail 30 rework-dev-pg | grep -i 'cannot assign'"
+ssh ubuntu@100.107.125.118 "ip -brief addr show tailscale0"   # is the address there?
+```
+
+Only recreate the container if the data volume is safe. Back the database up
+first, and keep the broken container under a new name instead of deleting it:
+
+```bash
+ssh ubuntu@100.107.125.118 "mkdir -p ~/backups && docker exec rework-dev-pg \
+  pg_dump -U postgres rework_state | gzip > ~/backups/rework_state-$(date +%Y%m%d).sql.gz"
+ssh ubuntu@100.107.125.118 "docker rename rework-dev-pg rework-dev-pg-broken-20261113"
+# then `docker run` the new container on the SAME data volume
+```
+
+The real fix is ordering, in
+`/etc/systemd/system/docker.service.d/wait-for-tailscale.conf`:
+
+```ini
+[Unit]
+After=tailscaled.service
+Wants=tailscaled.service
+
+[Service]
+# a Docker port published on the tailnet address needs tailscaled to have
+# assigned it first, or the bind fails and the container comes up offline
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do \
+  ip -brief addr show tailscale0 | grep -q 100.107.125.118 && exit 0; sleep 1; done; \
+  echo "tailscale address 100.107.125.118 not up after 60s" >&2; exit 1'
+```
+
+Then `sudo systemctl daemon-reload` and `sudo systemctl restart docker`. Verify
+`docker ps` shows the port mapped and the daemon's Postgres connection is
+fresh: `systemctl is-active rework` plus a mission that is not stuck.
+
 Health checks:
 
 ```bash
@@ -341,7 +571,7 @@ ssh ubuntu@100.107.125.118 "docker exec rework-dev-pg psql -U postgres -d rework
 
 Tests never touch `rework_state`. Postgres tests use the dedicated
 `rework_test` database:
-`REWORK_TEST_POSTGRES=postgresql://postgres:rework@100.107.125.118:5433/rework_test`.
+`REWORK_TEST_POSTGRES=postgresql://postgres:<password>@<host>:5433/rework_test`.
 
 ## Preview a PR
 

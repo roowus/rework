@@ -7,8 +7,11 @@ dead daemon is reclaimed by `prune_worktrees` at mission end or boot.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import re
 from pathlib import Path
 
+from rework.nodes.failure_text import HTTP_5XX, RATE_LIMIT, marker_regex, scrub
 from rework.nodes.tools import ToolExecutor
 
 
@@ -20,12 +23,44 @@ async def _run(repo: Path, *args: str, timeout_s: float = 60.0) -> tuple[int, st
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
-    try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-    except TimeoutError:
-        proc.terminate()
-        return 124, "(git timeout)"
-    return proc.returncode or 0, out.decode(errors="replace").strip()
+    # Read incrementally: after a timed-out communicate() the pipe is abandoned
+    # and a second communicate() returns b"" on real asyncio, so the only way
+    # to keep what git wrote before it hung (the `remote:` banner, `fatal:
+    # early EOF`) is to already hold the bytes when the deadline hits.
+    assert proc.stdout is not None
+    chunks: list[bytes] = []
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    timed_out = False
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            timed_out = True
+            break
+        try:
+            chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=remaining)
+        except TimeoutError:
+            timed_out = True
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+    if not timed_out:
+        # EOF only means the pipe closed: git can close it and keep running, so
+        # the exit-code wait spends what is left of the SAME deadline.
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=max(deadline - loop.time(), 0.001))
+        except TimeoutError:
+            timed_out = True
+    text = b"".join(chunks).decode(errors="replace").strip()
+    if timed_out:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        note = f"(git timeout after {timeout_s:g}s)"
+        return 124, f"{text}\n{note}" if text else note
+    return proc.returncode or 0, text
 
 
 async def has_repo(path: Path) -> bool:
@@ -222,12 +257,137 @@ async def current_branch(worktree: Path) -> str:
     return out
 
 
-async def push_branch(worktree: Path, branch: str) -> None:
+# -- push delivery: transient vs. real rejection -----------------------------
+#
+# Found live (mission m-26591d66f460): GitHub answered one push with
+# `! [remote rejected] <branch> -> <branch> (failed)` with no reason given, and
+# the single unclassified attempt threw a finished mission away. A manual retry
+# minutes later succeeded. So: retry what the remote can plausibly answer
+# differently next time, never retry what it has decided (non-fast-forward,
+# protected branch, push protection, auth).
+
+PUSH_ATTEMPTS = 3
+PUSH_BACKOFF_S: tuple[float, ...] = (1.0, 2.0, 4.0)
+
+# The remote said NO and will say no again: retrying only buries the real
+# message under "3 attempts".
+_PUSH_REJECTION_MARKERS = (
+    "non-fast-forward",
+    "fetch first",
+    "protected branch",
+    "gh006",
+    "push declined due to repository rule violations",
+    "gh013",
+    "permission denied",
+    "authentication failed",
+    "denied to",
+)
+_PUSH_REJECTION_PATTERNS = (
+    re.compile(r"\b(?:http|status|error|returned error)[/:\s.\d]*\b403\b"),
+    re.compile(r"\b403\s+forbidden\b"),
+)
+
+# The transport (or the forge behind it) hiccuped: a retry IS the fix.
+_PUSH_TRANSIENT_MARKERS = (
+    "connection reset",
+    "connection refused",
+    "connection timed out",
+    "timed out",
+    "timeout",
+    "rpc failed",
+    "unable to access",
+    "could not resolve host",
+    "early eof",
+    "tls",
+    "ssl",
+    "broken pipe",
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+    "500 internal server error",
+    "502 bad gateway",
+    "503 service unavailable",
+    "504 gateway timeout",
+)
+# `! [remote rejected] b -> b (failed)`: the remote refused the ref update and
+# did NOT say why. This is the live case; treat it as transient.
+# Anchored to the END of the line so `(failed)` can never be the tail of a
+# reasoned refusal such as `(stale info)` / `(fetch first)`.
+_PUSH_REASONLESS_REJECTION = re.compile(r"\[remote rejected\][^\n]*\(failed\)\s*$", re.MULTILINE)
+_PUSH_REJECTION_RE = marker_regex(_PUSH_REJECTION_MARKERS)
+_PUSH_TRANSIENT_RE = marker_regex(_PUSH_TRANSIENT_MARKERS)
+
+
+class PushError(RuntimeError):
+    """A push that did not happen. `retryable` says whether the remote might
+    answer differently next time; `output` keeps git's FULL output, every line
+    (the line that matters is the LAST one, after the forge's hints)."""
+
+    def __init__(
+        self, message: str, *, output: str = "", retryable: bool = False, attempts: int = 1
+    ) -> None:
+        super().__init__(message)
+        self.output = output
+        self.retryable = retryable
+        self.attempts = attempts
+
+
+def push_failure_is_transient(output: str, code: int = 1) -> bool:
+    """Is this push failure worth another attempt?
+
+    Real rejections (the remote decided) win over transient markers, because a
+    protected-branch or auth failure also mentions hosts, TLS and timeouts."""
+    if code == 124:  # git was killed on timeout: no answer is a transient answer
+        return True
+    text = scrub(output)
+    # GitHub answers a secondary rate limit / abuse detection with a 403, the
+    # permission status: it is a "wait and retry", so it is checked first
+    if RATE_LIMIT.search(text):
+        return True
+    if _PUSH_REJECTION_RE.search(text):
+        return False
+    if any(pattern.search(text) for pattern in _PUSH_REJECTION_PATTERNS):
+        return False
+    # a 5xx is the forge failing, not deciding: checked before the weaker
+    # transient markers (a wasted retry costs seconds; a false "real
+    # rejection" costs the mission's PR)
+    if HTTP_5XX.search(text) or _PUSH_TRANSIENT_RE.search(text):
+        return True
+    return bool(_PUSH_REASONLESS_REJECTION.search(text))
+
+
+async def push_branch(
+    worktree: Path,
+    branch: str,
+    *,
+    attempts: int | None = None,
+    backoff_s: tuple[float, ...] | None = None,
+) -> None:
     """Push the run's branch to origin. For self-hosting: agents push
-    branches, humans merge (CLAUDE.md dogfooding rules)."""
-    code, out = await _run(worktree, "push", "-u", "origin", branch, timeout_s=120.0)
-    if code != 0:
-        raise RuntimeError(f"git push failed: {out}")
+    branches, humans merge (CLAUDE.md dogfooding rules).
+
+    Transient failures (a reasonless `remote rejected ... (failed)`, a dropped
+    connection, an HTTP 5xx, a timeout) are retried with backoff; a real
+    rejection is raised on the first answer, with the remote's own words."""
+    tries = PUSH_ATTEMPTS if attempts is None else attempts
+    delays = PUSH_BACKOFF_S if backoff_s is None else backoff_s
+    out = ""
+    code = 1
+    for attempt in range(1, tries + 1):
+        code, out = await _run(worktree, "push", "-u", "origin", branch, timeout_s=120.0)
+        if code == 0:
+            return
+        if not push_failure_is_transient(out, code):
+            raise PushError(f"git push rejected: {out}", output=out, attempts=attempt)
+        if attempt < tries and delays:
+            await asyncio.sleep(delays[min(attempt - 1, len(delays) - 1)])
+    raise PushError(
+        f"git push failed after {tries} attempts (transient): {out}",
+        output=out,
+        retryable=True,
+        attempts=tries,
+    )
 
 
 async def head_sha(worktree: Path) -> str | None:

@@ -96,7 +96,10 @@ class AuditorSpec(RoleSpec):
         " proportionality, and coverage; general evaluator for any artifact."
     )
     goal = "Find issues before they reach production."
-    default_model = "pro"  # audit on a stronger tier: misses cost more than the tokens
+    # empty = the configured default (REWORK_DEFAULT_MODEL); no literal id in
+    # a default path, so switching models is env-only. Escalation to a stronger
+    # model is the orchestrator's explicit, configurable choice, not a default.
+    default_model = ""
     context_manifest: ClassVar[set[str]] = {
         "diff",
         "brief",
@@ -109,7 +112,7 @@ class AuditorSpec(RoleSpec):
     def build_graph(self, ctx: RoleBuildCtx) -> CompiledStateGraph:
         run_ctx = ctx.run.context or {}
         sections = resolve_sections(run_ctx.get("requested_sections", list(ASSEMBLY_AUDIT)))
-        catalog_id = str(ctx.run.model_ref.get("id") or self.default_model)
+        catalog_id = self.resolve_model(ctx)
 
         # worktree_path (the coder's branch checkout) wins; else the mission's
         # staged repo; else the empty per-run dir (degenerate: no repo access)

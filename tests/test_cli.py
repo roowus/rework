@@ -13,6 +13,7 @@ real ~/.rework/state.sqlite3.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -22,11 +23,21 @@ import pytest
 from typer.testing import CliRunner
 
 from rework import __version__
-from rework.cli import app
+from rework.cli import _models_doc_entries, app
 from rework.kernel.state.records import Gate, GateKind, GateStatus, Mission, MissionStatus
 from rework.kernel.state.sqlite import open_sqlite
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def plain_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Typer/rich colour error panels when FORCE_COLOR is set (GitHub Actions
+    sets it), which splits messages with ANSI codes: asserting on
+    `result.output` then fails in CI only. Tests read plain text."""
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "dumb")
 
 
 @pytest.fixture(autouse=True)
@@ -79,6 +90,117 @@ def _get_mission(db: Path, mission_id: str) -> Mission | None:
             await store.aclose()
 
     return asyncio.run(go())
+
+
+def _get_project(db: Path, project_id: str):  # type: ignore[no-untyped-def]
+    async def go():  # type: ignore[no-untyped-def]
+        store = await open_sqlite(str(db))
+        try:
+            return await store.get_project(project_id)
+        finally:
+            await store.aclose()
+
+    return asyncio.run(go())
+
+
+def _get_chat(db: Path, chat_id: str):
+    async def go():
+        store = await open_sqlite(str(db))
+        try:
+            return await store.get_chat(chat_id)
+        finally:
+            await store.aclose()
+
+    return asyncio.run(go())
+
+
+def test_project_create_defaults_to_the_upload_transport(rework_db: Path) -> None:
+    """A project with no --repo has no origin to push to (ADR 0005): creation
+    must store transport=upload / results=fetch, never git/push_branch."""
+    result = runner.invoke(app, ["project", "create", "NAME"])
+
+    assert result.exit_code == 0, result.output
+    project = _get_project(rework_db, result.output.strip())
+    assert project is not None
+    assert project.settings["transport"] == "upload"
+    assert project.settings["results"] == "fetch"
+    assert project.settings["repos"] == []
+
+
+def test_project_create_with_a_repo_defaults_to_git(rework_db: Path) -> None:
+    result = runner.invoke(app, ["project", "create", "N2", "--repo", "r=https://github.com/a/b"])
+
+    assert result.exit_code == 0, result.output
+    project = _get_project(rework_db, result.output.strip())
+    assert project is not None
+    assert project.settings["transport"] == "git"
+    assert project.settings["results"] == "push_branch"
+    assert project.settings["repos"] == [
+        {"name": "r", "kind": "github", "url": "https://github.com/a/b"}
+    ]
+
+
+def test_project_create_rejects_git_transport_without_a_repo(rework_db: Path) -> None:
+    """--transport git with nothing to clone would create a project every fix
+    mission then fails on; refuse it at creation."""
+    result = runner.invoke(app, ["project", "create", "N3", "--transport", "git"])
+
+    assert result.exit_code != 0, result.output
+    assert "needs at least one --repo" in result.output
+
+
+def test_project_create_rejects_a_transport_that_contradicts_the_repo(
+    rework_db: Path,
+) -> None:
+    """`--transport upload --repo r=URL` stored a transport the project does not
+    have (the repos derive git), and `project show` printed that stale value.
+    Storing the derived pair is the rule; a contradiction is refused outright."""
+    result = runner.invoke(
+        app, ["project", "create", "N4", "--transport", "upload", "--repo", "r=github.com/a/b"]
+    )
+
+    assert result.exit_code != 0, result.output
+    assert "--transport upload needs no --repo; drop one" in result.output
+
+
+def test_project_create_stores_the_transport_the_repos_derive(rework_db: Path) -> None:
+    """Whatever the flags say, the stored settings agree with the repo list, so
+    `project show` can never print a transport the project does not have."""
+    with_repo = runner.invoke(app, ["project", "create", "N5", "--repo", "r=github.com/a/b"])
+    assert with_repo.exit_code == 0, with_repo.output
+    assert _get_project(rework_db, with_repo.output.strip()).settings["transport"] == "git"
+    assert _get_project(rework_db, with_repo.output.strip()).settings["results"] == "push_branch"
+
+    bare = runner.invoke(app, ["project", "create", "N6"])
+    assert bare.exit_code == 0, bare.output
+    assert _get_project(rework_db, bare.output.strip()).settings["transport"] == "upload"
+    assert _get_project(rework_db, bare.output.strip()).settings["results"] == "fetch"
+
+
+def test_project_add_files_rejects_a_missing_path(
+    rework_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A typo'd path used to pack to an EMPTY tarball and come back 200, so a
+    wrong path looked like success. It now fails before any network call."""
+    created = runner.invoke(app, ["project", "create", "ADDF"])
+    assert created.exit_code == 0, created.output
+    project_id = created.output.strip()
+
+    def no_network(*_a: object, **_k: object) -> None:  # pragma: no cover
+        raise AssertionError("a missing path must fail before any HTTP call")
+
+    import rework.project_files as project_files
+
+    monkeypatch.setattr(project_files, "_check", no_network)
+    present = tmp_path / "there.md"
+    present.write_text("# there\n")
+
+    result = runner.invoke(
+        app, ["project", "add-files", project_id, str(present), str(tmp_path / "tehre.md")]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "no such file or folder" in result.output
 
 
 def test_help_exits_zero() -> None:
@@ -368,6 +490,13 @@ def test_new_creates_an_orchestrated_mission_by_default(rework_db: Path) -> None
     assert plan["gates"] == []
     assert plan["orchestrator"]["model"]
     assert plan["budget"]["max_usd"] == 3.0
+    # a CLI-created mission gets a chat titled from the mission title, so it is
+    # reachable from the Work tab / Dashboard like any chat-backed mission
+    assert mission.chat_id is not None
+    chat = _get_chat(rework_db, mission.chat_id)
+    assert chat is not None
+    assert chat.title == mission.title
+    assert chat.mission_id == mission.id
 
 
 def test_new_mechanical_keeps_the_legacy_pipeline(rework_db: Path) -> None:
@@ -520,11 +649,13 @@ def test_sync_config_merges_only_key_lines_and_never_prints_values(
 ) -> None:
 
     envdir = tmp_path / "state"
-    envdir.mkdir()
+    envdir.mkdir(exist_ok=True)  # a test may fake two remote shapes in a row
     (envdir / "rework.env").write_text(
         "# local keys\nREWORK_FIREWORKS_KEY=supersecretvalue123\nOTHER=stay\n"
     )
-    (envdir / "models.json").write_text("{}")  # a local catalog exists to copy
+    (envdir / "models.json").write_text(
+        json.dumps([{"id": "flash", "provider": "fake", "model": "f", "tier": 1}])
+    )
     import rework.config as config_mod
 
     monkeypatch.setattr(config_mod, "DEFAULT_STATE_DIR", envdir)
@@ -537,6 +668,9 @@ def test_sync_config_merges_only_key_lines_and_never_prints_values(
         calls.append((list(cmd), kwargs.get("input")))
         if cmd[:1] == ["ssh"] and len(cmd) > 2 and cmd[2].startswith("cat"):
             stdout = "REWORK_FIREWORKS_KEY=old\nREWORK_DB=keepme\n"
+            if "models.json" in cmd[2]:
+                # the read completed: the end marker the command checks for
+                stdout = "__REWORK_MODELS_EOF__\n"
             return type("P", (), {"stdout": stdout, "returncode": 0})()
         return type("P", (), {"stdout": "", "returncode": 0})()
 
@@ -555,48 +689,332 @@ def test_sync_config_merges_only_key_lines_and_never_prints_values(
         (argv, stdin) for argv, stdin in calls if argv[:1] == ["ssh"] and "cat >" in argv[2]
     ]
     assert ssh_writes, "the merged rework.env was never written"
-    write_cmd, stdin = ssh_writes[-1]
+    env_writes = [(argv, stdin) for argv, stdin in ssh_writes if "rework.env" in argv[2]]
+    assert env_writes, "the merged rework.env was never written"
+    write_cmd, stdin = env_writes[-1]
     assert stdin is not None and "REWORK_FIREWORKS_KEY=supersecretvalue123" in str(stdin)
     assert "REWORK_DB=keepme" in str(stdin)  # remote non-KEY line preserved verbatim
     assert any("chmod 600" in part for part in write_cmd)
-    assert any(argv[0] == "scp" for argv, _ in calls), "models.json was not copied"
+    # models.json is MERGED, not scp'd over: the merged JSON travels to
+    # ~/.rework/models.json over ssh, and no scp of a local file happens at all
+    assert not any(argv[0] == "scp" for argv, _ in calls), "models.json was still scp'd"
+    models_writes = [(argv, stdin) for argv, stdin in ssh_writes if "models.json" in argv[2]]
+    assert models_writes, "the merged models.json was never written"
+    _, models_stdin = models_writes[-1]
+    assert json.loads(str(models_stdin))[0]["id"] == "flash"
 
 
-def test_sync_config_dry_run_touches_nothing(
-    targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+# A local catalog with one callable-from-anywhere entry, one loopback-only
+# entry (the Mac-only 9router case) and one that SHARES the loopback entry's
+# key. The remote catalog has one entry only the target knows.
+LOCAL_MODELS = [
+    {
+        "id": "flash",
+        "provider": "openai-compatible",
+        "model": "glm-4.5-flash",
+        "tier": 1,
+        "base_url": "https://api.z.ai/api/coding/paas/v4",
+        "api_key_env": "REWORK_FIREWORKS_KEY",
+    },
+    {
+        "id": "router",
+        "provider": "openai-compatible",
+        "model": "router-model",
+        "tier": 1,
+        "base_url": "http://localhost:20128/v1",
+        "api_key_env": "REWORK_ROUTER_KEY",
+    },
+    {
+        "id": "router-sibling",
+        "provider": "openai-compatible",
+        "model": "router-sibling",
+        "tier": 1,
+        "base_url": "https://api.example.com/v1",
+        "api_key_env": "REWORK_SIBLING_KEY",  # its own key: the router's is droppable
+    },
+]
 
+REMOTE_MODELS = [
+    {"id": "flash", "provider": "fake", "model": "old-flash", "tier": 0},
+    {"id": "rewvis-only", "provider": "fake", "model": "rewvis-1", "tier": 2},
+]
+
+
+def _sync_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, remote_models: object = None
+) -> tuple[list[tuple[list[str], object]], Path]:
+    """Fake the whole remote side: local state dir + a fake `subprocess.run`
+    that answers the read-only `cat` calls with canned remote files and records
+    every (argv, stdin) pair. Hermetic: no ssh, no network, no real HOME."""
     envdir = tmp_path / "state"
-    envdir.mkdir()
-    (envdir / "rework.env").write_text("REWORK_FIREWORKS_KEY=supersecretvalue123\n")
+    envdir.mkdir(exist_ok=True)  # a test may fake two remote shapes in a row
+    (envdir / "rework.env").write_text(
+        "REWORK_FIREWORKS_KEY=supersecretvalue123\n"
+        "REWORK_ROUTER_KEY=routersecret\n"
+        "REWORK_SIBLING_KEY=siblingsecret\n"
+        "REWORK_STALE_KEY=stale\n"
+    )
+    (envdir / "models.json").write_text(json.dumps(LOCAL_MODELS))
     import rework.config as config_mod
 
     monkeypatch.setattr(config_mod, "DEFAULT_STATE_DIR", envdir)
 
-    called: list[list[str]] = []
+    calls: list[tuple[list[str], object]] = []
 
     def fake_run(cmd: list[str], **kwargs: object) -> object:
-        called.append(list(cmd))
-        return type("P", (), {"stdout": "", "returncode": 0})()
+        calls.append((list(cmd), kwargs.get("input")))
+        stdout = ""
+        if cmd[:1] == ["ssh"] and len(cmd) > 2:
+            if "models.json" in cmd[2]:
+                stdout = "" if remote_models is None else json.dumps(remote_models)
+                # the read is answered like a real shell: the file (or nothing)
+                # then the end-of-read marker the command checks for
+                stdout += "__REWORK_MODELS_EOF__\n"
+            elif "rework.env" in cmd[2]:
+                stdout = "REWORK_FIREWORKS_KEY=old\nREWORK_DB=keepme\n"
+        return type("P", (), {"stdout": stdout, "returncode": 0})()
 
     monkeypatch.setattr("subprocess.run", fake_run)
+    return calls, envdir
 
-    result = runner.invoke(app, ["sync-config", "rewvis", "--dry-run"])
-    if result.exit_code != 0:
-        print(result.output)
-    assert result.exit_code == 0
-    assert "would copy" in result.output
-    assert "dry run: nothing was sent" in result.output
-    assert "REWORK_FIREWORKS_KEY: 19 chars" in result.output
-    assert "supersecretvalue123" not in result.output
-    # dry-run may READ the remote env (the read-only cat, to know add vs
+
+def _ssh_write(calls: list[tuple[list[str], object]], needle: str) -> str:
+    writes = [
+        stdin
+        for argv, stdin in calls
+        if argv[:1] == ["ssh"] and "cat >" in argv[2] and needle in argv[2]
+    ]
+    assert writes, f"nothing was written to {needle} over ssh"
+    return str(writes[-1])
+
+
+def test_sync_config_skips_loopback_entries_and_their_keys(
+    targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls, _ = _sync_env(tmp_path, monkeypatch, remote_models=REMOTE_MODELS)
+
+    result = runner.invoke(app, ["sync-config", "sandbox"])
+    assert result.exit_code == 0, result.output
+    out = result.output
+    # the loopback entry is skipped, with its reason
+    assert "skip router: loopback base_url http://localhost:20128/v1" in out
+    # ...and so is the key ONLY that skipped entry uses, with its reason
+    assert "skip REWORK_ROUTER_KEY: used only by skipped entries" in out
+    env_written = _ssh_write(calls, "rework.env")
+    assert "REWORK_ROUTER_KEY" not in env_written, "a key only skipped entries use was sent"
+    assert "REWORK_FIREWORKS_KEY=supersecretvalue123" in env_written
+    assert "REWORK_DB=keepme" in env_written  # remote line survives
+    # no secret value is ever printed
+    assert "supersecretvalue123" not in out and "routersecret" not in out
+    # the merged catalog: loopback entry gone, target-only entry kept, and the
+    # local entry replaced the target's same-id one
+    merged = json.loads(_ssh_write(calls, "models.json"))
+    ids = [e["id"] for e in merged]
+    assert "router" not in ids
+    assert ids == ["flash", "router-sibling", "rewvis-only"]
+    assert merged[0]["model"] == "glm-4.5-flash"  # local wins on id
+    assert "  keep    rewvis-only: only on the target" in out
+    assert "  replace flash:" in out and "  add     router-sibling:" in out
+    assert not any(argv[0] == "scp" for argv, _ in calls)
+
+
+def test_sync_config_keeps_a_target_entry_containing_the_marker_token(
+    targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The marker is appended LAST by the remote shell, so it must be stripped
+    from the TAIL. A target entry whose text happens to contain the token
+    (here a "note") is legitimate: a head-anchored split truncates the document
+    there, the remainder fails json.loads, the merge then treats the target as
+    empty and `cat >` drops every target-only entry."""
+    remote = [
+        *REMOTE_MODELS,
+        {
+            "id": "tokens-holder",
+            "provider": "fake",
+            "model": "t",
+            "tier": 1,
+            "note": "echo __REWORK_MODELS_EOF__ appears in a string",
+        },
+    ]
+    calls, _ = _sync_env(tmp_path, monkeypatch, remote_models=remote)
+
+    result = runner.invoke(app, ["sync-config", "sandbox"])
+    assert result.exit_code == 0, result.output
+    # the target's catalog parsed, so no "treating it as empty" warning
+    assert "not valid JSON" not in result.output
+    assert "keep    tokens-holder: only on the target" in result.output
+
+    payload = _ssh_write(calls, "models.json")
+    merged = json.loads(payload)
+    ids = [entry["id"] for entry in merged]
+    assert ids == ["flash", "router-sibling", "rewvis-only", "tokens-holder"]
+    holder = next(entry for entry in merged if entry["id"] == "tokens-holder")
+    assert holder["note"] == "echo __REWORK_MODELS_EOF__ appears in a string"
+    # the same payload round-trips through the loader's entry parser
+    assert [entry["id"] for entry in _models_doc_entries(merged)] == ids
+    written = tmp_path / "token-models.json"
+    written.write_text(payload)
+    monkeypatch.setenv("REWORK_MODELS", str(written))
+    from rework.config import load_catalog
+
+    assert [e.id for e in load_catalog().all()] == ids
+
+
+def test_sync_config_writes_nothing_when_the_remote_read_fails(
+    targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ssh read that never completed must not be mistaken for an empty
+    target catalog: the merge would then drop the target's own entries and
+    `cat >` would REPLACE the remote models.json with local-only ones. The
+    read carries an end marker only a finished shell run can produce, so a
+    missing marker aborts the whole write phase."""
+    calls, _ = _sync_env(tmp_path, monkeypatch, remote_models=REMOTE_MODELS)
+
+    def dead_run(cmd: list[str], **kwargs: object) -> object:
+        calls.append((list(cmd), kwargs.get("input")))
+        # unreachable host: ssh exits non-zero and prints a diagnostic, and the
+        # shell never ran, so the marker is absent (this is what ssh_run returns)
+        stdout = "ssh: connect to host 100.107.125.118 port 22: No route to host\n"
+        return type("P", (), {"stdout": stdout, "returncode": 255})()
+
+    monkeypatch.setattr("subprocess.run", dead_run)
+    result = runner.invoke(app, ["sync-config", "sandbox"])
+    assert result.exit_code != 0, "a failed remote read must exit non-zero"
+    assert "__REWORK_MODELS_EOF__" in result.output or "did not complete" in result.output
+    assert "100.107.125.118" in result.output  # names the target
+    assert "nothing was written" in result.output
+    writes = [
+        argv
+        for argv, _ in calls
+        if argv[0] == "scp" or (argv[0] == "ssh" and ("cat >" in argv[2] or "chmod" in argv[2]))
+    ]
+    assert not writes, f"a failed remote read still wrote to the target: {writes}"
+
+    # --dry-run must report the same problem, not crash, and still write nothing
+    calls2, _ = _sync_env(tmp_path, monkeypatch, remote_models=REMOTE_MODELS)
+    monkeypatch.setattr("subprocess.run", dead_run)
+    result = runner.invoke(app, ["sync-config", "sandbox", "--dry-run"])
+    assert result.exit_code != 0
+    assert "nothing was written" in result.output
+    assert not [a for a, _ in calls2 if a[0] == "scp" or (a[0] == "ssh" and "cat >" in a[2])]
+
+    # ...while a SUCCESSFUL read of an absent file still writes the local
+    # catalog (empty target: no file, only the marker)
+    calls3, _ = _sync_env(tmp_path, monkeypatch, remote_models=None)
+    ok = runner.invoke(app, ["sync-config", "sandbox"])
+    assert ok.exit_code == 0, ok.output
+    merged = json.loads(_ssh_write(calls3, "models.json"))
+    assert [e["id"] for e in merged] == ["flash", "router-sibling"]
+
+
+def test_sync_config_keeps_a_key_a_kept_entry_also_uses(
+    targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of the key rule: a key the skipped loopback entry uses is
+    still needed on the target when a KEPT entry needs it too, so it must be
+    sent and must NOT be reported as skipped."""
+    calls, envdir = _sync_env(tmp_path, monkeypatch, remote_models=None)
+    shared = [
+        {**e, "api_key_env": "REWORK_ROUTER_KEY"} if e["id"] == "router-sibling" else e
+        for e in LOCAL_MODELS
+    ]
+    (envdir / "models.json").write_text(json.dumps(shared))
+
+    result = runner.invoke(app, ["sync-config", "sandbox"])
+    assert result.exit_code == 0, result.output
+    assert "skip router: loopback base_url http://localhost:20128/v1" in result.output
+    assert "REWORK_ROUTER_KEY: used only by skipped entries" not in result.output
+    env_written = _ssh_write(calls, "rework.env")
+    assert "REWORK_ROUTER_KEY=routersecret" in env_written
+
+
+def test_sync_config_never_writes_a_models_json_the_loader_cannot_read(
+    targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The payload actually written must PARSE through the loader.
+
+    An object-shaped remote document ({"version": 2, "entries": [...]}) is not
+    readable by rework at all: ModelCatalog.from_config runs ModelEntry(**item)
+    over the raw document, so preserving that shape would hand the target a
+    catalog that raises TypeError. So the sync writes the flat list, says why,
+    and the target keeps its own entries in the merge. Asserting the payload
+    parses (not merely that it is JSON) is the point: json.loads alone passed
+    while the file was unloadable."""
+    from rework.config import load_catalog
+
+    calls, _ = _sync_env(
+        tmp_path, monkeypatch, remote_models={"version": 2, "entries": REMOTE_MODELS}
+    )
+    result = runner.invoke(app, ["sync-config", "sandbox"])
+    assert result.exit_code == 0, result.output
+    assert "not an entry list the loader can read" in result.output
+
+    payload = _ssh_write(calls, "models.json")
+    assert isinstance(json.loads(payload), list), "the object shape must not survive"
+
+    # the REAL proof: feed the exact payload to the loader the daemon uses
+    written = tmp_path / "written-models.json"
+    written.write_text(payload)
+    monkeypatch.setenv("REWORK_MODELS", str(written))
+    catalog = load_catalog()
+    assert [e.id for e in catalog.all()] == ["flash", "router-sibling", "rewvis-only"]
+    assert catalog.resolve("flash").model == "glm-4.5-flash"  # local wins on id
+
+    # a malformed remote document: reported, and still written as a loadable list
+    calls2, _ = _sync_env(tmp_path, monkeypatch, remote_models=None)
+
+    def bad_run(cmd: list[str], **kwargs: object) -> object:
+        calls2.append((list(cmd), kwargs.get("input")))
+        stdout = (
+            "{not json__REWORK_MODELS_EOF__\n"
+            if cmd[:1] == ["ssh"] and "models.json" in cmd[2]
+            else ""
+        )
+        return type("P", (), {"stdout": stdout, "returncode": 0})()
+
+    monkeypatch.setattr("subprocess.run", bad_run)
+    result = runner.invoke(app, ["sync-config", "sandbox"])
+    assert result.exit_code == 0, result.output  # a warning, never a crash
+    assert "not valid JSON" in result.output
+    payload2 = _ssh_write(calls2, "models.json")
+    assert [e["id"] for e in json.loads(payload2)] == ["flash", "router-sibling"]
+    written.write_text(payload2)
+    monkeypatch.setenv("REWORK_MODELS", str(written))
+    assert [e.id for e in load_catalog().all()] == ["flash", "router-sibling"]
+
+
+def test_sync_config_dry_run_prints_the_same_plan_and_writes_nothing(
+    targets_file: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls, _ = _sync_env(tmp_path, monkeypatch, remote_models=REMOTE_MODELS)
+
+    result = runner.invoke(app, ["sync-config", "sandbox", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "merge models.json" in out
+    assert "skip router: loopback base_url http://localhost:20128/v1" in out
+    assert "skip REWORK_ROUTER_KEY: used only by skipped entries" in out
+    assert "dry run: nothing was sent" in out
+    assert "supersecretvalue123" not in out
+    # dry-run may READ the remote files (the read-only cat, to know add vs
     # replace) but must never WRITE anything: no heredoc/cat>, no chmod, no scp
     writes = [
         argv
-        for argv in called
+        for argv in [a for a, _ in calls]
         if argv[0] == "scp" or (argv[0] == "ssh" and ("cat >" in argv[2] or "chmod" in argv[2]))
     ]
     assert not writes, f"dry run wrote to the remote host: {writes}"
+
+    # the plan is byte-identical to the real run's plan lines
+    real, _ = _sync_env(tmp_path, monkeypatch, remote_models=REMOTE_MODELS)
+    real_out = runner.invoke(app, ["sync-config", "sandbox"]).output
+    plan = lambda text: [  # noqa: E731
+        line
+        for line in text.splitlines()
+        if line.startswith(("merge ", "  add", "  replace", "  keep", "  skip"))
+    ]
+    assert plan(out) == plan(real_out), "dry run and real run printed different plans"
+    assert real, "the real run must write"
 
 
 def test_sync_config_requires_an_ssh_host(targets_file: Path) -> None:
@@ -869,3 +1287,33 @@ def test_new_with_unknown_priority_is_a_clean_cli_error(rework_db: Path) -> None
             await store.aclose()
 
     assert asyncio.run(all_missions()) == []
+
+
+def test_message_publishes_an_owner_message(rework_db: Path) -> None:
+    """`rework message ID TEXT` appends an OWNER_MESSAGE for that mission;
+    an unknown id fails loudly and publishes nothing."""
+    from rework.kernel.state.records import EventType
+
+    async def seed() -> None:
+        store = await open_sqlite(str(rework_db))
+        try:
+            await store.create_mission(Mission(id="m-msg", objective="talk to me"))
+        finally:
+            await store.aclose()
+
+    async def owner_texts(mission_id: str) -> list[str]:
+        store = await open_sqlite(str(rework_db))
+        try:
+            events = await store.events_since(0, mission_id=mission_id)
+            return [e.payload["text"] for e in events if e.type == EventType.OWNER_MESSAGE]
+        finally:
+            await store.aclose()
+
+    asyncio.run(seed())
+    result = runner.invoke(app, ["message", "m-msg", "please also add tests"])
+    assert result.exit_code == 0, result.output
+    assert asyncio.run(owner_texts("m-msg")) == ["please also add tests"]
+
+    missing = runner.invoke(app, ["message", "m-nope", "hello"])
+    assert missing.exit_code != 0
+    assert asyncio.run(owner_texts("m-nope")) == []

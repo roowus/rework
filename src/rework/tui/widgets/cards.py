@@ -119,6 +119,9 @@ class MissionCard(Vertical):
         self.active_role = ""
         # a finished card backfills its tail once, then is never polled again
         self.tail_filled = False
+        # backoff for a failing full-row fetch (monotonic seconds)
+        self.fetch_failures = 0
+        self.fetch_next_try = 0.0
 
     def compose(self) -> ComposeResult:
         yield Static(f"[{MUTED}]mission {esc(self.mission_id)}[/]", classes="card-body mc-head")
@@ -128,6 +131,7 @@ class MissionCard(Vertical):
         with Horizontal(classes="card-actions mc-actions"):
             yield Btn("Open", "open")
             yield Btn("Preview", "preview", classes="mc-previewbtn")
+            yield Btn("Retry PR", "retry-pr", variant="primary", classes="mc-retrypr")
             yield Btn("Approve", "approve", variant="primary", classes="mc-gatebtn")
             yield Btn("Reject", "reject", variant="danger", classes="mc-gatebtn")
             yield Btn("Answer…", "answer", variant="ghost", classes="mc-gatebtn")
@@ -234,10 +238,13 @@ class MissionCard(Vertical):
             else:
                 btn.display = yes_no  # questions and choices need the Gates tab
         status = self.status
-        for verb in ("pause", "resume", "cancel"):
+        result = getattr(m, "result", None) or {}
+        # the ONE writer of these buttons' visibility ("retry-pr": finished,
+        # work kept, PR not delivered)
+        for verb in ("pause", "resume", "cancel", "retry-pr"):
             for btn in self.query(Btn):
                 if btn.action == verb:
-                    btn.display = can(verb, status)
+                    btn.display = can(verb, status, result)
 
     def on_btn_pressed(self, event: Btn.Pressed) -> None:
         event.stop()
