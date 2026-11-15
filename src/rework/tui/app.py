@@ -22,13 +22,15 @@ from textual.widgets import ContentSwitcher
 from textual.worker import WorkerFailed
 
 from rework import update as update_mod
-from rework.runtime import CODE_CHANGED, CodeChangeWatcher
+from rework.runtime import CODE_CHANGED_IDLE, CodeChangeWatcher
+from rework.tui import reload as reload_mod
 from rework.tui.hub import Hub, Snapshot
 from rework.tui.settings import Settings
 from rework.tui.theme import THEME, WARN, clip
 from rework.tui.views.base import View
 from rework.tui.widgets.chrome import SEPARATOR, HintBar, MenuBar, MenuItem, TabBar
 from rework.tui.widgets.modals import Field, Form, Help
+from rework.tui.widgets.prompt import Prompt
 
 log = logging.getLogger("rework.tui")
 
@@ -113,6 +115,7 @@ def _menus() -> dict[str, list[MenuItem]]:
         ],
         "Help": [
             MenuItem("Update rework…", "app.action_update_rework"),
+            MenuItem("Reload rework", "app.action_reload_rework"),
             SEPARATOR,
             MenuItem("Keyboard shortcuts", "app.help", "f1"),
             MenuItem("About rework", "app.about"),
@@ -171,6 +174,18 @@ class ReworkApp(App[None]):
         # _check_code); None until the shell is mounted and can paint a note
         self._code_watcher: CodeChangeWatcher | None = None
         self._code_changed = False
+        # self-reload: when the owner last pressed a key (the idle predicate's
+        # clock), whether a reload is armed, and why. `reloaded` is what
+        # `run_tui` inspects after `app.run()` returns to decide on the exec:
+        # the app itself NEVER execs, it only saves state and exits.
+        self._last_input = time.monotonic()
+        self.reload_pending = False
+        self.reload_reason = ""
+        self.reloaded = False
+        # an update worker is mid `uv sync`: re-execing now would kill it
+        self._updating = False
+        # state read from disk at mount, applied once the first snapshot lands
+        self._restore: reload_mod.ReloadState | None = None
         # commits origin/main is ahead by; None = not known (yet/offline)
         self._update_commits_behind: int | None = None
 
@@ -216,6 +231,8 @@ class ReworkApp(App[None]):
         self._code_watcher = CodeChangeWatcher()
         self.set_interval(CODE_CHECK_SECONDS, self._check_code)
         self.set_interval(UPDATE_CHECK_SECONDS, self._check_update)
+        self.set_interval(reload_mod.RELOAD_CHECK_SECONDS, self._check_reload)
+        self._restore_ui_state()
 
     def get_theme_variable_defaults(self) -> dict[str, str]:
         # the stylesheet references $bg/$fg/… before any theme switch happens
@@ -233,6 +250,9 @@ class ReworkApp(App[None]):
 
     async def on_event(self, event: events.Event) -> None:
         if isinstance(event, events.Key) and not event.is_forwarded:
+            # ONE place records "the owner is here": every reload decision
+            # reads this stamp, so a reload can never land mid-sentence
+            self._last_input = time.monotonic()
             tab = OPTION_KEYS.get(event.key)
             if tab is not None:
                 self.action_tab(tab)
@@ -278,6 +298,9 @@ class ReworkApp(App[None]):
                 view.on_snapshot(snap)
             except Exception as exc:
                 self._swallow(exc)
+        if self._restore is not None and snap.loaded:
+            # after the views have painted, so a restored chat/gate finds its rows
+            self._apply_restore(snap)
 
     def _notify_new_gates(self, snap: Snapshot) -> None:
         if not snap.loaded:
@@ -390,14 +413,16 @@ class ReworkApp(App[None]):
     # -- code on disk ----------------------------------------------------------
 
     def _check_code(self) -> None:
-        """A merge landed in the checkout this process was started from. The
-        modules in memory are the OLD ones, so say so in the status bar and in
-        tui.log, once. Never restart: that is the owner's call (finding 28)."""
+        """A merge landed in the checkout this process was started from, so the
+        modules in memory are the OLD ones. Say so once in tui.log and the
+        status bar, and ARM a reload: the shell re-execs itself as soon as the
+        owner is idle (finding 15, was "restart to load"). A running chat turn
+        is never dropped for it — the idle predicate waits."""
         if self._code_watcher is None or not self._code_watcher.poll():
             return
-        log.warning("%s", CODE_CHANGED)
+        log.warning("%s", CODE_CHANGED_IDLE)
         self._code_changed = True
-        self._refresh_note()
+        self.request_reload(reason="code changed")
 
     async def _check_update(self) -> None:
         """Every UPDATE_CHECK_SECONDS: is origin/main ahead of this checkout?
@@ -418,13 +443,186 @@ class ReworkApp(App[None]):
         code on disk moved, origin is ahead) coexist instead of clobbering."""
         parts = []
         if self._code_changed:
-            parts.append(f"[{WARN}]{CODE_CHANGED}[/]")
+            parts.append(f"[{WARN}]{CODE_CHANGED_IDLE}[/]")
         if self._update_commits_behind:
             parts.append(f"[{WARN}]update available: {self._update_commits_behind} commits[/]")
+        if self.reload_pending:
+            parts.append(f"[{WARN}]{reload_mod.RELOADING}[/]")
         try:
             self.set_note(" | ".join(parts))
         except Exception:  # a missing widget must not kill the tick
             log.debug("note update failed", exc_info=True)
+
+    # -- self-reload -----------------------------------------------------------
+
+    def chat_busy(self) -> bool:
+        """Is a chat turn (or a chat load) in flight? Read off the WorkView's
+        own flags rather than the worker list: those are exactly the states
+        that make the prompt show "thinking…", so they are also the states a
+        reload must never interrupt."""
+        work = self.view("work")
+        return bool(
+            getattr(work, "_sending", False)
+            or getattr(work, "_thinking", None) is not None
+            or getattr(work, "_loading_chat", None) is not None
+        )
+
+    def idle_for_reload(self) -> bool:
+        """The idle predicate with the app's own facts plugged in (the pure
+        decision is `rework.tui.reload.is_idle`, which is what the tests pin)."""
+        return reload_mod.is_idle(
+            now=time.monotonic(),
+            last_input=self._last_input,
+            modal_open=isinstance(self.screen, ModalScreen),
+            chat_busy=self.chat_busy(),
+            updating=self._updating,
+        )
+
+    def request_reload(self, *, reason: str = "") -> None:
+        """Arm the reload. It happens on the next RELOAD_CHECK_SECONDS tick
+        where the owner is idle — never immediately, so typing and turns win."""
+        if self.reloaded:
+            return
+        if not self.reload_pending:
+            log.info("reload armed (%s)", reason or "requested")
+        self.reload_pending = True
+        if reason:
+            self.reload_reason = reason
+        self._refresh_note()
+
+    def action_reload_rework(self) -> None:
+        """Help ▸ Reload rework: on demand, i.e. now — unless a turn is running,
+        in which case the turn wins and the owner is told why."""
+        if self._updating:
+            self.notify("can't reload while an update is running", severity="warning", timeout=4)
+            return
+        if self.chat_busy():
+            self.notify("can't reload while a turn is running", severity="warning", timeout=4)
+            return
+        self.request_reload(reason="reload requested")
+        self._exit_for_reload()
+
+    def _check_reload(self) -> None:
+        """The periodic "may I reload now?" — four booleans, so it is cheap
+        enough for its own interval."""
+        if not self.reload_pending or self.reloaded:
+            return
+        if not self.idle_for_reload():
+            return
+        self._exit_for_reload()
+
+    def _exit_for_reload(self) -> None:
+        """Save the UI state and exit; `run_tui` re-execs once `run()` returns.
+        The app never execs itself (a test could never catch that)."""
+        try:
+            self._save_ui_state(toast=self.reload_toast())
+        except Exception:
+            # a state-save failure must not strand the running OLD process
+            log.exception("could not save the reload state")
+        self.reloaded = True
+        log.info("reloading: %s", self.reload_reason or "requested")
+        self.exit()
+
+    def reload_toast(self) -> str:
+        return reload_mod.toast_for(reload_mod.current_commit(), reason=self.reload_reason)
+
+    def _save_ui_state(self, *, toast: str = "") -> reload_mod.ReloadState:
+        """What the next process puts back. Only things that are cheap and safe:
+        the tab, the open chat / mission / gate id, the unsent draft, and the two
+        transcripts' scroll offsets. NOT saved: the messages themselves (the
+        store is the source of truth), the prompt's image attachments (silently
+        re-attached on the next send would be a surprise), and any filter/
+        picker text outside the gate selection."""
+        work = self.view("work")
+        dash = self.view("dashboard")
+        gates = self.view("gates")
+        state = reload_mod.ReloadState(
+            tab=self.active_tab,
+            chat_id=str(getattr(getattr(work, "convo", None), "id", "") or ""),
+            mission_id=str(getattr(dash, "mission_id", None) or ""),
+            gate_id=str(getattr(getattr(gates, "selected", None), "id", "") or ""),
+            draft=self._draft_text(),
+            scroll=self._scroll_positions(),
+            pending_toast=toast,
+            commit=reload_mod.current_commit(),
+            at=time.time(),
+        )
+        reload_mod.save_state(state)
+        return state
+
+    def _draft_text(self) -> str:
+        try:
+            return str(self.query_one("#prompt", Prompt).text)
+        except NoMatches:  # a teardown race: the draft is simply unknown
+            return ""
+
+    def _scroll_positions(self) -> dict[str, float]:
+        out: dict[str, float] = {}
+        for selector in ("#chat-log", "#m-traj"):
+            try:
+                y = float(self.query_one(selector).scroll_y or 0.0)
+            except Exception:  # a teardown race or a missing widget: skip it
+                continue
+            if y > 0:
+                out[selector] = y
+        return out
+
+    def _restore_ui_state(self) -> None:
+        """Read the file left by the previous process (once: it is deleted
+        here), show its toast, and stash the rest for `_apply_restore`, which
+        runs on the first LOADED snapshot so an unknown chat/mission/gate id
+        can be ignored instead of toasted about."""
+        state = reload_mod.load_state()
+        if state is None:
+            return
+        reload_mod.clear_state()
+        self._restore = state
+        if state.pending_toast:
+            self.notify(state.pending_toast, timeout=6, markup=False)
+
+    def _apply_restore(self, snap: Snapshot) -> None:
+        """Put the saved UI back, field by field, ignoring anything that is not
+        there any more. Anything unexpected is swallowed into a toast: a stale
+        restore is never a crash."""
+        state, self._restore = self._restore, None
+        if state is None:
+            return
+        try:
+            if state.tab in TABS:
+                self.action_tab(state.tab)
+            work = self.view("work")
+            if state.chat_id and any(c.id == state.chat_id for c in snap.chats):
+                work.open_chat(state.chat_id)
+            elif state.mission_id and snap.mission(state.mission_id) is not None:
+                self.open_mission(state.mission_id)
+            # a gate's selection only exists on the Gates tab, and selecting one
+            # focuses its answer box: restore it only where it was visible
+            if state.tab == "gates" and any(g.id == state.gate_id for g in snap.gates):
+                self.view("gates").select_gate(state.gate_id)
+            if state.draft:
+                self.query_one("#prompt", Prompt).text = state.draft
+                if state.tab == "work":
+                    work.focus_prompt()
+            self._restore_scroll(state.scroll)
+        except Exception as exc:
+            self._swallow(exc)
+
+    def _restore_scroll(self, scroll: dict[str, float]) -> None:
+        """Scrolling needs laid-out content, which lands after the first paint
+        (and after a chat load scrolls itself to the end), so it is applied
+        once, a beat later. Best effort: a selector that no longer exists is
+        skipped."""
+        if not scroll:
+            return
+
+        def apply() -> None:
+            for selector, y in scroll.items():
+                try:
+                    self.query_one(selector).scroll_to(y=y, animate=False)
+                except Exception:
+                    continue
+
+        self.set_timer(1.0, apply)
 
     # -- chrome helpers --------------------------------------------------------
 
@@ -530,12 +728,22 @@ class ReworkApp(App[None]):
         )
 
     def action_update_rework(self) -> None:
-        """Pull origin/main into THIS checkout and `uv sync`, then tell the owner
-        to restart: nothing restarts itself (finding 28). Unlike the remote
+        """Pull origin/main into THIS checkout and `uv sync`, then ARM a reload
+        (finding 15: it used to stop at "restart to load"). Unlike the remote
         `rework update --target NAME` path, this is local and report-only."""
+        if self._updating:
+            self.notify("already updating…", timeout=3)
+            return
+        self._updating = True  # a reload must not land inside `uv sync`
         self.run_worker(self._update_rework(), group="update")
 
     async def _update_rework(self) -> None:
+        try:
+            await self._run_update()
+        finally:
+            self._updating = False
+
+    async def _run_update(self) -> None:
         repo_root = update_mod.find_repo_root()
         if repo_root is None:
             self.notify("cannot find this checkout's git root", severity="error", timeout=6)
@@ -553,8 +761,14 @@ class ReworkApp(App[None]):
             self.notify(update_mod.describe_update(result), timeout=5)
             return
         self._update_commits_behind = 0
+        self._code_changed = False  # the tree is what this process will load next
         self._refresh_note()
-        self.notify(update_mod.describe_update(result), title="rework updated", timeout=10)
+        self.notify(
+            update_mod.describe_update(result, self_reload=True),
+            title="rework updated",
+            timeout=10,
+        )
+        self.request_reload(reason=f"updated to {reload_mod.current_commit()}")
 
     def action_mission(self, verb: str) -> None:
         dash = self.view("dashboard")
@@ -808,3 +1022,8 @@ def run_tui() -> None:
         log.error("tui exit with code %s", app.return_code)
     else:
         log.info("tui exit")
+    if getattr(app, "reloaded", False):
+        # the app saved its UI state and exited for a reload: come back as a
+        # fresh process running the NEW code, same argv (`--target` still
+        # applies), same environment. Only a failed exec returns here.
+        reload_mod.reexec()

@@ -336,14 +336,19 @@ async def mission_busy(store: StateStore) -> bool:
     return bool(gates)
 
 
-def describe_update(result: UpdateResult) -> str:
+def describe_update(result: UpdateResult, *, self_reload: bool = False) -> str:
     """One human line for a refusal, a no-op or a landed update (the CLI, the
-    TUI toast and the daemon log all say the same thing)."""
+    TUI toast and the daemon log all say the same thing).
+
+    `self_reload` is the TUI's case: it re-execs itself as soon as the owner is
+    idle (finding 15), so telling it to restart would be wrong. The CLI and the
+    daemon keep the restart wording — neither reloads itself."""
     if not result.ok:
         return f"update refused: {result.reason}"
     if not result.changed:
         return f"already up to date ({_short(result.new)})"
+    tail = "will reload when idle" if self_reload else "restart to load"
     return (
         f"updated {_short(result.old)} -> {_short(result.new)}"
-        f" ({len(result.subjects)} commit(s)); restart to load"
+        f" ({len(result.subjects)} commit(s)); {tail}"
     )
