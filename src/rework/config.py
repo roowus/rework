@@ -29,6 +29,19 @@ ESCALATION_MODEL_ENV = "REWORK_ESCALATION_MODEL"
 ESCALATION_MODEL_ID = "claude-sonnet-5-5"
 
 
+# The URL schemes this loader treats as Postgres. ONE source of truth: the
+# credential-recovery guard compares candidate URLs against this same set,
+# because anything else is opened as a sqlite PATH, which would create a local
+# file named after the URL (password included).
+POSTGRES_SCHEMES = ("postgresql", "postgres")
+POSTGRES_URL_PREFIXES = tuple(f"{scheme}://" for scheme in POSTGRES_SCHEMES)
+
+
+def is_postgres_url(url: str) -> bool:
+    """Whether a database value is a Postgres URL rather than a sqlite path."""
+    return url.startswith(POSTGRES_URL_PREFIXES)
+
+
 def default_env_file() -> Path:
     """The env file this process reads: REWORK_ENV_FILE, else
     ~/.rework/rework.env (the same file systemd loads on rewvis)."""
@@ -150,14 +163,14 @@ class Config:
 
     @property
     def is_postgres(self) -> bool:
-        return self.db.startswith("postgresql://") or self.db.startswith("postgres://")
+        return is_postgres_url(self.db)
 
     @classmethod
     def from_env(cls) -> Config:
         db = os.environ.get("REWORK_DB", _default_db())
         author_name = os.environ.get("REWORK_GIT_AUTHOR_NAME", "rework")
         author_email = os.environ.get("REWORK_GIT_AUTHOR_EMAIL", "rework@rework.local")
-        if db.startswith(("postgresql://", "postgres://")):
+        if is_postgres_url(db):
             # single source of truth: state and checkpoints share the database
             return cls(
                 db=db,

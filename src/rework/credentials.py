@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
-from rework.config import parse_env_file
+from rework.config import is_postgres_url, parse_env_file
 
 if TYPE_CHECKING:
     from rework.targets import TargetsFile
@@ -128,9 +128,19 @@ def target_key(url: str) -> tuple[str, str, str, str] | None:
     database name and the non-credential query string (sslmode and friends).
     A credential rotation changes the user/password only, so two URLs with the
     same key address the same database. None when the value cannot be read as
-    a postgres URL: this runs on a recovery path, so it never raises."""
+    a postgres URL: this runs on a recovery path, so it never raises.
+
+    The SCHEME is part of the check, not of the key, and it is decided by the
+    loader's OWN predicate (config.is_postgres_url, what Config.from_env uses),
+    so the guard can never drift from what is actually opened: anything that
+    predicate rejects becomes a sqlite PATH, i.e. a local file whose NAME is the
+    URL, password included, so a scheme typo must never read as a rotation.
+    A scheme difference BETWEEN accepted forms (`postgresql://` vs `postgres://`)
+    still keys the same, because that is not a credential problem."""
     try:
         parts = urlsplit(url)
+        if not is_postgres_url(url):
+            return None
         host = (parts.hostname or "").lower()
         port = str(parts.port or "")
         database = parts.path.strip("/")

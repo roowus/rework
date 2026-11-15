@@ -215,6 +215,63 @@ def test_a_changed_password_on_the_same_host_port_and_database_is_accepted(
     )
 
 
+def test_a_candidate_with_a_wrong_scheme_is_never_a_rotation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit blocker: target_key looked at host/port/db only, so a value
+    differing from the in-use DSN by a SCHEME TYPO keyed identically and was
+    accepted. Config.from_env opens anything that is not `postgresql://`/
+    `postgres://` as a sqlite PATH, so the wrong scheme left the TUI silently
+    "live" on an empty local file whose NAME held the DSN, password included."""
+    path = tmp_path / "rework.env"
+    monkeypatch.setenv("REWORK_DB", STALE)
+    for wrong in (
+        "postgresql+asyncpg://postgres:LIVEHOSTPASS@db.internal:5433/rework_state",
+        "junk://postgres:LIVEHOSTPASS@db.internal:5433/rework_state",
+        "http://postgres:LIVEHOSTPASS@db.internal:5433/rework_state",
+        "mysql://postgres:LIVEHOSTPASS@db.internal:5433/rework_state",
+        # urlsplit lowercases the scheme, but the loader matches the prefix
+        # case-sensitively, so this is still a sqlite path to Config.from_env.
+        "POSTGRESQL://postgres:LIVEHOSTPASS@db.internal:5433/rework_state",
+    ):
+        path.write_text(f"REWORK_DB={wrong}\n")
+        assert fresh_db_url(path, STALE, ("REWORK_DB",)) is None, wrong
+        # and the guard holds where it matters: the environment is untouched
+        assert (
+            recover_db_credentials(current_url=STALE, env_file=path, var_names=("REWORK_DB",))
+            is None
+        ), wrong
+        assert os.environ["REWORK_DB"] == STALE, wrong
+
+
+def test_the_two_accepted_postgres_schemes_are_interchangeable(tmp_path: Path) -> None:
+    """`postgres://` and `postgresql://` name the same database and both open a
+    real Postgres connection, so a rotation that only changes the spelling is
+    still a rotation (the guard rejects scheme TYPOS, not this)."""
+    path = tmp_path / "rework.env"
+    path.write_text("REWORK_DB=postgres://postgres:LIVEHOSTPASS@db.internal:5433/rework_state\n")
+    assert fresh_db_url(path, STALE) == (
+        "postgres://postgres:LIVEHOSTPASS@db.internal:5433/rework_state"
+    )
+    long_current = "postgresql://postgres:STALEPASS@db.internal:5433/rework_state"
+    path.write_text(f"REWORK_DB={FRESH}\n")
+    assert fresh_db_url(path, long_current) == FRESH
+
+
+def test_fresh_db_url_refuses_to_rotate_from_a_non_postgres_current_url(tmp_path: Path) -> None:
+    """Defensive: a current URL the loader would not open as Postgres is not a
+    database this process can be said to be rotating credentials ON."""
+    path = tmp_path / "rework.env"
+    path.write_text(f"REWORK_DB={FRESH}\n")
+    for current in (
+        "junk://postgres:STALEPASS@db.internal:5433/rework_state",
+        "postgresql+asyncpg://postgres:STALEPASS@db.internal:5433/rework_state",
+        "http://postgres:STALEPASS@db.internal:5433/rework_state",
+        "POSTGRESQL://postgres:STALEPASS@db.internal:5433/rework_state",
+    ):
+        assert fresh_db_url(path, current) is None, current
+
+
 def test_fresh_db_url_never_switches_from_an_unparseable_current_url(tmp_path: Path) -> None:
     """Nothing to compare against means nothing can be proven to be the same
     database, so the safe answer is None (this runs while already failing)."""

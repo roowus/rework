@@ -596,6 +596,10 @@ The procedure:
 4. Nothing else. Open TUIs reconnect on their next failed query, and a
    `rework library-mcp` process that already holds a session does the same.
 
+Recovery is monotone, so a process never goes back to a URL it has already
+left: a deliberate rotation BACK to a previous password is only picked up when
+the TUI or `library-mcp` process is restarted.
+
 ## Preview a PR
 
 `rework preview <n>` runs pull request <n>'s build as a fully isolated second
