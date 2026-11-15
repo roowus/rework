@@ -18,12 +18,13 @@ from pathlib import Path
 from typing import Any
 
 from rework import update
-from rework.config import Config
+from rework.config import Config, max_roles
 from rework.kernel.events.bus import EventBus
 from rework.kernel.llm.catalog import ModelCatalog
 from rework.kernel.state.records import EventRecord, EventType, MissionStatus
 from rework.kernel.state.store import StateStore
 from rework.orchestrator.engine import CheckpointerFactory, MissionRunner
+from rework.orchestrator.limits import MissionSlot, RoleLimiter
 from rework.roles.registry import RoleRegistry
 from rework.runtime import CODE_CHANGED, CodeChangeWatcher, find_repo_root
 
@@ -124,6 +125,9 @@ class Daemon:
         self._repo_root: Path | None = None
         self._last_update_check = 0.0
         self._sem = asyncio.Semaphore(config.concurrency)
+        # daemon-wide cap on concurrently RUNNING roles, shared by every
+        # mission's RunSupervisor (REWORK_MAX_ROLES, orchestrator/limits.py)
+        self._limiter = RoleLimiter(max_roles(config), poll_interval_s=config.poll_interval_s)
         self._runners: dict[str, asyncio.Task[None]] = {}
         self._bg: set[asyncio.Task[None]] = set()
         self._owner = f"daemon-{uuid.uuid4().hex[:8]}"
@@ -228,7 +232,14 @@ class Daemon:
             return
 
         async def guarded() -> None:
-            async with self._sem:
+            # the mission slot is taken for WORK only. The runner hands it back
+            # while it sits at a gate / waits for the owner / is on hold
+            # (MissionSlot.while_waiting), so a waiting mission never blocks an
+            # approved gate from proceeding (docs/ops.md#rewvis). Built here (not
+            # in _spawn_runner) so the coroutine owns its own event loop's state.
+            slot = MissionSlot(self._sem, mission_id)
+            await slot.acquire()
+            try:
                 runner = MissionRunner(
                     mission_id,
                     self._store,
@@ -240,8 +251,12 @@ class Daemon:
                     poll_interval_s=self._config.poll_interval_s,
                     git_author=self._config.git_author,
                     library=self._library,
+                    slot=slot,
+                    limiter=self._limiter,
                 )
                 await runner.run()
+            finally:
+                slot.release()
 
         self._runners[mission_id] = asyncio.create_task(guarded())
 

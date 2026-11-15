@@ -330,6 +330,135 @@ it the command says so and exits 1).
 A `DaemonLocked` right after a restart is benign: the old heartbeat is still
 fresh; systemd's restart retry wins after one stale window.
 
+### rework cannot overload its host
+
+rewvis is 2 CPUs, 12 GB of RAM, 4 GB of swap, and it is shared: sshd,
+tailscaled, Postgres (`rework-dev-pg`), journald and the daemon all live on it.
+rework therefore bounds itself. Three knobs, all optional, all in
+`~/.rework/rework.env`:
+
+| variable | default | what it caps |
+| --- | --- | --- |
+| `REWORK_MAX_ROLES` | one per CPU (`os.cpu_count()`, min 1) — 2 on rewvis | roles RUNNING at the same time, across all missions |
+| `REWORK_ROLE_MEMORY_MAX` | 60% of RAM | the memory one role's command tree may use before the kernel kills it |
+| `REWORK_CONCURRENCY` | `min(cpu_count, 4)` — 2 on rewvis | working MISSIONS at the same time |
+
+`REWORK_MAX_ROLES` is daemon-wide: every `spawn_role` counts, whichever mission
+it belongs to. Runs beyond the cap are not refused, they queue — the run row
+stays `intent` and the orchestrator sees `queued (waiting for a free role
+slot, cap N)` in `wait` / `check_in`, so a queue never looks like a hung role.
+
+`REWORK_ROLE_MEMORY_MAX` accepts `4G`, `512M`, `60%` or raw bytes (a percentage
+is that share of total RAM, resolved once at startup). rework applies it through
+a chain of mechanisms and uses the FIRST one that works on the box, so a single
+runaway `pytest`/`mypy` dies on its own instead of taking the box (or the
+daemon) down:
+
+1. a systemd transient USER scope with `MemoryMax=` (`systemd-run --user
+   --scope`) — interactive, user-managed installs;
+2. a systemd transient SYSTEM scope with `MemoryMax=` (`systemd-run --system
+   --scope --uid=<uid>`, plus `MemoryAccounting=yes` and `--collect`) — this is
+   the one in force on rewvis: a transient user scope needs a user bus, and
+   `rework.service` has none (`systemd-run --user` there fails with "Failed to
+   connect to bus: No medium found" even though lingering is enabled for
+   ubuntu), whereas the system bus is there and `--uid` runs the command as the
+   owner, not root. It is only attempted when `/run/systemd/private` exists and
+   it fails soft (3 s probe, cached once per process);
+3. a hard `ulimit -v` in the wrapper shell (`/bin/sh -c 'ulimit -v <kB>
+   2>/dev/null; exec <command>'`) — no systemd, no cgroup, no privileges
+   needed, and it still turns swap-thrashing into an allocation failure. It
+   only affects the wrapper's children, never the daemon;
+4. no memory limit at all, if `REWORK_ROLE_MEMORY_MAX` is unset or unparseable
+   and no RAM could be read.
+
+Role commands are deprioritized on every path so the work rework does stays
+behind sshd, tailscaled and Postgres: `nice -n 10`, and the IO IDLE class —
+`ionice -c3` in the fallback and `IOSchedulingClass=idle` in a scope. rework
+says which mechanism is actually in force in ONE daemon log record at the first
+command (`role commands run in a systemd system scope with MemoryMax=5G: …`, or
+`… with MemoryMax=5G (no systemd scope available: applying ulimit -v instead;
+…)`, or `… with NO memory limit`). Check it with `rework logs daemon -g 'role
+commands run'`.
+
+`REWORK_CONCURRENCY` caps WORKING missions only. A mission that is waiting — at
+a gate, for the owner, or on hold — gives its slot back and takes a new one at
+the back of the queue before it works again. Before that, with
+`REWORK_CONCURRENCY=1`, an approved `open_pr` gate could sit for hours behind a
+mission that was merely parked at its own gate.
+
+A sqlite deployment keeps its historical concurrency of 1 unless the env says
+otherwise; Postgres deployments get the host-aware default.
+
+#### The 2026-11-13 incident
+
+The reason all three exist. The kernel OOM killer fired three times — Nov 12
+19:23, Nov 13 06:23 and 06:58 UTC — the last killing a role's `mypy` at 790 MB
+*inside* `rework.service`, which took the service itself down. From about
+16:20 UTC the box was swap-thrashing instead: journald wrote its lines out of
+order, no OOM kill came, and nothing answered until a hard reboot at 17:02.
+
+The load that did it: between 15:57 and 16:24 UTC four missions ran at once,
+one of them a batch mission running four investigators in parallel — 6-7 roles
+at a time, each running `pytest`, `mypy` and `uv sync` on 2 CPUs and 12 GB.
+`REWORK_CONCURRENCY=1` was the stopgap until the caps above existed.
+
+Look for OOM kills before blaming the network, a bad deploy or a hung daemon;
+they are logged by the kernel, not by rework:
+
+```bash
+ssh ubuntu@100.107.125.118 "journalctl -k | grep -i oom"          # every OOM kill
+ssh ubuntu@100.107.125.118 "journalctl -u rework --since '2026-11-13 06:00'"  # died too?
+ssh ubuntu@100.107.125.118 "free -h; uptime; systemctl is-active rework"
+```
+
+A `rework.service` that died without a Python traceback is an OOM kill, not a
+bug: look for `Killed process ... (python3)` in the kernel log and lower
+`REWORK_MAX_ROLES` (1 is the floor and it is a legitimate setting).
+
+#### Boot recovery: `rework-dev-pg` comes up with no network
+
+`rework-dev-pg` publishes its port on the Tailscale address
+`100.107.125.118:5433`, not on `0.0.0.0`. After a reboot Docker started before
+tailscaled had assigned that address, the port bind failed with `cannot assign
+requested address`, and the container came up with no network at all — which
+looks exactly like a dead database from the Mac:
+
+```bash
+ssh ubuntu@100.107.125.118 "docker inspect -f '{{json .NetworkSettings.Ports}}' rework-dev-pg"
+ssh ubuntu@100.107.125.118 "docker logs --tail 30 rework-dev-pg | grep -i 'cannot assign'"
+ssh ubuntu@100.107.125.118 "ip -brief addr show tailscale0"   # is the address there?
+```
+
+Only recreate the container if the data volume is safe. Back the database up
+first, and keep the broken container under a new name instead of deleting it:
+
+```bash
+ssh ubuntu@100.107.125.118 "mkdir -p ~/backups && docker exec rework-dev-pg \
+  pg_dump -U postgres rework_state | gzip > ~/backups/rework_state-$(date +%Y%m%d).sql.gz"
+ssh ubuntu@100.107.125.118 "docker rename rework-dev-pg rework-dev-pg-broken-20261113"
+# then `docker run` the new container on the SAME data volume
+```
+
+The real fix is ordering, in
+`/etc/systemd/system/docker.service.d/wait-for-tailscale.conf`:
+
+```ini
+[Unit]
+After=tailscaled.service
+Wants=tailscaled.service
+
+[Service]
+# a Docker port published on the tailnet address needs tailscaled to have
+# assigned it first, or the bind fails and the container comes up offline
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do \
+  ip -brief addr show tailscale0 | grep -q 100.107.125.118 && exit 0; sleep 1; done; \
+  echo "tailscale address 100.107.125.118 not up after 60s" >&2; exit 1'
+```
+
+Then `sudo systemctl daemon-reload` and `sudo systemctl restart docker`. Verify
+`docker ps` shows the port mapped and the daemon's Postgres connection is
+fresh: `systemctl is-active rework` plus a mission that is not stuck.
+
 Health checks:
 
 ```bash

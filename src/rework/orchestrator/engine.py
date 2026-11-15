@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from contextlib import AbstractAsyncContextManager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,7 @@ from rework.kernel.state.records import (
 from rework.kernel.state.store import StateStore
 from rework.logs import bind
 from rework.nodes.report_sections import accepted_findings_section, mechanical_verdict
+from rework.orchestrator.limits import MissionSlot, RoleLimiter
 from rework.roles.base import EscalationKind, RoleBuildCtx
 from rework.roles.registry import RoleRegistry
 
@@ -144,6 +146,7 @@ class RunSupervisor:
         git_author: tuple[str, str] = ("rework", "rework@rework.local"),
         provider: ModelProvider | None = None,
         library: Any | None = None,
+        limiter: RoleLimiter | None = None,
     ) -> None:
         self._mission = mission
         self._store = store
@@ -155,6 +158,9 @@ class RunSupervisor:
         self._git_author = git_author
         self._provider = provider  # test/di override; None = build from catalog
         self._library = library  # LibraryHandle | None (M5); never breaks a run
+        # daemon-wide cap on concurrently RUNNING roles (REWORK_MAX_ROLES): a
+        # supervisor of its own gets its own limiter, the daemon shares one
+        self.limiter = limiter if limiter is not None else RoleLimiter(1)
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self._closers: list[Callable[[], Awaitable[None]]] = []
         self._ctxs: dict[str, RoleBuildCtx] = {}
@@ -247,8 +253,11 @@ class RunSupervisor:
     async def _execute(self, run: Run, resume_from_checkpoint: bool) -> None:
         """Run one role graph to its next stop: completion or interrupt."""
         bind(mission=self._mission.id, run=run.id, role=run.role)
-        log.info("role %s started%s", run.role, " (resume)" if resume_from_checkpoint else "")
+        # the row stays INTENT (queued) until a role slot is free: that is what
+        # the orchestrator's wait/check_in renders as "queued"
+        await self.limiter.acquire(run.id)
         try:
+            log.info("role %s started%s", run.role, " (resume)" if resume_from_checkpoint else "")
             graph = await self._build_graph(run)
             await self._store.update_run(run.id, status=RunStatus.RUNNING)
             await self._bus.publish(
@@ -290,6 +299,8 @@ class RunSupervisor:
                     payload={"error": f"{type(exc).__name__}: {exc}"},
                 )
             )
+        finally:
+            self.limiter.release(run.id)
 
     def _run_config(self, run: Run) -> dict[str, Any]:
         """Checkpoint thread + a callback that publishes each node start, so a
@@ -355,6 +366,7 @@ class RunSupervisor:
 
     async def _execute_resume(self, run: Run, decision: Any) -> None:
         bind(mission=self._mission.id, run=run.id, role=run.role)
+        await self.limiter.acquire(run.id)
         log.info("role %s resuming with a decision", run.role)
         try:
             graph = await self._build_graph(run)
@@ -373,6 +385,8 @@ class RunSupervisor:
                     payload={"error": f"resume failed: {type(exc).__name__}: {exc}"},
                 )
             )
+        finally:
+            self.limiter.release(run.id)
 
     async def wait_all(self) -> None:
         if self.tasks:
@@ -405,6 +419,8 @@ class MissionRunner:
         git_author: tuple[str, str] = ("rework", "rework@rework.local"),
         provider: ModelProvider | None = None,
         library: Any | None = None,
+        slot: MissionSlot | None = None,
+        limiter: RoleLimiter | None = None,
     ) -> None:
         self._store = store
         self._bus = bus
@@ -420,6 +436,11 @@ class MissionRunner:
         self._gates = GateManager(store, bus)
         self.mission_id = mission_id
         self._supervisor: RunSupervisor | None = None
+        # daemon mission slot (REWORK_CONCURRENCY). None = this runner owns no
+        # slot (tests, evals): the daemon decides, and it is the daemon's
+        # semaphore that a waiting mission gives back.
+        self._slot = slot
+        self._limiter = limiter
 
     async def run(self) -> None:
         bind(mission=self.mission_id)
@@ -442,6 +463,7 @@ class MissionRunner:
             self._git_author,
             self._provider,
             self._library,
+            self._limiter,
         )
         try:
             if (mission.plan or {}).get("orchestrator"):
@@ -935,16 +957,29 @@ class MissionRunner:
             return {**gate.decision, "approved": approved}
         return approved
 
+    def _waiting(self) -> AbstractAsyncContextManager[None]:
+        """Hold no daemon mission slot while this mission only waits.
+
+        docs/ops.md#rewvis: a mission parked at a gate, waiting for the owner or
+        on hold must not occupy a REWORK_CONCURRENCY slot, or an approved gate
+        waits behind a mission that is doing nothing at all. The slot comes back
+        at the back of the queue before work resumes (MissionSlot.while_waiting).
+        """
+        if self._slot is None:
+            return nullcontext()
+        return self._slot.while_waiting()
+
     async def _gate_decision(self, mission_id: str, gate_id: str) -> bool:
         """Read the decision from the gate ROW (the source of truth). The
         row-update and its event commit separately, so the event log can lag
         the empty-open-gates check by a beat; polling the row closes that race
         (found as a rare CI-only 'ship rejected despite approval')."""
-        while True:
-            gate = await self._store.get_gate(gate_id)
-            if gate is not None and gate.status != GateStatus.OPEN:
-                return gate.status == GateStatus.APPROVED
-            await asyncio.sleep(self._poll)
+        async with self._waiting():
+            while True:
+                gate = await self._store.get_gate(gate_id)
+                if gate is not None and gate.status != GateStatus.OPEN:
+                    return gate.status == GateStatus.APPROVED
+                await asyncio.sleep(self._poll)
 
     async def _dispatch_step(self, mission: Mission, step: dict[str, Any]) -> list[Run]:
         role = str(step["role"])
@@ -1081,22 +1116,23 @@ class MissionRunner:
                 payload={"note": "mission paused by owner; roles stopped, state kept"},
             )
         )
-        while True:
-            mission = await self._store.get_mission(self.mission_id)
-            if mission is None:
-                return "cancelled"
-            if mission.status == MissionStatus.CANCELLED:
-                return "cancelled"
-            if mission.status != MissionStatus.ON_HOLD:
-                await self._bus.publish(
-                    EventRecord(
-                        mission_id=self.mission_id,
-                        type=EventType.INFO,
-                        payload={"note": "mission resumed by owner"},
+        async with self._waiting():
+            while True:
+                mission = await self._store.get_mission(self.mission_id)
+                if mission is None:
+                    return "cancelled"
+                if mission.status == MissionStatus.CANCELLED:
+                    return "cancelled"
+                if mission.status != MissionStatus.ON_HOLD:
+                    await self._bus.publish(
+                        EventRecord(
+                            mission_id=self.mission_id,
+                            type=EventType.INFO,
+                            payload={"note": "mission resumed by owner"},
+                        )
                     )
-                )
-                return "ok"
-            await asyncio.sleep(max(self._poll, 0.2))
+                    return "ok"
+                await asyncio.sleep(max(self._poll, 0.2))
 
     async def _pump_until_terminal(self, runs: list[Run]) -> str:
         """Pump until every run is terminal. Returns "cancelled" when the burn
@@ -1171,10 +1207,11 @@ class MissionRunner:
                 },
             )
         )
-        while True:
-            if not await self._store.list_open_gates(self.mission_id):
-                break
-            await asyncio.sleep(self._poll)
+        async with self._waiting():
+            while True:
+                if not await self._store.list_open_gates(self.mission_id):
+                    break
+                await asyncio.sleep(self._poll)
         decision = await self._gate_decision(self.mission_id, gate.id)
         if not decision:
             await self._store.update_mission(
