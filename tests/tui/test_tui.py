@@ -799,6 +799,96 @@ async def test_double_launch_creates_one_mission(
         await store.aclose()
 
 
+async def test_a_live_turn_and_the_poller_do_not_paint_the_same_row_twice(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The 0.3 s transcript poller must not paint a row the live turn is
+    painting itself.
+
+    `_send` awaits `engine.send(...)`, which persists the assistant row and only
+    then registers its id in `own_chat_ids`. A tick that runs inside that window
+    sees the row above `_rendered_max_id`, does not find it among `own_chat_ids`
+    and renders it -- and `_send` renders the same proposal again on top. The
+    observed symptom was two identical cards for ONE engine proposal and ONE
+    stored assistant row. The tick therefore has to stand down while a live turn
+    is in flight; this drives that tick directly, because catching the real
+    window from a test would be a race, not a regression test.
+    """
+    script_provider(
+        monkeypatch,
+        [propose_many({"objective": "say hello", "plan": "echo", "title": "Greeting"})],
+    )
+    from rework.kernel.state.records import ChatMessage
+    from rework.tui.widgets.cards import ProposalCard
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        work = app.view("work")
+        # a fresh chat, the way the turn tests make one: the seeded chat already
+        # carries a proposal of its own, which would muddy the count
+        for ch in "say hello":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        for _ in range(60):  # wait for the scripted turn, not for a fixed time
+            await _settle(pilot, 0.1)
+            if len(app.query(ProposalCard)) >= 1 and not work._sending:
+                break
+        await _settle(pilot, 0.3)
+        chat_id = work.convo.id
+        before = len(app.query(ProposalCard))
+        assert before == 1, await _diag(app)
+
+        # a row lands in the store while a live turn is in flight (this is
+        # exactly what `engine.send` does before `own_chat_ids` knows about it)
+        store = await _store(env)
+        try:
+            await store.append_chat_message(
+                ChatMessage(
+                    chat_id=chat_id,
+                    role="assistant",
+                    body={
+                        "role": "assistant",
+                        "content": "Two separate pieces of work.",
+                        "tool_calls": [
+                            {
+                                "id": "p1",
+                                "type": "function",
+                                "function": {
+                                    "name": "propose_mission",
+                                    "arguments": json.dumps(
+                                        {
+                                            "objective": "say hello",
+                                            "plan": "echo",
+                                            "title": "Greeting",
+                                        }
+                                    ),
+                                },
+                            }
+                        ],
+                    },
+                    display="Two separate pieces of work.",
+                )
+            )
+        finally:
+            await store.aclose()
+
+        work._sending = True  # the window the live turn holds
+        try:
+            await work._tick_chat(chat_id).wait()
+        finally:
+            work._sending = False
+        assert len(app.query(ProposalCard)) == before, (
+            "the poller painted a row the live turn owns\n" + await _diag(app)
+        )
+        assert not app.swallowed
+    store = await _store(env)
+    try:
+        assert [m.objective for m in await store.list_missions(limit=100, chat_id=chat_id)] == []
+    finally:
+        await store.aclose()
+
+
 async def test_a_single_remaining_card_does_not_offer_launch_all(
     ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

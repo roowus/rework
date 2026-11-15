@@ -201,6 +201,11 @@ class WorkView(View):
             # `open_chat` schedules it the same way.
             self._load_chat(chat_id)
             return
+        if self._sending:
+            # a live turn paints its own rows; polling here would paint the
+            # same chat_messages row a second time (own_chat_ids is only
+            # populated after the row is committed)
+            return
         head = await self.hub.guard(partial(data.chat_messages_max_id, chat_id), None)
         if head is None or head <= self._chat_cursor:
             return  # None = the probe failed; <= means nothing new
