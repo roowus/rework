@@ -344,15 +344,19 @@ class Stat(Static):
         self._label = label
         self._value = value
         self._sub = ""
+        self._raw = False
 
     def on_mount(self) -> None:
         self._paint()
 
-    def set(self, value: str, sub: str = "") -> None:
-        if (value, sub) != (self._value, self._sub):
-            self._value, self._sub = value, sub
+    def set(self, value: str, sub: str = "", *, markup: bool = False) -> None:
+        """`markup=True` means `value` is already safe Rich markup (a coloured
+        spinner glyph); otherwise it is escaped like any other text."""
+        if (value, sub, markup) != (self._value, self._sub, self._raw):
+            self._value, self._sub, self._raw = value, sub, markup
             self._paint()
 
     def _paint(self) -> None:
         sub = f"\n[{FAINT}]{esc(self._sub)}[/]" if self._sub else ""
-        self.update(f"[b]{esc(self._value)}[/b]\n[{MUTED}]{esc(self._label)}[/]{sub}")
+        value = self._value if self._raw else esc(self._value)
+        self.update(f"[b]{value}[/b]\n[{MUTED}]{esc(self._label)}[/]{sub}")

@@ -59,12 +59,19 @@ badges). Defined once in `theme.py::STATUS`.
 | state | glyph | colour |
 |---|---|---|
 | pending / intent | `○` | `$faint` |
-| running | `●` | `$accent` |
+| running (live) | braille spinner `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` (one cell, 10 frames, 0.1s each) | `$accent` |
+| running (idle) | `◌` | `$faint` |
 | awaiting gate / halted | `◆` | `$warn` |
 | on hold (paused) | `‖` | `$warn` |
 | done / completed / approved | `✓` | `$ok` |
 | failed / rejected | `✗` | `$danger` |
 | cancelled / aborted | `⊘` | `$faint` |
+
+A running mission or run shows the spinner only while it is producing events.
+With no event for 5 minutes (`spinner.STALL_SECONDS`, 300s) the spinner stops
+and the row shows the static idle marker `◌` plus `idle 7m`, so a wedged run
+cannot look busy. Pending, on hold and awaiting-gate states never animate.
+The frame set and the 5 minute rule live in `tui/spinner.py`.
 
 Trajectory glyphs (Claude-Code familiar):
 
@@ -146,7 +153,10 @@ Each lives in `src/rework/tui/widgets/` and is the only way that thing is drawn.
   anything that escapes into a toast.
 - Long work (model calls, fetch, library index) runs in workers; the UI never
   blocks.
-- Motion: the running glyph pulses; nothing else animates.
+- Motion: only the running spinner animates (dashboard rows, the trajectory
+  tail `working · role · Ns`, Work tab mission cards). One 10fps app timer
+  (`ReworkApp._tick_frames`) paints the active tab only, never touches the
+  store, and takes the frame from the monotonic clock so a poll cannot reset it.
 
 ## 8. Notifications
 

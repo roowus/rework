@@ -159,6 +159,20 @@ class WorkView(View):
         self._refresh_cards()
         self._poll_chat()
 
+    def tick(self, frame: str, now: float) -> None:
+        """Animate the running mission cards (10fps): no store, no remounting.
+
+        The frame comes from the shared clock; the last event time comes from
+        the snapshot the view already holds, so a poll cannot reset the spinner."""
+        cards = [c for c in self.query(MissionCard) if c.status == "running"]
+        if not cards:
+            return
+        stamps = self.snap.last_event
+        with self.painting():
+            for card in cards:
+                last = stamps.get(card.mission_id) or stamps.get("*")
+                card.tick(frame, now, last)
+
     def _poll_chat(self) -> None:
         """Another instance's turns are persisted to the shared store; an
         already-open transcript has to re-read them. Cheap max-id probe first,

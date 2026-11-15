@@ -437,7 +437,7 @@ class DashboardView(View):
                 human = spinner.human_duration(spinner.silence(now, last))
                 self.query_one("#st-running", Stat).set(str(running), f"idle {human}")
             else:
-                self.query_one("#st-running", Stat).set(f"{mark} {running}", "working")
+                self.query_one("#st-running", Stat).set(f"{mark} {running}", "working", markup=True)
 
     def _tick_mission(self, frame: str, now: float) -> None:
         mission = self.snap.mission(self.mission_id)
