@@ -338,35 +338,31 @@ def test_real_rejections_are_not_transient(output: str) -> None:
     assert push_failure_is_transient(output) is False
 
 
-async def test_git_timeout_keeps_the_real_output(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`_run` used to swap git's output for the bare "(git timeout)"; the
+async def test_git_timeout_keeps_the_real_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A REAL subprocess: a `git` on PATH that writes two lines to stderr and
+    then hangs. `_run` used to swap git's output for the bare "(git timeout)"
+    (a second communicate() after a timeout returns b"" on real asyncio); the
     partial output is the only evidence of a push that hung mid-negotiation."""
     import rework.nodes.git_ops as git_ops
 
-    class FakeProc:
-        returncode = 1
+    bindir = tmp_path / "hangbin"
+    bindir.mkdir()
+    shim = bindir / "git"
+    shim.write_text(
+        "#!/bin/sh\necho 'remote: banner line' >&2\necho 'fatal: early EOF' >&2\nexec sleep 30\n"
+    )
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
 
-        def __init__(self) -> None:
-            self.calls = 0
+    code, out = await git_ops._run(tmp_path, "push", timeout_s=1)
 
-        def terminate(self) -> None:
-            pass
-
-        async def communicate(self) -> tuple[bytes, bytes]:
-            self.calls += 1
-            if self.calls == 1:
-                raise TimeoutError
-            await asyncio.sleep(0)
-            return (b"remote: banner line\nfatal: early EOF\n", b"")
-
-    async def fake_exec(*args: Any, **kwargs: Any) -> Any:
-        return FakeProc()
-
-    monkeypatch.setattr(git_ops.asyncio, "create_subprocess_exec", fake_exec)
-    code, out = await git_ops._run(Path("."), "push", timeout_s=0.01)
     assert code == 124
-    assert "fatal: early EOF" in out, "the real output must survive the timeout"
-    assert "timeout" in out
+    lines = out.splitlines()
+    assert lines[:2] == ["remote: banner line", "fatal: early EOF"], out
+    assert lines[-1] == "(git timeout after 1s)"
+    assert push_failure_is_transient(out, code) is True
 
 
 # ---------------------------------------------------------------------------
@@ -940,3 +936,32 @@ def test_pr_classification_ignores_marker_words_in_names_and_numbers() -> None:
     assert pr_failure_is_transient("created 512 objects, 5432 bytes") is False
     assert pr_failure_is_transient("could not open /tmp/server-permission/x: timed out") is True
     assert pr_failure_is_transient("HTTP 502: Bad Gateway for branch rework/permission-fix") is True
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        # bare curl form, no `RPC failed` / `HTTP` prefix
+        "error: The requested URL returned error: 503",
+        "fatal: unable to access: The requested URL returned error: 502",
+        # proxy/init noise that merely contains a weak word, then a 5xx
+        "invalid response from proxy\nerror: The requested URL returned error: 504",
+    ],
+)
+def test_a_bare_5xx_is_retryable_for_push_and_pr(output: str) -> None:
+    assert push_failure_is_transient(output) is True
+    assert pr_failure_is_transient(output) is True
+
+
+def test_weak_words_are_not_definitive_non_retry_markers() -> None:
+    # `invalid` / bare `authentication` are not decisions by the forge: they
+    # must not turn a timeout into a "real rejection"
+    assert pr_failure_is_transient("invalid response from proxy: timed out") is True
+    assert pr_failure_is_transient("authentication proxy init: connection reset") is True
+    # ...and on their own they do not make anything retryable either
+    assert pr_failure_is_transient("invalid response") is False
+    assert push_failure_is_transient("invalid response") is False
+    # the forge's real decisions still win
+    assert pr_failure_is_transient("gh: Authentication failed (HTTP 401)") is False
+    assert pr_failure_is_transient("GraphQL: Resource not accessible: forbidden") is False
+    assert pr_failure_is_transient("remote: error: GH006: Protected branch update failed") is False

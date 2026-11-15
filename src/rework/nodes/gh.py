@@ -11,10 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 from pathlib import Path
 
-from rework.nodes.failure_text import marker_regex, scrub
+from rework.nodes.failure_text import HTTP_5XX, marker_regex, scrub
 
 PR_ATTEMPTS = 3
 PR_BACKOFF_S: tuple[float, ...] = (1.0, 2.0, 4.0)
@@ -41,20 +40,27 @@ _PR_TRANSIENT_MARKERS = (
     "bad gateway",
 )
 # The forge already answered (a PR exists, the token is not allowed): repeating
-# the call changes nothing and can only confuse the owner.
+# the call changes nothing and can only confuse the owner. Only phrases the
+# forge itself DECIDED belong here. Broad words (`invalid`, a bare
+# `authentication`) fire on proxy/init noise such as `invalid response`, so
+# they are deliberately absent.
+# Principle: a wasted retry costs seconds; a false "real rejection" costs the
+# mission's PR (the owner is told to fix something they cannot). When in
+# doubt, retry.
 _PR_DEFINITIVE_MARKERS = (
     "already exists",
     "already been taken",
-    "authentication",
+    "authentication failed",
     "not logged in",
     "permission",
     "forbidden",
     "unauthorized",
     "gh_token",
     "no commits between",
-    "invalid",
+    "protected branch",
+    "gh006",
+    "gh013",
 )
-_PR_5XX = re.compile(r"\b(?:http|status|error|returned error)[/:\s.\d]*\b5\d\d\b")
 _PR_TRANSIENT_RE = marker_regex(_PR_TRANSIENT_MARKERS)
 _PR_DEFINITIVE_RE = marker_regex(_PR_DEFINITIVE_MARKERS)
 
@@ -75,7 +81,7 @@ def pr_failure_is_transient(output: str) -> bool:
     text = scrub(output)
     if _PR_DEFINITIVE_RE.search(text):
         return False
-    if _PR_5XX.search(text):
+    if HTTP_5XX.search(text):
         return True
     return bool(_PR_TRANSIENT_RE.search(text))
 

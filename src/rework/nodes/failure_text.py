@@ -34,3 +34,8 @@ def marker_regex(markers: Iterable[str]) -> re.Pattern[str]:
     side disqualify: `ssl` must not match inside `classless`)."""
     alternation = "|".join(re.escape(m) for m in markers)
     return re.compile(rf"(?<![a-z0-9])(?:{alternation})(?![a-z0-9])")
+
+
+# A 5xx status in git/gh output: `HTTP 503`, `status: 502`, and the bare curl
+# form `The requested URL returned error: 503`. Shared by both classifiers.
+HTTP_5XX = re.compile(r"\b(?:http|status|error|returned error)[/:\s.\d]*\b5\d\d\b")

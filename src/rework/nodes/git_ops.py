@@ -11,7 +11,7 @@ import contextlib
 import re
 from pathlib import Path
 
-from rework.nodes.failure_text import marker_regex, scrub
+from rework.nodes.failure_text import HTTP_5XX, marker_regex, scrub
 from rework.nodes.tools import ToolExecutor
 
 
@@ -23,19 +23,37 @@ async def _run(repo: Path, *args: str, timeout_s: float = 60.0) -> tuple[int, st
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
-    try:
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-    except TimeoutError:
-        proc.terminate()
-        # keep whatever git had already written before it hung: replacing it
-        # with a bare placeholder threw away the only evidence of the failure
-        partial = b""
-        with contextlib.suppress(Exception):
-            partial, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
-        text = partial.decode(errors="replace").strip()
+    # Read incrementally: after a timed-out communicate() the pipe is abandoned
+    # and a second communicate() returns b"" on real asyncio, so the only way
+    # to keep what git wrote before it hung (the `remote:` banner, `fatal:
+    # early EOF`) is to already hold the bytes when the deadline hits.
+    assert proc.stdout is not None
+    chunks: list[bytes] = []
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
+    timed_out = False
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            timed_out = True
+            break
+        try:
+            chunk = await asyncio.wait_for(proc.stdout.read(4096), timeout=remaining)
+        except TimeoutError:
+            timed_out = True
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+    text = b"".join(chunks).decode(errors="replace").strip()
+    if timed_out:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        await proc.wait()
         note = f"(git timeout after {timeout_s:g}s)"
         return 124, f"{text}\n{note}" if text else note
-    return proc.returncode or 0, out.decode(errors="replace").strip()
+    await proc.wait()
+    return proc.returncode or 0, text
 
 
 async def has_repo(path: Path) -> bool:
@@ -320,7 +338,10 @@ def push_failure_is_transient(output: str, code: int = 1) -> bool:
         return False
     if any(pattern.search(text) for pattern in _PUSH_REJECTION_PATTERNS):
         return False
-    if _PUSH_TRANSIENT_RE.search(text):
+    # a 5xx is the forge failing, not deciding: checked before the weaker
+    # transient markers (a wasted retry costs seconds; a false "real
+    # rejection" costs the mission's PR)
+    if HTTP_5XX.search(text) or _PUSH_TRANSIENT_RE.search(text):
         return True
     return bool(_PUSH_REASONLESS_REJECTION.search(text))
 
