@@ -54,6 +54,11 @@ Plans you can choose:
 - echo    — no roles, just prove the plumbing works
 - fix     — investigate, code, audit, then a ship gate
 - fix-pr  — same, then the engine opens a pull request (no gate by default)
+- draft   — use draft for document work: research write-ups, reports, letters,
+            content — anything whose deliverable is writing, not code. The roles
+            research with the web tools, write the draft as files in the
+            project, and audit every claim against its cited source. No branch
+            push and no PR.
 
 A project may also be repo-less: its transport is "upload", which means rework
 keeps that project's files itself. For an upload project, fix and fix-pr do NOT
@@ -102,7 +107,7 @@ PROPOSE_TOOL = ToolSpec(
                 "type": "string",
                 "description": "A short name for lists, 3 to 6 words.",
             },
-            "plan": {"type": "string", "enum": ["echo", "fix", "fix-pr"]},
+            "plan": {"type": "string", "enum": ["echo", "fix", "fix-pr", "draft"]},
             "project": {"type": "string", "description": "Project name, or empty for none."},
             "repo": {
                 "type": "string",

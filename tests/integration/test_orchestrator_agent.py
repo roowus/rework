@@ -756,6 +756,29 @@ async def test_the_catalog_shows_each_model_s_provider_and_endpoint(
     assert "tier 3" in catalog and "per Mtok" in catalog, "the rest of the line is intact"
 
 
+async def test_the_roles_block_names_the_web_tools_without_the_draft_playbook(
+    world: dict[str, Any],
+) -> None:
+    """A fix mission's planner must still learn that investigators and coders can
+    reach the public web: before this, web_search/fetch_url were named only in
+    PLAYBOOKS["draft"], so `fix`/`fix-pr` missions never heard of them."""
+    from rework.orchestrator.agent import PLAYBOOKS, MissionOrchestrator
+
+    world["mission"].plan = {**(world["mission"].plan or {}), "playbook": "fix"}
+    prompt = await MissionOrchestrator(runner(world), world["mission"])._system_prompt()
+    roles = prompt.split("ROLES:")[1].split("Automatic wiring:")[0]
+    lines = {ln.split(":")[0].strip("- "): ln for ln in roles.splitlines() if ln.startswith("- ")}
+    for role in ("investigator", "coder"):
+        line = lines[role]
+        assert "web_search" in line, f"the {role} entry does not mention web_search: {line}"
+        assert "fetch_url" in line, f"the {role} entry does not mention fetch_url: {line}"
+    assert "web_search" not in lines["auditor"], "the auditor must not gain web access"
+    # and the proof it does not come from the playbook text
+    playbook_text = prompt.split("PLAYBOOK (fix):")[1].split("ROLES:")[0]
+    assert "web_search" not in playbook_text and "fetch_url" not in playbook_text
+    assert "web_search" in PLAYBOOKS["draft"], "the draft playbook still names them too"
+
+
 async def test_the_rules_say_to_retry_on_another_provider_and_not_a_pricier_tier(
     world: dict[str, Any],
 ) -> None:
