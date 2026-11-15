@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import time
 from functools import partial
+from pathlib import Path
 from typing import Any, ClassVar
 
 from textual import work
@@ -59,6 +60,7 @@ from rework.tui.widgets.graph import (
     mission_layers,
     mission_nodes,
 )
+from rework.tui.widgets.modals import Field, Form
 from rework.tui.widgets.trajectory import Trajectory, role_of
 
 ALL = "*"
@@ -82,6 +84,36 @@ MTABS = [
     ("Report", "report"),
     ("Gates", "gates"),
 ]
+
+
+def parse_paths(raw: str) -> list[str]:
+    """The Add-files form's value -> paths ready to hand to `add-files`.
+
+    ONE PATH PER LINE is the primary form, so a path containing spaces
+    (`/Users/me/My Papers`) can finally be entered at all; a line that is a
+    shell-ish list is split like a shell (`shlex`), and the historical
+    comma/space-separated single line still works. `~` is expanded.
+
+    Splitting the whole input on spaces was the bug: a path with a space in it
+    was unenterable. A line that DOES exist on disk is never split, so the two
+    readings cannot disagree about a real path."""
+    import shlex
+
+    paths: list[str] = []
+    for line in raw.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        if Path(text).expanduser().exists():
+            paths.append(str(Path(text).expanduser()))
+            continue  # the line IS one real path, spaces and all
+        try:
+            parts = shlex.split(text)
+        except ValueError:  # unbalanced quote: take the line literally
+            parts = [text]
+        for part in parts:
+            paths.extend(str(Path(p).expanduser()) for p in part.replace(",", " ").split())
+    return [p for p in paths if p.strip()]
 
 
 class DashboardView(View):
@@ -149,6 +181,10 @@ class DashboardView(View):
                     yield Stat("spend · 7d", id="st-week")
                 with Horizontal():
                     with Vertical(classes="sidebar", id="dash-side"):
+                        with Horizontal(classes="side-actions"):
+                            # only an upload-transport (repo-less) project has a
+                            # files area to add to; a git project is told to push
+                            yield Btn("Add files", "add-files", variant="ghost")
                         yield Label("Projects")
                         yield RowList(id="proj-list")
                     with Vertical(classes="main"):
@@ -646,6 +682,11 @@ class DashboardView(View):
             self.ai_armed = True
             self._run_ai_search()
             return
+        if event.action == "add-files":
+            # the selected PROJECT decides, not a mission: works with nothing open
+            event.stop()
+            self.add_project_files()
+            return
         if not self.mission_id:
             return
         event.stop()
@@ -670,6 +711,56 @@ class DashboardView(View):
             self.run_worker(actions.prioritize(self.rw, self.mission_id, current), group="control")
             return
         self.run_worker(actions.control(self.rw, self.mission_id, verb), group="control")
+
+    def add_project_files(self) -> None:
+        """Push local files into the selected project's files area (upload
+        transport only). The daemon keeps them; missions seed from there."""
+        from rework.missions import project_is_upload
+
+        project = next((p for p in self.snap.projects if p.id == self.project), None)
+        if project is None:
+            self.toast("Select a project first", severity="warning")
+            return
+        if not project_is_upload(project.settings):
+            self.toast("this project uses git: push a branch instead", severity="warning")
+            return
+
+        def done(values: dict[str, str] | None) -> None:
+            if values is None:
+                return
+            paths = parse_paths(values.get("paths", ""))
+            if not paths:
+                self.toast("No paths given", severity="warning")
+                return
+            self.run_worker(self._add_project_files(project.id, paths), group="add-files")
+
+        self.rw.push_screen(
+            Form(
+                f"Add files to {project.name}",
+                [
+                    Field(
+                        "paths",
+                        "Local files/folders on this machine: one path per line"
+                        " (~ is expanded; commas and spaces also separate paths)",
+                        kind="area",
+                    )
+                ],
+                submit="Add",
+            ),
+            done,
+        )
+
+    async def _add_project_files(self, project_id: str, paths: list[str]) -> None:
+        try:
+            changed = await self.hub.data.add_project_files(project_id, paths)
+        except Exception as exc:
+            self.toast(f"Could not add files: {exc}", severity="error")
+            return
+        if changed:
+            self.toast(f"{len(changed)} path(s) added to the project files")
+        else:
+            self.toast("no changes (identical)")
+        await self.hub.refresh()
 
     def _disarm(self, btn: Btn) -> None:
         btn.remove_class("-armed")
