@@ -87,9 +87,13 @@ The Graph draws two levels and they must never be confused:
   Only the current step is `▶` + `$accent` bold.
 - **The mission**: review rounds, coder(s) -> audit -> revision. The edge into
   an audit carries its findings (`request changes: 2 high`); the edge leaving
-  an audit carries the verdict's direction - toward the next coder revision
-  (`request changes`) or on to the mission's gates (`approve`). An edge is
-  `│ ▼ label`, so its height is auto: a fixed height clipped the label.
+  an audit carries the audit's mechanical verdict (`request changes`,
+  `approve`) and nothing more - which direction it means is implied by where
+  the arrow points, toward a revision or on to the gates/end (a mission capped
+  by `max_rounds` ends on `request changes` too, and the arrow says so). The
+  leaving edge stays unlabelled while the round's audit is still running: there
+  is no verdict yet, and the into-audit edge already carries the state. An edge
+  is `│ ▼ label`, so its height is auto: a fixed height clipped the label.
 
 ## 4. Layout
 

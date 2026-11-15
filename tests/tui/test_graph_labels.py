@@ -135,14 +135,20 @@ async def test_non_running_run_keeps_the_strip_but_no_marker() -> None:
     assert "▶" not in text, text
 
 
-def _run(run_id: str, role: str, attempt: int, artifact: dict[str, Any] | None = None) -> Run:
+def _run(
+    run_id: str,
+    role: str,
+    attempt: int,
+    artifact: dict[str, Any] | None = None,
+    status: RunStatus = RunStatus.COMPLETED,
+) -> Run:
     return Run(
         id=run_id,
         mission_id="m-labels0001",
         role=role,
         step="code" if role == "coder" else "audit",
         attempt=attempt,
-        status=RunStatus.COMPLETED,
+        status=status,
         context={"strictness": "standard"} if role == "auditor" else {},
         artifact=artifact,
     )
@@ -204,3 +210,57 @@ async def test_mission_flow_renders_the_review_verdicts() -> None:
         assert "approve" in text, text
         # the review direction is visible at mission level: audit -> revision
         assert any(e.strip().splitlines()[-1].strip() == "request changes" for e in edges), text
+
+
+def test_leaving_a_running_audit_has_no_label() -> None:
+    """A running audit has no verdict yet, and `mechanical_verdict` is
+    fail-closed ('not audited'), so labelling its out-edge would repeat the
+    into-audit label on the far side and read like a reached verdict."""
+    runs = [
+        _run("m-labels0001:code:coder:1", "coder", 1, {"branch": "b"}),
+        _run("m-labels0001:audit:auditor:1", "auditor", 1, None, RunStatus.RUNNING),
+    ]
+    layers = mission_layers(_mission(), runs, [], {}, {}, [])
+    by_key = {node.key: i for i, layer in enumerate(layers) for node in layer.nodes}
+
+    coder_layer = layers[by_key["m-labels0001:code:coder:1"]]
+    audit_layer = layers[by_key["m-labels0001:audit:auditor:1"]]
+
+    # the edge INTO the running audit still says where the review stands
+    into = coder_layer.edge_to_next
+    assert into is not None and into.label, into
+    assert "not audited" in into.label, into
+    # ... and the edge LEAVING it must not repeat that as if it were a verdict
+    leaving = audit_layer.edge_to_next
+    assert leaving is None or not leaving.label, leaving
+
+
+def test_leaving_a_round_with_one_running_auditor_has_no_label() -> None:
+    """Mixed parallel auditors: one already approved, one still running. Both
+    in-edge and out-edge would otherwise read 'approve / not audited'."""
+    runs = [
+        _run("m-labels0001:code:coder:1", "coder", 1, {"branch": "b"}),
+        _run("m-labels0001:audit:auditor:1", "auditor", 1, {"findings": []}),
+        _run("m-labels0001:audit:auditor:2", "auditor", 2, None, RunStatus.RUNNING),
+    ]
+    layers = mission_layers(_mission(), runs, [], {}, {}, [])
+    by_key = {node.key: i for i, layer in enumerate(layers) for node in layer.nodes}
+    leaving = layers[by_key["m-labels0001:audit:auditor:2"]].edge_to_next
+    assert leaving is None or not leaving.label, leaving
+
+
+async def test_running_audit_renders_an_unlabelled_edge() -> None:
+    runs = [
+        _run("m-labels0001:code:coder:1", "coder", 1, {"branch": "b"}),
+        _run("m-labels0001:audit:auditor:1", "auditor", 1, None, RunStatus.RUNNING),
+    ]
+    layers = mission_layers(_mission(), runs, [], {}, {}, [])
+    app = GraphApp()
+    async with app.run_test() as pilot:
+        app.query_one("#m-graph", GraphView).set_layers(layers)
+        await pilot.pause()
+        edges = [str(e.render()).splitlines() for e in app.query(".gedge")]
+        # orchestrator -> coder -> audit -> end; the into-audit edge keeps the
+        # state ('not audited'), the leaving edge is a bare '│ ▼', no third line
+        assert "not audited" in "\n".join(edges[1]), edges
+        assert len(edges[2]) == 2 and edges[2][-1].strip() == "▼", edges

@@ -502,11 +502,22 @@ def _review_edge_label(audits: list[Any]) -> str:
     return verdict
 
 
+def _audits_terminal(audits: list[Any]) -> bool:
+    """True once every audit of the round has finished (status, not verdict)."""
+    return all(status_value(a.status) not in {"pending", "intent", "running"} for a in audits)
+
+
 def _outcome_edge_label(audits: list[Any]) -> str:
     """What an audit told the next coder on its way out of the review:
     'request changes' / 'approve with fixes' / 'approve' (the mechanical
-    verdict's own words, so the graph invents no second vocabulary)."""
-    if not audits:
+    verdict's own words, so the graph invents no second vocabulary).
+
+    Empty while any audit of the round is still running: `mechanical_verdict` is
+    fail-closed (no artifact yet => 'not audited'), which would put the same
+    pre-verdict string on both sides of the same audit and read like a reached
+    verdict. The edge INTO the audit already carries the state.
+    """
+    if not audits or not _audits_terminal(audits):
         return ""
     verdicts = {mechanical_verdict(a.artifact) for a in audits}
     return " / ".join(sorted(verdicts))
@@ -678,11 +689,14 @@ def mission_layers(
         if round_.audits and round_.coders and len(round_layers) >= 2:
             round_layers[-2].edge_to_next = GEdge(label=_review_edge_label(round_.audits))
         if round_.is_review and round_layers:
-            # The edge LEAVING the audit was blank. It carries the verdict's
-            # DIRECTION - 'request changes' toward the next coder revision, or
-            # 'approve' when the mission proceeds to its gates/end - so the
-            # audit loop reads at mission level, not as one run's inner steps.
-            round_layers[-1].edge_to_next = GEdge(label=_outcome_edge_label(round_.audits))
+            # The edge LEAVING the audit was blank. It carries the audit's
+            # mechanical verdict ('request changes' / 'approve'), so the audit
+            # loop reads at mission level, not as one run's inner steps. Only
+            # once the round's audits are terminal: before that there is no
+            # verdict yet, and the into-audit edge already shows the state.
+            outcome = _outcome_edge_label(round_.audits)
+            if outcome:
+                round_layers[-1].edge_to_next = GEdge(label=outcome)
         layers.extend(round_layers)
         if round_.is_review:
             seen_review = True
