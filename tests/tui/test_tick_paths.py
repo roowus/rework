@@ -328,12 +328,15 @@ def _due(view: Any) -> None:
 
 
 def _count(view: Any, name: str) -> SimpleNamespace:
-    """Count calls of one paint method, still running it."""
+    """Count calls of one paint method, still running it. A call carrying a
+    `frame` is the spinner's 10 fps animation tick, not a poll: it repaints a
+    running mission's header by design and is not what these tests pin."""
     seen = SimpleNamespace(n=0)
     real = getattr(view, name)
 
     def counting(*a: Any, **kw: Any) -> Any:
-        seen.n += 1
+        if "frame" not in kw:
+            seen.n += 1
         return real(*a, **kw)
 
     setattr(view, name, counting)

@@ -422,7 +422,7 @@ async def test_a_failed_full_fetch_shows_the_light_facts_backs_off_and_recovers(
         assert dash.full_failed and not dash.full_mission.light
         stale = str(header.render())
         assert "could not load plan/result (retrying)" in stale, stale
-        assert "running  fix" in stale, "the stale plan label is still shown"
+        assert "fix  ·  polystats" in stale, "the stale plan label is still shown"
         broken = False
         dash._full_next_try = 0.0
         await app.hub.refresh()

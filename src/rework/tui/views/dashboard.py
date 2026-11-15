@@ -586,7 +586,10 @@ class DashboardView(View):
         build them the same way (and with the same keys)."""
         snap = self.snap
         rows = [RowData(ALL, self._proj_row("All projects", snap.missions, frame=frame, now=now))]
+        needle = self.project_query.strip().lower()
         for p in snap.projects:
+            if needle and needle not in str(p.name).lower():
+                continue
             ms = [m for m in snap.missions if m.project_id == p.id]
             rows.append(RowData(p.id, self._proj_row(p.name, ms, frame=frame, now=now)))
         loose = [m for m in snap.missions if not m.project_id]
@@ -1231,6 +1234,9 @@ class DashboardView(View):
             tuple(sorted(self.run_cost.items())),
             len(self.events),
             self._report_key(),
+            # the spinner reads "working" vs "idle 7m" off this stamp: a poll alone
+            # (no tick while unfocused) must repaint the header when it moves
+            self._stamp(self.mission_id),
         )
 
     async def _load_full_mission(self, mission_id: str) -> None:

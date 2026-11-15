@@ -188,6 +188,14 @@ class MissionCard(Vertical):
             self.last_seq = max(self.last_seq, max(int(ev.seq or 0) for ev in events))
         self.paint()
 
+    def observe(self, last_event: float | None) -> bool:
+        """Take this poll's event stamp. True when it moved (the caller repaints),
+        so an UNCHANGED poll still flips a silent card to idle without a tick."""
+        if self.status != "running" or last_event == self._last_event:
+            return False
+        self._last_event = last_event
+        return True
+
     def tick(self, frame: str, last_event: float | None) -> None:
         """Repaint the card head with the current spinner frame (surface d).
 

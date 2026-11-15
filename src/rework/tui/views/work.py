@@ -185,6 +185,10 @@ class WorkView(View):
             self._paint_chat_list()  # "4m ago" on each chat row
             for card in cards:  # "started 3m ago" on each live card
                 card.paint()
+        else:
+            for card in cards:  # a moved event stamp can flip a card to idle
+                if card.observe(snap.last_event.get(card.mission_id)):
+                    card.paint()
         if cards:
             self._poll_cards(cards)
         self._poll_chat()
