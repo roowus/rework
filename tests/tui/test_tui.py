@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from textual.widgets import Input
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -763,6 +764,120 @@ async def test_dashboard_drill_down_and_back(ids: dict[str, str]) -> None:
         await pilot.pause()
         assert dash.mission_id is None
         assert app.is_running, "esc inside a drill-down navigates, never arms quit"
+
+
+async def test_dashboard_search_filters_and_clears(ids: dict[str, str]) -> None:
+    """The search bar above the mission list: "/" focuses it, typing filters
+    live (debounced), esc clears it and hands focus back to the list."""
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        lst = app.query_one("#mission-list", RowList)
+        before = len(lst.selectable)
+        assert before > 1
+
+        await pilot.press("slash")
+        bar = app.query_one("#mission-search", Input)
+        assert bar.has_focus, "/ focuses the search bar"
+        assert bar.placeholder == "Search missions…  (/ to focus)"
+        for ch in "flaky":
+            await pilot.press(ch)
+        await _settle(pilot, 0.8)  # the filter is debounced
+        dash = app.view("dashboard")
+        after = lst.selectable
+        assert after == [ids["running"]], after
+        assert dash.query_text == "flaky"
+        # the other filters still combine with the text
+        assert len(after) < before
+
+        await pilot.press("escape")
+        await _settle(pilot, 0.8)
+        assert bar.value == "" and not bar.has_focus
+        assert len(lst.selectable) == before, "esc clears the search"
+        assert lst.has_focus
+        assert app.is_running, "esc in the search bar must not arm quit"
+        assert not app.swallowed
+
+
+async def test_dashboard_ai_search_ranks_and_opens(
+    ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """✦ ranks missions through a provider and the ranked rows open missions."""
+    provider = script_provider(
+        monkeypatch,
+        [
+            ChatResult(
+                text=(
+                    "Sure — best first:\n```json\n"
+                    f'[{{"id": "{ids["running"]}", "reason": "the float tolerance fix"}}]\n'
+                    "```"
+                ),
+                usage=Usage(input_tokens=200, output_tokens=40),
+            )
+        ],
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        await pilot.press("slash")
+        for ch in "flaky":
+            await pilot.press(ch)
+        await _settle(pilot, 0.5)
+        await pilot.click(_btn(app, dash, "ai-search"))
+        await _settle(pilot, 1.5)
+        assert provider.requests, "the ✦ search asked the model"
+        assert "flaky" in provider.requests[0].messages[0]["content"]
+        assert dash.ai_results == [{"id": ids["running"], "reason": "the float tolerance fix"}]
+        lst = app.query_one("#mission-list", RowList)
+        assert lst.selectable == [ids["running"]]
+        assert "1 ranked" in str(app.query_one("#mission-note").render())
+        row = next(r for r in app.query("#mission-list .row") if r.key == ids["running"])
+        assert "float tolerance" in str(row.render()), "the reason rides the row"
+
+        lst.activate(ids["running"], via_mouse=True)
+        await _settle(pilot, 0.8)
+        assert dash.mission_id == ids["running"], "a ranked row opens its mission"
+
+        await pilot.press("escape")
+        await _settle(pilot, 0.5)
+        assert dash.ai_results is None
+        await pilot.press("escape")
+        await _settle(pilot, 0.5)
+        assert dash.mission_id is None
+        assert app.is_running
+        assert not app.swallowed
+
+
+async def test_dashboard_ai_search_without_credentials_says_so(
+    ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No key for any catalog model: a clean notice, never a crash."""
+    monkeypatch.setenv(
+        "REWORK_MODELS",
+        '[{"id":"haiku","provider":"anthropic","model":"claude-haiku-4-5","tier":1}]',
+    )
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        await pilot.press("slash")
+        await pilot.press("x")
+        await _settle(pilot, 0.5)
+        await pilot.click(_btn(app, dash, "ai-search"))
+        await _settle(pilot, 1.0)
+        assert dash.ai_results is None
+        assert "AI search unavailable: no model with credentials" in dash.ai_note
+        assert "no model with credentials" in str(app.query_one("#mission-note").render())
+        assert app.is_running
+        assert not app.swallowed
 
 
 async def test_dashboard_graph_and_tabs_render(ids: dict[str, str]) -> None:
@@ -3263,6 +3378,323 @@ async def test_dashboard_graph_collapsed_rounds_toggle(env: Path) -> None:
         assert keys() == folded, keys()
 
         assert not app.swallowed
+
+
+async def test_dashboard_ai_search_deadline_covers_the_run_fetch(
+    ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hung run fetch must not outlive the search budget: the ranking still
+    happens (summaries without run output) and the bar never sticks on ✦."""
+    import asyncio
+
+    from rework.tui import search
+
+    class _Provider:
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        async def complete(self, request: Any) -> ChatResult:
+            self.requests.append(request)
+            return ChatResult(
+                text=f'[{{"id": "{ids["running"]}", "reason": "still the closest"}}]',
+                usage=Usage(input_tokens=200, output_tokens=20),
+            )
+
+    provider = _Provider()
+    import rework.kernel.llm.adapters as adapters
+
+    monkeypatch.setattr(adapters, "build_provider", lambda entry, extra=None: provider)
+    monkeypatch.setattr(search, "TIMEOUT_S", 0.6)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+
+        async def hung(mission_id: str) -> list[Any]:
+            await asyncio.sleep(30)
+            return []
+
+        monkeypatch.setattr(dash.hub.data, "mission_runs", hung, raising=False)
+        await pilot.press("slash")
+        for ch in "flaky":
+            await pilot.press(ch)
+        await _settle(pilot, 0.5)
+        started = asyncio.get_running_loop().time()
+        await pilot.click(_btn(app, dash, "ai-search"))
+        await _settle(pilot, 2.0)
+        assert asyncio.get_running_loop().time() - started < 4.0, "the budget held"
+        assert provider.requests, "a hung fetch still reaches the model"
+        assert dash.ai_results == [{"id": ids["running"], "reason": "still the closest"}]
+        assert dash._ai_busy is False
+        assert "searching" not in str(app.query_one("#mission-note").render())
+        assert app.is_running
+
+
+async def test_dashboard_escape_dismisses_an_in_flight_ai_search(
+    ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """esc while ✦ is still running dismisses it — it never arms app quit."""
+    import asyncio
+
+    class _Slow:
+        name = "fake"
+
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        async def complete(self, request: Any) -> ChatResult:
+            self.requests.append(request)
+            await asyncio.sleep(3)
+            return ChatResult(text=f'[{{"id": "{ids["running"]}", "reason": "late"}}]')
+
+    provider = _Slow()
+    import rework.kernel.llm.adapters as adapters
+
+    monkeypatch.setattr(adapters, "build_provider", lambda entry, extra=None: provider)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        await pilot.press("slash")
+        for ch in "flaky":
+            await pilot.press(ch)
+        await _settle(pilot, 0.5)
+        await pilot.click(_btn(app, dash, "ai-search"))
+        await _settle(pilot, 0.4)
+        assert dash._ai_busy is True, "the search is in flight"
+        await pilot.press("escape")
+        await _settle(pilot, 0.6)
+        assert dash._ai_busy is False
+        assert dash.ai_results is None
+        assert dash.ai_note == ""
+        assert app.is_running, "esc did not arm quit"
+        assert not app.swallowed
+
+
+# -- repo-less (upload) projects -------------------------------------------------
+
+
+async def test_create_project_derives_transport_from_its_repos(env: Path) -> None:
+    """The TUI must never write a settings dict that contradicts itself: no
+    repo means upload/fetch, a repo means git/push_branch."""
+    from rework.tui.data import TuiData
+
+    data = TuiData()
+    try:
+        plain = await data.create_project("p")
+        assert plain.settings["transport"] == "upload"
+        assert plain.settings["results"] == "fetch"
+        assert plain.settings["repos"] == []
+        with_repo = await data.create_project(
+            "p2", [{"name": "r", "kind": "github", "url": "https://github.com/a/b"}]
+        )
+        assert with_repo.settings["transport"] == "git"
+        assert with_repo.settings["results"] == "push_branch"
+    finally:
+        await data.aclose()
+
+
+async def _launch_fix_proposal(
+    app: ReworkApp, pilot: Any, ids: dict[str, str], env: Path, **proposal: Any
+) -> list[Any]:
+    """Type one message, click the proposal's Launch, return the NEW missions."""
+    from rework.tui.widgets.cards import ProposalCard
+
+    store = await _store(env)
+    try:
+        before = {m.id for m in await store.list_missions(limit=100)}
+    finally:
+        await store.aclose()
+    text = proposal.pop("say")
+    for ch in text:
+        await pilot.press(ch if ch != " " else "space")
+    await pilot.press("enter")
+    await _settle(pilot, 1.0)
+    cards = list(app.query(ProposalCard))
+    assert cards, "the proposal must render as a card"
+    await pilot.click(_btn(app, cards[-1], "launch"))
+    await _settle(pilot, 1.0)
+    store = await _store(env)
+    try:
+        return [m for m in await store.list_missions(limit=100) if m.id not in before]
+    finally:
+        await store.aclose()
+
+
+async def test_fix_on_a_repo_less_project_launches_without_a_repo(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fix mission on an upload project supplies its files from the project's
+    files area, so no repo is required and none is invented."""
+    script_provider(
+        monkeypatch,
+        [propose(objective="tidy the notes", plan="fix", project="rework")],
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        new = await _launch_fix_proposal(app, pilot, ids, env, say="tidy the notes")
+        assert not app.swallowed
+    assert len(new) == 1, new
+    mission = new[0]
+    assert mission.project_id == ids["upload_project"]
+    assert not mission.repo_origin and not mission.repo_path, "an upload project names no repo"
+
+
+async def test_a_repo_named_on_an_upload_project_is_dropped(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The project's transport decides: a model that names a repo out of habit
+    must not turn an upload-project mission into a clone of something else."""
+    script_provider(
+        monkeypatch,
+        [
+            propose(
+                objective="tidy the notes",
+                plan="fix",
+                project="rework",
+                repo="https://github.com/x/elsewhere",
+            )
+        ],
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        new = await _launch_fix_proposal(app, pilot, ids, env, say="tidy the notes")
+        assert not app.swallowed
+    assert len(new) == 1, new
+    assert new[0].project_id == ids["upload_project"]
+    assert not new[0].repo_origin and not new[0].repo_path, "the files area supplies the files"
+
+
+async def test_fix_on_a_git_project_still_passes_its_repo_through(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    script_provider(
+        monkeypatch,
+        [
+            propose(
+                objective="fix the flaky test",
+                plan="fix",
+                project="polystats",
+                repo="https://github.com/x/polystats",
+            )
+        ],
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        new = await _launch_fix_proposal(app, pilot, ids, env, say="fix the flaky test")
+        assert not app.swallowed
+    assert len(new) == 1, new
+    assert new[0].project_id == ids["project"]
+    assert new[0].repo_origin == "https://github.com/x/polystats"
+
+
+async def test_add_files_pushes_parsed_paths_into_an_upload_project(
+    ids: dict[str, str], env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rework.tui.data import TuiData
+    from rework.tui.widgets.modals import Form
+
+    seen: list[tuple[str, list[str]]] = []
+
+    async def fake(self: Any, project_id: str, paths: list[str]) -> list[str]:
+        seen.append((project_id, paths))
+        return ["notes.md (new)"]
+
+    monkeypatch.setattr(TuiData, "add_project_files", fake)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.action_tab("dashboard")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        dash.project = ids["upload_project"]
+        await pilot.click(_btn(app, dash, "add-files"))
+        await _settle(pilot)
+        form = app.screen
+        assert isinstance(form, Form)
+        form.query_one("#f-paths").text = "~/notes.md\na.md"
+        await pilot.click(_btn(app, form, "submit"))
+        await _settle(pilot, 1.0)
+        assert not app.swallowed
+    assert seen == [(ids["upload_project"], [str(tmp_path / "notes.md"), "a.md"])], seen
+    assert any("1 path(s) added" in text for _, text in app.notifications_sent)
+
+
+async def test_add_files_accepts_a_path_with_a_space(
+    ids: dict[str, str], env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The form split its whole input on spaces, so `My Papers` could not be
+    entered at all: one path per line must survive the spaces."""
+    from rework.tui.data import TuiData
+    from rework.tui.widgets.modals import Form
+
+    seen: list[tuple[str, list[str]]] = []
+    spaced = tmp_path / "My Papers"
+    spaced.mkdir()
+    (spaced / "notes.md").write_text("# n\n")
+
+    async def fake(self: Any, project_id: str, paths: list[str]) -> list[str]:
+        seen.append((project_id, paths))
+        return ["notes.md (new)"]
+
+    monkeypatch.setattr(TuiData, "add_project_files", fake)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.action_tab("dashboard")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        dash.project = ids["upload_project"]
+        await pilot.click(_btn(app, dash, "add-files"))
+        await _settle(pilot)
+        form = app.screen
+        assert isinstance(form, Form)
+        label = str(form.query(".form-label").first().render())
+        assert "one path per line" in label, label
+        form.query_one("#f-paths").text = f"{spaced}\nnotes.md"
+        await pilot.click(_btn(app, form, "submit"))
+        await _settle(pilot, 1.0)
+        assert not app.swallowed
+    assert seen == [(ids["upload_project"], [str(spaced), "notes.md"])], seen
+
+
+async def test_add_files_refuses_a_git_project(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rework.tui.data import TuiData
+    from rework.tui.widgets.modals import Form
+
+    async def fake(self: Any, project_id: str, paths: list[str]) -> list[str]:  # pragma: no cover
+        raise AssertionError("a git project must never reach the files area")
+
+    monkeypatch.setattr(TuiData, "add_project_files", fake)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.view("dashboard").project = ids["project"]  # polystats: git transport
+        # the File menu is the other way in; it lands on the same handler
+        title = next(t for t in app.query(".menu-title") if "File" in str(t.render()))
+        await pilot.click(title)
+        await pilot.pause()
+        entry = next(
+            e for e in app.screen.query(".menu-item") if "Add project files" in str(e.render())
+        )
+        await pilot.click(entry)
+        await _settle(pilot, 0.6)
+        assert not isinstance(app.screen, Form), "no form for a git project"
+        assert not app.swallowed
+    assert any("push a branch instead" in text for _, text in app.notifications_sent)
 
 
 def _send_back_btn(app: ReworkApp) -> Btn:

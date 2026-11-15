@@ -57,6 +57,66 @@ PROVIDER_FAILURE_LIMIT = 2  # failed runs on one model before spawn_role refuses
 STRICTNESS_LEVELS = ("light", "standard", "strict")
 DEFAULT_STRICTNESS = "standard"
 
+# The ONLY reasons a PR gate may be asked for (issue #36, owner decision
+# 2026-11-14: most fixes -- especially ones the owner asked for -- ship with no
+# gate). Single source of truth: the finish tool's schema enum, its validation
+# and the prompt text all read this.
+GATE_CATEGORIES: dict[str, str] = {
+    "data_loss": "data loss or a destructive data migration",
+    "security": "security, credentials, auth or permissions",
+    "money": "money (billing, payments, paid resources)",
+    "production_infrastructure": (
+        "irreversible or production infrastructure (deploys, DNS, cloud resources, "
+        "deleting user files)"
+    ),
+}
+GATE_CATEGORY_NAMES = ", ".join(GATE_CATEGORIES)
+
+
+def model_policy() -> tuple[str, str]:
+    """(default model id, escalation model id) from config, read at RUNTIME so
+    changing REWORK_DEFAULT_MODEL / REWORK_ESCALATION_MODEL changes the prompt
+    text (and every role default) with no code change."""
+    from rework.config import default_model_id, escalation_model_id
+
+    return default_model_id(), escalation_model_id()
+
+
+def render(text: str) -> str:
+    """Fill the model-policy and gate-category placeholders in prompt/tool text."""
+    default, escalation = model_policy()
+    return (
+        text.replace("$DEFAULT_MODEL", default)
+        .replace("$ESCALATION_MODEL", escalation)
+        .replace("$GATE_CATEGORIES", GATE_CATEGORY_NAMES)
+    )
+
+
+def _render_schema(node: Any) -> Any:
+    """Every string inside a tool's JSON schema, placeholders filled. The
+    policy text lives in the spawn_role `model` field's description, so
+    rendering only the tool's top-level description would ship a literal
+    `$DEFAULT_MODEL` to the model."""
+    if isinstance(node, str):
+        return render(node)
+    if isinstance(node, dict):
+        return {key: _render_schema(value) for key, value in node.items()}
+    if isinstance(node, list):
+        return [_render_schema(item) for item in node]
+    return node
+
+
+def render_tool(tool: ToolSpec) -> ToolSpec:
+    """One tool with the configured model policy rendered into its description
+    AND its input_schema (spawn_role's `model` field carries the policy)."""
+    return tool.model_copy(
+        update={
+            "description": render(tool.description),
+            "input_schema": _render_schema(tool.input_schema),
+        }
+    )
+
+
 PLAYBOOKS: dict[str, str] = {
     "echo": (
         "Plumbing check: spawn the `echo` role once with the objective as its brief, "
@@ -86,8 +146,34 @@ PLAYBOOKS: dict[str, str] = {
         "medium-or-higher findings you are not willing to ship (ask_owner after three "
         "rounds). Pick each audit's `strictness` from risk (size, blast radius, prior "
         "findings) and re-decide it every round from the latest report, never once for "
-        "the whole mission. After you finish, the ENGINE pushes the last coder's branch "
-        "and opens the pull request when the owner approves the gate; agents never merge."
+        "the whole mission.\n\n"
+        "After a clean audited done, the ENGINE pushes the last coder's branch and opens "
+        "the pull request itself, with no gate. Asking for a gate is the exception, and it "
+        "is strict: pass ask_before_pr=true ONLY when the change falls in one of these four "
+        "high-stakes categories ("
+        + GATE_CATEGORY_NAMES
+        + "), and set `gate_category` to that category: the `reason` must name it. A change "
+        "the owner asked for is NEVER gated for being large, unusual, touching many files, "
+        "or because the audit had findings you accepted: put those in the finish `summary`, "
+        "which becomes the PR body the owner reads before merging. Agents never merge."
+    ),
+    "draft": (
+        "Document work, not code: the deliverable is WRITING. Usual shape: (1) "
+        "RESEARCH: spawn an investigator whose brief is to gather the facts with "
+        "`web_search` and `fetch_url`, and to RECORD the source url of every claim it "
+        "makes; (2) DRAFT: spawn a coder (it owns the worktree and can write files, so "
+        "use it here too) to write the deliverables into the project as real files "
+        "(Markdown or whatever format the objective asks for), citing those sources; "
+        "(3) REVIEW: spawn an auditor to check the draft claim by claim against the "
+        "cited sources, to check any constraint the objective states (length, format, "
+        "tone, audience), and to check that nothing about the OWNER is invented, "
+        "assumed or guessed -- an unsupported personal detail is a high finding; "
+        "(4) REVISE: while the audit requests changes, respawn the coder with the audit "
+        "findings in its brief and review again (pick each audit's `strictness` from "
+        "risk and re-decide it every round, as with fix). Use `ask_owner` for facts "
+        "only the owner knows (their own details, preferences, commitments) BEFORE "
+        "finalising: never guess them. THERE IS NO BRANCH PUSH AND NO PR: the results "
+        "are the project's files, so the mission finishes with no gate."
     ),
 }
 
@@ -100,12 +186,16 @@ How you work:
   work is hard or failure-prone; for easy work just wait for the handoff.
 - You may run roles in parallel (several spawn_role calls in one turn), but be
   conservative: parallelism costs money and most missions are sequential.
-- Pick each role's model from the catalog: cheap tiers for exploration and
-  straightforward coding, stronger tiers for audits and hard problems. If a role
-  failed on provider errors (timeouts, 5xx, rate limits), its endpoint is
-  struggling: respawn it on a model from a DIFFERENT provider, because another
-  model on the same provider hits the same endpoint. Do not pick a pricier tier
-  just to retry: keep the same tier/price or cheaper, and say why in the note.
+- MODEL POLICY: run every role on the default model ($DEFAULT_MODEL). Escalate a
+  role ONLY to the escalation model ($ESCALATION_MODEL), and only when (i) a run
+  on the default model failed on the WORK (the change itself was wrong or
+  incomplete), or (ii) it is a strict audit of a high-risk change (auth, money,
+  migrations, core control flow). When you escalate, say WHY in the brief.
+- Provider errors (timeouts, 5xx, rate limits) are NOT an escalation reason: they
+  mean the endpoint is struggling, not that the model is too weak. Retry, or
+  respawn that role on a model from a DIFFERENT provider at the same level
+  (another model on the same provider hits the same endpoint); never move to
+  a pricier tier just to retry. Do not pick a stronger tier for any other reason.
 - Write every brief so the role can act without asking: what to do, why, what
   done looks like, and anything earlier roles found that it needs.
 - Scope briefs to the objective. Pass findings along as context, but do not turn
@@ -125,13 +215,28 @@ How you work:
   a needed revision or audit to save budget. The budget gate asks the owner before
   the cap is passed.
 - Call `finish` when the mission's goal is met, or when it cannot be met (say why).
-  Final gates (ship / open a PR) happen after you finish; you do not open them.
-  The engine pushes the last coder's branch and opens the PR itself on approval:
-  never spawn a role to push, commit, or open PRs (each coder run also creates a
-  new branch, so a "push" coder only adds noise).
+  You never open PRs and never merge. After a clean audited `done` the engine
+  pushes the last coder's branch and opens the PR itself, with no gate. Asking
+  for a gate is the strict exception: pass `ask_before_pr=true` plus a `reason`
+  ONLY when the change falls in one of the four high-stakes categories
+  ($GATE_CATEGORIES), and set `gate_category` to it. A change the owner asked for
+  is NEVER gated for being large, unusual, touching many files, or because the
+  audit had findings you accepted: those go in the finish `summary`, which
+  becomes the PR body. A project setting can force that gate always or never.
+  Merging is always the owner's decision. Never spawn a role to push, commit, or
+  open PRs (each coder run also creates a new branch, so a "push" coder only adds
+  noise).
 - Respond with tool calls. Text without a tool call wastes a turn."""
 
-TOOLS: list[ToolSpec] = [
+
+def orchestrator_tools() -> list[ToolSpec]:
+    """The orchestrator's tools. UNRENDERED templates: the descriptions and the
+    spawn_role `model` schema still carry the $DEFAULT_MODEL / $ESCALATION_MODEL
+    placeholders, so every caller must pass them through render_tool()."""
+    return _TOOLS
+
+
+_TOOLS: list[ToolSpec] = [
     ToolSpec(
         name="spawn_role",
         description=(
@@ -154,7 +259,15 @@ TOOLS: list[ToolSpec] = [
                     "to a run id or step name, optionally with .field (e.g. "
                     '{"diff": "code.diff"}). Usual wiring is automatic.',
                 },
-                "model": {"type": "string", "description": "Catalog id (default: role's)."},
+                "model": {
+                    "type": "string",
+                    "description": "Catalog id. Leave it OUT to run the role on the"
+                    " default model ($DEFAULT_MODEL). The only other value you may"
+                    " pass is the escalation model ($ESCALATION_MODEL), and only for"
+                    " a run that already failed on the WORK or for a strict audit of"
+                    " a high-risk change; provider errors (timeouts, 5xx, rate"
+                    " limits) are never a reason to escalate.",
+                },
                 "effort": {"type": "string", "enum": ["low", "medium", "high"]},
                 "max_turns": {
                     "type": "integer",
@@ -317,6 +430,28 @@ TOOLS: list[ToolSpec] = [
                     "description": "What happened, for the owner: what changed, why, and what "
                     "the audit found. This leads the PR body, so write it for a reviewer.",
                 },
+                "ask_before_pr": {
+                    "type": "boolean",
+                    "description": "Ask the owner to review before the PR opens. Default "
+                    "false: after a clean audited `done` the engine opens the PR itself. "
+                    "Reserved for the high-stakes categories below; a change the owner "
+                    "asked for is never gated for size, unusualness or accepted findings "
+                    "(say those in `summary`, which becomes the PR body).",
+                },
+                "gate_category": {
+                    "type": "string",
+                    "enum": list(GATE_CATEGORIES),
+                    "description": "Only set when ask_before_pr is true; it names which "
+                    "high-stakes category the change falls in: "
+                    + "; ".join(f"{k} = {v}" for k, v in GATE_CATEGORIES.items())
+                    + ". Anything else belongs in `summary`.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Required with ask_before_pr: one sentence naming the "
+                    "high-stakes category and why this change is in it. Ignored unless "
+                    "ask_before_pr is true.",
+                },
                 "accepted_findings": {
                     "type": "array",
                     "description": "Judgment, not a bypass: for every open medium-or-higher "
@@ -359,6 +494,34 @@ TERMINAL = {RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.ABORTED}
 
 class ToolError(Exception):
     """A tool call the orchestrator got wrong: returned to it as text."""
+
+
+GATE_ASK_REFUSED = (
+    "ask_before_pr is refused: a PR gate is only for the four high-stakes "
+    f"categories ({GATE_CATEGORY_NAMES}). The engine requires BOTH a non-empty "
+    "`reason` (meant to name the category; the owner sees it in the gate question, "
+    "next to the category) AND a `gate_category` from that list. Call finish again "
+    "with both set, or with ask_before_pr unset or false and the engine opens the PR "
+    "without a gate; anything else that makes the owner look twice (a large diff, "
+    "many files, an unusual-looking change, audit findings you accepted) belongs in "
+    "the `summary`, which becomes the PR body."
+)
+
+
+def _gate_ask(args: dict[str, Any]) -> tuple[bool, str, str]:
+    """Read and STRICTLY validate finish's PR-gate request (issue #36): the owner
+    decided most fixes -- especially ones the owner asked for -- ship ungated, so
+    a gate is only for the four high-stakes categories. The mechanical rule is a
+    non-empty `reason` plus a `gate_category` in the enum (the reason is meant to
+    name it, and is shown to the owner beside it). Returns (ask, reason, category);
+    raises ToolError when the ask is invalid."""
+    if not bool(args.get("ask_before_pr")):
+        return False, "", ""
+    reason = str(args.get("reason") or "").strip()
+    category = str(args.get("gate_category") or "").strip().lower()
+    if not reason or category not in GATE_CATEGORIES:
+        raise ToolError(GATE_ASK_REFUSED)
+    return True, reason, category
 
 
 def orchestrator_chat_id(mission_id: str) -> str:
@@ -432,9 +595,9 @@ class MissionOrchestrator:
         catalog = runner._catalog
         wanted = str(orch.get("model") or "")
         try:
-            self.entry = catalog.resolve(wanted) if wanted else self._strongest()
+            self.entry = catalog.resolve(wanted) if wanted else self._default_entry()
         except Exception:
-            self.entry = self._strongest()
+            self.entry = self._default_entry()
         self.effort = orch.get("effort") or None
         self.history: list[dict[str, Any]] = []
         self.seen: dict[str, str] = {}  # run id -> status already reported
@@ -451,17 +614,32 @@ class MissionOrchestrator:
         # one mechanical rail that blocks finish(done) requires them (see
         # _enforce_findings_accepted), and they lead the mission report/PR body
         self.accepted_findings: list[dict[str, str]] = []
+        # the orchestrator's optional request for a human look before the PR
+        # opens (engine opens the PR directly after a clean audited `done`)
+        self.ask_before_pr = False
+        self.pr_reason = ""
+        self.pr_gate_category = ""
         self._providers: dict[str, Any] = {}
+        # built once per orchestrator: the model-policy text is rendered from
+        # config and the system prompt stays byte-stable for prompt caching
+        self.tools = [render_tool(t) for t in orchestrator_tools()]
 
     def _usable(self) -> list[Any]:
         """Catalog entries this daemon can actually call (real ones first)."""
-        entries = self.r._catalog.all()
-        real = [e for e in entries if e.provider != "fake" and e.has_credentials()]
-        return real or [e for e in entries if e.has_credentials()] or entries
+        return self.r._catalog.usable()
 
-    def _strongest(self) -> Any:
-        entries = self._usable()
-        return max(entries, key=lambda e: (e.tier, -e.cost_in_per_mtok))
+    def _default_entry(self) -> Any:
+        """The orchestrator's OWN model when the plan names none: the configured
+        default (REWORK_DEFAULT_MODEL), resolved against this catalog. Cost
+        control starts with the orchestrator; a stronger tier is never an
+        automatic choice."""
+        from rework.config import default_model_id
+
+        catalog = self.r._catalog
+        try:
+            return catalog.resolve(default_model_id(catalog))
+        except Exception:
+            return catalog.strongest_usable() or catalog.all()[0]
 
     # -- provider ------------------------------------------------------------
 
@@ -568,7 +746,12 @@ class MissionOrchestrator:
                     _pre["accepted_findings"] = self.accepted_findings
                 await self.r._store.update_mission(self.mid, result=_pre)
                 ship, pr_url, sent_back = await self.r._final_gates(
-                    self.mission, results, audit.artifact if audit else None
+                    self.mission,
+                    results,
+                    audit.artifact if audit else None,
+                    ask_before_pr=self.ask_before_pr,
+                    reason=self.pr_reason,
+                    gate_category=self.pr_gate_category,
                 )
                 if sent_back:
                     # the owner sent the work back: the engine already queued their
@@ -665,7 +848,7 @@ class MissionOrchestrator:
                 model=entry.model,
                 system=system,
                 messages=messages,
-                tools=TOOLS,
+                tools=self.tools,
                 max_tokens=min(int(entry.max_output or 4096), 4096),
                 effort=self.effort,
                 session_id=self.run_id,
@@ -810,6 +993,15 @@ class MissionOrchestrator:
                 if call.get("name") == "finish" and answered.get(call.get("id")) == "finished":
                     args = call.get("arguments") or {}
                     self.accepted_findings = _accepted_findings(args.get("accepted_findings"))
+                    # a replay of a pre-strictness record must not resurrect a
+                    # gate the live rule would have refused: downgrade to no ask
+                    try:
+                        ask, reason, category = _gate_ask(args)
+                    except ToolError:
+                        ask, reason, category = False, "", ""
+                    self.ask_before_pr = ask
+                    self.pr_reason = reason
+                    self.pr_gate_category = category
                     return (str(args.get("outcome") or "done"), str(args.get("summary") or ""))
         return None
 
@@ -870,12 +1062,19 @@ class MissionOrchestrator:
                     + ". Wait for them or cancel them first."
                 )
             accepted: list[dict[str, str]] = []
+            # the PR gate is strict (issue #36): validated BEFORE self.finished
+            # is set, so a refused ask leaves the mission unfinished and the
+            # orchestrator can retry.
+            ask, reason, category = _gate_ask(args)
             if outcome == "done":
                 accepted = _accepted_findings(args.get("accepted_findings"))
                 await self._enforce_audit_fresh()
                 await self._enforce_findings_accepted(accepted)
             self.finished = (outcome, str(args.get("summary") or ""))
             self.accepted_findings = accepted
+            self.ask_before_pr = ask
+            self.pr_reason = reason
+            self.pr_gate_category = category
             await self._note(f"finished ({outcome}): {self.finished[1]}"[:400], to_owner=True)
             return "finished"
         raise ToolError(f"unknown tool {name!r}")
@@ -1146,15 +1345,34 @@ class MissionOrchestrator:
                 for r in changed:
                     self.seen[r.id] = r.status.value
                     lines.append(await self._report(r))
-                live = [r.id for r in runs if r.status not in TERMINAL]
+                live = [self._live_label(r) for r in runs if r.status not in TERMINAL]
                 tail = f"\nstill running: {', '.join(live)}" if live else ""
                 return "\n".join(lines) + tail
             live_runs = [r for r in runs if r.status not in TERMINAL]
             if not live_runs:
                 return "no roles are running. spawn a role or finish."
             if deadline is not None and time.monotonic() >= deadline:
-                return "timeout; still running: " + ", ".join(r.id for r in live_runs)
+                return "timeout; still running: " + ", ".join(
+                    self._live_label(r) for r in live_runs
+                )
             await asyncio.sleep(self.r._poll)
+
+    def _queued_note(self, run_id: str) -> str | None:
+        """How the orchestrator sees a run that is waiting for a role slot
+        (REWORK_MAX_ROLES). Roles beyond the cap are QUEUED, not refused, and a
+        silent queue looks like a hung role; say it out loud."""
+        supervisor = self.r._supervisor
+        if supervisor is None:
+            return None
+        limiter = getattr(supervisor, "limiter", None)
+        if limiter is None:
+            return None
+        note: str | None = limiter.queue_note(run_id)
+        return note
+
+    def _live_label(self, run: Run) -> str:
+        note = self._queued_note(run.id)
+        return f"{run.id} (queued)" if note else run.id
 
     async def _report(self, run: Run) -> str:
         if run.status == RunStatus.COMPLETED:
@@ -1204,7 +1422,11 @@ class MissionOrchestrator:
                 lines.append(f"  -> {_short(body, 200)}")
             elif p.get("note") or p.get("error"):
                 lines.append(f"  ({_short(p.get('note') or p.get('error'), 200)})")
-        status = f"{run_id} is {run.status.value}"
+        queued = self._queued_note(run_id)
+        if queued:
+            status = f"{run_id} is {queued}"  # not started: waiting for a role slot
+        else:
+            status = f"{run_id} is {run.status.value}"
         return status + ("\n" + "\n".join(lines) if lines else "; no steps yet")
 
     async def _cancel(self, run_id: str, reason: str) -> str:
@@ -1291,14 +1513,16 @@ class MissionOrchestrator:
                 self.mid, kind=kind, question=question, for_run=run_id, spec=spec
             )
         await self.store.update_mission(self.mid, status=MissionStatus.AWAITING_GATE)
-        while True:
-            row = await self.store.get_gate(gate.id)
-            if row is not None and row.status != GateStatus.OPEN:
-                break
-            mission = await self.store.get_mission(self.mid)
-            if mission is not None and mission.status == MissionStatus.CANCELLED:
-                return "the owner cancelled the mission"
-            await asyncio.sleep(self.r._poll)
+        # waiting for the OWNER: hold no daemon mission slot meanwhile
+        async with self.r._waiting():
+            while True:
+                row = await self.store.get_gate(gate.id)
+                if row is not None and row.status != GateStatus.OPEN:
+                    break
+                mission = await self.store.get_mission(self.mid)
+                if mission is not None and mission.status == MissionStatus.CANCELLED:
+                    return "the owner cancelled the mission"
+                await asyncio.sleep(self.r._poll)
         await self.store.update_mission(self.mid, status=MissionStatus.RUNNING)
         text = answer_text(row)
         if run_id is not None:
@@ -1356,11 +1580,12 @@ class MissionOrchestrator:
                 spec={"turn_cap": True, "asked_by": "engine"},
             )
         await self.store.update_mission(self.mid, status=MissionStatus.AWAITING_GATE)
-        while True:
-            row = await self.store.get_gate(gate.id)
-            if row is not None and row.status != GateStatus.OPEN:
-                break
-            await asyncio.sleep(self.r._poll)
+        async with self.r._waiting():  # no daemon slot while the owner decides
+            while True:
+                row = await self.store.get_gate(gate.id)
+                if row is not None and row.status != GateStatus.OPEN:
+                    break
+                await asyncio.sleep(self.r._poll)
         await self.store.update_mission(self.mid, status=MissionStatus.RUNNING)
         return row.status == GateStatus.APPROVED
 
@@ -1401,11 +1626,12 @@ class MissionOrchestrator:
                 spec={"_call": call_id, "asked_by": "orchestrator", "budget_to": wanted},
             )
         await self.store.update_mission(self.mid, status=MissionStatus.AWAITING_GATE)
-        while True:
-            row = await self.store.get_gate(gate.id)
-            if row is not None and row.status != GateStatus.OPEN:
-                break
-            await asyncio.sleep(self.r._poll)
+        async with self.r._waiting():  # no daemon slot while the owner decides
+            while True:
+                row = await self.store.get_gate(gate.id)
+                if row is not None and row.status != GateStatus.OPEN:
+                    break
+                await asyncio.sleep(self.r._poll)
         await self.store.update_mission(self.mid, status=MissionStatus.RUNNING)
         if row.status != GateStatus.APPROVED:
             return (
@@ -1482,6 +1708,7 @@ class MissionOrchestrator:
         mission = await self.store.get_mission(self.mid) or self.mission
         plan = mission.plan or {}
         registry = self.r._registry
+        default, _ = model_policy()
         roles = []
         for name in registry.sorted_by_name():
             spec = registry.get(name)
@@ -1490,7 +1717,8 @@ class MissionOrchestrator:
             inputs = sorted(getattr(spec, "context_manifest", set()) or [])
             roles.append(
                 f"- {name}: {spec.description} Goal: {spec.goal or '-'} "
-                f"Default model: {spec.default_model}. INPUTS: {', '.join(inputs) or 'brief'}"
+                f"Default model: {spec.default_model or default}. "
+                f"INPUTS: {', '.join(inputs) or 'brief'}"
             )
         catalog = [
             f"- {e.id}: {e.provider} ({endpoint_of(e)}), tier {e.tier}, "
@@ -1506,8 +1734,9 @@ class MissionOrchestrator:
             [
                 f"{MARKER} for rework, a multi-agent workflow engine. You run one "
                 "mission by delegating work to roles.",
-                RULES,
-                f"PLAYBOOK ({self.playbook}): {PLAYBOOKS.get(self.playbook, PLAYBOOKS['fix'])}",
+                render(RULES),
+                f"PLAYBOOK ({self.playbook}): "
+                f"{render(PLAYBOOKS.get(self.playbook, PLAYBOOKS['fix']))}",
                 "ROLES:\n" + "\n".join(roles),
                 "Automatic wiring: a coder receives the latest investigator handoff; an "
                 "auditor receives the latest coder's diff and worktree plus the latest "

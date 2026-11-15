@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -15,6 +16,17 @@ if TYPE_CHECKING:
     from rework.kernel.state.store import StateStore
 
 DEFAULT_STATE_DIR = Path.home() / ".rework"
+
+# The cheap, strong model every role runs on unless a plan/brief names another
+# one. One env var (or one catalog edit) switches it deployment-wide: no code
+# change, no literal id in a default path.
+DEFAULT_MODEL_ENV = "REWORK_DEFAULT_MODEL"
+DEFAULT_MODEL_ID = "flash"
+# The one model a role is escalated TO (a run that failed on the WORK, or a
+# strict audit of a high-risk change). NOT a ban on anything: the default and
+# the escalation target are pure config, so moving either later is env-only.
+ESCALATION_MODEL_ENV = "REWORK_ESCALATION_MODEL"
+ESCALATION_MODEL_ID = "claude-sonnet-5-5"
 
 
 def load_env_file(path: Path | None = None) -> list[str]:
@@ -65,6 +77,31 @@ def default_reports_dir() -> Path:
     ).expanduser()
 
 
+def projects_dir() -> Path:
+    """Where per-project files areas live (upload transport, ADR 0005). This is
+    daemon-side internal state, so it sits under the same state root as the
+    database rather than in the visible deliverables directory."""
+    override = os.environ.get("REWORK_PROJECTS_DIR")
+    if override:
+        return Path(override).expanduser()
+    return DEFAULT_STATE_DIR / "projects"
+
+
+_UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def project_files_dir(project_id: str) -> Path:
+    """A repo-less project's persistent files area: <projects_dir>/<id>/files.
+
+    The id is a path segment, so it is sanitised: a dot is not a legal id
+    character in practice (`new_id` mints `p-<hex>`), but anything that could
+    read as a traversal (".", "..", separators) must never escape the area."""
+    safe = _UNSAFE_ID_CHARS.sub("_", project_id)
+    if not safe.strip("_"):
+        raise ValueError(f"unusable project id for a files area: {project_id!r}")
+    return projects_dir() / safe / "files"
+
+
 def _default_db() -> str:
     return str(DEFAULT_STATE_DIR / "state.sqlite3")
 
@@ -75,6 +112,10 @@ class Config:
     checkpoints_db: str  # sqlite path for role checkpoints (postgres shares db in M4)
     poll_interval_s: float = 0.5
     concurrency: int = 1  # sqlite deployments stay at 1 (docs/design.md)
+    # daemon-wide cap on concurrently RUNNING role runs, across all missions
+    # (REWORK_MAX_ROLES; 0/unset = os.cpu_count(), min 1). Runs beyond the cap
+    # are queued, not dropped: see orchestrator/limits.py
+    max_roles: int = 0
     git_author_name: str = "rework"  # agent commit identity; per-deployment via env
     git_author_email: str = "rework@rework.local"
 
@@ -96,7 +137,8 @@ class Config:
             return cls(
                 db=db,
                 checkpoints_db=db,
-                concurrency=int(os.environ.get("REWORK_CONCURRENCY", "4")),
+                concurrency=_concurrency(),
+                max_roles=_max_roles(),
                 git_author_name=author_name,
                 git_author_email=author_email,
             )
@@ -107,10 +149,45 @@ class Config:
         return cls(
             db=db,
             checkpoints_db=checkpoints,
-            concurrency=int(os.environ.get("REWORK_CONCURRENCY", "1")),
+            concurrency=_concurrency(sqlite_default=1),
+            max_roles=_max_roles(),
             git_author_name=author_name,
             git_author_email=author_email,
         )
+
+
+def _concurrency(sqlite_default: int | None = None) -> int:
+    """REWORK_CONCURRENCY, else a host-aware default: min(cpu_count, 4), min 1.
+    A sqlite deployment keeps its historical 1 unless the env says otherwise."""
+    from rework.nodes import hostlimits
+
+    raw = os.environ.get("REWORK_CONCURRENCY")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    if sqlite_default is not None:
+        return sqlite_default
+    return hostlimits.default_concurrency()
+
+
+def max_roles(config: Config) -> int:
+    """The daemon-wide role cap for this config (REWORK_MAX_ROLES, else CPUs)."""
+    return config.max_roles if config.max_roles > 0 else _max_roles()
+
+
+def _max_roles() -> int:
+    """REWORK_MAX_ROLES, else one role per CPU (min 1)."""
+    from rework.nodes import hostlimits
+
+    raw = os.environ.get("REWORK_MAX_ROLES")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    return hostlimits.default_max_roles()
 
 
 def _prepare_sqlite_dir(db: str) -> str:
@@ -128,6 +205,47 @@ async def open_store_from_config(config: Config) -> StateStore:
     from rework.kernel.state.sqlite import open_sqlite
 
     return await open_sqlite(await asyncio.to_thread(_prepare_sqlite_dir, config.db))
+
+
+def _configured_model(
+    env_var: str,
+    fallback_id: str,
+    *,
+    catalog: ModelCatalog | None = None,
+    cheapest: bool,
+) -> str:
+    """Resolve one configured model id against the catalog.
+
+    The requested id wins when it exists AND this process can call it. A
+    missing id or one with no key here falls back to the cheapest (or
+    strongest) USABLE entry, so a machine that does not hold a key still runs
+    on something it can actually call. With no usable entry at all the
+    requested id is returned unresolved (the engine reports it)."""
+    wanted = (os.environ.get(env_var) or fallback_id).strip() or fallback_id
+    cat = catalog if catalog is not None else load_catalog()
+    entry = next((e for e in cat.all() if e.id == wanted), None)
+    if entry is not None and entry.has_credentials():
+        return entry.id
+    pick = cat.cheapest_usable() if cheapest else cat.strongest_usable()
+    return pick.id if pick is not None else wanted
+
+
+def default_model_id(catalog: ModelCatalog | None = None) -> str:
+    """THE default model: REWORK_DEFAULT_MODEL (default 'flash'), resolved
+    against the catalog. Every role, plan step, the TUI knob and the
+    orchestrator's own model use this one function, so switching the default
+    is env-only."""
+    return _configured_model(DEFAULT_MODEL_ENV, DEFAULT_MODEL_ID, catalog=catalog, cheapest=True)
+
+
+def escalation_model_id(catalog: ModelCatalog | None = None) -> str:
+    """THE escalation model: REWORK_ESCALATION_MODEL (default
+    'claude-sonnet-5-5'), resolved against the catalog, falling back to the
+    strongest usable entry. Used wherever a role is escalated; nothing is
+    excluded, ever."""
+    return _configured_model(
+        ESCALATION_MODEL_ENV, ESCALATION_MODEL_ID, catalog=catalog, cheapest=False
+    )
 
 
 def load_catalog() -> ModelCatalog:

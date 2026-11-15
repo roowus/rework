@@ -216,8 +216,22 @@ class LocalExecutor:
                 # Found live: terminate() killed only /bin/sh; the orphaned
                 # `uv run pytest` kept the pipe open and communicate() blocked
                 # forever, hanging the role and its mission with no log.
-                proc = await asyncio.create_subprocess_shell(
-                    command,
+                # rework must not overload its host (docs/ops.md, 2026-11-13):
+                # deprioritize the command and cap its tree's memory so one
+                # runaway pytest/mypy is killed alone instead of taking the box
+                # down — via a systemd user/system scope when one is usable,
+                # else a hard `ulimit -v` inside the wrapper shell. The wrappers
+                # are plain argv (the shell command is one argument), so the
+                # process group (start_new_session) and the timeout kill below
+                # still cover the whole tree.
+                from rework.nodes.hostlimits import command_prefix, configured_memory_max
+                from rework.nodes.hostlimits import report_once as _report_wrapper
+
+                memory_max = configured_memory_max()
+                prefix = command_prefix(command, memory_max=memory_max)
+                _report_wrapper(prefix, memory_max)
+                proc = await asyncio.create_subprocess_exec(
+                    *prefix,
                     cwd=str(self._workdir),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,

@@ -293,3 +293,180 @@ async def test_chat_history_survives_real_adapters(store) -> None:
     replay = ChatRequest(model="f", messages=[*history, {"role": "user", "content": "more"}])
     to_openai(replay)
     to_anthropic(replay)
+
+
+# -- a chat turn always ends visibly (provider/tool/persistence/cut-off) ------
+
+
+class RaisingProvider:
+    """Fails complete() once, then behaves like a scripted reply."""
+
+    def __init__(self, exc: Exception, then: ChatResult | None = None) -> None:
+        self.exc = exc
+        self.then = then
+        self.calls = 0
+
+    async def complete(self, request: Any) -> ChatResult:
+        self.calls += 1
+        if self.exc is not None:
+            exc, self.exc = self.exc, None
+            raise exc
+        assert self.then is not None
+        return self.then
+
+
+def _catalog() -> Any:
+    from rework.kernel.llm.catalog import ModelCatalog, ModelEntry
+
+    return ModelCatalog([ModelEntry(id="flash", provider="fake", model="fake-flash", tier=1)])
+
+
+@pytest.mark.asyncio
+async def test_provider_error_is_visible_and_logged(caplog: pytest.LogCaptureFixture) -> None:
+    """A provider crash must not take the turn down silently: the owner sees a
+    line and the traceback is logged."""
+    import logging
+
+    chat = OrchestratorChat(
+        RaisingProvider(RuntimeError("boom")), _catalog(), "flash", tools_enabled=False
+    )
+    with caplog.at_level(logging.ERROR, logger="rework.chat"):
+        result = await chat.send("hello")
+    assert "RuntimeError" in result.reply and "boom" in result.reply
+    assert "(no reply)" not in result.reply
+    assert result.transcript[-1].text == result.reply
+    assert chat.transcript[-1] == ("orchestrator", result.reply)
+    errors = [r for r in caplog.records if r.name == "rework.chat" and r.levelname == "ERROR"]
+    assert errors and any(r.exc_info for r in errors), "the traceback must be logged"
+
+
+@pytest.mark.asyncio
+async def test_tool_failure_reaches_the_model_plainly_and_the_turn_continues(
+    store: Any,
+) -> None:
+    """A library search blow-up is information, not a dead turn: the model is
+    told plainly and goes on to answer."""
+    from rework.kernel.state.records import Chat
+
+    class _BrokenLibrary:
+        async def search_items(self, query: str, type_: Any = None) -> list:
+            raise RuntimeError("database connection lost")
+
+    class _P:
+        def __init__(self) -> None:
+            self.requests: list[Any] = []
+
+        async def complete(self, request: Any) -> ChatResult:
+            self.requests.append(request)
+            if len(self.requests) == 1:
+                return ChatResult(
+                    tool_calls=[ToolCall(id="t1", name="library_search", arguments={"query": "x"})]
+                )
+            return ChatResult(text="carrying on without the library")
+
+    row = await store.create_chat(Chat(title=""))
+    provider = _P()
+    chat = OrchestratorChat(
+        provider,
+        _catalog(),
+        "flash",
+        store=store,
+        chat_id=row.id,
+        library=_BrokenLibrary(),
+    )
+    result = await chat.send("what do we know about x?")
+    tool_rows = [m for m in provider.requests[1].messages if m.get("role") == "tool"]
+    assert tool_rows, "the tool result must reach the model"
+    assert "Library search failed" in tool_rows[0]["content"]
+    assert "continuing without it" in tool_rows[0]["content"]
+    assert "RuntimeError" not in tool_rows[0]["content"]  # no raw exception repr
+    assert result.reply == "carrying on without the library"
+
+
+@pytest.mark.asyncio
+async def test_persistence_failure_still_surfaces_the_reply(
+    store: Any, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A store that refuses writes must not eat the reply: it is shown with a
+    note, and the traceback is logged."""
+    import logging
+
+    from rework.kernel.state.records import Chat
+
+    row = await store.create_chat(Chat(title=""))
+
+    async def _boom(message: Any) -> Any:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(store, "append_chat_message", _boom)
+    chat = OrchestratorChat(ScriptedProvider(), _catalog(), "flash", store=store, chat_id=row.id)
+    chat._provider.route("orchestrator", [ChatResult(text="the answer")])
+    with caplog.at_level(logging.ERROR, logger="rework.chat"):
+        result = await chat.send("hi")
+    assert "the answer" in result.reply
+    assert "not saved" in result.reply
+    assert chat.transcript[-1][1] == result.reply
+    errors = [r for r in caplog.records if r.name == "rework.chat" and r.exc_info]
+    assert errors, "the persistence traceback must be logged"
+
+
+def _cut_off() -> ChatResult:
+    return ChatResult(text="", stop_reason="max_tokens")
+
+
+@pytest.mark.asyncio
+async def test_max_tokens_cut_off_retries_with_a_bigger_budget() -> None:
+    """Thinking ate the whole budget: retry once with 2x the tokens, then answer."""
+    provider = ScriptedProvider()
+    provider.route("orchestrator", [_cut_off(), ChatResult(text="here you go")])
+    chat = OrchestratorChat(provider, _catalog(), "flash", effort="high")
+    result = await chat.send("think hard")
+    assert result.reply == "here you go"
+    first, second = provider.requests
+    assert first.max_tokens >= 8_192, "effort raises the budget floor"
+    assert second.max_tokens == first.max_tokens * 2
+    assert second.effort == "high"  # first retry keeps the effort
+
+
+@pytest.mark.asyncio
+async def test_repeated_cut_offs_end_in_a_visible_diagnostic(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """If the retries also return nothing, the owner gets a real line, never
+    '(no reply)', and nothing empty enters the history."""
+    import logging
+
+    provider = ScriptedProvider()
+    provider.route("orchestrator", [_cut_off(), _cut_off(), _cut_off(), _cut_off()])
+    chat = OrchestratorChat(provider, _catalog(), "flash", effort="high")
+    with caplog.at_level(logging.WARNING, logger="rework.chat"):
+        result = await chat.send("think forever")
+    assert "output token limit" in result.reply
+    assert "(no reply)" not in result.reply
+    assert chat.transcript[-1][1] == result.reply
+    requests = provider.requests
+    assert len(requests) == 3  # initial + bigger budget + lower effort
+    assert requests[1].max_tokens == requests[0].max_tokens * 2
+    assert requests[2].effort == "medium"  # the ladder then lowers the effort
+    assert [m["role"] for m in chat._history] == ["user"], "no empty assistant turns"
+    assert any(r.levelname == "ERROR" for r in caplog.records if r.name == "rework.chat")
+
+
+@pytest.mark.asyncio
+async def test_empty_assistant_turns_are_never_persisted(store: Any) -> None:
+    """Anthropic rejects empty assistant messages: an empty model reply leaves
+    no empty row in the store or the history, and the display still says why."""
+    from rework.kernel.state.records import Chat
+
+    row = await store.create_chat(Chat(title=""))
+    provider = ScriptedProvider()
+    provider.route("orchestrator", [ChatResult(text="", stop_reason="end_turn")])
+    chat = OrchestratorChat(provider, _catalog(), "flash", store=store, chat_id=row.id)
+    result = await chat.send("hi")
+    assert result.reply and "(no reply)" not in result.reply
+    stored = await store.chat_messages(row.id)
+    for m in stored:
+        if m.role == "assistant":
+            assert m.body == {} or m.body.get("content"), "no empty assistant body"
+            assert m.display, "no empty assistant display"
+    assert [m["role"] for m in chat._history] == ["user"]

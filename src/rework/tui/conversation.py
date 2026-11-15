@@ -122,11 +122,18 @@ def context_note(snap: Snapshot, project_id: str | None) -> str:
     """Facts the orchestrator should not have to ask about."""
     lines: list[str] = []
     if snap.projects:
-        lines.append("Projects (name: repos):")
+        from rework.missions import derive_transport
+
+        lines.append("Projects (name: transport; repos):")
         for p in snap.projects:
-            repos = (p.settings or {}).get("repos") or []
+            settings = p.settings or {}
+            repos = settings.get("repos") or []
             refs = ", ".join(f"{r.get('name')}={r.get('url') or r.get('kind')}" for r in repos if r)
-            lines.append(f"- {p.name} (id {p.id}): {refs or 'no repos registered'}")
+            transport, results = derive_transport(settings)
+            lines.append(
+                f"- {p.name} (id {p.id}): transport {transport} (results {results}); "
+                f"{refs or 'no repos registered'}"
+            )
     else:
         lines.append("There are no projects yet; missions can be project-less.")
     if project_id:
@@ -139,7 +146,13 @@ def context_note(snap: Snapshot, project_id: str | None) -> str:
         lines.append("Missions in flight:")
         for mission in active[:10]:
             lines.append(f"- {mission.id} [{mission.status.value}] {mission.objective[:80]}")
-    lines.append("Plans: echo (no repo), fix and fix-pr (need a repo).")
+    lines.append(
+        "Plans: echo (no repo). fix and fix-pr need a repo for a git-transport "
+        "project; for an upload-transport project they do NOT need one — the "
+        "project's files area supplies the files, and results are fetched, not pushed. "
+        "draft (document work: research with the web tools, write files in the "
+        "project, no PR) follows the same repo rule as fix."
+    )
     return "\n".join(lines)
 
 
@@ -226,16 +239,28 @@ class Conversation:
     async def launch(self, snap: Snapshot, proposal: Any) -> Any:
         """Create the mission a confirmed proposal describes. Raises ValueError
         when the plan needs a repo nobody named (the caller asks for one)."""
+        from rework.missions import create_mission, project_is_upload
+
         project_id = resolve_project(snap, proposal.project, self.chat.project_id)
+        # the project's OWN settings decide whether a repo is meaningful: for an
+        # upload project the files area supplies the files (results fetched).
+        settings = next(
+            (dict(p.settings or {}) for p in snap.projects if str(p.id) == str(project_id)),
+            None,
+        )
+        upload = settings is not None and project_is_upload(settings)
         kwargs: dict[str, Any] = {
             "objective": proposal.objective,
             "plan": proposal.plan or "fix",
             "project_id": project_id,
-            "repo": proposal.repo or None,
             "model": proposal.model or None,
             "effort": proposal.effort or None,
         }
-        from rework.missions import create_mission
+        # never hand create_mission a None repo: the key is simply absent when
+        # there is nothing to clone (upload project, or no repo named at all).
+        repo = (getattr(proposal, "repo", "") or "").strip()
+        if repo and not upload:
+            kwargs["repo"] = repo
 
         # forward-compatible: once missions carry their own orchestrator model
         # (ADR 0007) and a chat link (M7 P0), pass them
@@ -256,8 +281,8 @@ class Conversation:
 
 
 def default_model(catalog: Any) -> str:
-    entries = catalog.all()
-    usable = [e for e in entries if e.provider != "fake" and e.has_credentials()] or entries
-    # the strongest callable tier is the orchestrator's natural default
-    best = max(usable, key=lambda e: (e.tier, -e.cost_in_per_mtok)) if usable else None
-    return str(best.id) if best else "fake"
+    # the configured default (REWORK_DEFAULT_MODEL), resolved against the
+    # catalog: the TUI knob starts on the same model everything else does
+    from rework.config import default_model_id
+
+    return default_model_id(catalog)

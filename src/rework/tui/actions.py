@@ -57,6 +57,23 @@ async def control(app: ReworkApp, mission_id: str, verb: str) -> bool:
     return True
 
 
+async def prioritize(app: ReworkApp, mission_id: str, current: str = "") -> bool:
+    """Flip a mission between the two pickup levels (one keypress: high when it
+    is normal, back to normal when it already is high)."""
+    target = "normal" if current == "high" else "high"
+    try:
+        result = await app.hub.data.prioritize_mission(mission_id, target)
+    except Exception as exc:
+        app.notify(f"Prioritize failed: {exc}", severity="error", timeout=6)
+        return False
+    if result is None:
+        app.notify(f"No mission {mission_id}", severity="error")
+        return False
+    app.notify(f"{mission_id}: priority {target}", timeout=3)
+    await app.hub.refresh()
+    return True
+
+
 async def fetch(app: ReworkApp, mission_id: str) -> bool:
     app.notify(f"Fetching {mission_id}…", timeout=3)
     try:

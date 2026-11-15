@@ -19,11 +19,22 @@ Design notes:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 from rework.kernel.llm.catalog import ModelCatalog, ModelProvider
 from rework.kernel.llm.types import ChatRequest, ToolSpec
+
+logger = logging.getLogger("rework.chat")
+
+# Reasoning headroom (the mission orchestrator's approach, ecbf960): thinking
+# shares the output budget, so with an effort set it is never below the floor,
+# and a reply cut off at max_tokens with no text and no tool call is retried
+# once with a bigger budget, then once more at a lower effort.
+EFFORT_FLOOR_TOKENS = 8_192
+MAX_CUT_OFFS = 2
+_LOWER_EFFORT = {"high": "medium", "medium": "low", "low": "low"}
 
 SYSTEM_PROMPT = """You are rework's orchestrator. You turn the owner's intent into a mission.
 
@@ -42,7 +53,18 @@ Ground rules:
 Plans you can choose:
 - echo    — no roles, just prove the plumbing works
 - fix     — investigate, code, audit, then a ship gate
-- fix-pr  — same, but finishes by opening a pull request
+- fix-pr  — same, then the engine opens a pull request (no gate by default)
+- draft   — use draft for document work: research write-ups, reports, letters,
+            content — anything whose deliverable is writing, not code. The roles
+            research with the web tools, write the draft as files in the
+            project, and audit every claim against its cited source. No branch
+            push and no PR.
+
+A project may also be repo-less: its transport is "upload", which means rework
+keeps that project's files itself. For an upload project, fix and fix-pr do NOT
+need a repo — the project's files area supplies the files, and results are
+fetched, not pushed. Pass no repo for such a project, and never tell the owner
+one is required.
 
 Every mission starts from the repo's default branch: you cannot hand it an
 earlier mission's branch, results or worktree, so never promise that. Describe
@@ -57,8 +79,8 @@ asking the owner what it meant). Only lessons about doing the work itself
 belong in the objective.
 
 For a project backed by a git repo, prefer fix-pr: the owner reviews the change
-as a pull request, and the PR gate still lets them stop first. Use fix when they
-only want the result held for inspection.
+as a pull request, which the engine opens after a clean audited finish. Use fix
+when they only want the result held for inspection.
 
 Available context is provided in the conversation as system notes. Use it.
 
@@ -85,7 +107,7 @@ PROPOSE_TOOL = ToolSpec(
                 "type": "string",
                 "description": "A short name for lists, 3 to 6 words.",
             },
-            "plan": {"type": "string", "enum": ["echo", "fix", "fix-pr"]},
+            "plan": {"type": "string", "enum": ["echo", "fix", "fix-pr", "draft"]},
             "project": {"type": "string", "description": "Project name, or empty for none."},
             "repo": {
                 "type": "string",
@@ -297,7 +319,10 @@ class ChatTools:
                 )
             return f"unknown tool {name!r}"
         except Exception as exc:  # a lookup failure is info, not a crash
-            return f"error: {type(exc).__name__}: {exc}"
+            logger.exception("chat lookup tool %s failed", name)
+            if name == "library_search":
+                return f"error: Library search failed: {exc}; continuing without it"
+            return f"error: {name} failed: {type(exc).__name__}: {exc}"
 
 
 class OrchestratorChat:
@@ -344,20 +369,22 @@ class OrchestratorChat:
         self.proposal: Proposal | None = None
         self.launched = False
 
-    async def _record(self, role: str, body: dict[str, Any], display: str) -> None:
-        """Persist one transcript row (no-op when persistence is off)."""
+    async def _record(self, role: str, body: dict[str, Any], display: str) -> bool:
+        """Persist one transcript row (no-op when persistence is off). Returns
+        False when the write failed — a storage hiccup must not lose the
+        conversation turn, but it must not be silent either."""
         if self._store is None or self.chat_id is None:
-            return
+            return True
         from rework.kernel.state.records import ChatMessage
 
         try:
             await self._store.append_chat_message(
                 ChatMessage(chat_id=self.chat_id, role=role, body=body, display=display)
             )
-        except Exception:  # a storage hiccup must not lose the conversation turn
-            import logging
-
-            logging.getLogger("rework.chat").exception("could not persist chat turn")
+        except Exception:
+            logger.exception("could not persist chat turn (role=%s)", role)
+            return False
+        return True
 
     async def _note(self, user_text: str, reply: str) -> None:
         """Record a turn that never reached the model (a bare yes/no)."""
@@ -395,6 +422,38 @@ class OrchestratorChat:
         a chat that quietly drops the screenshot answers confidently about
         something it never saw."""
         return "vision" in getattr(self._entry, "capabilities", set())
+
+    def _output_budget(self) -> int:
+        """Output tokens for one request: the model's max_output; with an
+        effort set, thinking shares the budget, so never below the floor."""
+        budget = int(self._entry.max_output or 4096)
+        return max(budget, EFFORT_FLOOR_TOKENS) if self._effort else budget
+
+    async def _complete(self, specs: list[ToolSpec], budget: int, effort: str | None) -> Any:
+        """One model call; a provider failure is logged with its traceback."""
+        request = ChatRequest(
+            model=self._entry.model,
+            system=self._system(),
+            messages=self._history,
+            tools=specs,
+            max_tokens=budget,
+            effort=effort,
+            session_id=self.chat_id,
+        )
+        try:
+            return await self._provider.complete(request)
+        except Exception:
+            logger.exception("orchestrator chat provider call failed")
+            raise
+
+    @staticmethod
+    def _cut_off(result: Any) -> bool:
+        """A reply that spent its whole budget thinking: no text, no tool call."""
+        return (
+            result.stop_reason == "max_tokens"
+            and not (result.text or "").strip()
+            and not result.tool_calls
+        )
 
     def _system(self) -> str:
         parts = [SYSTEM_PROMPT]
@@ -446,72 +505,103 @@ class OrchestratorChat:
         total_in = 0
         total_out = 0
         rounds = 0
-        while True:
-            request = ChatRequest(
-                model=self._entry.model,
-                system=self._system(),
-                messages=self._history,
-                tools=specs,
-                max_tokens=min(self._entry.max_output, 2_048),
-                effort=self._effort,
-                session_id=self.chat_id,
-            )
-            result = await self._provider.complete(request)
-            total_in += result.usage.input_tokens
-            total_out += result.usage.output_tokens
+        cut_offs = 0
+        budget = self._output_budget()
+        effort = self._effort
+        try:
+            while True:
+                result = await self._complete(specs, budget, effort)
+                total_in += result.usage.input_tokens
+                total_out += result.usage.output_tokens
 
-            look_calls = [tc for tc in result.tool_calls if tc.name in {t.name for t in LOOK_TOOLS}]
-            if not look_calls or self._toolbox is None or rounds >= self._max_tool_rounds:
-                break
-            rounds += 1
-            # the assistant's tool-call turn, then one tool result per call
-            call_msg: dict[str, Any] = {
-                "role": "assistant",
-                "content": result.text or "",
-                "tool_calls": _neutral_calls(result.tool_calls),
-            }
-            self._history.append(call_msg)
-            # persisted too: a reloaded history with tool rows but no preceding
-            # assistant tool_calls is rejected by OpenAI-compatible providers
-            await self._record("assistant", call_msg, "")
-            for tc in result.tool_calls:
-                if tc.name in {t.name for t in LOOK_TOOLS}:
-                    if self._on_turn is not None:
-                        self._on_turn("tool_call", {"name": tc.name, "arguments": tc.arguments})
-                    out = await self._toolbox.execute(tc.name, dict(tc.arguments))
-                    if self._on_turn is not None:
-                        self._on_turn(
-                            "tool_result",
-                            {
-                                "name": tc.name,
-                                "result": out[:300],
-                                "error": out[:200] if out.startswith("error") else "",
-                            },
+                if self._cut_off(result) and cut_offs < MAX_CUT_OFFS:
+                    # cut off mid-thought: retry once with more room, then at a
+                    # lower effort (the mission orchestrator's ladder, ecbf960)
+                    cut_offs += 1
+                    if cut_offs == 1:
+                        budget = budget * 2
+                        logger.warning(
+                            "orchestrator reply cut off at the output limit; retrying with"
+                            " a %d-token budget",
+                            budget,
                         )
-                else:
-                    out = "not executed here"
-                self._history.append(
-                    {"role": "tool", "tool_call_id": tc.id, "name": tc.name, "content": out}
-                )
-                if self._record is not None:
-                    await self._record(
-                        "tool",
-                        {"role": "tool", "tool_call_id": tc.id, "name": tc.name, "content": out},
-                        "",
+                    else:
+                        effort = _LOWER_EFFORT.get(effort or "", "low")
+                        logger.warning(
+                            "orchestrator reply cut off at the output limit again; retrying"
+                            " at effort %s",
+                            effort,
+                        )
+                    continue
+
+                look_calls = [
+                    tc for tc in result.tool_calls if tc.name in {t.name for t in LOOK_TOOLS}
+                ]
+                if not look_calls or self._toolbox is None or rounds >= self._max_tool_rounds:
+                    break
+                rounds += 1
+                # the assistant's tool-call turn, then one tool result per call
+                call_msg: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": result.text or "",
+                    "tool_calls": _neutral_calls(result.tool_calls),
+                }
+                self._history.append(call_msg)
+                # persisted too: a reloaded history with tool rows but no preceding
+                # assistant tool_calls is rejected by OpenAI-compatible providers
+                await self._record("assistant", call_msg, "")
+                for tc in result.tool_calls:
+                    if tc.name in {t.name for t in LOOK_TOOLS}:
+                        if self._on_turn is not None:
+                            self._on_turn("tool_call", {"name": tc.name, "arguments": tc.arguments})
+                        out = await self._toolbox.execute(tc.name, dict(tc.arguments))
+                        if self._on_turn is not None:
+                            self._on_turn(
+                                "tool_result",
+                                {
+                                    "name": tc.name,
+                                    "result": out[:300],
+                                    "error": out[:200] if out.startswith("error") else "",
+                                },
+                            )
+                    else:
+                        out = "not executed here"
+                    self._history.append(
+                        {"role": "tool", "tool_call_id": tc.id, "name": tc.name, "content": out}
                     )
-            if self._on_turn is not None:
-                self._on_turn("turn", {"turn": rounds, "tools": [c.name for c in look_calls]})
+                    if self._record is not None:
+                        await self._record(
+                            "tool",
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc.id,
+                                "name": tc.name,
+                                "content": out,
+                            },
+                            "",
+                        )
+                if self._on_turn is not None:
+                    self._on_turn("turn", {"turn": rounds, "tools": [c.name for c in look_calls]})
+        except Exception as exc:
+            logger.exception("orchestrator chat turn failed")
+            note = f"⚠ {type(exc).__name__}: {exc}"
+            self._display.append(("orchestrator", note))
+            await self._record("assistant", {}, note)
+            return ChatResult(
+                reply=note, transcript=[Turn("you", text), Turn("orchestrator", note)]
+            )
 
         cost = self._entry.estimate_cost(total_in, total_out)
 
         # Record the assistant turn (including any tool call) in history so
-        # follow-ups keep context.
+        # follow-ups keep context — but never an empty-text turn with no tool
+        # call: Anthropic rejects empty assistant messages (m-aea59e6edac5).
+        reply = (result.text or "").strip()
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": result.text or ""}
         if result.tool_calls:
             assistant_msg["tool_calls"] = _neutral_calls(result.tool_calls)
-        self._history.append(assistant_msg)
-
-        reply = (result.text or "").strip()
+        if reply or result.tool_calls:
+            self._history.append(assistant_msg)
         asked = ""
         proposal: Proposal | None = None
         for call in result.tool_calls:
@@ -538,12 +628,32 @@ class OrchestratorChat:
             reply = asked
             transcript.append(Turn("orchestrator", asked))
         else:
-            reply = reply or "(no reply)"
+            if not reply:
+                if self._cut_off(result):
+                    reply = (
+                        "the model returned nothing (output token limit); "
+                        "please retry or raise max_output"
+                    )
+                else:
+                    reply = "the model returned nothing; please retry"
+                logger.error(
+                    "orchestrator chat turn ended with no reply (stop_reason=%s, effort=%s)",
+                    result.stop_reason,
+                    effort,
+                )
             transcript.append(Turn("orchestrator", reply))
 
         shown = transcript[-1].text if transcript else reply
         self._display.append(("orchestrator", shown))
-        await self._record("assistant", assistant_msg, shown)
+        # an empty-text reply has no replayable body: {} keeps the display row
+        # without re-feeding an empty assistant message on reload
+        body = assistant_msg if ((result.text or "").strip() or result.tool_calls) else {}
+        saved = await self._record("assistant", body, shown)
+        if not saved:
+            # the reply still reaches the owner; only the note marks it unsaved
+            reply = f"{reply}\n(not saved — could not persist the chat turn)"
+            transcript[-1] = Turn("orchestrator", reply)
+            self._display[-1] = ("orchestrator", reply)
 
         return ChatResult(
             reply=reply,

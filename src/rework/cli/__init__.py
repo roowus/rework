@@ -65,10 +65,10 @@ def new(
         None,
         help="A few words naming the mission (default: derived from the objective).",
     ),
-    plan: str = typer.Option("echo", help="Playbook: echo | fix | fix-pr"),
+    plan: str = typer.Option("echo", help="Playbook: echo | fix | fix-pr | draft"),
     orchestrator: str | None = typer.Option(
         None,
-        help="Catalog id for the mission's orchestrator (default: the strongest tier).",
+        help="Catalog id for the mission's orchestrator (default: REWORK_DEFAULT_MODEL).",
     ),
     effort: str | None = typer.Option(None, help="Orchestrator effort: low | medium | high"),
     budget: float | None = typer.Option(
@@ -79,10 +79,19 @@ def new(
         "--mechanical",
         help="Legacy: run the canned step pipeline instead of an LLM orchestrator.",
     ),
+    priority: str = typer.Option(
+        "normal",
+        "--priority",
+        help="Pickup priority: normal | high. High missions are picked up before"
+        " normal ones; the oldest first within a level.",
+    ),
 ) -> None:
     """Create a mission; the daemon picks it up. An LLM orchestrator runs it
     (ADR 0007), following the plan as a playbook: `fix` = investigate, code,
-    audit, then a ship gate; `fix-pr` ends at an open-PR gate instead."""
+    audit, then a ship gate; `fix-pr` opens a PR instead (no gate by default,
+    unless the project's `pr_gate` setting or the orchestrator asks for one);
+    `draft` is document work (research with the web tools, write files, audit
+    the claims) and has no gate: no branch push and no PR."""
 
     async def go() -> str:
         from rework.missions import create_mission, resolve_project
@@ -98,6 +107,7 @@ def new(
             project_id=project_id,
             title=title,
             plan=plan,
+            priority=priority,
             orchestrator_model=orch_model,
             orchestrator_effort=effort,
             budget_usd=budget,
@@ -110,14 +120,15 @@ def new(
         raise typer.BadParameter(str(exc)) from exc
 
 
-def default_orchestrator_model() -> str:
-    """The strongest real tier in the catalog (the orchestrator decides for a
-    whole mission; it is the last place to save tokens)."""
-    from rework.config import load_catalog
+def default_orchestrator_model(catalog: Any = None) -> str:
+    """The configured default model (REWORK_DEFAULT_MODEL, default 'flash'):
+    the same cheap strong model every role runs on, resolved against the
+    catalog. Cost control starts here. `catalog` is optional so a caller that
+    already loaded one (or a test) can pass it instead of re-reading
+    ~/.rework/models.json."""
+    from rework.config import default_model_id
 
-    entries = load_catalog().all()
-    real = [e for e in entries if e.provider != "fake" and e.has_credentials()] or entries
-    return max(real, key=lambda e: (e.tier, -e.cost_in_per_mtok)).id
+    return default_model_id(catalog)
 
 
 project_app = typer.Typer(no_args_is_help=True, add_completion=False, help="Projects (ADR 0005).")
@@ -159,8 +170,16 @@ def project_assign(
 @project_app.command("create")
 def project_create(
     name: str,
-    transport: str = typer.Option("git", help="git (daemon clones origins) | upload"),
-    results: str = typer.Option("push_branch", help="push_branch | fetch | both"),
+    transport: str | None = typer.Option(
+        None,
+        help="git (daemon clones origins) | upload (daemon keeps the files)."
+        " Defaults from --repo: given repos -> git, none -> upload.",
+    ),
+    results: str | None = typer.Option(
+        None,
+        help="push_branch | fetch | both. Defaults from --repo:"
+        " given repos -> push_branch, none -> fetch.",
+    ),
     # typer needs list for repeatable options (tuple[str, ...] chokes on the
     # Ellipsis); ruff B008 flags any list-annotated default, so noqa is the
     # only clean escape (matches the existing ASYNC240 noqa above)
@@ -175,6 +194,7 @@ def project_create(
     async def go() -> str:
         from rework.config import Config, open_store_from_config
         from rework.kernel.state.records import Project
+        from rework.missions import derive_transport
         from rework.missions import is_git_url as missions_is_git_url
 
         repos: list[dict] = []
@@ -184,10 +204,34 @@ def project_create(
             rname, url = spec.split("=", 1)
             kind = "github" if missions_is_git_url(url) else "path"
             repos.append({"name": rname, "kind": kind, "url": url})
+        # repos decide the transport (ADR 0005): a repo-less project travels by
+        # upload/fetch, never git/push_branch, because it has no origin to push to
+        derived_transport, derived_results = derive_transport({"repos": repos})
+        if transport == "git" and not repos:
+            raise typer.BadParameter("transport=git needs at least one --repo NAME=URL")
+        if transport is not None and transport != derived_transport:
+            # storing the contradiction made `project show` print a transport the
+            # project does not have (and every reader derives it anyway): refuse
+            # it instead of quietly disagreeing with the repo list
+            raise typer.BadParameter(
+                "--transport upload needs no --repo; drop one"
+                if transport == "upload"
+                else f"--transport {transport} contradicts the repos"
+                f" (that project is transport={derived_transport})"
+            )
+        # the DERIVED pair is what gets stored, so settings never contradict the
+        # repo list; an explicit --results still wins where `derive_transport`
+        # honours it (a git project's push_branch | fetch | both)
+        settings_transport = derived_transport
+        settings_results = results or derived_results
         cfg = Config.from_env()
         store = await open_store_from_config(cfg)
         try:
-            settings = {"transport": transport, "results": results, "repos": repos}
+            settings = {
+                "transport": settings_transport,
+                "results": settings_results,
+                "repos": repos,
+            }
             p = await store.create_project(Project(name=name, settings=settings))
             return p.id
         finally:
@@ -202,14 +246,16 @@ def project_ls() -> None:
 
     async def go() -> list[str]:
         from rework.config import Config, open_store_from_config
+        from rework.missions import derive_transport
 
         store = await open_store_from_config(Config.from_env())
         try:
             rows = []
             for p in await store.list_projects():
                 repos = (p.settings or {}).get("repos") or []
+                transport, results = derive_transport(p.settings)
                 rows.append(
-                    f"{p.id}  {p.name}  transport={(p.settings or {}).get('transport', 'git')}"
+                    f"{p.id}  {p.name}  transport={transport}  results={results}"
                     f"  repos={len(repos)}"
                 )
             return rows
@@ -218,6 +264,86 @@ def project_ls() -> None:
 
     for line in asyncio.run(go()):
         typer.echo(line)
+
+
+@project_app.command("add-files")
+def project_add_files(
+    project: str = typer.Argument(..., help="Project name or id."),
+    paths: list[str] = typer.Argument(..., help="Local files/folders to send."),  # noqa: B008
+    daemon_url: str | None = typer.Option(None, help="Override REWORK_DAEMON_URL."),
+) -> None:
+    """Copy local files into a repo-less project's files area on the daemon.
+    Every mission on that project then starts from them."""
+
+    async def go() -> tuple[str, list[str]]:
+        from rework.config import Config, open_store_from_config
+        from rework.missions import resolve_project
+
+        project_id = await resolve_project(project)
+        assert project_id is not None
+        store = await open_store_from_config(Config.from_env())
+        try:
+            found = await store.get_project(project_id)
+        finally:
+            await store.aclose()
+        from rework.missions import project_is_upload
+
+        if found is None or not project_is_upload(found.settings):
+            raise ValueError(f"project {project} is git transport: push a branch, not files")
+        from rework.project_files import add_project_files
+
+        changed = await asyncio.to_thread(add_project_files, project_id, list(paths), daemon_url)
+        return project_id, changed
+
+    try:
+        project_id, changed = asyncio.run(go())
+    except ValueError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+    if not changed:
+        typer.echo(f"{project_id}: no changes (files identical)")
+        return
+    typer.echo(f"{project_id}: {len(changed)} path(s) in the project files area")
+    for line in changed:
+        typer.echo(f"  {line}")
+
+
+@project_app.command("pull")
+def project_pull(
+    project: str = typer.Argument(..., help="Project name or id."),
+    dest: str = typer.Argument(..., help="Local folder to unpack the files into."),
+    daemon_url: str | None = typer.Option(None, help="Override REWORK_DAEMON_URL."),
+) -> None:
+    """Fetch a repo-less project's files area from the daemon into DEST."""
+
+    async def go() -> str:
+        from rework.config import Config, open_store_from_config
+        from rework.missions import resolve_project
+
+        project_id = await resolve_project(project)
+        assert project_id is not None
+        store = await open_store_from_config(Config.from_env())
+        try:
+            found = await store.get_project(project_id)
+        finally:
+            await store.aclose()
+        from rework.missions import project_is_upload
+
+        if found is None or not project_is_upload(found.settings):
+            raise ValueError(f"project {project} is git transport: clone its repo instead")
+        from pathlib import Path as _Path
+
+        from rework.project_files import pull_project_archive
+
+        path = await asyncio.to_thread(pull_project_archive, project_id, _Path(dest), daemon_url)
+        return str(path)
+
+    try:
+        path = asyncio.run(go())
+    except ValueError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"project files pulled into {path}")
 
 
 @project_app.command("show")
@@ -842,6 +968,40 @@ def pause(mission_id: str) -> None:
 def resume(mission_id: str) -> None:
     """Resume a paused mission (or un-cancel one that never got far)."""
     _set_mission_status(mission_id, "running")
+
+
+@app.command()
+def prioritize(
+    mission_id: str,
+    priority: str = typer.Option(
+        "high",
+        "--priority",
+        help="normal | high. Defaults to high: prioritizing is the common case,"
+        " and --priority normal puts a mission back in the normal queue.",
+    ),
+) -> None:
+    """Set a mission's pickup priority (high missions are picked up first,
+    oldest first within a level). Does not touch a running mission."""
+    from rework.missions import PRIORITIES
+
+    level = (priority or "high").strip().lower()
+    if level not in PRIORITIES:
+        raise typer.BadParameter(f"unknown priority {priority!r}; priorities: normal, high")
+
+    async def go() -> str:
+        from rework.config import Config, open_store_from_config
+
+        store = await open_store_from_config(Config.from_env())
+        try:
+            updated = await store.update_mission(mission_id, priority=level)
+            if updated is None:
+                typer.echo(f"unknown mission {mission_id}", err=True)
+                raise typer.Exit(1)
+            return updated.priority
+        finally:
+            await store.aclose()
+
+    typer.echo(f"{mission_id}: priority {asyncio.run(go())}")
 
 
 def _set_mission_status(mission_id: str, status: str) -> None:
@@ -1647,13 +1807,17 @@ def sync_config_cmd(
         False, "--dry-run", help="Show what would change; never touch the remote host."
     ),
 ) -> None:
-    """Copy ~/.rework/models.json and the REWORK_*_KEY lines of
-    ~/.rework/rework.env to the target's ssh host. Prints key NAMES and value
-    LENGTHS only, never a secret. REWORK_DB / REWORK_DAEMON_URL and every
-    other line in the remote rework.env are left untouched."""
+    """MERGE ~/.rework/models.json and the REWORK_*_KEY lines of
+    ~/.rework/rework.env into the target's ssh host: local catalog entries add
+    or replace by id, the target's own entries survive, and entries whose
+    base_url is loopback (localhost / 127.0.0.1 / ::1) - and the keys only they
+    use - stay local, because the target could never call them. Prints key
+    NAMES and value LENGTHS only, never a secret. REWORK_DB / REWORK_DAEMON_URL
+    and every other line in the remote rework.env are left untouched."""
     import subprocess as _sp
 
     from rework.config import DEFAULT_STATE_DIR
+    from rework.kernel.llm.catalog import is_loopback_url
     from rework.targets import TARGETS_PATH, load_targets_file
 
     file = load_targets_file()
@@ -1685,6 +1849,50 @@ def sync_config_cmd(
         )
         return proc.stdout
 
+    # -- the local catalog, minus what only THIS machine can call --------------
+    # A loopback base_url is reachable only where it was written, so such an
+    # entry (and a key no kept entry needs) is not synced: the target would
+    # only ever fail on it.
+    models = DEFAULT_STATE_DIR / "models.json"
+    local_doc: Any = None
+    try:
+        local_doc = json.loads(models.expanduser().read_text())
+    except OSError:
+        local_doc = None
+    except ValueError as exc:
+        typer.secho(
+            f"warning: local {models} is not valid JSON ({exc}); treating it as empty",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        local_doc = None
+    local_entries = _models_doc_entries(local_doc)
+    if local_doc is not None and not local_entries:
+        typer.secho(
+            f"warning: local {models} holds no catalog entries; nothing to merge",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        local_doc = None
+
+    kept_entries: list[dict[str, Any]] = []
+    skipped_entries: list[tuple[str, str]] = []  # (id, base_url)
+    skipped_keys: set[str] = set()
+    for entry in local_entries:
+        entry_id = str(entry.get("id") or "?")
+        url = entry.get("base_url")
+        if is_loopback_url(url if isinstance(url, str) else None):
+            skipped_entries.append((entry_id, str(url)))
+            key = _entry_key_env(entry)
+            if key:
+                skipped_keys.add(key)
+            continue
+        kept_entries.append(entry)
+    kept_keys = {key for key in map(_entry_key_env, kept_entries) if key}
+    # a key a kept entry ALSO uses is still needed on the target: only keys that
+    # no kept entry needs are dropped
+    dropped_keys = {key for key in skipped_keys if key not in kept_keys}
+
     local_env = DEFAULT_STATE_DIR / "rework.env"
     try:
         local_lines = local_env.expanduser().read_text().splitlines()
@@ -1706,6 +1914,8 @@ def sync_config_cmd(
                 local_keys[key] = value
 
     # remote rework.env: keep every line, replace/insert only REWORK_*_KEY ones
+    # that a kept catalog entry may need
+    send_keys = {key: value for key, value in local_keys.items() if key not in dropped_keys}
     remote_raw = ssh_run("cat ~/.rework/rework.env 2>/dev/null || true")
     remote_lines: list[str] = remote_raw.splitlines()
     covered: set[str] = set()
@@ -1713,52 +1923,152 @@ def sync_config_cmd(
     for line in remote_lines:
         stripped = line.strip()
         key = stripped.split("=", 1)[0].strip() if "=" in stripped else ""
-        if key in local_keys:
-            merged.append(f"{key}={local_keys[key]}")
+        if key in send_keys:
+            merged.append(f"{key}={send_keys[key]}")
             covered.add(key)
         else:
             merged.append(line)
-    for key, value in local_keys.items():
+    for key, value in send_keys.items():
         if key not in covered:
             merged.append(f"{key}={value}")
     if merged and not merged[-1].strip():
         merged = merged[:-1]  # a trailing blank line, not two
     merged_text = "\n".join(merged) + ("\n" if merged else "")
-    added = sorted(k for k in local_keys if k not in covered)
-    updated = sorted(k for k in local_keys if k in covered)
-    if added or updated:
+    added = sorted(k for k in send_keys if k not in covered)
+    updated = sorted(k for k in send_keys if k in covered)
+    key_lines = [f"  add     {key}: {len(send_keys[key])} chars" for key in added]
+    key_lines += [f"  replace {key}: {len(send_keys[key])} chars" for key in updated]
+    key_lines += [f"  skip {key}: used only by skipped entries" for key in sorted(dropped_keys)]
+    if key_lines:
         typer.echo(f"REWORK_*_KEY lines from {local_env}:")
-        for key in added:
-            typer.echo(f"  add     {key}: {len(local_keys[key])} chars")
-        for key in updated:
-            typer.echo(f"  replace {key}: {len(local_keys[key])} chars")
+        for line in key_lines:
+            typer.echo(line)
     else:
         typer.echo(f"no REWORK_*_KEY lines in {local_env}: nothing to merge")
 
-    models = DEFAULT_STATE_DIR / "models.json"
-    exists = models.exists()
-    typer.echo(
-        f"{'would copy' if dry_run else 'copy'} models.json: {models}"
-        f"    -> {host}:~/.rework/models.json"
+    # -- remote models.json: read, merge by id, write the merged document ------
+    # `ssh_run` cannot tell a failed ssh from an empty file (it returns stdout
+    # either way), and an empty read is ALSO what a target with no models.json
+    # gives. Those two must not be confused: treating a failed read as "the
+    # target has no catalog" makes the merge below see no target entries and
+    # then REPLACE the remote file with local-only ones, destroying the
+    # target-only entries this command exists to preserve. So the read appends
+    # a sentinel that only a completed shell run can produce.
+    target_doc: Any = None
+    models_sentinel = "__REWORK_MODELS_EOF__"
+    remote_models = ssh_run(
+        f"cat ~/.rework/models.json 2>/dev/null || true; echo {models_sentinel}"
     )
+    if models_sentinel not in remote_models:
+        typer.secho(
+            f"cannot read {host}:~/.rework/models.json: the ssh read did not complete"
+            f" (no {models_sentinel} marker in the output), so the target's catalog"
+            " cannot be merged; nothing was written and the local files are untouched",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(1)
+    # The marker is echoed LAST (`cat ...; echo <marker>`), so the split is
+    # tail-anchored on purpose: a document may legitimately contain the token
+    # inside a string, and a head-anchored split would truncate it there.
+    remote_models = remote_models.rsplit(models_sentinel, 1)[0]
+    if remote_models.endswith("\n"):
+        remote_models = remote_models[:-1]
+    if remote_models.strip():
+        try:
+            target_doc = json.loads(remote_models)
+        except ValueError as exc:
+            typer.secho(
+                f"warning: {host}:~/.rework/models.json is not valid JSON ({exc});"
+                " treating it as empty and writing a valid merged catalog",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+            target_doc = None
+    target_entries = _models_doc_entries(target_doc)
+    target_ids = {str(entry.get("id")) for entry in target_entries}
+    local_ids = [str(entry.get("id")) for entry in kept_entries]
+    merged_entries = list(kept_entries) + [
+        entry for entry in target_entries if str(entry.get("id")) not in set(local_ids)
+    ]
+    # The ONLY document shape the loader reads is the flat entry list
+    # (load_catalog -> ModelCatalog.from_config -> ModelEntry(**item)). Nothing
+    # in rework writes the object shape and an object-shaped file makes the
+    # target's catalog unreadable, so preserving it could only corrupt the
+    # target: sync-config always writes the list (its entries are merged above).
+    merged_doc = _models_doc_with(merged_entries)
+    if isinstance(target_doc, dict):
+        typer.echo(
+            "note: the target's models.json is not an entry list the loader can "
+            "read; written as a plain entry list"
+        )
+
+    if local_doc is None:
+        typer.echo(f"no local {models}: models.json not merged")
+    else:
+        typer.echo(f"merge models.json: {models}    -> {host}:~/.rework/models.json")
+        for entry in kept_entries:
+            verb = "replace" if str(entry.get("id")) in target_ids else "add    "
+            typer.echo(f"  {verb} {entry.get('id')}: {len(json.dumps(entry))} chars")
+        for entry in target_entries:
+            if str(entry.get("id")) not in set(local_ids):
+                typer.echo(f"  keep    {entry.get('id')}: only on the target")
+        for entry_id, url in skipped_entries:
+            typer.echo(f"  skip {entry_id}: loopback base_url {url}")
 
     if dry_run:
         typer.echo("dry run: nothing was sent to the remote host")
         return
-    if local_keys:
-        mkdir = ssh_run(
-            "mkdir -p ~/.rework && touch ~/.rework/rework.env && chmod 600 ~/.rework/rework.env"
-        )
-        _ = mkdir
+    if send_keys or local_doc is not None:
+        ssh_run("mkdir -p ~/.rework")
+    if send_keys:
+        ssh_run("touch ~/.rework/rework.env && chmod 600 ~/.rework/rework.env")
         ssh_run(
             "cat > ~/.rework/rework.env && chmod 600 ~/.rework/rework.env", input_text=merged_text
         )
         typer.echo(f"merged rework.env written to {host} (mode 600 preserved)")
-    if exists:
-        _sp.run(["scp", str(models), f"{host}:.rework/models.json"], check=True)
-        typer.echo("models.json copied")
+    if local_doc is not None:
+        ssh_run(
+            "cat > ~/.rework/models.json && chmod 600 ~/.rework/models.json",
+            input_text=json.dumps(merged_doc, indent=2) + "\n",
+        )
+        typer.echo(f"merged models.json written to {host}:~/.rework/models.json (mode 600)")
+
+
+def _models_doc_entries(doc: Any) -> list[dict[str, Any]]:
+    """The catalog entry list inside a models.json document: the document
+    itself when it is a JSON list, or its `entries` list when it is an object.
+    A malformed shape gives [] (and non-dict items are dropped) rather than
+    crashing a sync."""
+    if isinstance(doc, list):
+        raw = doc
+    elif isinstance(doc, dict) and isinstance(doc.get("entries"), list):
+        raw = doc["entries"]
     else:
-        typer.echo(f"no local {models}: models.json not copied")
+        return []
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def _models_doc_with(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The document to write for `entries`: ALWAYS the flat list, the one shape
+    the loader can read (ModelCatalog.from_config). The object shape
+    `{"version": 2, "entries": [...]}` is deliberately NOT preserved: rework
+    cannot read it, so reproducing it would only corrupt the target's catalog.
+    """
+    return entries
+
+
+def _entry_key_env(entry: dict[str, Any]) -> str:
+    """The env var a raw models.json entry's key lives in ("" when the provider
+    needs none). Goes through api_key_env_name so the loopback filter can never
+    drift from the lookup the adapters use; an entry too malformed to validate
+    contributes no key instead of crashing the sync."""
+    from rework.kernel.llm.catalog import ModelEntry, api_key_env_name
+
+    try:
+        return api_key_env_name(ModelEntry(**entry))
+    except Exception:
+        return ""
 
 
 @app.command()

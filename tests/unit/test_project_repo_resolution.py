@@ -56,12 +56,65 @@ async def test_several_repos_and_no_name_is_ambiguous(db: str) -> None:
         await create_mission("x", plan="fix", project_id=pid)
 
 
-async def test_project_without_repos_still_needs_one_for_fix(db: str) -> None:
+async def test_project_without_repos_is_upload_transport_not_an_error(db: str) -> None:
+    """A repo-less project travels by the upload transport (ADR 0005), so it
+    supplies its own workspace from the files area: `fix` must NOT demand an
+    origin it can never have. Nothing is resolved at creation time."""
     pid = await _project(db, [])
-    with pytest.raises(ValueError, match="requires a repo"):
-        await create_mission("x", plan="fix", project_id=pid)
+    fix = await create_mission("x", plan="fix", project_id=pid)
+    assert fix.repo_origin is None and fix.repo_path is None
     echo = await create_mission("x", plan="echo", project_id=pid)
     assert echo.repo_origin is None and echo.repo_path is None
+
+
+def test_derive_transport_repos_mean_git() -> None:
+    from rework.missions import derive_transport
+
+    assert derive_transport({"repos": [{"name": "r", "kind": "git", "url": URL}]}) == (
+        "git",
+        "push_branch",
+    )
+
+
+@pytest.mark.parametrize("settings", [{"repos": []}, {}, None])
+def test_derive_transport_without_repos_is_upload(settings: dict | None) -> None:
+    from rework.missions import derive_transport
+
+    assert derive_transport(settings) == ("upload", "fetch")
+
+
+def test_derive_transport_never_pushes_for_a_repo_less_project() -> None:
+    """A stored `results: push_branch` cannot survive the derivation: with no
+    repo there is no origin to push to, so the project fetches."""
+    from rework.missions import derive_transport
+
+    transport, results = derive_transport({"repos": [], "results": "push_branch"})
+    assert (transport, results) == ("upload", "fetch")
+    assert results != "push_branch"
+
+
+def test_project_is_upload() -> None:
+    from rework.missions import project_is_upload
+
+    assert project_is_upload({"repos": []}) is True
+    assert project_is_upload({}) is True
+    assert project_is_upload(None) is True
+    assert project_is_upload({"repos": [{"name": "r", "kind": "git", "url": URL}]}) is False
+
+
+async def test_mechanical_draft_gets_its_own_plan_not_the_echo_default(db: str) -> None:
+    """`draft` without an orchestrator model used to fall through the template
+    branch, leaving plan_spec None: the engine's DEFAULT_PLAN (echo) then ran a
+    mission that does nothing instead of failing or drafting."""
+    pid = await _project(db, [{"name": "rework", "kind": "git", "url": URL}])
+    mission = await create_mission("write the README", plan="draft", project_id=pid)
+    plan = mission.plan or {}
+    assert plan.get("kind") == "draft", f"draft fell through to {plan!r}"
+    assert [s["role"] for s in plan["steps"]] == ["investigator", "coder", "auditor"]
+    assert plan["gates"] == [], "a writing mission ships files, not a branch or a PR"
+    # negative controls: the mechanical templates are unchanged
+    fix = await create_mission("fix it", plan="fix", project_id=pid)
+    assert (fix.plan or {})["kind"] == "fix" and fix.plan["gates"] == ["ship"]
 
 
 async def test_resolve_project_accepts_a_name(db: str) -> None:
