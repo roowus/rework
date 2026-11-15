@@ -59,6 +59,19 @@ class View(Container):
     def on_snapshot(self, snap: Snapshot) -> None:
         pass
 
+    def animate(self, frame: str, now: float) -> None:
+        """Called by the app's ONE animation timer with the current frame.
+
+        `frame` comes from the shared clock (spinner.frame_for), never from a
+        counter stored on a view: every store poll rebuilds the row markup from
+        fresh data, so a stored frame would be reset. Views that show running
+        work override this; the default is a no-op, which is what lets the app
+        fan the tick to `self.current` with no isinstance checks.
+
+        An override must do nothing when it has nothing running, and must wrap
+        its paint in `self.painting()` (teardown races)."""
+        pass
+
     def shown(self) -> None:
         pass
 

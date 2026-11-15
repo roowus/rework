@@ -40,6 +40,10 @@ class Snapshot:
     error: str = ""
     loaded: bool = False  # False until the first successful refresh
     at: float = 0.0
+    # newest event epoch per run. Events are the only live signal a role gives,
+    # so this is what tells a working run from a wedged one (spinner.STALL_SECONDS).
+    # "*" is the newest across every active mission.
+    last_event: dict[str, float] = field(default_factory=dict)
 
     def project_name(self, project_id: str | None) -> str:
         if not project_id:
@@ -106,6 +110,7 @@ class Hub:
                 snap.projects = await self.data.projects()
                 snap.chats = await self._chats()
                 snap.spend_today = await self._spend_today()
+                await self._event_stamps(snap)
                 snap.online = not self.data._reconnecting_hint
                 snap.error = self.data._reconnecting_hint
                 snap.loaded = True
@@ -132,6 +137,38 @@ class Hub:
             return snap
         finally:
             self._busy = False
+
+    async def _event_stamps(self, snap: Snapshot) -> None:
+        """Newest event ts per run for the missions that are actually running.
+
+        Carries the previous stamps forward for runs that are still active, so
+        the map does not empty between events. Bounded on purpose: one query per
+        running mission per poll, and the timestamp is only used to decide
+        "animating frame" vs "idle 7m"."""
+        stamps: dict[str, float] = {}
+        active = [
+            m for m in snap.missions if str(getattr(m.status, "value", m.status)) == "running"
+        ]
+        for mission in active[:24]:
+            try:
+                newest = await self.data.latest_event_ts(mission.id)
+            except Exception:  # offline, old store: no note, just no stamps
+                continue
+            if newest:
+                stamps[mission.id] = newest
+            try:
+                runs = await self.data.mission_runs(mission.id)
+            except Exception:
+                continue
+            for run in runs:
+                if run.id in stamps:
+                    continue
+                ts = await self.data.latest_event_ts(mission.id, run.id)
+                if ts:
+                    stamps[run.id] = ts
+        if stamps:
+            stamps["*"] = max(stamps.values())
+        snap.last_event = stamps
 
     async def _chats(self) -> list[Any]:
         try:

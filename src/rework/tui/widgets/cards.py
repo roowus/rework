@@ -10,6 +10,7 @@ from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.widgets import Static
 
+from rework.tui import spinner
 from rework.tui.actions import can
 from rework.tui.theme import (
     ACCENT,
@@ -21,6 +22,7 @@ from rework.tui.theme import (
     esc,
     money,
     plan_label,
+    run_mark,
     status_text,
     status_value,
 )
@@ -117,6 +119,10 @@ class MissionCard(Vertical):
         self.last_seq = 0
         self.tail: list[str] = []
         self.active_role = ""
+        # spinner state: the frame comes from the app's shared clock every tick
+        self._frame = ""
+        self._now = 0.0
+        self._last_event: float | None = None
         # a finished card backfills its tail once, then is never polled again
         self.tail_filled = False
 
@@ -174,6 +180,17 @@ class MissionCard(Vertical):
             self.last_seq = max(self.last_seq, max(int(ev.seq or 0) for ev in events))
         self.paint()
 
+    def animate(self, frame: str, now: float, last_event: float | None) -> None:
+        """Repaint the card head with the current spinner frame (surface d).
+
+        Nothing but a genuinely running mission animates; the frame itself comes
+        from the shared clock, so a store poll repainting the card cannot reset
+        it."""
+        if self.status != "running":
+            return
+        self._frame, self._now, self._last_event = frame, now, last_event
+        self.paint()
+
     def paint(self) -> None:
         # children may not be composed yet (or already gone during teardown)
         if not self.is_mounted or not self.query(".mc-head"):
@@ -184,6 +201,16 @@ class MissionCard(Vertical):
             head.update(f"[{MUTED}]mission {esc(self.mission_id)} · loading…[/]")
         else:
             status = status_value(m.status)
+            mark = (
+                run_mark(spinner.is_stalled(self._now, self._last_event), self._frame)
+                if status == "running" and self._frame
+                else ""
+            )
+            if mark and spinner.is_stalled(self._now, self._last_event):
+                mark += f" [{FAINT}]idle"
+                mark += f" {spinner.human_duration(spinner.silence(self._now, self._last_event))}[/]"
+            elif mark:
+                mark += f" [{FAINT}]working[/]"
             bits = [esc(self.mission_id), esc(plan_label(m.plan))]
             if self.active_role and status in {"running", "awaiting_gate"}:
                 bits.append(f"[b]{esc(self.active_role)}[/b]")
@@ -195,7 +222,9 @@ class MissionCard(Vertical):
                 if getattr(m, "title", None)
                 else f"[b]{esc(clip(m.objective, 200))}[/b]"
             )
-            head.update(f"{status_text(status)}  [{MUTED}]" + "  ·  ".join(bits) + f"[/]\n{name}")
+            shown = mark if mark else status_text(status)
+            head.update(f"{shown}  [{MUTED}]" + "  ·  ".join(bits) + f"[/]\n{name}")
+
             for cls in ("-accent", "-warn", "-ok", "-danger"):
                 self.remove_class(cls)
             self.add_class(

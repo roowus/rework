@@ -192,6 +192,31 @@ class TuiData:
             lambda: self._call(lambda s: s.events_since(since, mission_id=mission_id, limit=limit)),
         )
 
+    async def latest_event_ts(self, mission_id: str, run_id: str | None = None) -> float | None:
+        """Newest event epoch for a mission (or one run). None = never seen.
+
+        Reads ONE row backwards (the store's newest_first), so the spinner's
+        zombie rule costs a single indexed query per running mission per poll."""
+
+        async def _q() -> float | None:
+            # one run's events are interleaved with its siblings' and with the
+            # orchestrator's, so a run filter has to look at a window
+            rows = await self.events_newest(mission_id, limit=1 if run_id is None else 200)
+            for row in rows:
+                if run_id is None or row.run_id == run_id:
+                    return float(row.ts) if row.ts else None
+            return None
+
+        return await self._resilient(f"last_event:{mission_id}:{run_id}", _q)
+
+    async def events_newest(self, mission_id: str, limit: int = 1) -> list[Any]:
+        return await self._resilient(
+            f"events_newest:{mission_id}:{limit}",
+            lambda: self._call(
+                lambda s: s.events_since(0, mission_id=mission_id, limit=limit, newest_first=True)
+            ),
+        )
+
     async def mission_runs(self, mission_id: str) -> list[Run]:
         return await self._resilient(
             f"runs:{mission_id}", lambda: self._call(lambda s: s.list_runs(mission_id))

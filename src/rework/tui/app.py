@@ -24,6 +24,7 @@ from textual.worker import WorkerFailed
 from rework import update as update_mod
 from rework.runtime import CODE_CHANGED_IDLE, CodeChangeWatcher
 from rework.tui import reload as reload_mod
+from rework.tui import spinner
 from rework.tui.hub import Hub, Snapshot
 from rework.tui.settings import Settings
 from rework.tui.theme import THEME, WARN, clip
@@ -51,6 +52,12 @@ CODE_CHECK_SECONDS = 60.0
 # slower than the stat walk above, so it gets its own slow interval and
 # runs off the UI thread; offline is silent.
 UPDATE_CHECK_SECONDS = 900.0
+
+# The ONE animation interval (spinner). This is the only timer in the app whose
+# job is to repaint, and it is the only place a 10fps tick may be registered:
+# `test_one_animation_timer` fails if a second one appears. 0.1s matches
+# spinner.SECONDS_PER_FRAME, so the visible frame advances every tick.
+ANIMATION_SECONDS = 0.1
 
 # Found live: alt+N worked under Pilot and NEVER in a real macOS terminal.
 # Option+digit reaches Textual as a character (¡ ™ £ ¢ ∞; Textual even maps
@@ -233,6 +240,10 @@ class ReworkApp(App[None]):
         self.set_interval(CODE_CHECK_SECONDS, self._check_code)
         self.set_interval(UPDATE_CHECK_SECONDS, self._check_update)
         self.set_interval(reload_mod.RELOAD_CHECK_SECONDS, self._check_reload)
+        # the ONLY animation timer: 10fps, feeding one frame from the shared
+        # clock to the active view. It does no I/O, no DB access and mounts
+        # nothing; a view with nothing running returns immediately.
+        self.set_interval(ANIMATION_SECONDS, self._animate)
         self._restore_ui_state()
 
     def get_theme_variable_defaults(self) -> dict[str, str]:
@@ -248,6 +259,21 @@ class ReworkApp(App[None]):
     @property
     def current(self) -> View:
         return self.view(self.active_tab)
+
+    def _animate(self) -> None:
+        """One spinner frame to the ACTIVE view only.
+
+        The frame value comes from a monotonic clock read HERE, at paint time,
+        so no widget stores an incrementing counter that a store poll could
+        reset. `app_focus` is the only cheap focus guard Textual 8.2.8 offers
+        (it goes False when the terminal loses focus); `screen.is_active` stays
+        True under a pushed ModalScreen, so "do not animate behind an overlay"
+        is not available without tracking screens ourselves."""
+        if not self.app_focus:
+            return
+        now = time.time()
+        frame = spinner.frame_for(time.monotonic())
+        self.current.animate(frame, now)
 
     async def on_event(self, event: events.Event) -> None:
         if isinstance(event, events.Key) and not event.is_forwarded:

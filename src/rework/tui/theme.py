@@ -10,6 +10,8 @@ import time
 
 from textual.theme import Theme
 
+from rework.tui import spinner
+
 # -- palette -----------------------------------------------------------------
 
 BG = "#0c0c10"
@@ -97,6 +99,25 @@ STATUS: dict[str, tuple[str, str]] = {
     "cancelled": ("⊘", FAINT),
     "aborted": ("⊘", FAINT),
 }
+
+# -- spinner vocabulary --------------------------------------------------------
+
+# A running thing is animated from the shared clock in spinner.py, so it has no
+# single glyph here: `run_mark` below picks the frame. The stall marker is
+# static on purpose (a frozen frame is what the spinner exists to rule out).
+IDLE_GLYPH, IDLE_COLOUR = spinner.IDLE_GLYPH, FAINT
+
+
+def run_mark(stalled: bool, frame: str) -> str:
+    """Rich markup for the marker on something that is RUNNING.
+
+    `frame` comes from spinner.frame_for(t) (or spinner.marker). Stalled runs
+    get the idle marker in FAINT, so a dead-but-running mission reads at a
+    glance differently from a working one."""
+    if stalled:
+        return f"[{IDLE_COLOUR}]{IDLE_GLYPH}[/]"
+    return f"[{ACCENT}]{frame}[/]"
+
 
 STATUS_LABEL: dict[str, str] = {
     "awaiting_gate": "needs you",
