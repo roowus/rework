@@ -1408,6 +1408,80 @@ def test_main_update_target_stays_exempt_from_the_guard(
     assert "needs a name" not in captured.err
 
 
+class _StopLogging(Exception):
+    """Sentinel: the logging branch ran, so stop main() before the typer app."""
+
+
+def _logging_spy(calls: list[str]):
+    """A setup_logging stand-in that records its component and halts main().
+
+    main() imports setup_logging inside the function, so patching the module
+    attribute is what it resolves; raising the sentinel keeps the test away
+    from app() (and therefore from any daemon or TUI start).
+    """
+
+    def spy(component: str, **_kwargs: object) -> None:
+        calls.append(component)
+        raise _StopLogging
+
+    return spy
+
+
+@pytest.mark.parametrize("argv", [["rework", "--", "serve"], ["rework", "--", "logs"]])
+def test_main_double_dash_shapes_take_the_logging_path(
+    argv: list[str],
+    dispatched_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REGRESSION: `rework -- serve` / `rework -- logs` still log like base.
+
+    `--` is the end-of-options marker, so `serve` is a POSITIONAL and not the
+    subcommand: the "serve/logs/library-mcp already log themselves" exemption
+    must not fire and the CLI logging path must run. Reading rest[0] as the
+    subcommand skipped setup_logging("cli") for exactly these shapes.
+    """
+    import rework.logs
+    import rework.tui as tui
+    from rework.cli import main
+
+    calls: list[str] = []
+    monkeypatch.setattr(rework.logs, "setup_logging", _logging_spy(calls))
+    monkeypatch.setattr(tui, "run_tui", _tui_must_not_start)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(_StopLogging):
+        main()
+
+    assert calls == ["cli"], argv  # exactly once, and for the CLI component
+
+
+def test_main_exempt_subcommand_skips_the_cli_logging(
+    dispatched_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Complement: `rework serve` does NOT take the CLI logging branch.
+
+    `serve` IS the subcommand here, and it configures its own ("daemon")
+    logging, so main() must leave setup_logging alone and go straight to the
+    app. The spy raises on its first call, which stops main() inside the serve
+    command body, before the daemon can boot: the recorded call list therefore
+    shows whose logging ran (serve's own, never "cli").
+    """
+    import rework.logs
+    import rework.tui as tui
+    from rework.cli import main
+
+    calls: list[str] = []
+    monkeypatch.setattr(rework.logs, "setup_logging", _logging_spy(calls))
+    monkeypatch.setattr(tui, "run_tui", _tui_must_not_start)
+    monkeypatch.setattr(sys, "argv", ["rework", "serve"])
+
+    with pytest.raises(_StopLogging):
+        main()
+
+    # exactly serve's own call: main() did not log for "cli" first
+    assert calls == ["daemon"]
+
+
 def test_main_target_after_a_subcommand_still_errors(
     dispatched_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

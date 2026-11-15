@@ -186,6 +186,23 @@ def test_parse_target_flag_forms() -> None:
     )
 
 
+def test_parse_target_flag_keeps_a_glued_short_option_in_rest() -> None:
+    """A glued short option like `-n3` is kept in rest like any foreign flag.
+
+    It is neither dropped nor skipped together with its glued value: typer is
+    the one that decides what `-n3` means (`rework logs -n3`), so the parser
+    hands the token over untouched. Dropping it turned `rework -n3 ls` into a
+    bare `rework` and opened the TUI instead of running the command.
+    """
+    from rework.cli import parse_target_flag
+
+    assert parse_target_flag(["-n3", "ls"]) == (None, ["-n3", "ls"])
+    assert parse_target_flag(["-n3", "--target", "sandbox", "ls"]) == (
+        "sandbox",
+        ["-n3", "ls"],
+    )
+
+
 def test_subcommand_ignores_everything_after_the_end_of_options_marker() -> None:
     """The subcommand is the first non-flag token, but never one after `--`.
 

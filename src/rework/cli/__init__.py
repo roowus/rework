@@ -1533,7 +1533,9 @@ def parse_target_flag(argv: list[str]) -> tuple[str | None, list[str]]:
     look like a bare `rework` and start the dashboard instead of printing help.
     Because they are kept, rest's FIRST element is not necessarily the
     subcommand: `rework --help update` parses to ["--help", "update"], so the
-    command name comes from _subcommand() and never from rest[0].
+    command name comes from _subcommand() and never from rest[0]. A glued
+    short option such as `-n3` is kept in rest like any other foreign leading
+    flag (it used to be skipped together with its glued value).
     """
     kept: list[str] = []  # leading flags that are not ours, preserved in order
     i = 0
