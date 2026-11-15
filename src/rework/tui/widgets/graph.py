@@ -3,8 +3,9 @@
 Each node is a step (or a gate / the end); its border carries the status
 colour, the active node is accent. Clicking a node selects that step's run.
 Inside a node, when the role published its own graph topology (ROLE_SPAWNED
-payload["graph"], M7 P3) the role's inner nodes are
-drawn as a strip with the current one highlighted.
+payload["graph"], M7 P3) the role's inner nodes are drawn as a strip labelled
+"inside this run:" (with the current one highlighted), so a run's own steps
+never read as the mission-level review loop.
 
 Orchestrated missions are drawn as ordered review ROUNDS: a round is every
 coder run between two audits, plus the audit that reviewed them. A coder that
@@ -36,6 +37,21 @@ from rework.tui.widgets.trajectory import role_of
 COLLAPSE_ROUND_THRESHOLD = 5  # only fold when there are more rounds than this
 COLLAPSE_KEEP_ROUNDS = 2  # the latest rounds stay expanded (the loop under review)
 PARALLEL_SPAWN_WINDOW_SECONDS = 2.0  # spawns this close are a parallel fan-out
+
+# The inner strip's step names are the role's own LangGraph node names
+# (coder: prepare/loop/handoff, auditor: prepare/loop/report). TUI-only friendly
+# names: the roles stay pluggable, so anything unrecognised is shown unchanged.
+INNER_STEP_NAMES = {
+    "prepare": "set up",
+    "loop": "working (tool calls)",
+    "report": "report",
+    "handoff": "hand off",
+}
+
+
+def inner_step_name(name: str) -> str:
+    """The friendly TUI name of a role graph node ('loop' -> 'working (tool calls)')."""
+    return INNER_STEP_NAMES.get(name, name)
 
 
 @dataclass
@@ -105,11 +121,14 @@ class _Node(Static):
         if node.inner:
             strip = []
             for name in node.inner:
+                shown = esc(inner_step_name(name))
                 if name == node.inner_at:
-                    strip.append(f"[{ACCENT}][b]▶ {esc(name)}[/b][/]")
+                    strip.append(f"[{ACCENT}][b]▶ {shown}[/b][/]")
                 else:
-                    strip.append(f"[{FAINT}]{esc(name)}[/]")
-            lines.append(f" [{FAINT}]─[/] ".join(strip))
+                    strip.append(f"[{FAINT}]{shown}[/]")
+            # The role's own LangGraph steps belong to ONE run: label the strip
+            # so it cannot be read as the mission-level review loop.
+            lines.append(f"[{FAINT}]inside this run:[/] " + f" [{FAINT}]─[/] ".join(strip))
         if node.loop_note:
             lines.append(f"[{FAINT}]↺ {esc(node.loop_note)}[/]")
         if node.expandable:
@@ -483,6 +502,16 @@ def _review_edge_label(audits: list[Any]) -> str:
     return verdict
 
 
+def _outcome_edge_label(audits: list[Any]) -> str:
+    """What an audit told the next coder on its way out of the review:
+    'request changes' / 'approve with fixes' / 'approve' (the mechanical
+    verdict's own words, so the graph invents no second vocabulary)."""
+    if not audits:
+        return ""
+    verdicts = {mechanical_verdict(a.artifact) for a in audits}
+    return " / ".join(sorted(verdicts))
+
+
 def _derive_collapsed_status(runs: list[Any]) -> str:
     """Derive a summary status for collapsed runs."""
     if not runs:
@@ -648,6 +677,12 @@ def mission_layers(
         # label the edge into the audits with the round's review outcome
         if round_.audits and round_.coders and len(round_layers) >= 2:
             round_layers[-2].edge_to_next = GEdge(label=_review_edge_label(round_.audits))
+        if round_.is_review and round_layers:
+            # The edge LEAVING the audit was blank. It carries the verdict's
+            # DIRECTION - 'request changes' toward the next coder revision, or
+            # 'approve' when the mission proceeds to its gates/end - so the
+            # audit loop reads at mission level, not as one run's inner steps.
+            round_layers[-1].edge_to_next = GEdge(label=_outcome_edge_label(round_.audits))
         layers.extend(round_layers)
         if round_.is_review:
             seen_review = True
