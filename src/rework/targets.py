@@ -51,6 +51,9 @@ TARGETS_PATH = Path(os.environ.get("REWORK_TARGETS", str(DEFAULT_STATE_DIR / "ta
 class Target:
     name: str
     db: str | None = None  # resolved (db_env looked up) db URL or sqlite path
+    # the VARIABLE NAME the URL came from, kept so a credential rotation knows
+    # which name to re-read from the env file (credentials.db_env_vars).
+    db_env: str | None = None
     daemon_url: str | None = None
     ssh: str | None = None
     library_dir: str | None = None
@@ -98,9 +101,10 @@ def load_targets_file(path: Path | None = None) -> TargetsFile:
             if not isinstance(entry, dict):
                 continue
             db_env = entry.get("db_env")
+            db_var = str(db_env) if db_env else None
             db = entry.get("db")
-            if db_env:
-                db = os.environ.get(str(db_env), db)  # db_env wins; fall back to db
+            if db_var:
+                db = os.environ.get(db_var, db)  # db_env wins; fall back to db
             if not db or not entry.get("daemon_url"):
                 continue
             checkpoints = entry.get("checkpoints_db")
@@ -110,6 +114,7 @@ def load_targets_file(path: Path | None = None) -> TargetsFile:
             targets[str(name)] = Target(
                 name=str(name),
                 db=str(db),
+                db_env=db_var,
                 daemon_url=str(entry["daemon_url"]),
                 ssh=entry.get("ssh"),
                 library_dir=entry.get("library_dir"),

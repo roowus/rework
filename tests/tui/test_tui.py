@@ -5357,3 +5357,405 @@ async def test_dashboard_open_mission_sends_a_message_through_the_shared_publish
         assert owner == ["please also run the linter", "second note"]
     finally:
         await store.aclose()
+
+
+# -- rotated credentials: an auth failure re-reads the env file ----------------
+
+
+class _RotatingStore:
+    """A store whose first connection is refused with a Postgres auth error
+    (as a rotated password leaves it), then works. Records how many times the
+    factory opened it."""
+
+    def __init__(self, error: BaseException, *, fail_times: int = 1) -> None:
+        self._error = error
+        self.fail_times = fail_times
+        self.attempts = 0
+        self.row = [{"id": "p1", "name": "after rotation"}]
+
+    async def list_projects(self) -> list[dict[str, str]]:
+        return self.row
+
+    async def append_chat_message(self, message: Any) -> Any:
+        return message
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _auth_failure() -> BaseException:
+    import psycopg
+
+    return psycopg.OperationalError('FATAL:  password authentication failed for user "postgres"')
+
+
+def _rotate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: str) -> Path:
+    """Point REWORK_ENV_FILE at a tmp env file, as a real rotation edits it."""
+    env_file = tmp_path / "rework.env"
+    env_file.write_text(f"REWORK_DB={value}\n")
+    monkeypatch.setenv("REWORK_ENV_FILE", str(env_file))
+    return env_file
+
+
+async def test_an_auth_failure_reconnects_with_the_rotated_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Found live: after the Postgres password was rotated, every reconnect
+    failed with 28P01 and the TUI stayed offline until it was quit and
+    reopened. AUTH failures must re-read the env file and reconnect ONCE."""
+    import logging
+
+    from rework.tui.data import CREDENTIALS_RELOADED, TuiData
+
+    stale, fresh = (
+        "postgresql://postgres:STALEPASS@host:5433/rework_state",
+        "postgresql://postgres:LIVEHOSTPASS@host:5433/rework_state",
+    )
+    monkeypatch.setenv("REWORK_DB", stale)
+    _rotate_env(monkeypatch, tmp_path, fresh)
+    caplog.set_level(logging.DEBUG, logger="rework.tui")
+
+    store = _RotatingStore(_auth_failure())
+    opened: list[_RotatingStore] = []
+
+    async def factory() -> _RotatingStore:
+        store.attempts += 1
+        if store.attempts == 1:
+            raise _auth_failure()
+        assert os.environ["REWORK_DB"] == fresh, "the reopen sees the rotated URL"
+        opened.append(store)
+        return store
+
+    data = TuiData(store_factory=factory)
+    got = await data.projects()
+    assert got == [{"id": "p1", "name": "after rotation"}], "real data, not offline"
+    assert store.attempts == 2, "one reopen, exactly one retry"
+    assert opened == [store]
+    assert data._reconnecting_hint == "", "the offline note is cleared"
+
+    messages = [r.getMessage() for r in caplog.records if r.name == "rework.tui"]
+    assert CREDENTIALS_RELOADED in messages
+    blob = " ".join(messages) + " ".join(str(r.args) for r in caplog.records)
+    for secret in ("STALEPASS", "LIVEHOSTPASS", stale, fresh):
+        assert secret not in blob, "no password or URL ever reaches the log"
+    await data.aclose()
+
+
+async def test_a_non_auth_error_never_re_reads_the_env_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tailnet hiccup must keep exactly today's behaviour: no file read."""
+    from rework.tui import data as data_mod
+    from rework.tui.data import TuiData
+
+    monkeypatch.setenv("REWORK_DB", "postgresql://postgres:x@host:5433/rework_state")
+    _rotate_env(monkeypatch, tmp_path, "postgresql://postgres:y@host:5433/rework_state")
+
+    def must_not_run(**_kwargs: Any) -> Any:
+        pytest.fail("the env file must not be re-read for a non-auth failure")
+
+    monkeypatch.setattr(data_mod, "recover_db_credentials", must_not_run)
+
+    store = _RotatingStore(OSError("consuming input failed: Operation timed out"))
+    attempts: list[int] = []
+
+    async def factory() -> _RotatingStore:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise OSError("consuming input failed: Operation timed out")
+        return store
+
+    data = TuiData(store_factory=factory)
+    assert await data.projects() == store.row
+    assert len(attempts) == 2, "the existing drop/reopen/retry is unchanged"
+    await data.aclose()
+
+
+async def test_an_unchanged_url_does_not_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The env file still holds the URL that just failed (a rotation that has
+    not been saved yet): go offline exactly as today, do not retry again."""
+    from rework.tui.data import TuiData
+
+    same = "postgresql://postgres:same@host:5433/rework_state"
+    monkeypatch.setenv("REWORK_DB", same)
+    _rotate_env(monkeypatch, tmp_path, same)
+
+    attempts: list[int] = []
+
+    async def factory() -> Any:
+        attempts.append(1)
+        raise _auth_failure()
+
+    data = TuiData(store_factory=factory)
+    import psycopg
+
+    with pytest.raises(psycopg.OperationalError):
+        await data.projects()
+    assert len(attempts) == 2, "two attempts total, never a third"
+    assert data._reconnecting_hint, "and the offline note is set"
+    await data.aclose()
+
+
+async def test_a_dead_socket_then_an_auth_failure_on_reopen_still_recovers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The real sequence: the tailnet drops (or the DB restarts) FIRST, so the
+    first error is a non-auth dead socket, and only the REOPEN meets the
+    rotated password. The reload still has to happen, and total attempts stay
+    bounded at 2 reconnects."""
+    import logging
+
+    from rework.tui.data import CREDENTIALS_RELOADED, TuiData
+
+    stale, fresh = (
+        "postgresql://postgres:STALEPASS@host:5433/rework_state",
+        "postgresql://postgres:LIVEHOSTPASS@host:5433/rework_state",
+    )
+    monkeypatch.setenv("REWORK_DB", stale)
+    _rotate_env(monkeypatch, tmp_path, fresh)
+    caplog.set_level(logging.DEBUG, logger="rework.tui")
+
+    store = _RotatingStore(OSError("the connection is closed"))
+    attempts: list[int] = []
+
+    async def factory() -> _RotatingStore:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise OSError("the connection is closed")
+        if len(attempts) == 2:
+            raise _auth_failure()  # the reopen is where the new password shows
+        assert os.environ["REWORK_DB"] == fresh, "the third attempt sees the new URL"
+        return store
+
+    data = TuiData(store_factory=factory)
+    assert await data.projects() == store.row, "recovered instead of offline forever"
+    assert len(attempts) == 3, "two reconnects, never a third"
+    assert data._reconnecting_hint == ""
+
+    messages = [r.getMessage() for r in caplog.records if r.name == "rework.tui"]
+    assert messages.count(CREDENTIALS_RELOADED) == 1, "exactly one reload line"
+    blob = " ".join(messages) + " ".join(str(r.args) for r in caplog.records)
+    for secret in ("STALEPASS", "LIVEHOSTPASS", stale, fresh):
+        assert secret not in blob, "no password or URL ever reaches the log"
+    await data.aclose()
+
+
+async def test_a_dead_socket_then_an_auth_failure_with_the_same_url_is_bounded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Same sequence with unchanged credentials: the offline path is today's,
+    and there is no third attempt (an unchanged URL never buys a retry)."""
+    from rework.tui.data import TuiData
+
+    same = "postgresql://postgres:same@host:5433/rework_state"
+    monkeypatch.setenv("REWORK_DB", same)
+    _rotate_env(monkeypatch, tmp_path, same)
+    attempts: list[int] = []
+
+    async def factory() -> Any:
+        attempts.append(1)
+        raise _auth_failure() if len(attempts) > 1 else OSError("the connection is closed")
+
+    data = TuiData(store_factory=factory)
+    import psycopg
+
+    with pytest.raises(psycopg.OperationalError):
+        await data.projects()
+    assert len(attempts) == 2, "two attempts total, never a third"
+    assert data._reconnecting_hint, "and the offline note is set"
+    await data.aclose()
+
+
+async def test_a_reload_drops_the_cached_library_handle_and_reopens_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The library index caches its own connection for the whole session, so a
+    rotated URL has to drop it too, or `library()` would keep serving the dead
+    one. Dropping it must not raise when nothing was opened yet."""
+    from rework.tui.data import TuiData
+
+    fresh = "postgresql://postgres:LIVEHOSTPASS@host:5433/rework_state"
+    monkeypatch.setenv("REWORK_DB", "postgresql://postgres:STALEPASS@host:5433/rework_state")
+    _rotate_env(monkeypatch, tmp_path, fresh)
+
+    closed: list[int] = []
+
+    class _Index:
+        async def aclose(self) -> None:
+            closed.append(1)
+
+    data = TuiData()
+    # the DSN this process holds (the library index was opened from it)
+    data._dsn = "postgresql://postgres:STALEPASS@host:5433/rework_state"
+    index = _Index()
+    data._index = index  # type: ignore[assignment]
+    data._git = object()  # type: ignore[assignment]
+    assert await data._reload_credentials() is True
+    assert closed == [1], "the stale index was closed"
+    assert data._index is None and data._git is None, "and dropped for a fresh open"
+    assert os.environ["REWORK_DB"] == fresh
+
+    # an unchanged URL drops nothing and reports False
+    assert await data._reload_credentials() is False
+    assert closed == [1]
+    # and with no library opened at all, the drop is a no-op, not an error
+    assert await data._reload_credentials() is False
+    await data.aclose()
+
+
+# -- two writers on one env file: the recovery must converge --
+
+
+class _AuthFailStore:
+    """A connection opened with credentials the server now refuses: every query
+    fails with a Postgres auth error (SQLSTATE 28P01)."""
+
+    def __init__(self) -> None:
+        self._err = _auth_failure()
+
+    async def list_projects(self) -> list[dict[str, str]]:
+        raise self._err
+
+    async def append_chat_message(self, message: Any) -> Any:
+        return message
+
+    async def aclose(self) -> None:
+        return None
+
+
+async def test_two_writers_converge_instead_of_flapping_between_passwords(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Found in audit with TWO writers (a TUI plus a long-lived library-mcp, the
+    deployment docs/ops.md advertises): the decision compared the env FILE with
+    os.environ, so a process that had already adopted password B later failed,
+    read a file the other writer had not updated yet (still A), adopted A BACK,
+    and the next failure adopted B again. REWORK_DB was observed as
+    ['A','A','A','A','A'] over one adoption and ten store opens: the recovery
+    never converged.
+
+    Comparing the file against the DSN this process is actually HOLDING, and
+    refusing one it has already left, makes the sequence monotone: once B is
+    adopted it is never traded back for A."""
+    import logging
+
+    from rework.tui.data import CREDENTIALS_RELOADED, TuiData
+
+    url_a = "postgresql://postgres:PASSA@host:5433/rework_state"
+    url_b = "postgresql://postgres:PASSB@host:5433/rework_state"
+    monkeypatch.setenv("REWORK_DB", url_a)
+    env_file = _rotate_env(monkeypatch, tmp_path, url_a)
+    caplog.set_level(logging.DEBUG, logger="rework.tui")
+
+    opens: list[str] = []
+    row = [{"id": "p1", "name": "live row"}]
+    # the password the SERVER currently accepts (rotated by the operator)
+    live = [url_a]
+
+    class _Store:
+        def __init__(self, dsn: str) -> None:
+            self._dsn = dsn
+
+        async def list_projects(self) -> list[dict[str, str]]:
+            if self._dsn != live[0]:
+                raise _auth_failure()  # this connection's credentials are stale
+            return row
+
+        async def append_chat_message(self, message: Any) -> Any:
+            return message
+
+        async def aclose(self) -> None:
+            return None
+
+    async def factory() -> Any:
+        dsn = os.environ["REWORK_DB"]  # what this process would open with now
+        opens.append(dsn)
+        return _Store(dsn)
+
+    data = TuiData(store_factory=factory)
+    data._last_good["projects"] = row
+
+    # 1. writer one opens with password A; A is what the server accepts
+    assert await data.projects() == row
+    assert opens == [url_a]
+    assert data._dsn == url_a, "the DSN in use is A"
+
+    # 2. the password is rotated to B, file and server together: this
+    #    connection's A is now refused, so the recovery must adopt B
+    live[0] = url_b
+    env_file.write_text(f"REWORK_DB={url_b}\n")
+    assert await data.projects() == row, "recovered on the rotated password"
+    assert opens == [url_a, url_b], f"the reopen used the rotated password: {opens}"
+    assert data._dsn == url_b, "B is now the DSN this process holds"
+    assert os.environ["REWORK_DB"] == url_b
+    assert data._reconnecting_hint == ""
+
+    # 3. it fails again while the file is momentarily BACK TO A (the other
+    #    writer has not caught up): it must NOT go back to A
+    live[0] = "postgresql://postgres:PASSC@host:5433/rework_state"
+    env_file.write_text(f"REWORK_DB={url_a}\n")
+    assert await data.projects() == row, "the cached payload, never a flap to A"
+    assert url_a not in opens[2:], f"A was never adopted back: {opens}"
+    assert os.environ["REWORK_DB"] == url_b, "the process env did not go back to A"
+    assert data._dsn == url_b, "still holding B"
+
+    # 4. and it keeps holding B while the file lags behind: bounded, no flap
+    assert await data.projects() == row
+    assert url_a not in opens[2:], f"no oscillation back to A: {opens}"
+    assert len(opens) <= 6, f"at most one reopen per failure: {opens}"
+
+    messages = [r.getMessage() for r in caplog.records if r.name == "rework.tui"]
+    assert messages.count(CREDENTIALS_RELOADED) == 1, "logged once, on the real rotation"
+    blob = " ".join(messages) + " ".join(str(r.args) for r in caplog.records)
+    for secret in ("PASSA", "PASSB", url_a, url_b):
+        assert secret not in blob, "no password or URL ever reaches the log"
+    await data.aclose()
+
+
+async def test_the_final_retry_failure_is_part_of_the_offline_ladder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FIX 2: the retry that follows the SECOND reconnect used to sit OUTSIDE
+    the try, so a third failure escaped `_resilient`: the reconnect hint stayed
+    empty and the cached last-good payload was bypassed, unlike every other
+    rung of the ladder. Dead socket -> auth failure on the reopen -> the
+    connection dies again must return the last good result with the offline
+    note."""
+    from rework.tui.data import TuiData
+
+    stale = "postgresql://postgres:STALEPASS@host:5433/rework_state"
+    fresh = "postgresql://postgres:LIVEHOSTPASS@host:5433/rework_state"
+    monkeypatch.setenv("REWORK_DB", stale)
+    env_file = _rotate_env(monkeypatch, tmp_path, stale)
+    attempts: list[int] = []
+
+    async def factory() -> Any:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise OSError("the connection is closed")  # the dead socket
+        if len(attempts) == 2:
+            raise _auth_failure()  # the rotated password shows on the reopen
+        raise OSError("the connection died again")  # and the retry dies too
+
+    data = TuiData(store_factory=factory)
+    data._dsn = stale
+    data._last_good["projects"] = [{"id": "cached"}]
+
+    real_reload = data._reload_credentials
+
+    async def rotate_then_reload() -> bool:
+        # the writer updates the file between the attempts, as a real rotation
+        # does; without a CHANGED url no third attempt is allowed
+        env_file.write_text(f"REWORK_DB={fresh}\n")
+        return await real_reload()
+
+    monkeypatch.setattr(data, "_reload_credentials", rotate_then_reload)
+
+    got = await data.projects()
+    assert got == [{"id": "cached"}], "the last good payload, not a raised error"
+    assert len(attempts) == 3, f"three opens, bounded at 3 (saw {len(attempts)})"
+    assert data._reconnecting_hint, "the offline note is set"
+    assert data._last_good["projects"] == got
+    await data.aclose()
