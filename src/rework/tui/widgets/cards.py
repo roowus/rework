@@ -119,6 +119,9 @@ class MissionCard(Vertical):
         self.active_role = ""
         # a finished card backfills its tail once, then is never polled again
         self.tail_filled = False
+        # backoff for a failing full-row fetch (monotonic seconds)
+        self.fetch_failures = 0
+        self.fetch_next_try = 0.0
 
     def compose(self) -> ComposeResult:
         yield Static(f"[{MUTED}]mission {esc(self.mission_id)}[/]", classes="card-body mc-head")

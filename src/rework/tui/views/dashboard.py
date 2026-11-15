@@ -147,6 +147,18 @@ class DashboardView(View):
         self.project_query = ""
         self._debounce: Timer | None = None
         self.mission_id: str | None = None
+        # the open mission's FULL row (plan, result): the snapshot only carries
+        # light rows, so _poll_mission fetches this once per open and again only
+        # when the mission's updated_at moves
+        self.full_mission: Any = None
+        self.full_failed = False  # the last full-row fetch came back empty
+        # backoff for a failing full-row fetch (the Hub._next_try idiom): a row
+        # that cannot be read must not be re-SELECTed on every tick
+        self._full_failures = 0
+        self._full_next_try = 0.0
+        # what the open mission's detail was last painted from; an unchanged
+        # poll (same key, cadence not due) repaints nothing
+        self._painted_key: tuple[Any, ...] | None = None
         self.run_id: str | None = None
         self.mtab = "traj"
         # mission page state
@@ -280,6 +292,7 @@ class DashboardView(View):
 
     def on_snapshot(self, snap: Snapshot) -> None:
         self.snap = snap
+        self.mark_time_painted()
         self._paint_overview()
         self._paint_head()
         if time.time() - self._enriched_at > 15:
@@ -287,6 +300,19 @@ class DashboardView(View):
             self._enrich()
         if self.mission_id:
             self._paint_mission_static()
+            self._poll_mission()
+
+    def on_tick(self, snap: Snapshot) -> None:
+        self.snap = snap
+        if self.time_repaint_due():
+            # the data is unchanged but `ago(...)` text is not: repaint only what
+            # carries time (the list rows, the open mission's header)
+            self._paint_overview()
+            self._painted_key = None  # the open mission repaints below
+        if time.time() - self._enriched_at > 15:
+            self._enriched_at = time.time()
+            self._enrich()
+        if self.mission_id:
             self._poll_mission()
 
     @work(exclusive=True, group="dash-enrich")
@@ -482,7 +508,6 @@ class DashboardView(View):
         bits = []
         if self.project == ALL and m.project_id:
             bits.append(self.snap.project_name(m.project_id))
-        bits.append(plan_label(m.plan))
         role = self.mission_role.get(m.id)
         if role and st in actions.ACTIVE:
             bits.append(role)
@@ -909,11 +934,16 @@ class DashboardView(View):
             self.budget = None
             self.run_cost = {}
             self.mission_gates = []
+            self.full_mission = None
+            self.full_failed = False
+            self._full_failures = 0
+            self._full_next_try = 0.0
             self.report_loaded_for = None
             self.query_one("#m-traj", Trajectory).clear()
             self.query_one("#run-list", RowList).set_rows([])
         self.mission_id = mission_id
         self.run_id = run_id
+        self._painted_key = None
         self.query_one("#dash-pages", ContentSwitcher).current = "dash-mission"
         self._paint_head()
         self._paint_mission_static()
@@ -923,6 +953,9 @@ class DashboardView(View):
 
     def close_mission(self) -> None:
         self.mission_id = None
+        self.full_mission = None
+        self.full_failed = False
+        self._painted_key = None
         self.run_id = None
         self.query_one("#dash-pages", ContentSwitcher).current = "dash-overview"
         self._paint_overview()
@@ -991,6 +1024,9 @@ class DashboardView(View):
         if not mission_id:
             return
         data = self.hub.data
+        await self._load_full_mission(mission_id)
+        if self.mission_id != mission_id:
+            return
         fresh = await self.hub.guard(lambda: data.mission_events(mission_id, self.last_seq), [])
         if self.mission_id != mission_id:
             return
@@ -1019,6 +1055,10 @@ class DashboardView(View):
         # first, so the view is still attached while '#m-header' (composed
         # statically, so only ever missing then) is gone; painting raised
         # NoMatches and failed tests under load (m7 findings #19: 2 of 8 runs)
+        key = self._paint_key()
+        if key == self._painted_key:
+            return  # nothing this poll read has changed since the last paint
+        self._painted_key = key
         try:
             self._paint_mission_static()
             self._paint_runs()
@@ -1026,11 +1066,89 @@ class DashboardView(View):
         except NoMatches:
             return
 
+    def _paint_key(self) -> tuple[Any, ...]:
+        """Everything the open mission's header, run list and detail tabs are
+        painted from. Time text is not in it: the cadence clears the key."""
+        mission = self._detail_mission()
+        budget = self.budget
+        return (
+            self.run_id,
+            self.mtab,
+            self.full_failed,
+            None
+            if mission is None
+            else (
+                status_value(mission.status),
+                mission.updated_at,
+                getattr(mission, "light", False),
+            ),
+            tuple((r.id, status_value(r.status), r.step, r.updated_at) for r in self.runs),
+            None
+            if budget is None
+            else (budget.spent_usd, budget.input_tokens, budget.output_tokens),
+            tuple((g.id, status_value(g.status), g.decided_at) for g in self.mission_gates),
+            tuple(sorted(self.run_cost.items())),
+            len(self.events),
+            self._report_key(),
+        )
+
+    async def _load_full_mission(self, mission_id: str) -> None:
+        """Fetch the open mission's full row (plan, result) off the light
+        snapshot row. Once per open, then only when updated_at moves (any plan or
+        result write bumps it); a snapshot row that is already full is used as is."""
+        row = self.snap.mission(mission_id)
+        if row is not None and not getattr(row, "light", False):
+            self.full_mission = row
+            return
+        if self.full_failed and time.monotonic() < self._full_next_try:
+            return  # the last fetch failed: wait out the backoff
+        have = self.full_mission
+        if (
+            have is not None
+            and have.id == mission_id
+            and (row is None or have.updated_at == row.updated_at)
+        ):
+            return
+        data = self.hub.data
+        got = await self.hub.guard(lambda: data.get_mission(mission_id), None)
+        if self.mission_id != mission_id:
+            return
+        self.full_failed = got is None  # offline or a store error: say so, retry later
+        if got is not None:
+            self.full_mission = got
+            self._full_failures = 0
+            self._full_next_try = 0.0
+        else:
+            self._full_failures += 1
+            self._full_next_try = time.monotonic() + min(30.0, 2.0**self._full_failures)
+
+    def _detail_mission(self) -> Any:
+        """The open mission for plan/result reads: the full row once fetched,
+        else the snapshot's light row (plan and result are None on it)."""
+        full = self.full_mission
+        if full is not None and full.id == self.mission_id:
+            return full
+        return self.snap.mission(self.mission_id)
+
     def _paint_mission_static(self) -> None:
-        mission = self.snap.mission(self.mission_id)
+        mission = self._detail_mission()
         header = self.query_one("#m-header", Static)
-        if mission is None:
+        if mission is None or (getattr(mission, "light", False) and not self.full_failed):
             header.update(f"[{FAINT}]loading {esc(self.mission_id)}…[/]")
+            return
+        if getattr(mission, "light", False):
+            # the full row could not be fetched: show the light facts we hold
+            # and say what is missing, instead of a permanent "loading"
+            st = status_value(mission.status)
+            end = time.time() if st in actions.ACTIVE else mission.updated_at
+            header.update(
+                f"[b]{esc(mission.objective)}[/b]\n{status_text(st)}  [{MUTED}]"
+                + esc(
+                    f"started {ago(mission.created_at)} · {duration(end - mission.created_at)}"
+                    "  ·  could not load plan/result (retrying)"
+                )
+                + "[/]"
+            )
             return
         st = status_value(mission.status)
         plan = mission.plan or {}
@@ -1051,6 +1169,9 @@ class DashboardView(View):
             )
         end = time.time() if st in actions.ACTIVE else mission.updated_at
         bits.append(f"started {ago(mission.created_at)} · {duration(end - mission.created_at)}")
+        if self.full_failed:
+            # a refetch failed after this row was fetched: it is stale, say so
+            bits.append("could not load plan/result (retrying)")
         header.update(
             f"[b]{esc(mission.objective)}[/b]\n{status_text(st)}  [{MUTED}]"
             + esc("  ·  ".join(bits))
@@ -1079,7 +1200,7 @@ class DashboardView(View):
         rows = [RowData(ALL, f"[b]All activity[/b]\n[{FAINT}]{len(self.events)} events[/]")]
         orch_id = self._orchestrator_id()
         if orch_id:
-            mission = self.snap.mission(self.mission_id)
+            mission = self._detail_mission()
             st = status_value(mission.status) if mission else "running"
             model = ((mission.plan or {}).get("orchestrator") or {}).get("model") if mission else ""
             cost = self.run_cost.get(orch_id, 0.0)
@@ -1106,7 +1227,7 @@ class DashboardView(View):
 
     def _orchestrator_id(self) -> str | None:
         """The orchestrator's pseudo run id (its events and charges carry it)."""
-        mission = self.snap.mission(self.mission_id)
+        mission = self._detail_mission()
         if mission is None or not (mission.plan or {}).get("orchestrator"):
             return None
         return f"{mission.id}:orchestrate:orchestrator:1"
@@ -1131,8 +1252,8 @@ class DashboardView(View):
     # -- detail tabs ----------------------------------------------------------------------------
 
     def _paint_detail_tabs(self) -> None:
-        mission = self.snap.mission(self.mission_id)
-        if mission is None:
+        mission = self._detail_mission()
+        if mission is None or getattr(mission, "light", False):
             return
         tab = self.mtab
         if tab == "graph":
