@@ -51,6 +51,9 @@ ACTION_LABELS = {
     "question": ("Send answer", "Decline"),
 }
 
+# the plan's final gates: the only ones with a third "send back" verdict
+SEND_BACK_KINDS = {"ship", "open_pr"}
+
 KIND_LABEL = {
     "ship": "ship it?",
     "open_pr": "open a PR?",
@@ -72,6 +75,7 @@ class GatesView(View):
         # can't eat them); the macOS å / ≈ spellings are handled by the App
         Binding("alt+a", "decide(True)", "approve", show=False, priority=True),
         Binding("alt+x", "decide(False)", "reject", show=False, priority=True),
+        Binding("alt+b", "send_back", "send back", show=False, priority=True),
     ]
 
     def __init__(self) -> None:
@@ -131,6 +135,7 @@ class GatesView(View):
                         with Horizontal(classes="gate-actions"):
                             yield Btn("Approve  alt+a", "approve", variant="primary")
                             yield Btn("Reject  alt+x", "reject", variant="danger")
+                            yield Btn("Send back  alt+b", "send-back", variant="ghost")
                             yield Static("", classes="spacer")
                             yield Static(
                                 f"[{FAINT}]a reject with feedback resumes the agent[/]",
@@ -154,6 +159,7 @@ class GatesView(View):
 
     def on_snapshot(self, snap: Snapshot) -> None:
         self.snap = snap
+        self.mark_time_painted()
         if self.mode == "open":
             self._paint_list(sorted(snap.gates, key=lambda g: float(g.created_at or 0)))
             if self.selected is not None and self.selected.status.value == "open":
@@ -173,6 +179,19 @@ class GatesView(View):
             self._paint_detail()
             if self._steps_ready_for == self.selected.id:
                 self._poll_steps(self.selected)
+
+    def on_tick(self, snap: Snapshot) -> None:
+        self.snap = snap
+        if self.time_repaint_due():
+            # unchanged data, but "waiting 2h" and "5m ago" keep moving
+            if self.mode == "open":
+                self._paint_list(sorted(snap.gates, key=lambda g: float(g.created_at or 0)))
+            if self.selected is not None:
+                self._paint_detail()
+        if self.mode != "open":
+            self._load_history()
+        if self.selected is not None and self._steps_ready_for == self.selected.id:
+            self._poll_steps(self.selected)
 
     def _paint_list(self, gates: list[Any]) -> None:
         rows = []
@@ -273,6 +292,9 @@ class GatesView(View):
                 btn.set_label(f"{yes}  alt+a")
             elif btn.action == "reject":
                 btn.set_label(f"{no}  alt+x")
+            elif btn.action == "send-back":
+                # the third verdict exists only for the plan's final gates
+                btn.display = is_open and gate.kind.value in SEND_BACK_KINDS
         decided = self.query_one("#gate-decided", Static)
         decided.display = not is_open
         if not is_open:
@@ -293,11 +315,14 @@ class GatesView(View):
             box.update(f"[{FAINT}]{esc(gate.mission_id)}[/]")
             return
         project = self.snap.project_name(mission.project_id) or "no project"
+        # a light snapshot row has no plan: the kind shows once _load_detail has
+        # fetched the full row
+        kind = "" if getattr(mission, "light", False) else (mission.plan or {}).get("kind", "")
+        kind_part = f"{esc(kind)} · " if kind or not getattr(mission, "light", False) else ""
         box.update(
             f"{esc(mission.objective)}\n"
             f"{status_text(mission.status)}  [{FAINT}]{esc(mission.id)} · {esc(project)} · "
-            f"{esc((mission.plan or {}).get('kind', ''))} · "
-            f"started {esc(ago(mission.created_at))}[/]"
+            f"{kind_part}started {esc(ago(mission.created_at))}[/]"
         )
 
     @work(exclusive=True, group="gate-detail")
@@ -307,6 +332,14 @@ class GatesView(View):
         self._steps_ready_for = None  # no step polling until the real cursor is set
         self._steps_seq = 0
         self._steps_lines = []
+        light = self.snap.mission(gate.mission_id)
+        if light is not None and getattr(light, "light", False):
+            # the snapshot row carries no plan: fetch the full one for the plan kind
+            full = await self.hub.guard(lambda: data.get_mission(gate.mission_id), None)
+            if self.selected is None or self.selected.id != gate.id:
+                return
+            if full is not None:
+                self._paint_mission(full, gate)
         runs = await self.hub.guard(lambda: data.mission_runs(gate.mission_id), [])
         if self.selected is None or self.selected.id != gate.id:
             return
@@ -431,6 +464,9 @@ class GatesView(View):
         if event.action in ("approve", "reject"):
             event.stop()
             self.action_decide(event.action == "approve")
+        elif event.action == "send-back":
+            event.stop()
+            self.action_send_back()
         elif event.action == "open-mission" and self.selected is not None:
             event.stop()
             self.rw.open_mission(self.selected.mission_id, self.selected.for_run)
@@ -453,11 +489,35 @@ class GatesView(View):
             decision = {"answer": text} if approved else {"feedback": text}
         self._decide(gate, approved, text or None, decision)
 
+    def action_send_back(self) -> None:
+        """Third verdict on a final gate: not shipped yet, do this first. The
+        typed text is the owner's feedback; the mission resumes with it."""
+        gate = self.selected
+        if gate is None or gate.status.value != "open":
+            self.toast("Select an open gate first", severity="warning")
+            return
+        if gate.kind.value not in SEND_BACK_KINDS:
+            self.toast("Only the ship / open-PR gates can be sent back", severity="warning")
+            return
+        text = self.query_one("#gate-text", TextArea).text.strip()
+        if not text:
+            self.toast("Type what should change first", severity="warning")
+            self.query_one("#gate-text", TextArea).focus()
+            return
+        self._decide(gate, False, text, {"feedback": text}, send_back=True)
+
     @work(exclusive=True, group="decide")
     async def _decide(
-        self, gate: Any, approved: bool, note: str | None, decision: dict[str, Any] | None
+        self,
+        gate: Any,
+        approved: bool,
+        note: str | None,
+        decision: dict[str, Any] | None,
+        send_back: bool = False,
     ) -> None:
-        ok = await actions.decide(self.rw, gate.id, approved, note=note, decision=decision)
+        ok = await actions.decide(
+            self.rw, gate.id, approved, note=note, decision=decision, send_back=send_back
+        )
         if not ok:
             return
         with self.painting():  # the app can close during the await above

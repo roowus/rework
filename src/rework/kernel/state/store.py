@@ -60,6 +60,18 @@ class StateStore(Protocol):
         chat_id: str | None = None,
     ) -> list[Mission]: ...
 
+    async def list_missions_light(
+        self,
+        status: MissionStatus | None = None,
+        limit: int = 200,
+        chat_id: str | None = None,
+    ) -> list[Mission]:
+        """list_missions without the heavy columns, for the TUI poll: plan and
+        result are NOT selected (None, `light=True`) and objective is clipped to
+        LIGHT_OBJECTIVE_CHARS. Same filters, order and limit as list_missions.
+        Use get_mission for the full row."""
+        ...
+
     async def next_pending_missions(self, limit: int = 100) -> list[Mission]:
         """Pending missions in PICKUP order: priority high first, then oldest
         first within a level. Not the browse order of list_missions (created_at
@@ -119,10 +131,13 @@ class StateStore(Protocol):
         approved: bool,
         note: str | None = None,
         decision: dict[str, Any] | None = None,
+        send_back: bool = False,
     ) -> Gate | None:
         """Resolve an open gate. `note` is for humans; `decision` is the TYPED
         answer handed to the paused role as its interrupt() result (None =
-        the role receives a plain bool, as before)."""
+        the role receives a plain bool, as before). `send_back` marks the gate
+        `sent_back` instead of approved/rejected (the third final-gate verdict:
+        the mission returns to `running` with the owner's feedback)."""
         ...
 
     async def list_open_gates(self, mission_id: str | None = None) -> list[Gate]: ...

@@ -8,6 +8,7 @@ import logging
 import os
 import shlex
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -75,8 +76,17 @@ def test_user_scope_is_the_first_mechanism_when_available() -> None:
     assert "--property=MemoryAccounting=yes" in prefix
     assert "--collect" in prefix and "--quiet" in prefix
     assert "--nice=10" in prefix
-    assert "--property=IOSchedulingClass=idle" in prefix
-    assert prefix[-3:] == ["/bin/sh", "-c", "uv run pytest -q"]
+    # ionice runs INSIDE the scope: a transient scope rejects the
+    # IOSchedulingClass property ("Unknown assignment", found on GitHub CI)
+    assert not any(p.startswith("--property=IOScheduling") for p in prefix)
+    assert prefix[-6:] == [
+        "/usr/bin/ionice",
+        "-c3",
+        "-n7",
+        "/bin/sh",
+        "-c",
+        "uv run pytest -q",
+    ]
     assert prefix[-1] == "uv run pytest -q", "the command is always the last element"
 
 
@@ -116,8 +126,17 @@ def test_system_scope_is_used_when_the_user_scope_fails(
     assert "--property=MemoryAccounting=yes" in prefix
     assert "--collect" in prefix and "--quiet" in prefix
     assert "--nice=10" in prefix
-    assert "--property=IOSchedulingClass=idle" in prefix
-    assert prefix[-3:] == ["/bin/sh", "-c", "uv run pytest -q"]
+    # ionice runs INSIDE the scope: a transient scope rejects the
+    # IOSchedulingClass property ("Unknown assignment", found on GitHub CI)
+    assert not any(p.startswith("--property=IOScheduling") for p in prefix)
+    assert prefix[-6:] == [
+        "/usr/bin/ionice",
+        "-c3",
+        "-n7",
+        "/bin/sh",
+        "-c",
+        "uv run pytest -q",
+    ]
 
 
 def test_scope_needs_a_memory_cap_to_be_worth_it() -> None:
@@ -215,8 +234,11 @@ def test_every_path_uses_the_idle_io_class() -> None:
     ):
         assert "--property=IOSchedulingPriority=7" not in prefix
         assert "--property=IOSchedulingClass=best-effort" not in prefix
-    assert "--property=IOSchedulingClass=idle" in wrap(user=True)
-    assert "--property=IOSchedulingClass=idle" in wrap(user=False, system=True)
+    for scoped in (wrap(user=True), wrap(user=False, system=True)):
+        assert not any(p.startswith("--property=IOScheduling") for p in scoped), (
+            "a scope rejects IOSchedulingClass: ionice must run inside it"
+        )
+        assert scoped[-6:-3] == ["/usr/bin/ionice", "-c3", "-n7"]
     fallback = wrap(user=False, system=False)
     assert fallback[3:6] == ["/usr/bin/ionice", "-c3", "-n7"]
 
@@ -487,6 +509,9 @@ def test_max_roles_on_the_config_object(monkeypatch: pytest.MonkeyPatch) -> None
 # -- wiring: run_command really executes the wrapper -----------------------
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="reads /proc/self/limits, which only exists on Linux"
+)
 async def test_run_command_executes_the_ulimit_wrapper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -2,6 +2,10 @@
 
 It polls the cheap global state (missions, open gates, projects, chats, spend
 today) on an interval, keeps the last good snapshot, and hands it to every view.
+The snapshot's missions are LIGHT rows (no plan, no result, objective clipped:
+`Mission.light`); a view that needs those fetches the full row with
+`TuiData.get_mission`. A refresh that changed nothing is not broadcast: views
+get `on_tick` instead.
 Views never run their own global polls; detail views (an open mission's events)
 use `Hub.guard` so a failed query degrades to "offline", never to a crash.
 
@@ -24,6 +28,11 @@ from rework.tui.data import TuiData
 
 log = logging.getLogger("rework.tui")
 
+# the spinner stamp sweep: at most this many running missions per poll, each one
+# small query of this many newest events
+STAMP_MISSIONS = 24
+EVENT_WINDOW = 40
+
 
 def midnight() -> float:
     lt = time.localtime()
@@ -42,6 +51,10 @@ class Snapshot:
     error: str = ""
     loaded: bool = False  # False until the first successful refresh
     at: float = 0.0
+    # newest event epoch per run. Events are the only live signal a role gives,
+    # so this is what tells a working run from a wedged one (spinner.STALL_SECONDS).
+    # "*" is the newest across every active mission.
+    last_event: dict[str, float] = field(default_factory=dict)
 
     def project_name(self, project_id: str | None) -> str:
         if not project_id:
@@ -66,6 +79,10 @@ class Hub:
         self.data = data or TuiData()
         self.snapshot = Snapshot()
         self._listeners: list[Callable[[Snapshot], None]] = []
+        # called instead of the listeners when a refresh found nothing new
+        self._tick_listeners: list[Callable[[Snapshot], None]] = []
+        # what the listeners last saw (None until the first broadcast)
+        self._broadcast_key: tuple[Any, ...] | None = None
         self._busy = False
         # offline backoff (found live: an unreachable host was retried and
         # logged twice every 2s, 2,400+ warnings in tui.log)
@@ -87,6 +104,33 @@ class Hub:
     def unsubscribe(self, fn: Callable[[Snapshot], None]) -> None:
         if fn in self._listeners:
             self._listeners.remove(fn)
+        if fn in self._tick_listeners:
+            self._tick_listeners.remove(fn)
+
+    def subscribe_tick(self, fn: Callable[[Snapshot], None]) -> None:
+        """Called after a refresh that changed nothing (no repaint needed), so a
+        view can keep its live detail polls going without repainting the lists."""
+        self._tick_listeners.append(fn)
+
+    @staticmethod
+    def _data_key(snap: Snapshot) -> tuple[Any, ...]:
+        """What a repaint depends on. Never `at` (new every refresh) or `loaded`
+        (the first broadcast always goes out: no key yet). online and error are
+        in: a flip to offline must reach the status bar."""
+        return (
+            snap.missions,
+            snap.gates,
+            snap.projects,
+            snap.chats,
+            snap.spend_today,
+            snap.online,
+            snap.error,
+            # a raise is carried by exactly ONE snapshot (the cursor moves past
+            # it), so a poll that holds one must broadcast: on an otherwise
+            # unchanged snapshot the repaint skip sends views `on_tick` only, and
+            # the toast lives in `on_snapshot` (the raise would be lost).
+            tuple(int(getattr(e, "seq", 0) or 0) for e in snap.budget_raises),
+        )
 
     async def refresh(self) -> Snapshot:
         """One poll. Single-flight: an overlapping call returns the current
@@ -112,6 +156,7 @@ class Hub:
                 snap.chats = await self._chats()
                 snap.spend_today = await self._spend_today()
                 snap.budget_raises = await self._budget_raises()
+                await self._event_stamps(snap)
                 snap.online = not self.data._reconnecting_hint
                 snap.error = self.data._reconnecting_hint
                 snap.loaded = True
@@ -134,10 +179,36 @@ class Hub:
                 return self.snapshot
             snap.at = time.time()
             self.snapshot = snap
-            self._broadcast()
+            key = self._data_key(snap)
+            if key == self._broadcast_key:
+                self._notify(self._tick_listeners)  # same data: no repaint
+            else:
+                self._broadcast()
             return snap
         finally:
             self._busy = False
+
+    async def _event_stamps(self, snap: Snapshot) -> None:
+        """Newest event ts per running mission and per run, for the spinner.
+
+        Cost, honestly: ONE store query per running mission per poll (the newest
+        EVENT_WINDOW events, no payload-heavy 200-row reads, no per-run queries)
+        for at most STAMP_MISSIONS missions, so at most 24 small queries. Runs
+        are read out of that one window in Python. A failed query leaves that
+        mission without a stamp ("unknown"), which animates; it never replays an
+        old stamp. The stamp only decides "animating frame" vs "idle 7m"."""
+        stamps: dict[str, float] = {}
+        active = [
+            m for m in snap.missions if str(getattr(m.status, "value", m.status)) == "running"
+        ]
+        for mission in active[:STAMP_MISSIONS]:
+            try:
+                stamps.update(await self.data.recent_event_stamps(mission.id, limit=EVENT_WINDOW))
+            except Exception:  # offline, old store: no stamps for it, never stale ones
+                continue
+        if stamps:
+            stamps["*"] = max(stamps.values())
+        snap.last_event = stamps
 
     async def _chats(self) -> list[Any]:
         try:
@@ -167,7 +238,13 @@ class Hub:
         return sum(float(r.get("cost_usd") or 0) for r in rows)
 
     def _broadcast(self) -> None:
-        for fn in list(self._listeners):
+        # record what the listeners are about to see (guard() broadcasts its own
+        # offline marker too, and the next refresh must compare against that)
+        self._broadcast_key = self._data_key(self.snapshot)
+        self._notify(self._listeners)
+
+    def _notify(self, listeners: list[Callable[[Snapshot], None]]) -> None:
+        for fn in list(listeners):
             try:
                 fn(self.snapshot)
             except NoMatches:

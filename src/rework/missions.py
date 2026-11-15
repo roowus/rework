@@ -16,6 +16,7 @@ from typing import Any
 
 from rework.kernel.state.records import (
     PRIORITIES,
+    Chat,
     EventRecord,
     EventType,
     Mission,
@@ -68,7 +69,7 @@ PLAN_FIX: dict = {
 # has no gate by default but still publishes.
 PLAN_FIX_PR: dict = {"steps": PLAN_FIX["steps"], "gates": [], "publish": "pr"}
 
-PLANS = ("echo", "fix", "fix-pr")
+PLANS = ("echo", "fix", "fix-pr", "draft")
 
 # a derived mission title is a few words for lists (PR titles, `rework ls`,
 # commit subjects): the whole objective is not one (found live: PR #24 was
@@ -111,10 +112,12 @@ def derive_title(objective: str) -> str | None:
     return line or None
 
 
-PLAYBOOK_GATES: dict[str, list[str]] = {"echo": [], "fix": ["ship"], "fix-pr": []}
+# a playbook's FINAL gates. `draft` deliberately has none: its results are
+# the project's files, so there is nothing to push and no PR to open.
+PLAYBOOK_GATES: dict[str, list[str]] = {"echo": [], "fix": ["ship"], "fix-pr": [], "draft": []}
 
 DEFAULT_BUDGET_USD = 2.0  # what a deployment gets when nothing usable is set
-PLAYBOOK_PUBLISH: dict[str, str] = {"echo": "", "fix": "", "fix-pr": "pr"}
+PLAYBOOK_PUBLISH: dict[str, str] = {"echo": "", "fix": "", "fix-pr": "pr", "draft": ""}
 
 
 BUDGET_ERROR = "budget must be a finite number greater than 0"
@@ -274,6 +277,41 @@ def upload_repo_dir(dir_arg: str, ws_name: str, daemon_url: str | None = None) -
     return str(resp.json()["path"])
 
 
+TRANSPORT_GIT = "git"
+TRANSPORT_UPLOAD = "upload"
+RESULTS_PUSH = "push_branch"
+RESULTS_FETCH = "fetch"
+
+
+def derive_transport(settings: dict[str, Any] | None) -> tuple[str, str]:
+    """(transport, results) derived from a project's settings.
+
+    Repos decide: a project with at least one repo reference travels by git and
+    delivers a pushed branch; a project with none has no VCS to travel by, so
+    it uses the upload transport and `rework project pull` brings the result
+    back. The stored keys are honoured only when they agree with that rule —
+    empty repos can never yield git/push_branch, because a fix mission would
+    then need an origin that does not exist."""
+    stored = settings or {}
+    repos = [r for r in (stored.get("repos") or []) if r]
+    if repos:
+        transport = TRANSPORT_GIT
+        default_results = RESULTS_PUSH
+    else:
+        transport = TRANSPORT_UPLOAD
+        default_results = RESULTS_FETCH
+    results = str(stored.get("results") or default_results)
+    if transport == TRANSPORT_UPLOAD and results == RESULTS_PUSH:
+        # no origin to push to: a repo-less project fetches, always
+        results = default_results
+    return transport, results
+
+
+def project_is_upload(settings: dict[str, Any] | None) -> bool:
+    """True for a repo-less ("upload" transport) project."""
+    return derive_transport(settings)[0] == TRANSPORT_UPLOAD
+
+
 async def resolve_repo(
     *,
     repo: str | None,
@@ -392,6 +430,18 @@ def _priority(value: str | None) -> str:
     return check_priority(level)
 
 
+async def _upload_project(project_id: str) -> bool:
+    """True when this project travels by the upload transport (no repo refs)."""
+    from rework.config import Config, open_store_from_config
+
+    store = await open_store_from_config(Config.from_env())
+    try:
+        found = await store.get_project(project_id)
+    finally:
+        await store.aclose()
+    return project_is_upload(found.settings if found else None)
+
+
 async def create_mission(
     objective: str,
     *,
@@ -436,7 +486,16 @@ async def create_mission(
         project_id = await project_for_repo(resolved["repo_origin"] or repo or "")
     if plan not in PLANS:
         raise ValueError(f"unknown plan {plan!r}; plans: {', '.join(PLANS)}")
-    if plan in ("fix", "fix-pr") and not resolved["repo_path"] and not resolved["repo_origin"]:
+    upload_project = project_id is not None and await _upload_project(project_id)
+    # draft needs one too: the deliverables are files written into the project
+    if (
+        plan in ("fix", "fix-pr", "draft")
+        and not resolved["repo_path"]
+        and not resolved["repo_origin"]
+        and not upload_project
+    ):
+        # a repo-less ("upload" transport) project supplies its own workspace
+        # from the daemon's files area, so the repo requirement does not apply
         raise ValueError(f"--plan {plan} requires a repo (URL, path, folder, or project ref)")
     plan_spec: dict | None = None
     if orchestrator_model:
@@ -451,7 +510,10 @@ async def create_mission(
             budget_usd=budget_usd,
             budget_step_usd=budget_step_usd,
         )
-    elif plan in ("fix", "fix-pr"):
+    elif plan in ("fix", "fix-pr", "draft"):
+        # `draft` needs the template as much as fix/fix-pr do: without it
+        # plan_spec stays None, the engine's DEFAULT_PLAN (echo) takes over, and
+        # a programmatic caller silently gets a mission that does nothing.
         template = PLAN_FIX_PR if plan == "fix-pr" else PLAN_FIX
         plan_spec = json.loads(json.dumps(template).replace("$OBJECTIVE", objective))
         plan_spec["kind"] = plan
@@ -461,6 +523,9 @@ async def create_mission(
             # missions have never had one, so inventing a default here would
             # put a new cap on every existing `--plan fix` mission.
             plan_spec["budget"] = budget_rail(budget_usd, budget_step_usd)
+        if plan == "draft":
+            # writing in the project's own files: nothing to ship, no PR
+            plan_spec["gates"] = list(PLAYBOOK_GATES["draft"])
         if model:
             # a mission-wide model choice replaces the template's per-step pins
             for step in plan_spec["steps"]:
@@ -468,6 +533,14 @@ async def create_mission(
             plan_spec["model"] = model
         if effort:
             plan_spec["effort"] = effort
+
+    effective_chat = chat_id
+    if effective_chat is None:
+        # a mission created without a chat (the CLI's `rework new`) still gets
+        # one so it is reachable everywhere a chat-backed mission is: the Work
+        # tab's "to" picker and the Dashboard. The TUI conversation, which
+        # supplies its OWN chat_id, is untouched (GAP 1).
+        effective_chat = new_id("chat")
 
     async def _go(own_store: StateStore) -> Mission:
         from rework.kernel.events.bus import InProcessEventBus
@@ -479,7 +552,7 @@ async def create_mission(
                 repo_path=resolved["repo_path"],
                 repo_origin=resolved["repo_origin"],
                 project_id=project_id,
-                chat_id=chat_id,
+                chat_id=effective_chat,
                 # an explicit title (the TUI's LLM proposal, `new --title`)
                 # always wins; otherwise derive one so every mission has a
                 # short name for lists, PR titles and commit subjects
@@ -488,6 +561,17 @@ async def create_mission(
                 plan=plan_spec,
             )
         )
+        if chat_id is None:
+            # titled from the mission title so it reads like any TUI-created
+            # chat; linked back so the chat row knows which mission it owns
+            await own_store.create_chat(
+                Chat(
+                    id=effective_chat,
+                    title=(title or "").strip()[:80] or derive_title(objective) or "",
+                    project_id=project_id,
+                    mission_id=mission.id,
+                )
+            )
         bus = InProcessEventBus(own_store)
         await bus.publish(
             EventRecord(
@@ -503,6 +587,31 @@ async def create_mission(
     own = await open_store_from_config(Config.from_env())
     try:
         return await _go(own)
+    finally:
+        await own.aclose()
+
+
+async def send_owner_message(mission_id: str, text: str, *, store: StateStore | None = None) -> Any:
+    """THE owner->mission message publisher (ADR 0007): appends an OWNER_MESSAGE
+    event; a running orchestrator is woken and sees it before its next turn.
+    One canonical implementation shared by the TUI (Work tab), the Dashboard
+    and `rework message` — do not duplicate the event-bus publish (GAP 1c).
+
+    When `store` is given it is used and NOT closed; otherwise a connection is
+    opened and closed here (CLI behavior)."""
+    from rework.kernel.state.records import EventRecord, EventType
+
+    if store is not None:
+        return await store.append_event(
+            EventRecord(mission_id=mission_id, type=EventType.OWNER_MESSAGE, payload={"text": text})
+        )
+    from rework.config import Config, open_store_from_config
+
+    own = await open_store_from_config(Config.from_env())
+    try:
+        return await own.append_event(
+            EventRecord(mission_id=mission_id, type=EventType.OWNER_MESSAGE, payload={"text": text})
+        )
     finally:
         await own.aclose()
 

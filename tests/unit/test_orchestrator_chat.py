@@ -597,3 +597,79 @@ async def test_a_replayed_card_is_priced_like_the_live_one(store: Any) -> None:
     blind = proposal_from_args(args)  # a caller with no store: keyword estimate only
     assert blind.budget_usd == 5.0, "without the history the band's ceiling is used"
     assert live.budget_usd != blind.budget_usd, "the history is what this test is about"
+
+
+# -- several proposals from one request ---------------------------------------
+
+
+def _propose(*objectives: str) -> ChatResult:
+    return ChatResult(
+        tool_calls=[
+            ToolCall(
+                id=f"c{i}",
+                name="propose_mission",
+                arguments={"objective": objective, "plan": "fix"},
+            )
+            for i, objective in enumerate(objectives)
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_propose_calls_in_one_turn_yield_two_proposals_in_order() -> None:
+    chat = _chat([_propose("fix the parser", "write the release notes")])
+    result = await chat.send("fix the parser and write the release notes")
+    assert [p.objective for p in result.proposals] == [
+        "fix the parser",
+        "write the release notes",
+    ]
+    assert [p.objective for p in chat.proposals] == [
+        "fix the parser",
+        "write the release notes",
+    ]
+    assert chat.launched is False, "several proposals still launch nothing by themselves"
+
+
+@pytest.mark.asyncio
+async def test_a_later_proposing_turn_replaces_the_pending_list() -> None:
+    """Documented rule: a turn that proposes REPLACES what was pending, so a
+    stale proposal can never be launched by a bare yes."""
+    chat = _chat([_propose("first", "second"), _propose("only this now")])
+    await chat.send("two things")
+    assert len(chat.proposals) == 2
+    result = await chat.send("actually just one thing")
+    assert [p.objective for p in chat.proposals] == ["only this now"]
+    assert result.proposal is not None and result.proposal.objective == "only this now"
+
+
+@pytest.mark.asyncio
+async def test_yes_launches_all_and_no_scraps_all() -> None:
+    chat = _chat([_propose("a", "b", "c")])
+    await chat.send("three things")
+    result = await chat.send("yes")
+    assert result.launched_all is True and result.scrapped_all is False
+    assert [p.objective for p in result.proposals] == ["a", "b", "c"]
+    assert chat.launched is True and chat.proposals == []
+
+    other = _chat([_propose("a", "b")])
+    await other.send("two things")
+    scrapped = await other.send("no")
+    assert scrapped.scrapped_all is True and scrapped.launched_all is False
+    assert other.proposals == [] and other.launched is False
+    assert "Scrapped" in scrapped.reply
+
+
+@pytest.mark.asyncio
+async def test_proposal_is_a_compatibility_view_of_the_first_pending() -> None:
+    chat = _chat([_propose("a", "b")])
+    result = await chat.send("two things")
+    assert chat.proposal is not None and chat.proposal.objective == "a"
+    assert result.proposal is not None and result.proposal.objective == "a"
+    # the old scalar setter replaces the whole list, which is what a caller
+    # written for one proposal means
+    from rework.orchestrator.chat import Proposal
+
+    chat.proposal = Proposal(objective="replacement")
+    assert [p.objective for p in chat.proposals] == ["replacement"]
+    chat.proposal = None
+    assert chat.proposals == [] and chat.proposal is None

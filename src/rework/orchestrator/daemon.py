@@ -24,7 +24,7 @@ from rework.kernel.llm.catalog import ModelCatalog
 from rework.kernel.state.records import EventRecord, EventType, MissionStatus
 from rework.kernel.state.store import StateStore
 from rework.orchestrator.engine import CheckpointerFactory, MissionRunner
-from rework.orchestrator.limits import MissionSlot, RoleLimiter
+from rework.orchestrator.limits import MissionSlot, PrioritySlots, RoleLimiter
 from rework.roles.registry import RoleRegistry
 from rework.runtime import CODE_CHANGED, CodeChangeWatcher, find_repo_root
 
@@ -124,7 +124,7 @@ class Daemon:
         self._auto_update = auto_update
         self._repo_root: Path | None = None
         self._last_update_check = 0.0
-        self._sem = asyncio.Semaphore(config.concurrency)
+        self._sem = PrioritySlots(config.concurrency)
         # daemon-wide cap on concurrently RUNNING roles, shared by every
         # mission's RunSupervisor (REWORK_MAX_ROLES, orchestrator/limits.py)
         self._limiter = RoleLimiter(max_roles(config), poll_interval_s=config.poll_interval_s)
@@ -152,6 +152,7 @@ class Daemon:
             while True:
                 await self._store.heartbeat_lock(self._owner)
                 await self._pickup_pending()
+                await self._repair_stale_gate_status()
                 self._reap()
                 self._check_code()
                 await self._maybe_auto_update()
@@ -209,6 +210,30 @@ class Daemon:
             for mission in await self._store.list_missions(status=status, limit=100):
                 log.info("recovering mission %s (%s)", mission.id, status.value)
                 await self._spawn_runner(mission.id)
+
+    async def _repair_stale_gate_status(self) -> int:
+        """Safety net for the "needs you, but the Gates tab is empty" bug: a
+        mission whose status says AWAITING_GATE while none of its gates is open
+        is not waiting for the owner. Say what is true (RUNNING) and leave one
+        INFO event behind. Cheap: one list per poll, and only the (normally
+        zero) stale rows cost a query each."""
+        fixed = 0
+        for mission in await self._store.list_missions(
+            status=MissionStatus.AWAITING_GATE, limit=100
+        ):
+            if await self._store.list_open_gates(mission.id):
+                continue
+            await self._store.update_mission(mission.id, status=MissionStatus.RUNNING)
+            await self._bus.publish(
+                EventRecord(
+                    mission_id=mission.id,
+                    type=EventType.INFO,
+                    payload={"note": "no open gate: awaiting_gate corrected to running"},
+                )
+            )
+            log.warning("mission %s: awaiting_gate with no open gate -> running", mission.id)
+            fixed += 1
+        return fixed
 
     async def _pickup_pending(self) -> None:
         # pickup order (NOT the browse order of list_missions): high priority
@@ -278,6 +303,14 @@ class Daemon:
         a mission whose runner crashed sat on 'running' forever in every UI."""
         log.error("runner for %s crashed: %s: %s", mission_id, type(exc).__name__, exc)
         error = f"{type(exc).__name__}: {exc}"
+        # Delivery errors (push / gh) are kept WHOLE: git's useful line is the
+        # LAST one, after the `remote:` banner and the forge's hints, so a
+        # 2000-char prefix ends before the reason. Every other error stays
+        # trimmed as before (a runaway traceback is not a mission report).
+        from rework.nodes.gh import GHError
+        from rework.nodes.git_ops import PushError
+
+        keep_whole = isinstance(exc, (PushError, GHError))
         try:
             mission = await self._store.get_mission(mission_id)
             if mission is not None and mission.status not in (
@@ -288,7 +321,10 @@ class Daemon:
                 await self._store.update_mission(
                     mission_id,
                     status=MissionStatus.FAILED,
-                    result={**(mission.result or {}), "error": error[:2000]},
+                    result={
+                        **(mission.result or {}),
+                        "error": error if keep_whole else error[:2000],
+                    },
                 )
         except Exception:
             log.exception("could not mark %s failed", mission_id)

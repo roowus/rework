@@ -5,9 +5,11 @@ Pure functions, no Textual and no store: the dashboard passes in Mission rows
 matching rules are unit-testable without mounting an app.
 
 Two stages:
-  * `search_missions` — the live filter. Case-insensitive; every whitespace
-    separated token must match (substring, or a forgiving subsequence as a
-    fallback) somewhere in the mission's id/title/objective/project/status.
+  * `search_missions` — the live filter. Case-insensitive and STRICT: every
+    whitespace separated token must be a plain substring somewhere in the
+    mission's id/title/objective/project/status. There is no fuzzy fallback:
+    a subsequence match over a long objective made two-letter queries match
+    every mission (m7 finding #44), so a query only ever shows real hits.
   * the AI ranking — `build_ai_prompt` + `parse_ai_ranking` (pure) around
     `ai_search`, which asks a cheap model to order the most plausible missions
     and explain each in one line.
@@ -63,32 +65,16 @@ def _fields(mission: Any) -> tuple[str, ...]:
     )
 
 
-def _subsequence(token: str, text: str) -> bool:
-    """Whether `token`'s characters appear in `text` in order (not adjacent).
-    The forgiving fallback: 'flky' still finds 'flaky test'."""
-    it = iter(text)
-    return all(char in it for char in token)
-
-
 def token_matches(token: str, fields: Sequence[str]) -> bool:
-    """A token hits when it is a substring of any field, else when it is a
-    subsequence of one of them (typos and abbreviations still find things)."""
-    if any(token in field for field in fields):
-        return True
-    return any(_subsequence(token, field) for field in fields)
-
-
-def score(mission: Any, tokens: Sequence[str]) -> int:
-    """How many tokens matched as LITERAL substrings: the trivial ranking that
-    pushes exact hits above fuzzy ones (0 when nothing matches)."""
-    fields = [f.lower() for f in _fields(mission)]
-    return sum(1 for token in tokens if any(token in field for field in fields))
+    """A token hits when it is a plain substring of any of the mission's fields.
+    Nothing more forgiving than that: no subsequence, no scoring."""
+    return any(token in field for field in fields)
 
 
 def search_missions(missions: Iterable[Any], query: str) -> list[Any]:
-    """The missions matching `query` — every whitespace token must match.
-    Empty query = everything, in the order given. Otherwise better (literal,
-    more-token) matches come first; ties keep the caller's order."""
+    """The missions genuinely matching `query` — every whitespace token must be
+    a substring of some field. Empty query = everything, in the order given;
+    hits keep the caller's order (no ranking, no near-misses)."""
     tokens = [t for t in str(query or "").lower().split() if t]
     if not tokens:
         return list(missions)
@@ -96,9 +82,8 @@ def search_missions(missions: Iterable[Any], query: str) -> list[Any]:
     for mission in missions:
         fields = [f.lower() for f in _fields(mission)]
         if all(token_matches(token, fields) for token in tokens):
-            hits.append((score(mission, tokens), mission))
-    hits.sort(key=lambda pair: pair[0], reverse=True)  # stable: order preserved
-    return [mission for _, mission in hits]
+            hits.append(mission)
+    return hits
 
 
 # -- AI ranking: prompt, summaries, parsing ------------------------------------
@@ -130,15 +115,15 @@ def summarize(mission: Any, runs: Sequence[Any] = ()) -> dict[str, str]:
 
 
 def candidates(missions: Sequence[Any], query: str, limit: int = MAX_CANDIDATES) -> list[Any]:
-    """Which missions the AI ranks. Under the cap: all of them. Over it: the
-    text search's hits when it has any (so a phrased query still reaches the
-    right mission), else the most recent `limit`."""
+    """Which missions the AI ranks. With a query, ONLY its strict matches: a
+    ranking reorders the hits, it never widens them, and no hits at all means
+    nothing to rank (no fallback to recent missions). With no query there is
+    nothing to isolate: under the cap, all of them, else the most recent."""
     missions = list(missions)
+    if str(query or "").strip():
+        return search_missions(missions, query)[:limit]
     if len(missions) <= limit:
         return missions
-    hits = search_missions(missions, query)
-    if hits:
-        return hits[:limit]
     return sorted(missions, key=lambda m: float(getattr(m, "created_at", 0) or 0), reverse=True)[
         :limit
     ]

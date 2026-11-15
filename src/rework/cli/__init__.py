@@ -25,6 +25,9 @@ app = typer.Typer(
     ),
     no_args_is_help=True,
     add_completion=False,
+    # `-h` as well as `--help`: without this only the long form is registered
+    # and `rework -h` was a "No such option" error (no command claims -h)
+    context_settings={"help_option_names": ["-h", "--help"]},
 )
 
 
@@ -66,7 +69,7 @@ def new(
         None,
         help="A few words naming the mission (default: derived from the objective).",
     ),
-    plan: str = typer.Option("echo", help="Playbook: echo | fix | fix-pr"),
+    plan: str = typer.Option("echo", help="Playbook: echo | fix | fix-pr | draft"),
     orchestrator: str | None = typer.Option(
         None,
         help="Catalog id for the mission's orchestrator (default: REWORK_DEFAULT_MODEL).",
@@ -93,7 +96,9 @@ def new(
     """Create a mission; the daemon picks it up. An LLM orchestrator runs it
     (ADR 0007), following the plan as a playbook: `fix` = investigate, code,
     audit, then a ship gate; `fix-pr` opens a PR instead (no gate by default,
-    unless the project's `pr_gate` setting or the orchestrator asks for one)."""
+    unless the project's `pr_gate` setting or the orchestrator asks for one);
+    `draft` is document work (research with the web tools, write files, audit
+    the claims) and has no gate: no branch push and no PR."""
 
     async def go() -> str:
         from rework.config import Config, open_store_from_config
@@ -204,6 +209,11 @@ def default_orchestrator_model(catalog: Any = None) -> str:
 project_app = typer.Typer(no_args_is_help=True, add_completion=False, help="Projects (ADR 0005).")
 app.add_typer(project_app, name="project")
 
+mission_app = typer.Typer(
+    no_args_is_help=True, add_completion=False, help="Mission owner actions (retry-pr)."
+)
+app.add_typer(mission_app, name="mission")
+
 
 @project_app.command("assign")
 def project_assign(
@@ -240,8 +250,16 @@ def project_assign(
 @project_app.command("create")
 def project_create(
     name: str,
-    transport: str = typer.Option("git", help="git (daemon clones origins) | upload"),
-    results: str = typer.Option("push_branch", help="push_branch | fetch | both"),
+    transport: str | None = typer.Option(
+        None,
+        help="git (daemon clones origins) | upload (daemon keeps the files)."
+        " Defaults from --repo: given repos -> git, none -> upload.",
+    ),
+    results: str | None = typer.Option(
+        None,
+        help="push_branch | fetch | both. Defaults from --repo:"
+        " given repos -> push_branch, none -> fetch.",
+    ),
     # typer needs list for repeatable options (tuple[str, ...] chokes on the
     # Ellipsis); ruff B008 flags any list-annotated default, so noqa is the
     # only clean escape (matches the existing ASYNC240 noqa above)
@@ -256,6 +274,7 @@ def project_create(
     async def go() -> str:
         from rework.config import Config, open_store_from_config
         from rework.kernel.state.records import Project
+        from rework.missions import derive_transport
         from rework.missions import is_git_url as missions_is_git_url
 
         repos: list[dict] = []
@@ -265,10 +284,34 @@ def project_create(
             rname, url = spec.split("=", 1)
             kind = "github" if missions_is_git_url(url) else "path"
             repos.append({"name": rname, "kind": kind, "url": url})
+        # repos decide the transport (ADR 0005): a repo-less project travels by
+        # upload/fetch, never git/push_branch, because it has no origin to push to
+        derived_transport, derived_results = derive_transport({"repos": repos})
+        if transport == "git" and not repos:
+            raise typer.BadParameter("transport=git needs at least one --repo NAME=URL")
+        if transport is not None and transport != derived_transport:
+            # storing the contradiction made `project show` print a transport the
+            # project does not have (and every reader derives it anyway): refuse
+            # it instead of quietly disagreeing with the repo list
+            raise typer.BadParameter(
+                "--transport upload needs no --repo; drop one"
+                if transport == "upload"
+                else f"--transport {transport} contradicts the repos"
+                f" (that project is transport={derived_transport})"
+            )
+        # the DERIVED pair is what gets stored, so settings never contradict the
+        # repo list; an explicit --results still wins where `derive_transport`
+        # honours it (a git project's push_branch | fetch | both)
+        settings_transport = derived_transport
+        settings_results = results or derived_results
         cfg = Config.from_env()
         store = await open_store_from_config(cfg)
         try:
-            settings = {"transport": transport, "results": results, "repos": repos}
+            settings = {
+                "transport": settings_transport,
+                "results": settings_results,
+                "repos": repos,
+            }
             p = await store.create_project(Project(name=name, settings=settings))
             return p.id
         finally:
@@ -283,14 +326,16 @@ def project_ls() -> None:
 
     async def go() -> list[str]:
         from rework.config import Config, open_store_from_config
+        from rework.missions import derive_transport
 
         store = await open_store_from_config(Config.from_env())
         try:
             rows = []
             for p in await store.list_projects():
                 repos = (p.settings or {}).get("repos") or []
+                transport, results = derive_transport(p.settings)
                 rows.append(
-                    f"{p.id}  {p.name}  transport={(p.settings or {}).get('transport', 'git')}"
+                    f"{p.id}  {p.name}  transport={transport}  results={results}"
                     f"  repos={len(repos)}"
                 )
             return rows
@@ -299,6 +344,86 @@ def project_ls() -> None:
 
     for line in asyncio.run(go()):
         typer.echo(line)
+
+
+@project_app.command("add-files")
+def project_add_files(
+    project: str = typer.Argument(..., help="Project name or id."),
+    paths: list[str] = typer.Argument(..., help="Local files/folders to send."),  # noqa: B008
+    daemon_url: str | None = typer.Option(None, help="Override REWORK_DAEMON_URL."),
+) -> None:
+    """Copy local files into a repo-less project's files area on the daemon.
+    Every mission on that project then starts from them."""
+
+    async def go() -> tuple[str, list[str]]:
+        from rework.config import Config, open_store_from_config
+        from rework.missions import resolve_project
+
+        project_id = await resolve_project(project)
+        assert project_id is not None
+        store = await open_store_from_config(Config.from_env())
+        try:
+            found = await store.get_project(project_id)
+        finally:
+            await store.aclose()
+        from rework.missions import project_is_upload
+
+        if found is None or not project_is_upload(found.settings):
+            raise ValueError(f"project {project} is git transport: push a branch, not files")
+        from rework.project_files import add_project_files
+
+        changed = await asyncio.to_thread(add_project_files, project_id, list(paths), daemon_url)
+        return project_id, changed
+
+    try:
+        project_id, changed = asyncio.run(go())
+    except ValueError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+    if not changed:
+        typer.echo(f"{project_id}: no changes (files identical)")
+        return
+    typer.echo(f"{project_id}: {len(changed)} path(s) in the project files area")
+    for line in changed:
+        typer.echo(f"  {line}")
+
+
+@project_app.command("pull")
+def project_pull(
+    project: str = typer.Argument(..., help="Project name or id."),
+    dest: str = typer.Argument(..., help="Local folder to unpack the files into."),
+    daemon_url: str | None = typer.Option(None, help="Override REWORK_DAEMON_URL."),
+) -> None:
+    """Fetch a repo-less project's files area from the daemon into DEST."""
+
+    async def go() -> str:
+        from rework.config import Config, open_store_from_config
+        from rework.missions import resolve_project
+
+        project_id = await resolve_project(project)
+        assert project_id is not None
+        store = await open_store_from_config(Config.from_env())
+        try:
+            found = await store.get_project(project_id)
+        finally:
+            await store.aclose()
+        from rework.missions import project_is_upload
+
+        if found is None or not project_is_upload(found.settings):
+            raise ValueError(f"project {project} is git transport: clone its repo instead")
+        from pathlib import Path as _Path
+
+        from rework.project_files import pull_project_archive
+
+        path = await asyncio.to_thread(pull_project_archive, project_id, _Path(dest), daemon_url)
+        return str(path)
+
+    try:
+        path = asyncio.run(go())
+    except ValueError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"project files pulled into {path}")
 
 
 @project_app.command("show")
@@ -980,6 +1105,42 @@ def _set_mission_status(mission_id: str, status: str) -> None:
     typer.echo(f"{mission_id}: {asyncio.run(go())}")
 
 
+@app.command("retry-pr")
+def retry_pr_cmd(mission_id: str) -> None:
+    """Retry the PR delivery of a mission that finished but whose push or
+    `gh pr create` failed (a transient remote hiccup must not cost the work).
+
+    Pushes the recorded branch and opens the missing PR with the persisted
+    title/body; on success the pending marker is cleared, on failure the
+    remote's FULL message is printed and nothing else is touched.
+    """
+    from rework.orchestrator.delivery import retry_pr
+
+    async def go() -> tuple[bool, str]:
+        from rework.config import Config, open_store_from_config
+        from rework.kernel.events.bus import InProcessEventBus
+
+        store = await open_store_from_config(Config.from_env())
+        try:
+            return await retry_pr(store, InProcessEventBus(store), mission_id)
+        finally:
+            await store.aclose()
+
+    ok, detail = asyncio.run(go())
+    if ok:
+        typer.echo(f"{mission_id}: PR opened: {detail}")
+        return
+    # the whole error, every line: the useful one is the LAST (git prints the
+    # rejection reason after the remote banner and the forge's hints)
+    typer.echo(f"{mission_id}: PR still not delivered:\n{detail}", err=True)
+    raise typer.Exit(1)
+
+
+# the same command under the `mission` group the docs use (`rework mission
+# retry-pr ID`); the top-level spelling stays, like every other mission command
+mission_app.command("retry-pr")(retry_pr_cmd)
+
+
 @app.command()
 def complaints(
     status: str | None = typer.Option(
@@ -1103,6 +1264,36 @@ def approve(
         typer.secho(status, fg=typer.colors.RED)
         raise typer.Exit(1)
     typer.echo(f"gate {gate_id}: {status}")
+
+
+@app.command()
+def message(
+    mission_id: str,
+    text: str = typer.Argument(..., help="Message text to send to the mission."),
+) -> None:
+    """Send a message to a mission. The orchestrator receives it and wakes."""
+
+    async def go() -> None:
+        from rework.config import Config, open_store_from_config
+        from rework.missions import send_owner_message
+
+        store = await open_store_from_config(Config.from_env())
+        try:
+            if await store.get_mission(mission_id) is None:
+                typer.echo(f"unknown mission {mission_id}", err=True)
+                raise typer.Exit(1)
+            await send_owner_message(mission_id, text, store=store)
+        finally:
+            await store.aclose()
+
+    try:
+        asyncio.run(go())
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        typer.secho(f"failed to send message: {exc}", fg=typer.colors.RED)
+        raise typer.Exit(1) from exc
+    typer.echo(f"{mission_id}: message sent")
 
 
 @app.command()
@@ -1473,34 +1664,60 @@ def parse_target_flag(argv: list[str]) -> tuple[str | None, list[str]]:
     Global options belong BEFORE the subcommand, so the scan stops at the
     first non-flag token (the command name) or at `--`: `rework --target
     sandbox ls` parses to ("sandbox", ["ls"]), while `rework ls --target
-    sandbox` parses to (None, ["ls", ...]) — main() turns that into a usage
+    sandbox` parses to (None, ["ls", ...]); main() turns that into a usage
     error before anything is applied (the silent wrong-target run this
     feature exists to prevent). The NAME itself is only consumed when it
     cannot be a command: anything starting with `-` (like `--help`) is left
     alone, so `rework --target --help` is a missing name, not a target
     literally called `--help`. Returns (name_or_None, rest): rest is the
-    argv AFTER the parsed global prefix (empty = no subcommand, the TUI).
+    argv with the parsed global prefix removed. Every OTHER leading flag is
+    KEPT in rest, in its original order: an empty rest means "no arguments,
+    open the TUI", so silently dropping `--help` / `-h` made `rework --help`
+    look like a bare `rework` and start the dashboard instead of printing help.
+    Because they are kept, rest's FIRST element is not necessarily the
+    subcommand: `rework --help update` parses to ["--help", "update"], so the
+    command name comes from _subcommand() and never from rest[0]. A glued
+    short option such as `-n3` is kept in rest like any other foreign leading
+    flag (it used to be skipped together with its glued value).
     """
+    kept: list[str] = []  # leading flags that are not ours, preserved in order
     i = 0
     while i < len(argv):
         arg = argv[i]
         if arg == "--":
-            return None, argv[i:]  # end of options, by definition
+            return None, kept + argv[i:]  # end of options, by definition
         if arg.startswith("-") and arg != "-":
             if arg == "--target":
                 if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
-                    return argv[i + 1], argv[i + 2 :]
-                return None, argv[i:]  # a missing NAME: env/default decide
+                    return argv[i + 1], kept + argv[i + 2 :]
+                return None, kept + argv[i:]  # a missing NAME: env/default decide
             if arg.startswith("--target="):
                 value = arg[len("--target=") :]
-                return (value or None), argv[i + 1 :]  # --target= is a missing name
-            if not arg.startswith("--") and len(arg) > 2:
-                i += 2  # a short option with a value glued on (-n3), not a flag
-            else:
-                i += 1  # some other global flag; its args are not ours to parse
+                return (value or None), kept + argv[i + 1 :]  # --target= is a missing name
+            # some other global flag (--help, -h, a glued short option like
+            # -n3): kept in rest, never dropped, so typer decides what it means
+            kept.append(arg)
+            i += 1
             continue
-        return None, argv[i:]  # the subcommand: the global-option scan is over
-    return None, []
+        return None, kept + argv[i:]  # the subcommand: the global-option scan is over
+    return None, kept
+
+
+def _subcommand(rest: list[str]) -> str:
+    """The first NON-FLAG token of rest: the subcommand itself, or "" when rest
+    is flags only. Leading flags are kept in rest, so rest[0] can be `--help`.
+
+    Stops at the `--` end-of-options marker and yields "": every token after
+    `--` is a positional, so none of them can claim to be the subcommand. That
+    is what click resolves (`rework -- serve` runs no `serve` command), so the
+    helper mirrors click instead of reading `serve` out of the operands.
+    """
+    for arg in rest:
+        if arg == "--":
+            return ""
+        if not arg.startswith("-"):
+            return arg
+    return ""
 
 
 def _subcommand_names() -> set[str]:
@@ -1529,7 +1746,7 @@ def main() -> None:
     # `rework update --target NAME` is NOT the global target flag: the update
     # command owns a --target of its own (a remote host to update over ssh), so
     # the after-the-subcommand rejection below must not fire for it.
-    _sub = _rest[0] if _rest else ""
+    _sub = _subcommand(_rest)
     if _explicit and _flag is None and _sub != "update":
         # --target on the argv line without a consumable NAME: either it was
         # left off entirely (`rework --target --help`, `rework --target=`, the
@@ -1566,7 +1783,7 @@ def main() -> None:
 
         run_tui()
         return
-    if _rest[0] not in ("serve", "logs", "library-mcp"):
+    if _sub not in ("serve", "logs", "library-mcp"):
         from rework.logs import setup_logging
 
         setup_logging("cli")

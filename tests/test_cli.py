@@ -31,6 +31,16 @@ runner = CliRunner()
 
 
 @pytest.fixture(autouse=True)
+def plain_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Typer/rich colour error panels when FORCE_COLOR is set (GitHub Actions
+    sets it), which splits messages with ANSI codes: asserting on
+    `result.output` then fails in CI only. Tests read plain text."""
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "dumb")
+
+
+@pytest.fixture(autouse=True)
 def rework_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point REWORK_DB at a tmp sqlite file for every test in this module.
 
@@ -91,6 +101,117 @@ def _get_mission(db: Path, mission_id: str) -> Mission | None:
             await store.aclose()
 
     return asyncio.run(go())
+
+
+def _get_project(db: Path, project_id: str):  # type: ignore[no-untyped-def]
+    async def go():  # type: ignore[no-untyped-def]
+        store = await open_sqlite(str(db))
+        try:
+            return await store.get_project(project_id)
+        finally:
+            await store.aclose()
+
+    return asyncio.run(go())
+
+
+def _get_chat(db: Path, chat_id: str):
+    async def go():
+        store = await open_sqlite(str(db))
+        try:
+            return await store.get_chat(chat_id)
+        finally:
+            await store.aclose()
+
+    return asyncio.run(go())
+
+
+def test_project_create_defaults_to_the_upload_transport(rework_db: Path) -> None:
+    """A project with no --repo has no origin to push to (ADR 0005): creation
+    must store transport=upload / results=fetch, never git/push_branch."""
+    result = runner.invoke(app, ["project", "create", "NAME"])
+
+    assert result.exit_code == 0, result.output
+    project = _get_project(rework_db, result.output.strip())
+    assert project is not None
+    assert project.settings["transport"] == "upload"
+    assert project.settings["results"] == "fetch"
+    assert project.settings["repos"] == []
+
+
+def test_project_create_with_a_repo_defaults_to_git(rework_db: Path) -> None:
+    result = runner.invoke(app, ["project", "create", "N2", "--repo", "r=https://github.com/a/b"])
+
+    assert result.exit_code == 0, result.output
+    project = _get_project(rework_db, result.output.strip())
+    assert project is not None
+    assert project.settings["transport"] == "git"
+    assert project.settings["results"] == "push_branch"
+    assert project.settings["repos"] == [
+        {"name": "r", "kind": "github", "url": "https://github.com/a/b"}
+    ]
+
+
+def test_project_create_rejects_git_transport_without_a_repo(rework_db: Path) -> None:
+    """--transport git with nothing to clone would create a project every fix
+    mission then fails on; refuse it at creation."""
+    result = runner.invoke(app, ["project", "create", "N3", "--transport", "git"])
+
+    assert result.exit_code != 0, result.output
+    assert "needs at least one --repo" in result.output
+
+
+def test_project_create_rejects_a_transport_that_contradicts_the_repo(
+    rework_db: Path,
+) -> None:
+    """`--transport upload --repo r=URL` stored a transport the project does not
+    have (the repos derive git), and `project show` printed that stale value.
+    Storing the derived pair is the rule; a contradiction is refused outright."""
+    result = runner.invoke(
+        app, ["project", "create", "N4", "--transport", "upload", "--repo", "r=github.com/a/b"]
+    )
+
+    assert result.exit_code != 0, result.output
+    assert "--transport upload needs no --repo; drop one" in result.output
+
+
+def test_project_create_stores_the_transport_the_repos_derive(rework_db: Path) -> None:
+    """Whatever the flags say, the stored settings agree with the repo list, so
+    `project show` can never print a transport the project does not have."""
+    with_repo = runner.invoke(app, ["project", "create", "N5", "--repo", "r=github.com/a/b"])
+    assert with_repo.exit_code == 0, with_repo.output
+    assert _get_project(rework_db, with_repo.output.strip()).settings["transport"] == "git"
+    assert _get_project(rework_db, with_repo.output.strip()).settings["results"] == "push_branch"
+
+    bare = runner.invoke(app, ["project", "create", "N6"])
+    assert bare.exit_code == 0, bare.output
+    assert _get_project(rework_db, bare.output.strip()).settings["transport"] == "upload"
+    assert _get_project(rework_db, bare.output.strip()).settings["results"] == "fetch"
+
+
+def test_project_add_files_rejects_a_missing_path(
+    rework_db: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A typo'd path used to pack to an EMPTY tarball and come back 200, so a
+    wrong path looked like success. It now fails before any network call."""
+    created = runner.invoke(app, ["project", "create", "ADDF"])
+    assert created.exit_code == 0, created.output
+    project_id = created.output.strip()
+
+    def no_network(*_a: object, **_k: object) -> None:  # pragma: no cover
+        raise AssertionError("a missing path must fail before any HTTP call")
+
+    import rework.project_files as project_files
+
+    monkeypatch.setattr(project_files, "_check", no_network)
+    present = tmp_path / "there.md"
+    present.write_text("# there\n")
+
+    result = runner.invoke(
+        app, ["project", "add-files", project_id, str(present), str(tmp_path / "tehre.md")]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "no such file or folder" in result.output
 
 
 def test_help_exits_zero() -> None:
@@ -380,6 +501,13 @@ def test_new_creates_an_orchestrated_mission_by_default(rework_db: Path) -> None
     assert plan["gates"] == []
     assert plan["orchestrator"]["model"]
     assert plan["budget"]["max_usd"] == 3.0
+    # a CLI-created mission gets a chat titled from the mission title, so it is
+    # reachable from the Work tab / Dashboard like any chat-backed mission
+    assert mission.chat_id is not None
+    chat = _get_chat(rework_db, mission.chat_id)
+    assert chat is not None
+    assert chat.title == mission.title
+    assert chat.mission_id == mission.id
 
 
 def test_new_mechanical_keeps_the_legacy_pipeline(rework_db: Path) -> None:
@@ -1170,6 +1298,278 @@ def test_new_with_unknown_priority_is_a_clean_cli_error(rework_db: Path) -> None
             await store.aclose()
 
     assert asyncio.run(all_missions()) == []
+
+
+# --- main()'s dispatch of the help flags ------------------------------------
+# `rework --help` / `rework -h` used to open the TUI: parse_target_flag dropped
+# the leading flag, so main() saw an empty rest and took its "bare rework"
+# branch before typer ever ran. CliRunner invokes app() directly and cannot see
+# that dispatch, so these call the real main() with run_tui monkeypatched to
+# fail loudly instead of opening a dashboard.
+
+
+@pytest.fixture()
+def dispatched_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A throwaway HOME/state dir for a real main() run, with no targets.toml.
+
+    The REWORK_* vars resolve_target would setdefault are pinned to empty
+    strings first: on an empty value setdefault leaves them alone, and
+    monkeypatch restores whatever the session had before.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("REWORK_TARGETS", str(home / "targets.toml"))
+    # TARGETS_PATH is read from the env at import time, so the env var alone
+    # does not redirect an already-imported rework.targets: patch the constant.
+    monkeypatch.setattr("rework.targets.TARGETS_PATH", home / "targets.toml")
+    monkeypatch.setenv("REWORK_ENV_FILE", str(home / "rework.env"))
+    monkeypatch.setenv("REWORK_LOG_DIR", str(home / "logs"))
+    monkeypatch.delenv("REWORK_TARGET", raising=False)
+    for name in (
+        "REWORK_DB",
+        "REWORK_DAEMON_URL",
+        "REWORK_LIBRARY_DIR",
+        "REWORK_TARGET_NAME",
+        "REWORK_CHECKPOINTS_DB",
+    ):
+        monkeypatch.setenv(name, "")
+    return home
+
+
+def _tui_must_not_start(*_args: object, **_kwargs: object) -> None:
+    raise AssertionError("run_tui() was called: this argv belongs to the CLI, not the TUI")
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_main_help_flag_prints_help_and_does_not_start_the_tui(
+    flag: str,
+    dispatched_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BLOCKER: `rework --help` and `rework -h` print typer help, exit 0, no TUI."""
+    import rework.tui as tui
+    from rework.cli import main
+
+    monkeypatch.setattr(tui, "run_tui", _tui_must_not_start)
+    monkeypatch.setattr(sys, "argv", ["rework", flag])
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 0
+    out = capsys.readouterr().out
+    # launcher-agnostic: click's "Usage: <prog>" prefix is derived from
+    # sys.modules["__main__"].__package__, so under `python -m pytest` it reads
+    # "Usage: python -m pytest.rework". Assert the usage header plus a real help
+    # body line, so an error panel cannot satisfy it either.
+    assert "Usage:" in out
+    assert "COMMAND" in out
+    assert "--target" in out  # the real help body, not an error panel
+    assert "No such option" not in out
+
+
+def test_main_bare_and_target_only_argv_still_open_the_tui(
+    dispatched_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control: the TUI path keeps working for a bare `rework` and `--target NAME`."""
+    import rework.tui as tui
+    from rework.cli import main
+
+    (dispatched_home / "targets.toml").write_text(
+        "[targets.sandbox]\n"
+        f'db = "sqlite:///{dispatched_home / "sandbox.db"}"\n'
+        'daemon_url = "http://127.0.0.1:8941"\n'
+    )
+
+    calls: list[str] = []
+
+    def fake_run_tui() -> None:
+        calls.append("started")
+
+    monkeypatch.setattr(tui, "run_tui", fake_run_tui)
+
+    for argv in (["rework"], ["rework", "--target", "sandbox"]):
+        calls.clear()
+        monkeypatch.setattr(sys, "argv", argv)
+        main()
+        assert calls == ["started"], argv
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_main_help_flag_before_a_subcommand_still_prints_help(
+    flag: str,
+    dispatched_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """REGRESSION: `rework --help update --target rewvis` is still a help request.
+
+    Leading flags are now KEPT in rest, so `_rest[0]` can be a flag: keying the
+    `update` exemption off it read the subcommand as "--help", fired the --target
+    usage-error guard, and turned a help request that printed help at base
+    eb7556c into a red usage error. The command name must come from the first
+    non-flag token.
+    """
+    import rework.tui as tui
+    from rework.cli import main
+
+    monkeypatch.setattr(tui, "run_tui", _tui_must_not_start)
+    monkeypatch.setattr(sys, "argv", ["rework", flag, "update", "--target", "rewvis"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 0
+    captured = capsys.readouterr()
+    assert "Usage:" in captured.out  # launcher-agnostic: see the test above
+    assert "COMMAND" in captured.out
+    assert "needs a name" not in captured.out
+    assert "needs a name" not in captured.err
+
+
+def test_main_update_target_stays_exempt_from_the_guard(
+    dispatched_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Positive control: `rework update --target NAME` is still exempt.
+
+    The update command owns its own --target, so the guard must not fire: the
+    command itself runs and reports the unknown target (exit 1), never the
+    "needs a name" usage error (exit 2).
+    """
+    import rework.tui as tui
+    from rework.cli import main
+
+    monkeypatch.setattr(tui, "run_tui", _tui_must_not_start)
+    monkeypatch.setattr(sys, "argv", ["rework", "update", "--target", "rewvis"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert "no target named 'rewvis'" in captured.err
+    assert "needs a name" not in captured.err
+
+
+class _StopLogging(Exception):
+    """Sentinel: the logging branch ran, so stop main() before the typer app."""
+
+
+def _logging_spy(calls: list[str]):
+    """A setup_logging stand-in that records its component and halts main().
+
+    main() imports setup_logging inside the function, so patching the module
+    attribute is what it resolves; raising the sentinel keeps the test away
+    from app() (and therefore from any daemon or TUI start).
+    """
+
+    def spy(component: str, **_kwargs: object) -> None:
+        calls.append(component)
+        raise _StopLogging
+
+    return spy
+
+
+@pytest.mark.parametrize("argv", [["rework", "--", "serve"], ["rework", "--", "logs"]])
+def test_main_double_dash_shapes_take_the_logging_path(
+    argv: list[str],
+    dispatched_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REGRESSION: `rework -- serve` / `rework -- logs` still log like base.
+
+    `--` is the end-of-options marker, so `serve` is a POSITIONAL and not the
+    subcommand: the "serve/logs/library-mcp already log themselves" exemption
+    must not fire and the CLI logging path must run. Reading rest[0] as the
+    subcommand skipped setup_logging("cli") for exactly these shapes.
+    """
+    import rework.logs
+    import rework.tui as tui
+    from rework.cli import main
+
+    calls: list[str] = []
+    monkeypatch.setattr(rework.logs, "setup_logging", _logging_spy(calls))
+    monkeypatch.setattr(tui, "run_tui", _tui_must_not_start)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(_StopLogging):
+        main()
+
+    assert calls == ["cli"], argv  # exactly once, and for the CLI component
+
+
+def test_main_exempt_subcommand_skips_the_cli_logging(
+    dispatched_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Complement: `rework serve` does NOT take the CLI logging branch.
+
+    `serve` IS the subcommand here, and it configures its own ("daemon")
+    logging, so main() must leave setup_logging alone and go straight to the
+    app. The spy raises on its first call, which stops main() inside the serve
+    command body, before the daemon can boot: the recorded call list therefore
+    shows whose logging ran (serve's own, never "cli").
+    """
+    import rework.logs
+    import rework.tui as tui
+    from rework.cli import main
+
+    calls: list[str] = []
+    monkeypatch.setattr(rework.logs, "setup_logging", _logging_spy(calls))
+    monkeypatch.setattr(tui, "run_tui", _tui_must_not_start)
+    monkeypatch.setattr(sys, "argv", ["rework", "serve"])
+
+    with pytest.raises(_StopLogging):
+        main()
+
+    # exactly serve's own call: main() did not log for "cli" first
+    assert calls == ["daemon"]
+
+
+def test_main_target_after_a_subcommand_still_errors(
+    dispatched_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Positive control: the guard itself is unchanged for `rework ls --target sandbox`."""
+    from rework.cli import main
+
+    monkeypatch.setattr(sys, "argv", ["rework", "ls", "--target", "sandbox"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 2
+    assert "must come before the subcommand" in capsys.readouterr().err
+
+
+def test_message_publishes_an_owner_message(rework_db: Path) -> None:
+    """`rework message ID TEXT` appends an OWNER_MESSAGE for that mission;
+    an unknown id fails loudly and publishes nothing."""
+    from rework.kernel.state.records import EventType
+
+    async def seed() -> None:
+        store = await open_sqlite(str(rework_db))
+        try:
+            await store.create_mission(Mission(id="m-msg", objective="talk to me"))
+        finally:
+            await store.aclose()
+
+    async def owner_texts(mission_id: str) -> list[str]:
+        store = await open_sqlite(str(rework_db))
+        try:
+            events = await store.events_since(0, mission_id=mission_id)
+            return [e.payload["text"] for e in events if e.type == EventType.OWNER_MESSAGE]
+        finally:
+            await store.aclose()
+
+    asyncio.run(seed())
+    result = runner.invoke(app, ["message", "m-msg", "please also add tests"])
+    assert result.exit_code == 0, result.output
+    assert asyncio.run(owner_texts("m-msg")) == ["please also add tests"]
+
+    missing = runner.invoke(app, ["message", "m-nope", "hello"])
+    assert missing.exit_code != 0
+    assert asyncio.run(owner_texts("m-nope")) == []
 
 
 def test_new_estimates_the_budget_and_keeps_stdout_the_bare_mission_id(

@@ -57,10 +57,11 @@ the daemon clones it), a project repo reference (`--project p-... --repo NAME`),
 or an uploaded folder (`--repo-dir ~/folder` with `REWORK_DAEMON_URL` pointed
 at the daemon; the workspace API is tailnet-only when the daemon binds its
 tailnet IP). A clean audited `done` pushes the branch and opens the pull
-request with no gate; the orchestrator may ask for a gate on a risky change
-(`ask_before_pr` + a reason), and a project `settings.pr_gate` of `always` or
-`never` overrides that. Merging is always the owner's. Results are also
-available via `rework fetch <mission-id>`.
+request with no gate; the orchestrator may ask for one only for a high-stakes
+change — data loss, security, money, or production infrastructure — naming that
+category (`ask_before_pr` + `gate_category` + a reason naming it), and a project
+`settings.pr_gate` of `always` or `never` overrides that. Merging is always the
+owner's. Results are also available via `rework fetch <mission-id>`.
 
 ## The TUI: just type `rework`
 

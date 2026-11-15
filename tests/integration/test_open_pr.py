@@ -342,13 +342,19 @@ async def test_pr_body_leads_with_orchestrator_summary(
 # ---------------------------------------------------------------------------
 
 
-def _with_reason(script: list[Any], *, reason: str, ask: bool = True) -> list[Any]:
-    """The same orchestrator script, but its finish call asks for a review."""
+def _with_reason(
+    script: list[Any], *, reason: str, ask: bool = True, category: str = "security"
+) -> list[Any]:
+    """The same orchestrator script, but its finish call asks for a review. A
+    gate ask is strict (issue #36): it needs a reason AND one of the four
+    high-stakes categories, so both are patched in."""
     patched = list(script)
     last = patched[-1]
     finish = last.tool_calls[-1]
     args = dict(finish.arguments)
     args["ask_before_pr"] = ask
+    if category:
+        args["gate_category"] = category
     if reason:
         args["reason"] = reason
     patched[-1] = last.model_copy(
@@ -421,7 +427,10 @@ async def test_ask_before_pr_gates_the_pr_and_shows_the_reason(
         await asyncio.sleep(0.05)
     open_gates = await orch_world["store"].list_open_gates(orch_world["mission"].id)
     assert open_gates and open_gates[0].kind.value == "open_pr"
-    assert reason in open_gates[0].question
+    question = open_gates[0].question
+    assert reason in question
+    # the strict gate shows WHICH high-stakes category justified it (issue #36)
+    assert "Gate category: security" in question
     await _decide(orch_world["store"], orch_world["db"], orch_world["mission"].id, True)
     await asyncio.wait_for(task, timeout=60)
     mission = await orch_world["store"].get_mission(orch_world["mission"].id)
@@ -468,6 +477,10 @@ async def test_pr_gate_always_forces_the_gate_without_an_ask(
         if await orch_world["store"].list_open_gates(orch_world["mission"].id):
             break
         await asyncio.sleep(0.05)
+    forced = await orch_world["store"].list_open_gates(orch_world["mission"].id)
+    # a category-less forced gate still renders sensibly (no empty category)
+    assert forced and "pr_gate=always" in forced[0].question
+    assert "Gate category:" not in forced[0].question
     await _decide(orch_world["store"], orch_world["db"], orch_world["mission"].id, True)
     await asyncio.wait_for(task, timeout=60)
     gates = await orch_world["store"].list_gates(orch_world["mission"].id)
@@ -488,3 +501,43 @@ async def test_pr_gate_never_overrides_the_ask(
     assert [g for g in gates if g.kind.value == "open_pr"] == []
     mission = await orch_world["store"].get_mission(orch_world["mission"].id)
     assert (mission.result or {}).get("pr_url")
+
+
+async def test_an_ask_without_a_category_is_refused_then_the_pr_opens_ungated(
+    orch_world: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(a) the strict rule end to end: an ask_before_pr with no valid category
+    is refused as a tool error (no gate, mission not finished), and the retry
+    the answer tells it to make -- finish with no ask -- opens the PR ungated."""
+    from rework.kernel.llm.types import ChatResult, ToolCall, Usage
+
+    script = _with_reason(_orch_pr_script(), reason="large diff, many files touched", category="")
+    # what the refusal text tells the orchestrator to do: finish with no ask
+    script = [
+        *script,
+        ChatResult(
+            text="",
+            tool_calls=[
+                ToolCall(
+                    id="r2", name="finish", arguments={"outcome": "done", "summary": ORCH_SUMMARY}
+                )
+            ],
+            usage=Usage(input_tokens=200, output_tokens=20),
+        ),
+    ]
+    runner = _runner(orch_world, monkeypatch, script)
+    await asyncio.wait_for(asyncio.create_task(runner.run()), timeout=60)
+
+    from rework.orchestrator.agent import orchestrator_chat_id
+
+    msgs = await orch_world["store"].chat_messages(orchestrator_chat_id(orch_world["mission"].id))
+    tool_out = [m.body.get("content", "") for m in msgs if m.role == "tool"]
+    refusals = [t for t in tool_out if "gate_category" in t]
+    assert refusals, f"the invalid ask was not refused; tool results: {tool_out}"
+    assert "without a gate" in refusals[0], "the refusal must say how to proceed"
+    gates = await orch_world["store"].list_gates(orch_world["mission"].id)
+    assert [g for g in gates if g.kind.value == "open_pr"] == [], "a refused ask opened a gate"
+    mission = await orch_world["store"].get_mission(orch_world["mission"].id)
+    assert mission is not None and mission.status == MissionStatus.DONE
+    assert (mission.result or {}).get("pr_url") == "https://github.com/roowus/toyrepo/pull/1"
+    assert orch_world["gh_body"].exists(), "the retry never opened the PR"

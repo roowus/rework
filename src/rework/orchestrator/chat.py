@@ -49,12 +49,31 @@ Ground rules:
 - When you are ready, call propose_mission with the objective, the plan, and
   the project/repo you intend to use. Never claim a mission exists — only the
   owner's confirmation creates one.
-- If the owner changes their mind mid-conversation, update the proposal.
+- When the owner's request contains clearly separate pieces of work (different
+  areas, different repos or different projects, things that could ship
+  independently), call propose_mission once per piece and add one line saying
+  why they are separate. Each one becomes its own mission, so they launch (and
+  fail) independently.
+- Keep ONE mission when the work is one coherent change, even if it touches
+  several files. Never split just to split.
+- If the owner changes their mind mid-conversation, update the proposal: a turn
+  that proposes replaces the pending proposals with what you propose now.
 
 Plans you can choose:
 - echo    — no roles, just prove the plumbing works
 - fix     — investigate, code, audit, then a ship gate
 - fix-pr  — same, then the engine opens a pull request (no gate by default)
+- draft   — use draft for document work: research write-ups, reports, letters,
+            content — anything whose deliverable is writing, not code. The roles
+            research with the web tools, write the draft as files in the
+            project, and audit every claim against its cited source. No branch
+            push and no PR.
+
+A project may also be repo-less: its transport is "upload", which means rework
+keeps that project's files itself. For an upload project, fix and fix-pr do NOT
+need a repo — the project's files area supplies the files, and results are
+fetched, not pushed. Pass no repo for such a project, and never tell the owner
+one is required.
 
 Every mission starts from the repo's default branch: you cannot hand it an
 earlier mission's branch, results or worktree, so never promise that. Describe
@@ -83,8 +102,9 @@ change anything from here — only a confirmed proposal creates a mission."""
 PROPOSE_TOOL = ToolSpec(
     name="propose_mission",
     description=(
-        "Propose the mission you would launch. The owner confirms or changes it. "
-        "Call this whenever you have a concrete objective; do not narrate it in prose."
+        "Propose the missions you would launch. The owner confirms or changes "
+        "them. Call this whenever you have a concrete objective; call it once per "
+        "separate piece of work. Do not narrate proposals in prose."
     ),
     input_schema={
         "type": "object",
@@ -97,7 +117,7 @@ PROPOSE_TOOL = ToolSpec(
                 "type": "string",
                 "description": "A short name for lists, 3 to 6 words.",
             },
-            "plan": {"type": "string", "enum": ["echo", "fix", "fix-pr"]},
+            "plan": {"type": "string", "enum": ["echo", "fix", "fix-pr", "draft"]},
             "project": {"type": "string", "description": "Project name, or empty for none."},
             "repo": {
                 "type": "string",
@@ -272,11 +292,25 @@ class Turn:
 @dataclass
 class ChatResult:
     reply: str = ""  # what to say back (may be empty when proposing)
-    proposal: Proposal | None = None
+    # every proposal this turn produced, in call order (usually one, sometimes
+    # several when the owner's request spans separate pieces of work)
+    proposals: list[Proposal] = field(default_factory=list)
+    # a bare yes with proposals pending means launch them ALL; a bare no means
+    # scrap them all. The caller acts on these signals instead of re-deriving
+    # which proposal the owner meant (there is no "which one" path).
+    launched_all: bool = False
+    scrapped_all: bool = False
     asked: str = ""  # a question when the model needs more
     turn_tokens: int = 0
     turn_cost_usd: float = 0.0
     transcript: list[Turn] = field(default_factory=list)
+
+    @property
+    def proposal(self) -> Proposal | None:
+        """Compatibility view: the FIRST proposal of this turn, None when there
+        is none. Callers that can only handle one proposal (a single card, a
+        CLI print) keep working; `proposals` is the real shape."""
+        return self.proposals[0] if self.proposals else None
 
 
 class ChatTools:
@@ -410,8 +444,24 @@ class OrchestratorChat:
         self._toolbox = ChatTools(store, library) if self._tools_enabled else None
         self._history: list[dict[str, Any]] = []
         self._display: list[tuple[str, str]] = []  # (who, text) replay for the UI
-        self.proposal: Proposal | None = None
+        # PENDING proposals, in the order the model made them. One owner request
+        # can span several separate pieces of work, so this is a list; the turn
+        # that produces proposals REPLACES it (documented, tested).
+        self.proposals: list[Proposal] = []
         self.launched = False
+
+    @property
+    def proposal(self) -> Proposal | None:
+        """Compatibility view of `proposals`: the FIRST pending proposal, or
+        None. Callers written for the old single-proposal engine keep working
+        (they see the first one and ignore the rest)."""
+        return self.proposals[0] if self.proposals else None
+
+    @proposal.setter
+    def proposal(self, value: Proposal | None) -> None:
+        """Replaces the WHOLE pending list with `[value]` (or `[]` for None),
+        which is what a single-proposal caller means when it assigns."""
+        self.proposals = [value] if value is not None else []
 
     async def _record(self, role: str, body: dict[str, Any], display: str) -> bool:
         """Persist one transcript row (no-op when persistence is off). Returns
@@ -520,16 +570,33 @@ class OrchestratorChat:
                 "switch the orchestrator model or drop the attachment"
             )
 
-        # A bare yes after a proposal launches it — the owner's confirm gate.
-        if self.proposal is not None and text.lower() in YES_WORDS:
+        # A bare yes after proposals launches ALL of them, a bare no scraps all
+        # of them. With more than one pending proposal there is no way to say
+        # "which one" in words, so the answer is never ambiguous: yes is
+        # all-in, no is all-out, and picking ONE is the per-card button in the
+        # UI (which never goes through this path).
+        if self.proposals and text.lower() in YES_WORDS:
+            launching = list(self.proposals)
+            self.proposals = []
             self.launched = True
-            await self._note(text, "Launching.")
-            return ChatResult(reply="Launching.", transcript=[Turn("you", text)])
-        if self.proposal is not None and text.lower() in NO_WORDS:
-            self.proposal = None
-            reply = "Scrapped it. Tell me what to change and I'll propose again."
+            reply = "Launching all of them." if len(launching) > 1 else "Launching."
             await self._note(text, reply)
-            return ChatResult(reply=reply, transcript=[Turn("you", text)])
+            return ChatResult(
+                reply=reply,
+                proposals=launching,
+                launched_all=True,
+                transcript=[Turn("you", text)],
+            )
+        if self.proposals and text.lower() in NO_WORDS:
+            scrapped = len(self.proposals)
+            self.proposals = []
+            reply = (
+                f"Scrapped all {scrapped}. Tell me what to change and I'll propose again."
+                if scrapped > 1
+                else "Scrapped it. Tell me what to change and I'll propose again."
+            )
+            await self._note(text, reply)
+            return ChatResult(reply=reply, scrapped_all=True, transcript=[Turn("you", text)])
 
         user_msg: dict[str, Any] = {"role": "user", "content": text}
         if images:
@@ -647,11 +714,15 @@ class OrchestratorChat:
         if reply or result.tool_calls:
             self._history.append(assistant_msg)
         asked = ""
-        proposal: Proposal | None = None
+        # EVERY propose_mission call in this turn becomes its own pending
+        # proposal, in call order. A later turn that proposes REPLACES the
+        # pending list (the model has re-stated what it wants to run), so stale
+        # proposals can never be launched by a bare yes.
+        proposals: list[Proposal] = []
         history: float | None = None
         if any(c.name == "propose_mission" for c in result.tool_calls) and self._store:
             # the same calibration `rework new` uses (median finished cost), so
-            # a proposal is sized against real spend and not just the keywords
+            # every proposal is sized against real spend and not just keywords
             from rework.budget_policy import typical_finished_cost
 
             history = await typical_finished_cost(self._store)
@@ -660,25 +731,29 @@ class OrchestratorChat:
             if call.name == "propose_mission":
                 objective = str(args.get("objective", "")).strip()
                 budget_usd, budget_reason = proposal_budget(args, objective, cost_history=history)
-                proposal = Proposal(
-                    objective=objective,
-                    title=str(args.get("title", "")).strip(),
-                    plan=str(args.get("plan", "fix")).strip() or "fix",
-                    project=str(args.get("project", "")).strip(),
-                    repo=str(args.get("repo", "")).strip(),
-                    model=str(args.get("model", "")).strip(),
-                    effort=str(args.get("effort", "")).strip(),
-                    budget_usd=budget_usd,
-                    budget_reason=budget_reason,
+                proposals.append(
+                    Proposal(
+                        objective=objective,
+                        title=str(args.get("title", "")).strip(),
+                        plan=str(args.get("plan", "fix")).strip() or "fix",
+                        project=str(args.get("project", "")).strip(),
+                        repo=str(args.get("repo", "")).strip(),
+                        model=str(args.get("model", "")).strip(),
+                        effort=str(args.get("effort", "")).strip(),
+                        budget_usd=budget_usd,
+                        budget_reason=budget_reason,
+                    )
                 )
-                self.proposal = proposal
             elif call.name == "ask":
                 asked = str(args.get("question", "")).strip()
+        if proposals:
+            self.proposals = proposals
 
         transcript = [Turn("you", text)]
-        if proposal is not None:
+        if proposals:
             reply = reply or "Here's what I'd run."
-            transcript.append(Turn("orchestrator", f"{reply}\n  {proposal.summary()}"))
+            lines = "\n  ".join(p.summary() for p in proposals)
+            transcript.append(Turn("orchestrator", f"{reply}\n  {lines}"))
         elif asked:
             reply = asked
             transcript.append(Turn("orchestrator", asked))
@@ -712,7 +787,7 @@ class OrchestratorChat:
 
         return ChatResult(
             reply=reply,
-            proposal=proposal,
+            proposals=proposals,
             asked=asked,
             turn_tokens=total_in + total_out,
             turn_cost_usd=cost,

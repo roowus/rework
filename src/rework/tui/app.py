@@ -13,7 +13,7 @@ import time
 from typing import Any, ClassVar
 
 from textual import events
-from textual.app import App, ComposeResult
+from textual.app import App, ComposeResult, ScreenStackError
 from textual.binding import Binding, BindingType
 from textual.css.query import NoMatches
 from textual.notifications import SeverityLevel
@@ -24,6 +24,7 @@ from textual.worker import WorkerFailed
 from rework import update as update_mod
 from rework.runtime import CODE_CHANGED_IDLE, CodeChangeWatcher
 from rework.tui import reload as reload_mod
+from rework.tui import spinner
 from rework.tui.hub import Hub, Snapshot
 from rework.tui.settings import Settings
 from rework.tui.theme import THEME, WARN, clip
@@ -46,11 +47,29 @@ ERROR_STORM_WINDOW = 5.0
 # off the 2s heartbeat: its own slow interval.
 CODE_CHECK_SECONDS = 60.0
 
+# The hub poll interval while the owner is active (the settings value, tui.json
+# `poll_seconds`, overrides it), and the slower one once they have been away for
+# reload.IDLE_SECONDS: nobody is looking at a screen that sat untouched for 30s,
+# and a left-open TUI over a tailnet is the expensive case. Any key goes back to
+# the fast rate (App.poll_interval).
+POLL_SECONDS = 2.0
+IDLE_POLL_SECONDS = 10.0
+# Timer ticks land a few ms either side of their schedule: a poll counts as due
+# this fraction of one timer period early (0.1 x 2 s = 0.2 s), far more than the
+# jitter and far less than a tick, so idle polls are 10 s apart, not 10 or 12.
+POLL_JITTER_FRACTION = 0.1
+
 # How often the shell asks origin whether main moved (finding 28: the
 # checkout can be behind the code the owner expects). A `git fetch` is
 # slower than the stat walk above, so it gets its own slow interval and
 # runs off the UI thread; offline is silent.
 UPDATE_CHECK_SECONDS = 900.0
+
+# The ONE animation interval (spinner). This is the only timer in the app whose
+# job is to repaint, and it is the only place a 10fps tick may be registered:
+# `test_one_animation_timer` fails if a second one appears. 0.1s matches
+# spinner.SECONDS_PER_FRAME, so the visible frame advances every tick.
+ANIMATION_SECONDS = 0.1
 
 # Found live: alt+N worked under Pilot and NEVER in a real macOS terminal.
 # Option+digit reaches Textual as a character (¡ ™ £ ¢ ∞; Textual even maps
@@ -81,6 +100,7 @@ def _menus() -> dict[str, list[MenuItem]]:
         "File": [
             MenuItem("New chat", "app.new_chat", "ctrl+n"),
             MenuItem("New project…", "app.new_project"),
+            MenuItem("Add project files…", "app.project_files"),
             MenuItem("New library item…", "app.new_library_item"),
             SEPARATOR,
             MenuItem("Refresh", "app.refresh", "ctrl+r"),
@@ -153,7 +173,10 @@ class ReworkApp(App[None]):
         self.theme = "rework"
         self.settings = Settings.load()
         self.hub = hub or Hub()
-        self.poll_seconds = poll_seconds or float(self.settings.poll_seconds or 2.0)
+        self.poll_seconds = poll_seconds or float(self.settings.poll_seconds or POLL_SECONDS)
+        # monotonic time of the last kick that polled; -inf so the first is due
+        self._last_poll = float("-inf")
+        self._closing = False  # set first thing in teardown (the Hub's shape)
         self.active_tab = "work"
         self._esc_armed_at = 0.0
         self._seen_gates: set[str] | None = None  # None until the first load
@@ -223,6 +246,7 @@ class ReworkApp(App[None]):
 
         asyncio.get_running_loop().set_exception_handler(asyncio_exception_handler)
         self.hub.subscribe(self._on_snapshot)
+        self.hub.subscribe_tick(self._on_tick)
         self.query_one(TabBar).set_active("work")
         self.query_one(MenuBar).set_status(online=True, gates=0, spend_today=0.0, connecting=True)
         self._paint_hints()
@@ -232,6 +256,10 @@ class ReworkApp(App[None]):
         self.set_interval(CODE_CHECK_SECONDS, self._check_code)
         self.set_interval(UPDATE_CHECK_SECONDS, self._check_update)
         self.set_interval(reload_mod.RELOAD_CHECK_SECONDS, self._check_reload)
+        # the ONLY animation timer: 10fps, feeding one frame from the shared
+        # clock to the active view. It does no I/O, no DB access and mounts
+        # nothing; a view with nothing running returns immediately.
+        self.set_interval(ANIMATION_SECONDS, self._tick_frames)
         self._restore_ui_state()
 
     def get_theme_variable_defaults(self) -> dict[str, str]:
@@ -248,11 +276,32 @@ class ReworkApp(App[None]):
     def current(self) -> View:
         return self.view(self.active_tab)
 
+    def _tick_frames(self) -> None:
+        """One spinner frame to the ACTIVE view only.
+
+        The frame value comes from a monotonic clock read HERE, at paint time,
+        so no widget stores an incrementing counter that a store poll could
+        reset. `app_focus` is the only cheap focus guard Textual 8.2.8 offers
+        (it goes False when the terminal loses focus); `screen.is_active` stays
+        True under a pushed ModalScreen, so "do not animate behind an overlay"
+        is not available without tracking screens ourselves."""
+        if not self.app_focus:
+            return
+        try:
+            view = self.current
+        except NoMatches:
+            # the app is closing: the timer can outlive the mounted views
+            return
+        view.tick(spinner.frame_for(time.monotonic()), time.time())
+
     async def on_event(self, event: events.Event) -> None:
         if isinstance(event, events.Key) and not event.is_forwarded:
             # ONE place records "the owner is here": every reload decision
             # reads this stamp, so a reload can never land mid-sentence
+            was_idle = self.poll_interval() > self.poll_seconds
             self._last_input = time.monotonic()
+            if was_idle:  # the owner is back: refresh now, then poll at full rate
+                self._kick(force=True)
             tab = OPTION_KEYS.get(event.key)
             if tab is not None:
                 self.action_tab(tab)
@@ -264,19 +313,64 @@ class ReworkApp(App[None]):
 
     # -- heartbeat -----------------------------------------------------------
 
-    def _kick(self) -> None:
+    def _kick(self, *, force: bool = False, now: float | None = None) -> None:
         """Start a refresh in a WORKER. Found live: the refresh used to be
         awaited on the App's own message queue, so a slow or unreachable
         database froze every key and click until it returned (rewvis offline =
         a dead TUI). Single-flight is the Hub's job; exclusive=False keeps a
-        hung refresh from being cancelled mid-query by the next tick."""
+        hung refresh from being cancelled mid-query by the next tick.
+
+        The timer fires every `poll_seconds`; a tick polls only when
+        `poll_due(now)`. `force` (a key after idle, ctrl+r) polls regardless.
+        `_last_poll` moves ONLY here, in the branch that polls, so a skipped
+        tick can never push the next poll back. `now` is injectable for tests."""
+        if self._closing or not self.is_running:
+            return  # teardown has begun: the screens may already be gone
+        if now is None:
+            now = time.monotonic()
+        if not force:
+            try:
+                due = self.poll_due(now)
+            except ScreenStackError:
+                log.debug("poll skipped: no screens on the stack (teardown)")
+                return
+            if not due:
+                return
+        self._last_poll = now
         self.run_worker(self._tick(), group="hub", exclusive=False)
+
+    def poll_due(self, now: float) -> bool:
+        """Is a poll due at monotonic time `now`? True once `poll_interval()`
+        seconds have passed since `_last_poll`, less POLL_JITTER_FRACTION of the
+        timer period: ticks land a few ms either side of their schedule, and
+        without that slack a tick 5 ms early would wait a whole extra tick
+        (idle polls every 12 s instead of 10)."""
+        slack = self.poll_seconds * POLL_JITTER_FRACTION
+        return now - self._last_poll >= self.poll_interval() - slack
+
+    def poll_interval(self) -> float:
+        """Seconds between refreshes right now: poll_seconds while the owner is
+        active, IDLE_POLL_SECONDS once they have been away (same idle test as the
+        reload: no input for reload.IDLE_SECONDS, no modal, no chat turn). Never
+        shorter than poll_seconds. Any key stamps `_last_input` and drops this
+        back to poll_seconds."""
+        if self.idle_for_reload():
+            return max(self.poll_seconds, IDLE_POLL_SECONDS)
+        return self.poll_seconds
 
     async def _tick(self) -> None:
         try:
             await self.hub.refresh()
         except Exception as exc:  # belt and braces: refresh already guards
             log.warning("tick failed: %s", exc)
+
+    def _on_tick(self, snap: Snapshot) -> None:
+        """A refresh found nothing new: no repaint, only the live detail polls."""
+        for view in self.views():
+            try:
+                view.on_tick(snap)
+            except Exception as exc:
+                self._swallow(exc)
 
     def _on_snapshot(self, snap: Snapshot) -> None:
         try:
@@ -679,7 +773,7 @@ class ReworkApp(App[None]):
         self.action_tab(event.name)
 
     def action_refresh(self) -> None:
-        self._kick()
+        self._kick(force=True)
 
     def action_go_back(self) -> None:
         if isinstance(self.screen, ModalScreen):
@@ -866,8 +960,9 @@ class ReworkApp(App[None]):
                     Field("name", "Name", placeholder="e.g. polystats"),
                     Field(
                         "repo",
-                        "Repo URL (optional)",
-                        placeholder="https://github.com/you/repo.git",
+                        "Repo URL (optional). Leave empty and rework keeps this project's "
+                        "files itself, on the daemon host: results are fetched, not pushed",
+                        placeholder="https://github.com/you/repo.git  (empty = upload project)",
                     ),
                 ],
                 submit="Create",
@@ -877,18 +972,22 @@ class ReworkApp(App[None]):
 
     async def _create_project(self, values: dict[str, str]) -> None:
         try:
-            project = await self.hub.data.create_project(values["name"].strip())
             repo = values.get("repo", "").strip()
+            repos: list[dict[str, str]] = []
             if repo:
-                store = await self.hub.data.store()
-                settings = dict(project.settings)
                 name = repo.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") or "repo"
-                settings["repos"] = [{"name": name, "kind": "git", "url": repo}]
-                await store.update_project(project.id, settings=settings)
+                repos.append({"name": name, "kind": "git", "url": repo})
+            # transport/results are derived from the repos inside create_project
+            project = await self.hub.data.create_project(values["name"].strip(), repos)
             self.notify(f"Project {project.name} created", timeout=3, markup=False)
             await self.hub.refresh()
         except Exception as exc:
             self.notify(f"Could not create project: {exc}", severity="error", markup=False)
+
+    def action_project_files(self) -> None:
+        """Add local files to the selected repo-less project's files area."""
+        self.action_tab("dashboard")
+        self.view("dashboard").add_project_files()
 
     def action_new_library_item(self) -> None:
         self.action_tab("library")
@@ -988,6 +1087,7 @@ class ReworkApp(App[None]):
             return False
 
     async def on_unmount(self) -> None:
+        self._closing = True  # before the first await: a timer tick now polls nothing
         await self.hub.aclose()
 
 
