@@ -72,16 +72,44 @@ def test_matches_id_project_and_status() -> None:
     assert ids(search.search_missions(MISSIONS, "done")) == ["m-flaky"]
 
 
-def test_fuzzy_subsequence_is_the_fallback() -> None:
-    """'flky' is no substring of anything: it only hits as a subsequence."""
-    assert ids(search.search_missions(MISSIONS, "flky")) == ["m-flaky"]
+def test_no_fuzzy_subsequence_fallback() -> None:
+    """m7 finding #44: the old fuzzy fallback matched the letters in order, so
+    'flky' hit "fix the flaky test" and near-everything matched short queries.
+    Strictness is the point: a non-substring is a miss."""
+    assert ids(search.search_missions(MISSIONS, "flky")) == []
     assert ids(search.search_missions(MISSIONS, "zzzz")) == []
+    # subsequence in the middle of a field, but never a substring of one
+    assert ids(search.search_missions(MISSIONS, "lutl")) == []
+    assert ids(search.search_missions([mission("m-2", "load edge request")], "ledger")) == []
 
 
-def test_literal_hits_rank_above_fuzzy_ones() -> None:
-    literal = mission("m-1", "ledger audit")
-    fuzzy = mission("m-2", "load edge request")  # only l…e…d…g…e…r in order
-    assert ids(search.search_missions([fuzzy, literal], "ledger")) == ["m-1", "m-2"]
+def test_short_queries_do_not_return_everything() -> None:
+    """The reported symptom: 'tst' (and every other short skeleton) matched every
+    mission, because the letters occurred in order somewhere in a long
+    objective. Now only real substrings match."""
+    objectives = [
+        mission("m-1", "fix the flaky test in toyrepo"),
+        mission("m-2", "add a heatmap to the cost tab"),
+        mission("m-3", "ship the parser"),
+    ]
+    assert ids(search.search_missions(objectives, "tst")) == []  # t…s…t in "test"
+    assert ids(search.search_missions(objectives, "hmap")) == []  # h…m…a…p in "heatmap"
+    assert ids(search.search_missions(objectives, "test")) == ["m-1"]
+    assert ids(search.search_missions(objectives, "heatmap")) == ["m-2"]
+    assert search.search_missions(MISSIONS, "zzzz") == []
+
+
+def test_matches_are_unranked_and_keep_caller_order() -> None:
+    """No scoring: pure substring filtering, in the order the caller gave."""
+    a = mission("m-1", "ledger audit")
+    b = mission("m-2", "audit the ledger too")
+    assert ids(search.search_missions([a, b], "ledger")) == ["m-1", "m-2"]
+    assert ids(search.search_missions([b, a], "ledger")) == ["m-2", "m-1"]
+
+
+def test_token_matches_is_plain_substring() -> None:
+    assert search.token_matches("lak", ["fix the flaky test"]) is True
+    assert search.token_matches("flky", ["fix the flaky test"]) is False
 
 
 # -- summaries & prompt -----------------------------------------------------

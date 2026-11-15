@@ -283,6 +283,7 @@ MarkdownH1, MarkdownH2, MarkdownH3 { background: transparent; color: $fg; }
 #mission-list .row { margin-bottom: 1; }
 #mission-list .row.-header { margin-bottom: 0; margin-top: 1; color: $faint; }
 #mission-list .row.-header:hover { background: transparent; }
+#proj-search { height: 1; margin: 0 1 0 1; }
 #proj-list .row { margin-bottom: 0; }
 #run-list .row { margin-bottom: 1; }
 #m-header { height: auto; padding: 1 2 0 2; }

@@ -853,6 +853,215 @@ async def test_dashboard_ai_search_ranks_and_opens(
         assert not app.swallowed
 
 
+def _row_texts(app: ReworkApp, selector: str = "#mission-list") -> list[str]:
+    """What the list actually RENDERS, row by row (not internal state). Section
+    headers are not rows a search produced, so they are left out."""
+    return [str(row.render()) for row in app.query(f"{selector} .row") if not row.has_class("-header")]
+
+
+async def test_dashboard_search_shows_only_real_matches(ids: dict[str, str]) -> None:
+    """A query isolates the list: matching missions are rendered, non-matching
+    ones are not, and a short query no longer returns everything (finding #44)."""
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        lst = app.query_one("#mission-list", RowList)
+        every = _row_texts(app)
+        assert len(every) > 3
+
+        await pilot.press("slash")
+        for ch in "flaky":
+            await pilot.press(ch)
+        await _settle(pilot, 0.8)
+        shown = _row_texts(app)
+        assert any("flaky test in test_rolling_mean" in t for t in shown), shown
+        assert not any("dark mode to the settings page" in t for t in shown), shown
+        assert not any("migrate the CI to uv" in t for t in shown), shown
+        assert [k for k in lst.selectable if not k.startswith("§")] == [ids["running"]]
+
+        # a one-letter query is a substring filter now, not "everything"
+        await pilot.press("backspace", "backspace", "backspace", "backspace", "backspace")
+        await pilot.press("z")
+        await _settle(pilot, 0.8)
+        assert _row_texts(app) == [], "a letter nothing contains shows nothing"
+        assert app.query_one("#mission-list .rowlist-empty").display
+        assert "No missions match" in str(app.query_one("#mission-list .rowlist-empty").render())
+        assert lst.selectable == []
+
+        # and a subsequence that is not a substring is a miss too
+        await pilot.press("backspace")
+        for ch in "tst":
+            await pilot.press(ch)
+        await _settle(pilot, 0.8)
+        assert _row_texts(app) == [], "'tst' must not match '…test…' any more"
+
+        await pilot.press("escape")
+        await _settle(pilot, 0.8)
+        assert _row_texts(app) == every, "clearing restores the full list"
+        assert not app.query_one("#mission-list .rowlist-empty").display
+        assert app.is_running and not app.swallowed
+
+
+async def test_dashboard_ai_search_uses_the_one_list(
+    ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """✦ answers the SAME query into the SAME list: no parallel rows, and Enter
+    means the same thing before and after pressing it."""
+    provider = script_provider(
+        monkeypatch,
+        [
+            ChatResult(
+                text=f'[{{"id": "{ids["waiting"]}", "reason": "closest"}}, '
+                f'{{"id": "{ids["running"]}", "reason": "also close"}}]',
+                usage=Usage(input_tokens=200, output_tokens=40),
+            )
+        ],
+    )
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        bar = app.query_one("#mission-search", Input)
+        lst = app.query_one("#mission-list", RowList)
+        await pilot.press("slash")
+        for ch in "the":
+            await pilot.press(ch)
+        await _settle(pilot, 0.8)
+        plain = _row_texts(app)
+        assert len(plain) > 2, plain
+
+        await pilot.click(_btn(app, dash, "ai-search"))
+        await _settle(pilot, 1.5)
+        assert provider.requests, "the ✦ search asked the model"
+        assert bar.value == "the", "it ran on the query already in the box"
+        assert "the" in provider.requests[0].messages[0]["content"]
+        ranked = _row_texts(app)
+        assert len(ranked) == 2, ranked
+        assert "dark mode" in ranked[0] and "closest" in ranked[0], ranked
+        assert "flaky" in ranked[1] and "also close" in ranked[1], ranked
+        # one list, one row per mission: nothing is rendered in a second list
+        assert lst.selectable == [ids["waiting"], ids["running"]]
+        # one row per mission in the ONE list: the only other rows are its
+        # section headers, never a second parallel result set
+        every_row = app.query("#mission-list .row")
+        assert len(ranked) == len([r for r in every_row if not r.has_class("-header")])
+        # the ranking orders the same set the plain filter feeds
+        assert [m.id for m in dash._filtered()] == [ids["waiting"], ids["running"]]
+        assert "2 ranked" in str(app.query_one("#mission-note").render())
+
+        # Enter still means "filter": it never re-runs the ranking and keeps the
+        # list it was showing
+        before = len(provider.requests)
+        await pilot.press("enter")
+        await _settle(pilot, 0.8)
+        assert len(provider.requests) == before, "enter never means 'rank'"
+        assert dash.ai_results is not None
+        assert _row_texts(app) == ranked
+
+        # typing a different query drops the AI order: no stale ranked rows
+        await pilot.press("s")
+        await _settle(pilot, 0.8)
+        assert dash.ai_results is None
+        assert str(app.query_one("#mission-note").render()) == ""
+        assert _row_texts(app) == [], "'thes' matches nothing, and nothing is stale"
+        assert lst.selectable == []
+
+        await pilot.press("backspace")
+        await _settle(pilot, 0.8)
+        assert _row_texts(app) == plain, "back to the plain filter's rows"
+        assert str(app.query_one("#mission-note").render()) == ""
+
+        # Enter before pressing ✦ means exactly the same thing
+        await pilot.press("enter")
+        await _settle(pilot, 0.8)
+        assert _row_texts(app) == plain
+        assert len(provider.requests) == before
+        assert app.is_running and not app.swallowed
+
+
+async def test_dashboard_project_search_filters_rows(ids: dict[str, str]) -> None:
+    """The Projects sidebar has a plain name filter: substring only, pinned
+    'All projects' always there, clearing restores the list."""
+    from rework.tui.views.dashboard import ALL
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        proj = app.query_one("#proj-list", RowList)
+        every = proj.keys
+        assert ids["project"] in every and len(every) >= 3
+        assert "All projects" in " ".join(_row_texts(app, "#proj-list"))
+        assert "rework" in " ".join(_row_texts(app, "#proj-list"))
+
+        bar = app.query_one("#proj-search", Input)
+        bar.focus()
+        await _settle(pilot, 0.2)
+        assert bar.has_focus, "keyboard focus can reach the project filter"
+        for ch in "poly":
+            await pilot.press(ch)
+        await _settle(pilot, 0.5)
+        shown = _row_texts(app, "#proj-list")
+        assert any("polystats" in t for t in shown), shown
+        assert not any("rework" in t for t in shown), shown
+        assert "All projects" in " ".join(shown), "the pinned row survives filtering"
+        # pinned rows survive: 'All projects' always, 'No project' while loose
+        # missions exist (the seeded 'rework' mission has no project)
+        assert proj.selectable[:2] == [ALL, ids["project"]]
+        assert "All projects" in str(shown[0])
+
+        # plain substring, not fuzzy: the letters in order are a miss
+        bar.value = ""
+        await _settle(pilot, 0.3)
+        for ch in "plsts":
+            await pilot.press(ch)
+        await _settle(pilot, 0.5)
+        assert not any("polystats" in t for t in _row_texts(app, "#proj-list"))
+
+        # 'All projects' still works while a filter is on
+        bar.value = ""
+        await _settle(pilot, 0.3)
+        for ch in "rewo":
+            await pilot.press(ch)
+        await _settle(pilot, 0.5)
+        proj.activate(ALL, via_mouse=True)
+        await _settle(pilot, 0.5)
+        assert dash.project == ALL
+        missions = _row_texts(app)
+        assert any("flaky" in t for t in missions), missions
+        assert any("dark mode" in t for t in missions), missions
+
+        # selecting a project and then filtering it out of view never crashes
+        # and never silently breaks the mission filter
+        proj.activate(ids["project"], via_mouse=True)
+        await _settle(pilot, 0.5)
+        assert dash.project == ids["project"]
+        bar.focus()
+        await _settle(pilot, 0.2)
+        for ch in "rewo":
+            await pilot.press(ch)
+        await _settle(pilot, 0.5)
+        assert ids["project"] not in proj.keys, "the selected project is filtered out"
+        assert dash.project == ids["project"], "the mission filter is not silently reset"
+        # the mission list is still filtered by the selected project (both of
+        # these are polystats missions), and rework's mission is still gone
+        assert any("flaky" in t for t in _row_texts(app))
+        assert any("dark mode" in t for t in _row_texts(app))
+        assert not any("migrate the CI" in t for t in _row_texts(app)), "still project-filtered"
+
+        bar.value = ""
+        await _settle(pilot, 0.5)
+        assert proj.keys == every, "clearing restores every project row"
+        assert proj.selected == ids["project"], "and the selection is back"
+        assert app.is_running and not app.swallowed
+
+
 async def test_dashboard_ai_search_without_credentials_says_so(
     ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
