@@ -238,7 +238,8 @@ class RowList(VerticalScroll, can_focus=True):
             return
         self._empty = text
         for empty in self.query(".rowlist-empty"):
-            empty.update(text)
+            if isinstance(empty, Static):
+                empty.update(text)
 
     @property
     def keys(self) -> list[str]:

@@ -856,7 +856,9 @@ async def test_dashboard_ai_search_ranks_and_opens(
 def _row_texts(app: ReworkApp, selector: str = "#mission-list") -> list[str]:
     """What the list actually RENDERS, row by row (not internal state). Section
     headers are not rows a search produced, so they are left out."""
-    return [str(row.render()) for row in app.query(f"{selector} .row") if not row.has_class("-header")]
+    return [
+        str(row.render()) for row in app.query(f"{selector} .row") if not row.has_class("-header")
+    ]
 
 
 async def test_dashboard_search_shows_only_real_matches(ids: dict[str, str]) -> None:

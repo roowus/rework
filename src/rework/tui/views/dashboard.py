@@ -418,13 +418,13 @@ class DashboardView(View):
             gates = self.snap.gates_for(m.id)
             if gates:
                 gate_note = f"\n  [{WARN}]◆ {esc(clip(gates[0].question, 90))}[/]"
+        meta = f"[{FAINT}]{esc('  ·  '.join(bits))}[/]"
+        # the ✦ reason is OUR markup, not mission text: escaping it with the
+        # rest of the line printed "[#a394f7]closest to the query[/]" literally
         reason = esc(clip(self._reason(m.id), 120))
         if reason:
-            bits.append(f"[{ACCENT}]{reason}[/]")
-        return (
-            f"{glyph(st)} [b]{esc(clip(m.objective, 100))}[/b]\n"
-            f"  [{FAINT}]{esc('  ·  '.join(bits))}[/]{gate_note}"
-        )
+            meta += f"  [{ACCENT}]{reason}[/]"
+        return f"{glyph(st)} [b]{esc(clip(m.objective, 100))}[/b]\n  {meta}{gate_note}"
 
     def on_row_list_activated(self, event: RowList.Activated) -> None:
         event.stop()
