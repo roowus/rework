@@ -181,7 +181,7 @@ async def retry_pr(store: StateStore, bus: Any, mission_id: str) -> tuple[bool, 
             "its PR delivery state is unknown (nothing to retry)"
         )
     worktree = str(result.get("pr_worktree") or mission.repo_path or "")
-    if not worktree or not Path(worktree).is_dir():
+    if not worktree or not Path(worktree).is_dir():  # noqa: ASYNC240 - one stat, not I/O worth offloading
         # the coder worktree may have been reclaimed since the failure: the
         # branch is usually still a ref of the mission's own repo
         worktree = str(mission.repo_path or worktree)
