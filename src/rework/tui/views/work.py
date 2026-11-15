@@ -672,7 +672,7 @@ class WorkView(View):
             self.rw.view("gates").select_gate(event.gate_id)
         elif verb == "preview":
             self.run_worker(actions.preview(self.rw, mid), group="preview")
-        elif verb in ("pause", "resume", "cancel"):
+        elif verb in ("pause", "resume", "cancel", "retry-pr"):
             self.run_worker(actions.control(self.rw, mid, verb), group="control")
 
     def last_mission_id(self) -> str | None:

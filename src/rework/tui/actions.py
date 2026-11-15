@@ -21,6 +21,15 @@ VERBS = {
     "cancel": ("cancel_mission", "Cancelled", ""),
 }
 
+# "Finished, but the PR was never delivered": the state the delivery helper
+# writes into mission.result when a push/`gh pr create` fails for good.
+PENDING_KEY = "pr_pending"
+
+
+def delivery_pending(result: dict[str, Any] | None) -> bool:
+    return bool((result or {}).get(PENDING_KEY))
+
+
 ACTIVE = {"pending", "running", "awaiting_gate", "on_hold"}
 
 
@@ -40,6 +49,8 @@ def can(verb: str, status: str) -> bool:
 async def control(app: ReworkApp, mission_id: str, verb: str) -> bool:
     if verb == "fetch":
         return await fetch(app, mission_id)
+    if verb == "retry-pr":
+        return await retry_pr(app, mission_id)
     if verb not in VERBS:
         app.notify(f"Unknown action {verb}", severity="error")
         return False
@@ -70,6 +81,24 @@ async def prioritize(app: ReworkApp, mission_id: str, current: str = "") -> bool
         app.notify(f"No mission {mission_id}", severity="error")
         return False
     app.notify(f"{mission_id}: priority {target}", timeout=3)
+    await app.hub.refresh()
+    return True
+
+
+async def retry_pr(app: ReworkApp, mission_id: str) -> bool:
+    """Re-deliver a finished mission's PR. Same helper as
+    `rework mission retry-pr`; the full error is shown, never a clipped one."""
+    app.notify(f"Retrying PR for {mission_id}…", timeout=3)
+    try:
+        ok, detail = await app.hub.data.retry_pr(mission_id)
+    except Exception as exc:
+        app.notify(f"Retry PR failed: {exc}", severity="error", timeout=10)
+        return False
+    if not ok:
+        app.notify(f"PR still not delivered: {detail}", severity="error", timeout=12)
+        await app.hub.refresh()
+        return False
+    app.notify(f"PR opened: {detail}", title="Retry PR", timeout=8)
     await app.hub.refresh()
     return True
 

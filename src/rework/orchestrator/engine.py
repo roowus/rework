@@ -47,6 +47,7 @@ from rework.kernel.state.records import (
 from rework.kernel.state.store import StateStore
 from rework.logs import bind
 from rework.nodes.report_sections import accepted_findings_section, mechanical_verdict
+from rework.orchestrator.delivery import DELIVERY_RESULT_KEYS
 from rework.orchestrator.limits import MissionSlot, RoleLimiter
 from rework.roles.base import EscalationKind, RoleBuildCtx
 from rework.roles.registry import RoleRegistry
@@ -829,8 +830,7 @@ class MissionRunner:
     async def _create_pr(self, mission: Mission, results: dict[str, Run]) -> str | None:
         """Push the coder's branch and open a PR. Mechanical: title/body from
         the brief + audit verdict; the human does the merging."""
-        from rework.nodes.gh import pr_create
-        from rework.nodes.git_ops import push_branch
+        from rework.orchestrator.delivery import deliver_pr
 
         coder_run = results.get("code")
         if coder_run is None or not (coder_run.artifact or {}).get("branch"):
@@ -871,14 +871,17 @@ class MissionRunner:
             finish_summary=str(result.get("summary") or ""),
             accepted_findings=list(result.get("accepted_findings") or []),
         )
-        await push_branch(worktree, branch)
-        url = await pr_create(worktree, head=branch, title=title, body=body)
-        await self._bus.publish(
-            EventRecord(
-                mission_id=mission.id,
-                type=EventType.INFO,
-                payload={"note": f"PR opened: {url}"},
-            )
+        # Push + PR through the shared delivery helper: a transient remote
+        # failure is RETRIED there, and a persistent one leaves the mission
+        # retryable instead of raising (which used to fail a finished mission).
+        url = await deliver_pr(
+            self._store,
+            self._bus,
+            mission.id,
+            branch=branch,
+            worktree=worktree,
+            title=title,
+            body=body,
         )
         return url
 
@@ -903,6 +906,14 @@ class MissionRunner:
             latest[(r.step, r.role)] = r
         failed = [r for r in latest.values() if r.status == RunStatus.FAILED]
         result: dict[str, Any] = {"artifacts": artifacts}
+        # the PR delivery record (pr_url / pr_pending / pr_error / what a retry
+        # needs) is written by _create_pr BEFORE this rebuild: carry it over, or
+        # "finished but PR pending" would be forgotten the moment we go DONE.
+        current_mission = await self._store.get_mission(mission_id)
+        for key in DELIVERY_RESULT_KEYS:
+            value = ((current_mission.result if current_mission else None) or {}).get(key)
+            if value is not None:
+                result[key] = value
         if summary:
             result["summary"] = summary
         if accepted_findings:

@@ -319,6 +319,16 @@ class TuiData:
     async def resume_mission(self, mission_id: str) -> Any:
         return await self.set_mission_status(mission_id, "running")
 
+    async def retry_pr(self, mission_id: str) -> tuple[bool, str]:
+        """Retry push+PR for a finished mission whose delivery failed. Shares
+        `rework.orchestrator.delivery.retry_pr` with `rework mission retry-pr`,
+        so the button and the command can never disagree."""
+        from rework.kernel.events.bus import InProcessEventBus
+        from rework.orchestrator.delivery import retry_pr
+
+        store = await self.store()
+        return await retry_pr(store, InProcessEventBus(store), mission_id)
+
     async def prioritize_mission(self, mission_id: str, priority: str = "high") -> Any:
         """Pickup priority (normal | high): the daemon reads the row, so this
         works from any machine and never touches a running mission."""

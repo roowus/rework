@@ -10,7 +10,7 @@ from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.widgets import Static
 
-from rework.tui.actions import can
+from rework.tui.actions import can, delivery_pending
 from rework.tui.theme import (
     ACCENT,
     FAINT,
@@ -128,6 +128,7 @@ class MissionCard(Vertical):
         with Horizontal(classes="card-actions mc-actions"):
             yield Btn("Open", "open")
             yield Btn("Preview", "preview", classes="mc-previewbtn")
+            yield Btn("Retry PR", "retry-pr", variant="primary", classes="mc-retrypr")
             yield Btn("Approve", "approve", variant="primary", classes="mc-gatebtn")
             yield Btn("Reject", "reject", variant="danger", classes="mc-gatebtn")
             yield Btn("Answer…", "answer", variant="ghost", classes="mc-gatebtn")
@@ -221,6 +222,10 @@ class MissionCard(Vertical):
             pr.update(f"PR: {esc(pr_url)}")
         for btn in self.query(".mc-previewbtn").results(Btn):
             btn.display = bool(pr_url)
+        # finished, work kept, PR not delivered: the one button that fixes it
+        pending = delivery_pending(getattr(m, "result", None) or {})
+        for btn in self.query(".mc-retrypr").results(Btn):
+            btn.display = pending and not pr_url
         yes_no = self.gate is not None and self.gate.kind.value in (
             "ship",
             "open_pr",
