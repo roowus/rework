@@ -552,3 +552,73 @@ list keeps its newest-first browse order.
 
 The default is `normal` for every project — there is no automatic high for
 non-rework projects; the explicit flag and the Dashboard button cover it.
+
+## Budget policy
+
+Every mission carries a cap (`plan["budget"]["max_usd"]`), and the cap decides
+how much work happens before the owner is asked. So it follows the SIZE OF THE
+TASK, not a single deployment default.
+
+**Sizing.** The opening cap is estimated from the task text
+(`rework.budget_policy.estimate_budget`, a keyword/size heuristic — pricing a
+mission must not spend money): docs and small fixes $1-2, a normal feature
+$3-5, a large or risky change (migration, schema, auth, deploy…) $8-10. The
+orchestrator is also asked to size the mission itself and, when it answers
+something usable, its number wins; garbage, `0`, negative or missing falls back
+to the estimate, so a proposal always carries a budget and a one-line reason.
+
+- The TUI chat proposal card shows `budget $3.00 (normal feature-sized change)`
+  and has an editable field under it: whatever is in that field when **Launch**
+  is pressed (or when a typed `yes` auto-launches) is the cap the mission is
+  created with. An unparseable or `<= 0` value keeps the previous number.
+- `rework new "…" --budget 6` overrides the estimate, and it says which rule
+  won on stderr (`budget: $6.00 (from --budget)`). `REWORK_BUDGET_USD` is the
+  deployment-wide default and wins over the estimate but not over `--budget`;
+  an explicit budget always wins.
+
+**The first raises are free.** The first two raises of a mission are approved
+automatically, as long as the new cap stays within 2x the ORIGINAL budget
+(`original_max_usd` — the estimate keeps growing with the current cap, the
+factor is applied to where the mission started). Both raise paths obey this:
+the orchestrator's `request_budget` tool (including its single re-estimate
+after investigating) and the engine's burn gate, which before this put the
+mission ON_HOLD and cancelled live roles on any overspend. An auto-raise
+rewrites the cap, appends to `plan["budget"]["raises"]` and counts in
+`budget["auto_raises"]`.
+
+The owner is told every time, three ways:
+
+- a TUI toast, from the `budget_raised` event (`old`, `new`, `auto`);
+- a decided row in the gate history (`Auto raise: budget $2.00 -> $4.00? …`,
+  written already `APPROVED` with `decision.note = "auto"`, so it appears in
+  history without ever looking like an open question);
+- `REWORK_NOTIFY_CMD`, which gets `REWORK_NOTIFY_KIND=budget_raise`,
+  `REWORK_MISSION_ID`, `REWORK_NOTIFY_MESSAGE` (old cap, new cap and reason)
+  and `REWORK_BUDGET_OLD` / `REWORK_BUDGET_NEW`. Same fire-and-forget contract
+  as gate notifications: 30s cap, a broken notifier never fails a mission.
+
+**After that it stops at a gate.** Once the auto raises are spent (or the ask
+is beyond the ceiling), the raise becomes a permission gate instead, and its
+question lists the earlier raises with their reasons and the original budget
+(`Earlier raises: $2.00 -> $4.00: …; $4.00 -> $6.00: …. Original budget
+$2.00.`). At the burn gate the mission goes ON_HOLD and live roles pause on
+their checkpoints until the owner answers.
+
+**Both numbers are settings.**
+
+| where | auto raises | ceiling factor |
+| --- | --- | --- |
+| global | `REWORK_BUDGET_AUTO_RAISES` | `REWORK_BUDGET_CEILING_FACTOR` |
+| per project | `Project.settings["budget_auto_raises"]` | `Project.settings["budget_ceiling_factor"]` |
+
+The global values go in `~/.rework/rework.env` (`REWORK_ENV_FILE` overrides the
+path) as plain `KEY=VALUE` lines; they never override a variable already set in
+the shell. Defaults are 2 and 2.0. The project wins over the global value, and
+an invalid value (`"lots"`, a negative count, a factor below 1.0) is ignored
+rather than fatal. `budget_auto_raises = 0` turns the free raises off: every
+raise gates, right from the first.
+
+Project keys live in the project's `settings` JSON (`rework project show <id>`
+prints it). There is no `rework project set` command yet, so changing them today
+means updating that JSON in the store (or creating the project with the keys in
+its settings); the global env vars are the supported knob otherwise.

@@ -45,16 +45,23 @@ def args_text(arguments: Any) -> str:
 
 
 def proposal_from_args(args: dict[str, Any]) -> Any:
-    from rework.orchestrator.chat import Proposal
+    """A stored propose_mission call rebuilt as a Proposal: a replayed card must
+    show the same budget the live one did, including the estimate fallback for
+    arguments saved before the model could price a mission."""
+    from rework.orchestrator.chat import Proposal, proposal_budget
 
+    objective = str(args.get("objective", "")).strip()
+    budget_usd, budget_reason = proposal_budget(args, objective)
     return Proposal(
-        objective=str(args.get("objective", "")).strip(),
+        objective=objective,
         title=str(args.get("title", "")).strip(),
         plan=str(args.get("plan", "fix")).strip() or "fix",
         project=str(args.get("project", "")).strip(),
         repo=str(args.get("repo", "")).strip(),
         model=str(args.get("model", "")).strip(),
         effort=str(args.get("effort", "")).strip(),
+        budget_usd=budget_usd,
+        budget_reason=budget_reason,
     )
 
 
@@ -236,6 +243,12 @@ class Conversation:
             "effort": proposal.effort or None,
         }
         from rework.missions import create_mission
+
+        # the owner may have edited the estimate on the card: whatever the
+        # budget field holds at launch is the cap the mission is created with
+        budget_usd = float(getattr(proposal, "budget_usd", 0.0) or 0.0)
+        if budget_usd > 0 and _accepts(create_mission, "budget_usd"):
+            kwargs["budget_usd"] = budget_usd
 
         # forward-compatible: once missions carry their own orchestrator model
         # (ADR 0007) and a chat link (M7 P0), pass them

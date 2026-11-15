@@ -9,11 +9,11 @@ from __future__ import annotations
 from typing import Any
 
 from textual.app import App, ComposeResult
-from textual.widgets import Static
+from textual.widgets import Input, Static
 
 from rework.kernel.state.records import EventRecord, EventType, Mission, MissionStatus
 from rework.tui.widgets.base import Btn
-from rework.tui.widgets.cards import MissionCard
+from rework.tui.widgets.cards import MissionCard, ProposalCard
 
 PR_URL = "https://github.com/roowus/rework/pull/123"
 
@@ -226,3 +226,84 @@ async def test_active_mission_card_keeps_appending_incrementally() -> None:
         assert len(card.tail) == MissionCard.TAIL
         assert "tool_11" in tail and "grep" not in tail
         assert card.last_seq == 11
+
+
+# -- the proposal card's budget -----------------------------------------------------
+
+
+class ProposalApp(App[None]):
+    """A bare app with one proposal card, no store and no conversation."""
+
+    def __init__(self, card: ProposalCard) -> None:
+        super().__init__()
+        self._card = card
+
+    def compose(self) -> ComposeResult:
+        yield self._card
+
+
+def _proposal(**kwargs: Any) -> Any:
+    from rework.orchestrator.chat import Proposal
+
+    fields: dict[str, Any] = {
+        "objective": "add dark mode to the settings page",
+        "plan": "fix",
+        "budget_usd": 3.0,
+        "budget_reason": "normal feature-sized change",
+    }
+    fields.update(kwargs)
+    return Proposal(**fields)
+
+
+async def test_proposal_card_shows_the_budget_and_its_reason() -> None:
+    card = ProposalCard(_proposal())
+    app = ProposalApp(card)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        text = str(card.query_one(".pc-budget", Static).render())
+        assert "budget $3.00" in text
+        assert "normal feature-sized change" in text
+        # the field starts on the estimate, so Launch spends what was shown
+        assert card.query_one("#budget", Input).value == "3.00"
+        assert card.proposal.budget_usd == 3.0
+
+
+async def test_editing_the_budget_field_reprices_the_proposal() -> None:
+    """The card writes the edit back onto the proposal: that object is what
+    Launch hands to Conversation.launch."""
+    card = ProposalCard(_proposal())
+    app = ProposalApp(card)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        card.query_one("#budget", Input).value = "7.50"
+        await pilot.pause()
+        assert card.proposal.budget_usd == 7.5
+
+
+async def test_an_unparseable_or_zero_budget_keeps_the_previous_value() -> None:
+    card = ProposalCard(_proposal(budget_usd=3.0))
+    app = ProposalApp(card)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        field = card.query_one("#budget", Input)
+        for bad in ("", "abc", "0", "-2", "  "):
+            field.value = bad
+            await pilot.pause()
+            assert card.proposal.budget_usd == 3.0, bad
+        field.value = "4.25"
+        await pilot.pause()
+        assert card.proposal.budget_usd == 4.25
+
+
+async def test_a_settled_proposal_card_shows_the_budget_but_no_field() -> None:
+    """A replayed/launched proposal is history: the money line stays, the form
+    goes away."""
+    card = ProposalCard(_proposal(), live=False)
+    app = ProposalApp(card)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert "budget $3.00 (normal feature-sized change)" in str(
+            card.query_one(".pc-budget", Static).render()
+        )
+        rows = list(card.query(".pc-budget-row"))
+        assert rows and not rows[0].display, "no editable field on a settled card"

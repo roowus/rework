@@ -20,6 +20,7 @@ Design notes:
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -104,6 +105,17 @@ PROPOSE_TOOL = ToolSpec(
             },
             "model": {"type": "string", "description": "Optional catalog id to run the roles on."},
             "effort": {"type": "string", "enum": ["low", "medium", "high"]},
+            "budget_usd": {
+                "type": "number",
+                "description": (
+                    "Mission budget in USD, sized to the task: docs/small fix $1-2, "
+                    "normal feature $3-5, large or risky $8+"
+                ),
+            },
+            "budget_reason": {
+                "type": "string",
+                "description": "One line: why this budget, e.g. 'normal feature-sized change'",
+            },
         },
         "required": ["objective", "plan"],
     },
@@ -192,6 +204,10 @@ class Proposal:
     repo: str = ""
     model: str = ""
     effort: str = ""
+    # always set: the model's own sizing when it gave a usable one, else the
+    # estimator's (a proposal with no budget is a proposal nobody can price)
+    budget_usd: float = 0.0
+    budget_reason: str = ""
 
     def summary(self) -> str:
         bits = [f"objective: {self.objective}", f"plan: {self.plan}"]
@@ -203,7 +219,42 @@ class Proposal:
             bits.append(f"model: {self.model}")
         if self.effort:
             bits.append(f"effort: {self.effort}")
+        if self.budget_usd > 0:
+            line = f"budget ${self.budget_usd:.2f}"
+            if self.budget_reason:
+                line = f"{line} ({self.budget_reason})"
+            bits.append(line)
         return " · ".join(bits)
+
+
+def proposal_budget(args: dict[str, Any], text: str = "") -> tuple[float, str]:
+    """(usd, reason) for a proposal: the model's own sizing when it gave a
+    usable one, else `estimate_budget` on the task text.
+
+    Model output is never trusted to be well-formed, and it must never raise
+    here: garbage falls back to the estimate, which always answers."""
+    from rework.budget_policy import estimate_budget
+
+    usd = _positive_float(args.get("budget_usd"))
+    reason = str(args.get("budget_reason") or "").strip()
+    if usd is not None:
+        return usd, reason or f"model priced this at ${usd:.2f}"
+    estimated, why = estimate_budget(text)
+    return float(estimated), reason or why
+
+
+def _positive_float(value: Any) -> float | None:
+    """A finite, positive amount of money, or None: strings, bools, NaN, inf
+    and <= 0 are all "the model did not really say" (never raise on them)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(str(value).strip().strip("$")) if isinstance(value, str) else float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return number
 
 
 @dataclass
@@ -596,14 +647,18 @@ class OrchestratorChat:
         for call in result.tool_calls:
             args = call.arguments or {}
             if call.name == "propose_mission":
+                objective = str(args.get("objective", "")).strip()
+                budget_usd, budget_reason = proposal_budget(args, objective)
                 proposal = Proposal(
-                    objective=str(args.get("objective", "")).strip(),
+                    objective=objective,
                     title=str(args.get("title", "")).strip(),
                     plan=str(args.get("plan", "fix")).strip() or "fix",
                     project=str(args.get("project", "")).strip(),
                     repo=str(args.get("repo", "")).strip(),
                     model=str(args.get("model", "")).strip(),
                     effort=str(args.get("effort", "")).strip(),
+                    budget_usd=budget_usd,
+                    budget_reason=budget_reason,
                 )
                 self.proposal = proposal
             elif call.name == "ask":
