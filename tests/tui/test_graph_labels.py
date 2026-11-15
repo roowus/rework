@@ -249,6 +249,45 @@ def test_leaving_a_round_with_one_running_auditor_has_no_label() -> None:
     assert leaving is None or not leaving.label, leaving
 
 
+@pytest.mark.parametrize("status", [RunStatus.FAILED, RunStatus.ABORTED])
+def test_leaving_a_verdictless_finished_audit_has_no_label(status: RunStatus) -> None:
+    """An audit that ended FAILED / ABORTED produced no artifact, and
+    `mechanical_verdict` is fail-closed ('not audited'). Its out-edge must stay
+    blank, exactly like a running audit's: labelling it would repeat the
+    into-audit string on the far side and invent a verdict that never happened."""
+    runs = [
+        _run("m-labels0001:code:coder:1", "coder", 1, {"branch": "b"}),
+        _run("m-labels0001:audit:auditor:1", "auditor", 1, None, status),
+    ]
+    layers = mission_layers(_mission(), runs, [], {}, {}, [])
+    by_key = {node.key: i for i, layer in enumerate(layers) for node in layer.nodes}
+
+    # the edge INTO the audit still reports that nothing was audited
+    into = layers[by_key["m-labels0001:code:coder:1"]].edge_to_next
+    assert into is not None and into.label, into
+    assert "not audited" in into.label, into
+    # ... and the edge LEAVING it must not repeat that as if it were a verdict
+    leaving = layers[by_key["m-labels0001:audit:auditor:1"]].edge_to_next
+    assert leaving is None or not leaving.label, leaving
+
+
+@pytest.mark.parametrize("status", [RunStatus.FAILED, RunStatus.ABORTED])
+async def test_verdictless_finished_audit_renders_an_unlabelled_edge(status: RunStatus) -> None:
+    runs = [
+        _run("m-labels0001:code:coder:1", "coder", 1, {"branch": "b"}),
+        _run("m-labels0001:audit:auditor:1", "auditor", 1, None, status),
+    ]
+    layers = mission_layers(_mission(), runs, [], {}, {}, [])
+    app = GraphApp()
+    async with app.run_test() as pilot:
+        app.query_one("#m-graph", GraphView).set_layers(layers)
+        await pilot.pause()
+        edges = [str(e.render()).splitlines() for e in app.query(".gedge")]
+        # orchestrator -> coder -> audit -> end: the leaving edge is a bare '│ ▼'
+        assert "not audited" in "\n".join(edges[1]), edges
+        assert len(edges[2]) == 2 and edges[2][-1].strip() == "▼", edges
+
+
 async def test_running_audit_renders_an_unlabelled_edge() -> None:
     runs = [
         _run("m-labels0001:code:coder:1", "coder", 1, {"branch": "b"}),

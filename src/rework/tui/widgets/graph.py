@@ -26,7 +26,7 @@ from textual.containers import Horizontal, VerticalScroll
 from textual.message import Message
 from textual.widgets import Static
 
-from rework.nodes.report_sections import mechanical_verdict
+from rework.nodes.report_sections import NOT_AUDITED, mechanical_verdict
 from rework.tui.theme import ACCENT, FAINT, MUTED, esc, glyph, status_value
 from rework.tui.widgets.trajectory import role_of
 
@@ -502,24 +502,22 @@ def _review_edge_label(audits: list[Any]) -> str:
     return verdict
 
 
-def _audits_terminal(audits: list[Any]) -> bool:
-    """True once every audit of the round has finished (status, not verdict)."""
-    return all(status_value(a.status) not in {"pending", "intent", "running"} for a in audits)
-
-
 def _outcome_edge_label(audits: list[Any]) -> str:
     """What an audit told the next coder on its way out of the review:
     'request changes' / 'approve with fixes' / 'approve' (the mechanical
     verdict's own words, so the graph invents no second vocabulary).
 
-    Empty while any audit of the round is still running: `mechanical_verdict` is
-    fail-closed (no artifact yet => 'not audited'), which would put the same
+    Empty unless EVERY audit of the round is verdict-bearing: `mechanical_verdict`
+    is fail-closed (no artifact => 'not audited'), so an audit still running - or
+    one that failed / aborted without producing a verdict - would put the same
     pre-verdict string on both sides of the same audit and read like a reached
-    verdict. The edge INTO the audit already carries the state.
+    verdict. The edge INTO the audit already carries that state.
     """
-    if not audits or not _audits_terminal(audits):
+    if not audits:
         return ""
     verdicts = {mechanical_verdict(a.artifact) for a in audits}
+    if NOT_AUDITED in verdicts:
+        return ""
     return " / ".join(sorted(verdicts))
 
 
@@ -692,8 +690,8 @@ def mission_layers(
             # The edge LEAVING the audit was blank. It carries the audit's
             # mechanical verdict ('request changes' / 'approve'), so the audit
             # loop reads at mission level, not as one run's inner steps. Only
-            # once the round's audits are terminal: before that there is no
-            # verdict yet, and the into-audit edge already shows the state.
+            # when the round's audits produced a verdict: until then (running,
+            # or failed without an artifact) the into-audit edge shows the state.
             outcome = _outcome_edge_label(round_.audits)
             if outcome:
                 round_layers[-1].edge_to_next = GEdge(label=outcome)
