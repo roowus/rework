@@ -197,25 +197,29 @@ class TuiData:
             lambda: self._call(lambda s: s.events_since(since, mission_id=mission_id, limit=limit)),
         )
 
-    async def recent_event_stamps(self, mission_id: str, limit: int = 40) -> dict[str, float]:
+    async def recent_event_stamps(
+        self, mission_id: str, limit: int = 40, deep_limit: int = 400
+    ) -> dict[str, float]:
         """Newest event epoch for a mission and for each run seen in its newest
         `limit` events: {mission_id: ts, run_id: ts, ...}. Empty = nothing seen.
 
         ONE store query (the newest `limit` events), then a scan in Python.
-        A run that has been silent for longer than the window simply has no key,
-        and the caller falls back to the mission stamp.
+
+        A busy interleaved mission can push a quiet run's newest event out of
+        that window. Only a SATURATED window (it returned `limit` rows) can hide
+        a run, so only then: one `list_runs`, and if a running run has no key,
+        one wider read of `deep_limit` events to find it. Worst case is 3
+        queries for a mission, 1 for most. A run still unseen after that has NO
+        key, which the caller treats as unknown and animates (never a borrowed
+        mission stamp).
 
         One wrapper with its own key and NO last-good fallback: on a store
         failure this raises (the caller treats that as "unknown", which
         animates) instead of replaying an old stamp that would claim the run
         has been silent."""
 
-        async def _q() -> dict[str, float]:
-            rows = await self._call(
-                lambda s: s.events_since(0, mission_id=mission_id, limit=limit, newest_first=True)
-            )
-            out: dict[str, float] = {}
-            # the store returns the window oldest-first, so take the max per key
+        def _fold(rows: list[Any], out: dict[str, float]) -> None:
+            # the store returns a window oldest-first, so take the max per key
             # instead of relying on order
             for row in rows:
                 if not row.ts:
@@ -224,17 +228,26 @@ class TuiData:
                 for key in (mission_id, str(row.run_id) if row.run_id else None):
                     if key is not None and ts > out.get(key, 0.0):
                         out[key] = ts
+
+        async def _window(n: int) -> list[Any]:
+            return await self._call(
+                lambda s: s.events_since(0, mission_id=mission_id, limit=n, newest_first=True)
+            )
+
+        async def _q() -> dict[str, float]:
+            rows = await _window(limit)
+            out: dict[str, float] = {}
+            _fold(rows, out)
+            if len(rows) >= limit:
+                runs = await self._call(lambda s: s.list_runs(mission_id))
+                live = [
+                    r.id for r in runs if str(getattr(r.status, "value", r.status)) == "running"
+                ]
+                if any(rid not in out for rid in live):
+                    _fold(await _window(deep_limit), out)
             return out
 
         return await self._resilient(f"stamps:{mission_id}", _q, stale_ok=False)
-
-    async def events_newest(self, mission_id: str, limit: int = 1) -> list[Any]:
-        return await self._resilient(
-            f"events_newest:{mission_id}:{limit}",
-            lambda: self._call(
-                lambda s: s.events_since(0, mission_id=mission_id, limit=limit, newest_first=True)
-            ),
-        )
 
     async def mission_runs(self, mission_id: str) -> list[Run]:
         return await self._resilient(

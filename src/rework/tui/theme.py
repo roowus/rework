@@ -111,7 +111,7 @@ IDLE_GLYPH, IDLE_COLOUR = spinner.IDLE_GLYPH, FAINT
 def run_mark(stalled: bool, frame: str | None = None) -> str:
     """Rich markup for the marker on something that is RUNNING.
 
-    `frame` comes from spinner.frame_for(t) (or spinner.marker); None or empty
+    `frame` comes from spinner.frame_for(t); None or empty
     means "compute it now", so a caller that has no tick (the store poll, an
     unfocused terminal) still paints a real one-cell frame and never an empty
     coloured span. Stalled runs get the idle marker in FAINT, so a

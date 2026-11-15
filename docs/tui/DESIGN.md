@@ -69,13 +69,33 @@ badges). Defined once in `theme.py::STATUS`.
 
 A running mission or run shows the spinner only while it is producing events.
 With no event for 5 minutes (`spinner.STALL_SECONDS`, 300s) the spinner stops
-and the row shows the static idle marker `◌` plus `idle 7m`, so a wedged run
-cannot look busy. Pending, on hold and awaiting-gate states never animate.
-The frame set and the 5 minute rule live in `tui/spinner.py`. With no event
-data at all (a store hiccup, a failed query) the running marker animates rather
-than claiming idle, so a store hiccup never falsely reports silence. Every
-paint, the store poll included, computes a real frame; an unfocused terminal
-shows a still frame, not a blank.
+and the row shows the static idle marker `◌` plus `idle 7m`. Pending, on hold
+and awaiting-gate states never animate. The frame set and the 5 minute rule
+live in `tui/spinner.py`.
+
+What "idle" means depends on the surface, because every run event also counts
+as an event of its mission:
+
+- **Run level** (a run row, the orchestrator row, a Work tab card, a dashboard
+  mission row, the trajectory tail with a run selected) is judged by THAT
+  entity's own newest event only. A wedged run shows `◌ idle 7m` even while a
+  sibling run or the orchestrator keeps the mission busy. Stamps are never
+  merged with a max and never borrowed from another entity.
+- **Mission level** (the drill-down header, the trajectory tail with no run
+  selected) is judged by the newest event of the whole mission, so it stays
+  animated while anything in the mission works. It is not allowed to hide a
+  silent run: the header adds `tester idle 7m` next to `working` for each
+  running run past the threshold, and the run rows carry the per-run truth.
+- **Aggregate** (the running stats tile and the project badge) uses the newest
+  event across all running missions; it reads idle only when every one is.
+
+No stamp for an entity means UNKNOWN, and unknown animates (no event data at
+all, a failed query, a run whose newest event fell outside the sampled window).
+It is never replaced by the mission stamp or the aggregate. A store hiccup
+therefore never falsely reports silence. Every paint, the store poll included,
+computes a real frame; an unfocused terminal shows a still frame, not a blank,
+and the poll also repaints or removes the trajectory tail, so the still state
+is current as of the last poll.
 
 Trajectory glyphs (Claude-Code familiar):
 

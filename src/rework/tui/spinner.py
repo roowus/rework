@@ -12,8 +12,6 @@ from a working mission.
 
 from __future__ import annotations
 
-import time
-
 # Braille spinner, the classic 10 frames. EVERY frame is one cell wide (a single
 # codepoint with no wide/zero-width property), so the glyph swap never reflows
 # the row it sits in.
@@ -68,15 +66,3 @@ def human_duration(seconds: float) -> str:
     if s < 86400:
         return f"{s // 3600}h {s % 3600 // 60:02d}m"
     return f"{s // 86400}d {s % 86400 // 3600}h"
-
-
-def marker(now: float, last_event: float | None, t: float | None = None) -> tuple[str, bool]:
-    """The marker for a RUNNING thing: (glyph, animated).
-
-    Animated: a frame from FRAMES, changing with `t` (default: now on the
-    monotonic clock). Stalled: IDLE_GLYPH, static. This is the one function
-    every surface uses, so the zombie rule cannot drift between them."""
-    if is_stalled(now, last_event):
-        return IDLE_GLYPH, False
-    clock = time.monotonic() if t is None else t
-    return frame_for(clock), True

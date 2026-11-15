@@ -163,14 +163,18 @@ class WorkView(View):
         """Animate the running mission cards (10fps): no store, no remounting.
 
         The frame comes from the shared clock; the last event time comes from
-        the snapshot the view already holds, so a poll cannot reset the spinner."""
+        the snapshot the view already holds, so a poll cannot reset the spinner.
+        Each card is judged by ITS mission's own stamp. A mission with no stamp
+        is unknown and animates; the "*" aggregate (newest event of any running
+        mission) is never borrowed, or a dead card would animate whenever any
+        other mission worked."""
         cards = [c for c in self.query(MissionCard) if c.status == "running"]
         if not cards:
             return
         stamps = self.snap.last_event
         with self.painting():
             for card in cards:
-                last = stamps.get(card.mission_id) or stamps.get("*")
+                last = stamps.get(card.mission_id)
                 card.tick(frame, now, last)
 
     def _poll_chat(self) -> None:

@@ -18,8 +18,9 @@ from rework.kernel.state.records import (
     EventType,
     Mission,
     MissionStatus,
+    Run,
+    RunStatus,
 )
-from rework.tui import spinner
 from rework.tui.app import ANIMATION_SECONDS, ReworkApp
 from rework.tui.spinner import (
     FRAMES,
@@ -303,14 +304,6 @@ def test_run_mark_without_a_frame_is_never_blank() -> None:
         assert _has_frame(out) and "[#a394f7][/]" not in out
 
 
-def test_marker_helper_is_consistent() -> None:
-    now = 5000.0
-    glyph, animated = spinner.marker(now, now - 1, t=0.0)
-    assert animated and glyph in FRAMES
-    glyph, animated = spinner.marker(now, now - STALL_SECONDS - 1)
-    assert not animated and glyph == spinner.IDLE_GLYPH
-
-
 # -- the stamp sweep ----------------------------------------------------------
 
 
@@ -321,6 +314,12 @@ class _FakeStore:
         self.events = events
         self.calls: list[dict] = []  # type: ignore[type-arg]
         self.fail = False
+        self.runs: list[Run] = []
+        self.run_calls = 0
+
+    async def list_runs(self, mission_id):  # type: ignore[no-untyped-def]
+        self.run_calls += 1
+        return [r for r in self.runs if r.mission_id == mission_id]
 
     async def events_since(self, seq, mission_id=None, limit=500, *, newest_first=False):  # type: ignore[no-untyped-def]
         self.calls.append({"mission_id": mission_id, "limit": limit})
@@ -391,3 +390,185 @@ async def test_event_stamp_failure_is_unknown_not_a_stale_stamp() -> None:
     await hub._event_stamps(snap2)
     assert snap2.last_event == {}
     assert not is_stalled(now, snap2.last_event.get("m1"))  # unknown animates
+
+
+async def test_quiet_run_pushed_out_of_the_window_is_found_by_one_wider_read() -> None:
+    now = time.time()
+    store = _FakeStore([])
+    quiet, busy = "m1:test:tester:1", "m1:code:coder:1"
+    store.runs = [
+        Run(id=quiet, mission_id="m1", role="tester", step="test", status=RunStatus.RUNNING),
+        Run(id=busy, mission_id="m1", role="coder", step="code", status=RunStatus.RUNNING),
+    ]
+    store.events = [_ev("m1", quiet, now - 3000, 1)]
+    store.events += [_ev("m1", busy, now - 60 + n * 0.1, 2 + n) for n in range(80)]
+    data = _data_with(store)
+
+    out = await data.recent_event_stamps("m1", limit=40)
+    assert out[quiet] == pytest.approx(now - 3000), "the quiet run was dropped by the window"
+    assert out[busy] > now - 60
+    # window + list_runs + one wider read: the documented worst case for a mission
+    assert [c["limit"] for c in store.calls] == [40, 400] and store.run_calls == 1
+
+
+async def test_unsaturated_window_costs_one_query_and_no_run_lookup() -> None:
+    now = time.time()
+    store = _FakeStore([_ev("m1", "m1:code:coder:1", now - 5, 1)])
+    store.runs = [
+        Run(id="m1:test:tester:1", mission_id="m1", role="tester", step="t", status="running")  # type: ignore[arg-type]
+    ]
+    out = await _data_with(store).recent_event_stamps("m1", limit=40)
+    assert "m1:test:tester:1" not in out, "a run with no events has no key (unknown)"
+    assert len(store.calls) == 1 and store.run_calls == 0
+
+
+# -- run-level stall detection --------------------------------------------------
+
+LIVE, SILENT = "m-two:code:coder:1", "m-two:test:tester:1"
+
+
+def _two_runs() -> list[Run]:
+    return [
+        Run(id=LIVE, mission_id="m-two", role="coder", step="code", status=RunStatus.RUNNING),
+        Run(id=SILENT, mission_id="m-two", role="tester", step="test", status=RunStatus.RUNNING),
+    ]
+
+
+def _rows_by_key(rows) -> dict[str, str]:  # type: ignore[no-untyped-def]
+    return {r.key: r.markup for r in rows}
+
+
+async def test_silent_run_is_idle_while_a_live_sibling_animates(env: Path) -> None:
+    """The wedged-one-run case. Every run event also stamps its mission, so a
+    mission-granular max keeps the silent run looking alive: this goes red if
+    that max (or any mission fallback) returns."""
+    await seed(str(env), history_days=20)
+    async with ReworkApp(poll_seconds=30).run_test(size=SIZE) as pilot:
+        await pilot.pause(0.5)
+        dash = pilot.app.view("dashboard")
+        now = time.time()
+        dash.mission_id = "m-two"
+        dash.runs = _two_runs()
+        dash.snap.last_event = {
+            "m-two": now - 1,  # the mission is busy (the live run just spoke)
+            LIVE: now - 1,
+            SILENT: now - STALL_SECONDS - 120,
+            "*": now - 1,
+        }
+        rows = _rows_by_key(dash._run_rows(FRAMES[4], now))
+        assert FRAMES[4] in rows[LIVE] and "◌" not in rows[LIVE]
+        assert "◌" in rows[SILENT] and not _has_frame(rows[SILENT]), rows[SILENT]
+
+        # an unknown run (no key of its own) animates, even when the mission
+        # stamp is old: the mission stamp is never substituted
+        dash.snap.last_event = {"m-two": now - STALL_SECONDS - 120, LIVE: now - 1}
+        rows = _rows_by_key(dash._run_rows(FRAMES[4], now))
+        assert FRAMES[4] in rows[SILENT] and "◌" not in rows[SILENT]
+
+
+async def test_mission_header_and_tail_name_the_silent_run(env: Path) -> None:
+    from textual.widgets import Static
+
+    ids = await seed(str(env), history_days=20)
+    async with ReworkApp(poll_seconds=30).run_test(size=SIZE) as pilot:
+        app = pilot.app
+        await pilot.pause(0.5)
+        app.action_tab("dashboard")
+        dash = app.view("dashboard")
+        dash.open_mission(ids["running"])
+        await pilot.pause(0.6)
+        mid = ids["running"]
+        live, silent = f"{mid}:code:coder:1", f"{mid}:test:tester:1"
+        now = time.time()
+        dash.runs = [
+            Run(id=live, mission_id=mid, role="coder", step="code", status=RunStatus.RUNNING),
+            Run(id=silent, mission_id=mid, role="tester", step="test", status=RunStatus.RUNNING),
+        ]
+        dash.snap.last_event = {mid: now - 1, live: now - 1, silent: now - STALL_SECONDS - 120}
+        dash.mtab = "traj"
+
+        def header() -> str:
+            return str(dash.query_one("#m-header", Static).render())
+
+        def tail() -> str:
+            step = dash.query_one("#m-traj", Trajectory)._spinner
+            assert step is not None
+            return str(step.render())
+
+        # the header is the mission: it animates, but names the silent run
+        dash._paint_mission_static(frame=FRAMES[2], now=now)
+        assert FRAMES[2] in header() and "working" in header()
+        assert "tester idle 7m" in header(), header()
+
+        # no run selected: the tail reflects the mission (busy)
+        dash.run_id = None
+        dash._paint_traj_tail(FRAMES[2], now)
+        assert FRAMES[2] in tail() and "working" in tail()
+        assert "coder" in tail() and "tester" not in tail(), "named the silent run as working"
+        # the silent run selected: the tail reflects THAT run
+        dash.run_id = silent
+        dash._paint_traj_tail(FRAMES[2], now)
+        assert "idle" in tail() and "◌" in tail() and not _has_frame(tail()), tail()
+        # the live run selected: animating
+        dash.run_id = live
+        dash._paint_traj_tail(FRAMES[2], now)
+        assert FRAMES[2] in tail() and "working" in tail()
+
+
+async def test_poll_clears_a_stale_tail_while_unfocused(env: Path) -> None:
+    """Unfocused, no tick runs. When the run finishes meanwhile, the store poll
+    (which does run) must remove the "working" claim."""
+    from rework.kernel.state.sqlite import open_sqlite
+
+    ids = await seed(str(env), history_days=20)
+    await _append_fresh_event(env, ids["running"])
+    async with ReworkApp(poll_seconds=0.3).run_test(size=SIZE) as pilot:
+        app = pilot.app
+        await pilot.pause(0.5)
+        app.action_tab("dashboard")
+        dash = app.view("dashboard")
+        dash.open_mission(ids["running"])
+        await pilot.pause(0.8)
+        traj = dash.query_one("#m-traj", Trajectory)
+        assert traj._spinner is not None and "working" in str(traj._spinner.render())
+
+        app.app_focus = False
+        store = await open_sqlite(str(env))
+        try:
+            await store.update_run(f"{ids['running']}:code:coder:1", status=RunStatus.COMPLETED)
+        finally:
+            await store.aclose()
+        await pilot.pause(1.5)  # several polls, zero ticks
+        assert traj._spinner is None, "stale 'working' claim survived the poll"
+
+
+async def test_work_card_is_judged_by_its_own_mission_not_the_aggregate(env: Path) -> None:
+    from textual.widgets import Static
+
+    await seed(str(env), history_days=20)
+    async with ReworkApp(poll_seconds=30).run_test(size=SIZE) as pilot:
+        await pilot.pause(0.5)
+        work = pilot.app.view("work")
+        cards = {}
+        for mid in ("m-dead", "m-busy", "m-new"):
+            card = MissionCard(mid)
+            await work.mount(card)
+            card.update_from(_mission(mid, MissionStatus.RUNNING), [])
+            cards[mid] = card
+        await pilot.pause()
+        now = time.time()
+        # "*" is fresh because m-busy works; m-dead went quiet; m-new has no stamp
+        work.snap.last_event = {"m-busy": now - 1, "m-dead": now - STALL_SECONDS - 90, "*": now - 1}
+        work.tick(FRAMES[5], now)
+
+        def head(mid: str) -> str:
+            return str(cards[mid].query_one(".mc-head", Static).render())
+
+        assert FRAMES[5] in head("m-busy")
+        assert "◌" in head("m-dead") and not _has_frame(head("m-dead"))
+        assert FRAMES[5] in head("m-new"), "unknown animates"
+
+        # and the aggregate is never borrowed for a card with no key of its own
+        work.snap.last_event = {"m-busy": now - STALL_SECONDS - 9, "*": now - STALL_SECONDS - 9}
+        work.tick(FRAMES[6], now)
+        assert FRAMES[6] in head("m-new"), "borrowed the stale aggregate"
