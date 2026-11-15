@@ -479,20 +479,23 @@ class ToolError(Exception):
 
 GATE_ASK_REFUSED = (
     "ask_before_pr is refused: a PR gate is only for the four high-stakes "
-    f"categories ({GATE_CATEGORY_NAMES}) and needs both a non-empty `reason` naming "
-    "that category and a matching `gate_category`. Call finish again with "
-    "ask_before_pr unset or false and the engine opens the PR without a gate; "
-    "anything else that makes the owner look twice (a large diff, many files, an "
-    "unusual-looking change, audit findings you accepted) belongs in the `summary`, "
-    "which becomes the PR body."
+    f"categories ({GATE_CATEGORY_NAMES}). The engine requires BOTH a non-empty "
+    "`reason` (meant to name the category; the owner sees it in the gate question, "
+    "next to the category) AND a `gate_category` from that list. Call finish again "
+    "with both set, or with ask_before_pr unset or false and the engine opens the PR "
+    "without a gate; anything else that makes the owner look twice (a large diff, "
+    "many files, an unusual-looking change, audit findings you accepted) belongs in "
+    "the `summary`, which becomes the PR body."
 )
 
 
 def _gate_ask(args: dict[str, Any]) -> tuple[bool, str, str]:
     """Read and STRICTLY validate finish's PR-gate request (issue #36): the owner
     decided most fixes -- especially ones the owner asked for -- ship ungated, so
-    a gate is only for the four high-stakes categories, with a reason naming it.
-    Returns (ask, reason, category); raises ToolError when the ask is invalid."""
+    a gate is only for the four high-stakes categories. The mechanical rule is a
+    non-empty `reason` plus a `gate_category` in the enum (the reason is meant to
+    name it, and is shown to the owner beside it). Returns (ask, reason, category);
+    raises ToolError when the ask is invalid."""
     if not bool(args.get("ask_before_pr")):
         return False, "", ""
     reason = str(args.get("reason") or "").strip()

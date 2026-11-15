@@ -9,6 +9,7 @@ from rework.orchestrator.agent import (
     GATE_CATEGORIES,
     PLAYBOOKS,
     RULES,
+    MissionOrchestrator,
     ToolError,
     _gate_ask,
     orchestrator_tools,
@@ -81,6 +82,55 @@ def test_the_refusal_does_not_complete_the_mission() -> None:
 
     source = inspect.getsource(MissionOrchestrator._dispatch)
     assert source.index("_gate_ask(") < source.index("self.finished = (outcome")
+
+
+def _replayed(args: dict) -> MissionOrchestrator:
+    """MissionOrchestrator reduced to what _recorded_finish reads: the history
+    holding one answered `finish` call, i.e. exactly the state a restarted
+    mission reloads. No store, bus or model: replay reads only the history."""
+    orch = object.__new__(MissionOrchestrator)
+    orch.history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "c1", "name": "finish", "arguments": args}],
+        },
+        {"role": "tool", "tool_call_id": "c1", "name": "finish", "content": "finished"},
+    ]
+    orch.accepted_findings = []
+    orch.ask_before_pr = False
+    orch.pr_reason = ""
+    orch.pr_gate_category = ""
+    return orch
+
+
+def test_a_replayed_pre_strictness_finish_cannot_resurrect_a_gate() -> None:
+    """Regression: a history record written before the strict rule carries
+    ask_before_pr with no gate_category. Replay must downgrade it to no ask
+    (and not raise), or a refactor back to the raw args.get() form would let
+    old missions open a gate the live rule refuses."""
+    orch = _replayed(
+        {"outcome": "done", "summary": "s", "ask_before_pr": True, "reason": "large diff"}
+    )
+    assert orch._recorded_finish() == ("done", "s")  # no ToolError escapes
+    assert orch.ask_before_pr is False
+    assert (orch.pr_reason, orch.pr_gate_category) == ("", "")
+
+
+def test_a_replayed_gate_with_a_valid_category_and_reason_is_preserved() -> None:
+    orch = _replayed(
+        {
+            "outcome": "done",
+            "summary": "s",
+            "ask_before_pr": True,
+            "gate_category": "security",
+            "reason": "rotates the deploy token",
+        }
+    )
+    assert orch._recorded_finish() == ("done", "s")
+    assert orch.ask_before_pr is True
+    assert orch.pr_gate_category == "security"
+    assert "deploy token" in orch.pr_reason
 
 
 def test_prompt_text_states_the_strict_rule() -> None:

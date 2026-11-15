@@ -106,12 +106,15 @@ crucial cases.
 
 Asking for a gate is strict (owner decision, 2026-11-14). The orchestrator may
 pass `finish(ask_before_pr=true, gate_category=..., reason=...)` ONLY when the
-change falls in one of four high-stakes categories, and the `reason` must name
-that category. Anything else is refused with a tool error telling the
-orchestrator to open the PR without a gate; a change you asked for is never
-gated for being large, unusual, or touching many files, and audit findings the
-orchestrator accepted belong in the finish `summary` — which becomes the PR body
-you read before merging.
+change falls in one of four high-stakes categories, and the `reason` should name
+that category. What the engine mechanically enforces is narrower: a non-empty
+`reason` and a `gate_category` from the list below. Your gate question shows
+both — the category first, then the reason — so you can judge the request.
+Anything else is refused with a tool error telling the orchestrator to open the
+PR without a gate; a change you asked for is never gated for being large,
+unusual, or touching many files, and audit findings the orchestrator accepted
+belong in the finish `summary` — which becomes the PR body you read before
+merging.
 
 | `gate_category` | the change does... |
 | --- | --- |
