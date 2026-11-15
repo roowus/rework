@@ -28,7 +28,6 @@ PLAN_FIX: dict = {
         {
             "step": "investigate",
             "role": "investigator",
-            "model": "flash",
             "context": {
                 "brief": "$OBJECTIVE",
                 "depth": "quick",
@@ -44,14 +43,12 @@ PLAN_FIX: dict = {
         {
             "step": "code",
             "role": "coder",
-            "model": "flash",
             "context": {"brief": "$OBJECTIVE"},
             "context_from": {"investigation": {"step": "investigate"}},
         },
         {
             "step": "audit",
             "role": "auditor",
-            "model": "pro",
             "context": {"brief": "$OBJECTIVE"},
             "context_from": {
                 "diff": {"step": "code", "field": "diff"},

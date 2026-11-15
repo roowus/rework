@@ -161,7 +161,13 @@ class RunSupervisor:
 
     async def _build_graph(self, run: Run) -> Any:
         spec = self._registry.get(run.role)
-        wanted = str(run.model_ref.get("id") or spec.default_model)
+        from rework.config import default_model_id
+
+        # no model named by plan/brief/role: the CONFIGURED default
+        # (REWORK_DEFAULT_MODEL), not the strongest tier in the catalog
+        wanted = str(
+            run.model_ref.get("id") or spec.default_model or default_model_id(self._catalog)
+        )
         try:
             entry = self._catalog.resolve(wanted)
         except UnknownModelError:
@@ -1312,16 +1318,55 @@ class MissionRunner:
         gates = [g for g in await self._store.list_gates(self.mission_id) if g.kind == kind]
         return gates[-1] if gates else None
 
+    def escalation_entry(self, current_id: str) -> Any:
+        """The model a role is escalated TO. Resolution order:
+
+        1. the configured escalation model (REWORK_ESCALATION_MODEL, default
+           'claude-sonnet-5-5') when it is in the catalog, usable here and not
+           already the current model: the mission spec's ONE escalation target,
+           the one the prompt tells the orchestrator to escalate to;
+        2. otherwise the STRONGEST USABLE entry, the documented fallback (what
+           `escalation_model_id` itself resolves to when the configured id is
+           missing or keyless on this machine);
+        3. only when that yields nothing or is already the current model, the
+           next tier up within the provider (config-gated cross-provider, ADR
+           0001) as a last resort.
+
+        The mechanical path never invents a target the policy text does not
+        name: a same-provider tier step is the fallback of last resort, not the
+        first answer. Nothing is ever excluded: switching the escalation target
+        is env-only."""
+        from rework.config import escalation_model_id
+
+        try:
+            wanted = escalation_model_id(self._catalog)
+        except Exception:  # an empty catalog: no escalation exists
+            return None
+        entry = next((e for e in self._catalog.all() if e.id == wanted), None)
+        if entry is not None and entry.has_credentials() and entry.id != current_id:
+            return entry
+        strongest = self._catalog.strongest_usable()
+        if strongest is not None and strongest.id != current_id:
+            return strongest
+        if not current_id:
+            return None
+        try:
+            # promote() -> resolve() raises UnknownModelError for an id the
+            # catalog does not hold (always true for an empty catalog), so the
+            # last resort must never raise: None sends the run to the human gate
+            return self._catalog.promote(current_id)
+        except UnknownModelError:
+            return None
+
     async def _promote_and_resume(self, run: Run) -> bool:
-        """needs_model policy: promote within the provider (cross-provider is
-        config-gated, ADR 0001) and resume the role with the new tier. Returns
-        True when handled mechanically; False falls through to a human gate.
-        Reads the run ROW: model_ref gets resolved onto it at graph-build time,
-        and the in-memory object here may predate that."""
+        """needs_model policy: escalate the role to the configured escalation
+        model and resume it. Returns True when handled mechanically; False falls
+        through to a human gate. Reads the run ROW: model_ref gets resolved onto
+        it at graph-build time, and the in-memory object here may predate that."""
         payload = run.escalation or {}
         fresh = await self._store.get_run(run.id)
         current_id = str((fresh or run).model_ref.get("id") or "")
-        promoted = self._catalog.promote(current_id) if current_id else None
+        promoted = self.escalation_entry(current_id)
         if promoted is None:
             await self._bus.publish(
                 EventRecord(

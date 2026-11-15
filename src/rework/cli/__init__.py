@@ -68,7 +68,7 @@ def new(
     plan: str = typer.Option("echo", help="Playbook: echo | fix | fix-pr"),
     orchestrator: str | None = typer.Option(
         None,
-        help="Catalog id for the mission's orchestrator (default: the strongest tier).",
+        help="Catalog id for the mission's orchestrator (default: REWORK_DEFAULT_MODEL).",
     ),
     effort: str | None = typer.Option(None, help="Orchestrator effort: low | medium | high"),
     budget: float | None = typer.Option(
@@ -118,14 +118,15 @@ def new(
         raise typer.BadParameter(str(exc)) from exc
 
 
-def default_orchestrator_model() -> str:
-    """The strongest real tier in the catalog (the orchestrator decides for a
-    whole mission; it is the last place to save tokens)."""
-    from rework.config import load_catalog
+def default_orchestrator_model(catalog: Any = None) -> str:
+    """The configured default model (REWORK_DEFAULT_MODEL, default 'flash'):
+    the same cheap strong model every role runs on, resolved against the
+    catalog. Cost control starts here. `catalog` is optional so a caller that
+    already loaded one (or a test) can pass it instead of re-reading
+    ~/.rework/models.json."""
+    from rework.config import default_model_id
 
-    entries = load_catalog().all()
-    real = [e for e in entries if e.provider != "fake" and e.has_credentials()] or entries
-    return max(real, key=lambda e: (e.tier, -e.cost_in_per_mtok)).id
+    return default_model_id(catalog)
 
 
 project_app = typer.Typer(no_args_is_help=True, add_completion=False, help="Projects (ADR 0005).")
@@ -1659,13 +1660,17 @@ def sync_config_cmd(
         False, "--dry-run", help="Show what would change; never touch the remote host."
     ),
 ) -> None:
-    """Copy ~/.rework/models.json and the REWORK_*_KEY lines of
-    ~/.rework/rework.env to the target's ssh host. Prints key NAMES and value
-    LENGTHS only, never a secret. REWORK_DB / REWORK_DAEMON_URL and every
-    other line in the remote rework.env are left untouched."""
+    """MERGE ~/.rework/models.json and the REWORK_*_KEY lines of
+    ~/.rework/rework.env into the target's ssh host: local catalog entries add
+    or replace by id, the target's own entries survive, and entries whose
+    base_url is loopback (localhost / 127.0.0.1 / ::1) - and the keys only they
+    use - stay local, because the target could never call them. Prints key
+    NAMES and value LENGTHS only, never a secret. REWORK_DB / REWORK_DAEMON_URL
+    and every other line in the remote rework.env are left untouched."""
     import subprocess as _sp
 
     from rework.config import DEFAULT_STATE_DIR
+    from rework.kernel.llm.catalog import is_loopback_url
     from rework.targets import TARGETS_PATH, load_targets_file
 
     file = load_targets_file()
@@ -1697,6 +1702,50 @@ def sync_config_cmd(
         )
         return proc.stdout
 
+    # -- the local catalog, minus what only THIS machine can call --------------
+    # A loopback base_url is reachable only where it was written, so such an
+    # entry (and a key no kept entry needs) is not synced: the target would
+    # only ever fail on it.
+    models = DEFAULT_STATE_DIR / "models.json"
+    local_doc: Any = None
+    try:
+        local_doc = json.loads(models.expanduser().read_text())
+    except OSError:
+        local_doc = None
+    except ValueError as exc:
+        typer.secho(
+            f"warning: local {models} is not valid JSON ({exc}); treating it as empty",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        local_doc = None
+    local_entries = _models_doc_entries(local_doc)
+    if local_doc is not None and not local_entries:
+        typer.secho(
+            f"warning: local {models} holds no catalog entries; nothing to merge",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        local_doc = None
+
+    kept_entries: list[dict[str, Any]] = []
+    skipped_entries: list[tuple[str, str]] = []  # (id, base_url)
+    skipped_keys: set[str] = set()
+    for entry in local_entries:
+        entry_id = str(entry.get("id") or "?")
+        url = entry.get("base_url")
+        if is_loopback_url(url if isinstance(url, str) else None):
+            skipped_entries.append((entry_id, str(url)))
+            key = _entry_key_env(entry)
+            if key:
+                skipped_keys.add(key)
+            continue
+        kept_entries.append(entry)
+    kept_keys = {key for key in map(_entry_key_env, kept_entries) if key}
+    # a key a kept entry ALSO uses is still needed on the target: only keys that
+    # no kept entry needs are dropped
+    dropped_keys = {key for key in skipped_keys if key not in kept_keys}
+
     local_env = DEFAULT_STATE_DIR / "rework.env"
     try:
         local_lines = local_env.expanduser().read_text().splitlines()
@@ -1718,6 +1767,8 @@ def sync_config_cmd(
                 local_keys[key] = value
 
     # remote rework.env: keep every line, replace/insert only REWORK_*_KEY ones
+    # that a kept catalog entry may need
+    send_keys = {key: value for key, value in local_keys.items() if key not in dropped_keys}
     remote_raw = ssh_run("cat ~/.rework/rework.env 2>/dev/null || true")
     remote_lines: list[str] = remote_raw.splitlines()
     covered: set[str] = set()
@@ -1725,52 +1776,152 @@ def sync_config_cmd(
     for line in remote_lines:
         stripped = line.strip()
         key = stripped.split("=", 1)[0].strip() if "=" in stripped else ""
-        if key in local_keys:
-            merged.append(f"{key}={local_keys[key]}")
+        if key in send_keys:
+            merged.append(f"{key}={send_keys[key]}")
             covered.add(key)
         else:
             merged.append(line)
-    for key, value in local_keys.items():
+    for key, value in send_keys.items():
         if key not in covered:
             merged.append(f"{key}={value}")
     if merged and not merged[-1].strip():
         merged = merged[:-1]  # a trailing blank line, not two
     merged_text = "\n".join(merged) + ("\n" if merged else "")
-    added = sorted(k for k in local_keys if k not in covered)
-    updated = sorted(k for k in local_keys if k in covered)
-    if added or updated:
+    added = sorted(k for k in send_keys if k not in covered)
+    updated = sorted(k for k in send_keys if k in covered)
+    key_lines = [f"  add     {key}: {len(send_keys[key])} chars" for key in added]
+    key_lines += [f"  replace {key}: {len(send_keys[key])} chars" for key in updated]
+    key_lines += [f"  skip {key}: used only by skipped entries" for key in sorted(dropped_keys)]
+    if key_lines:
         typer.echo(f"REWORK_*_KEY lines from {local_env}:")
-        for key in added:
-            typer.echo(f"  add     {key}: {len(local_keys[key])} chars")
-        for key in updated:
-            typer.echo(f"  replace {key}: {len(local_keys[key])} chars")
+        for line in key_lines:
+            typer.echo(line)
     else:
         typer.echo(f"no REWORK_*_KEY lines in {local_env}: nothing to merge")
 
-    models = DEFAULT_STATE_DIR / "models.json"
-    exists = models.exists()
-    typer.echo(
-        f"{'would copy' if dry_run else 'copy'} models.json: {models}"
-        f"    -> {host}:~/.rework/models.json"
+    # -- remote models.json: read, merge by id, write the merged document ------
+    # `ssh_run` cannot tell a failed ssh from an empty file (it returns stdout
+    # either way), and an empty read is ALSO what a target with no models.json
+    # gives. Those two must not be confused: treating a failed read as "the
+    # target has no catalog" makes the merge below see no target entries and
+    # then REPLACE the remote file with local-only ones, destroying the
+    # target-only entries this command exists to preserve. So the read appends
+    # a sentinel that only a completed shell run can produce.
+    target_doc: Any = None
+    models_sentinel = "__REWORK_MODELS_EOF__"
+    remote_models = ssh_run(
+        f"cat ~/.rework/models.json 2>/dev/null || true; echo {models_sentinel}"
     )
+    if models_sentinel not in remote_models:
+        typer.secho(
+            f"cannot read {host}:~/.rework/models.json: the ssh read did not complete"
+            f" (no {models_sentinel} marker in the output), so the target's catalog"
+            " cannot be merged; nothing was written and the local files are untouched",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(1)
+    # The marker is echoed LAST (`cat ...; echo <marker>`), so the split is
+    # tail-anchored on purpose: a document may legitimately contain the token
+    # inside a string, and a head-anchored split would truncate it there.
+    remote_models = remote_models.rsplit(models_sentinel, 1)[0]
+    if remote_models.endswith("\n"):
+        remote_models = remote_models[:-1]
+    if remote_models.strip():
+        try:
+            target_doc = json.loads(remote_models)
+        except ValueError as exc:
+            typer.secho(
+                f"warning: {host}:~/.rework/models.json is not valid JSON ({exc});"
+                " treating it as empty and writing a valid merged catalog",
+                fg=typer.colors.YELLOW,
+                err=True,
+            )
+            target_doc = None
+    target_entries = _models_doc_entries(target_doc)
+    target_ids = {str(entry.get("id")) for entry in target_entries}
+    local_ids = [str(entry.get("id")) for entry in kept_entries]
+    merged_entries = list(kept_entries) + [
+        entry for entry in target_entries if str(entry.get("id")) not in set(local_ids)
+    ]
+    # The ONLY document shape the loader reads is the flat entry list
+    # (load_catalog -> ModelCatalog.from_config -> ModelEntry(**item)). Nothing
+    # in rework writes the object shape and an object-shaped file makes the
+    # target's catalog unreadable, so preserving it could only corrupt the
+    # target: sync-config always writes the list (its entries are merged above).
+    merged_doc = _models_doc_with(merged_entries)
+    if isinstance(target_doc, dict):
+        typer.echo(
+            "note: the target's models.json is not an entry list the loader can "
+            "read; written as a plain entry list"
+        )
+
+    if local_doc is None:
+        typer.echo(f"no local {models}: models.json not merged")
+    else:
+        typer.echo(f"merge models.json: {models}    -> {host}:~/.rework/models.json")
+        for entry in kept_entries:
+            verb = "replace" if str(entry.get("id")) in target_ids else "add    "
+            typer.echo(f"  {verb} {entry.get('id')}: {len(json.dumps(entry))} chars")
+        for entry in target_entries:
+            if str(entry.get("id")) not in set(local_ids):
+                typer.echo(f"  keep    {entry.get('id')}: only on the target")
+        for entry_id, url in skipped_entries:
+            typer.echo(f"  skip {entry_id}: loopback base_url {url}")
 
     if dry_run:
         typer.echo("dry run: nothing was sent to the remote host")
         return
-    if local_keys:
-        mkdir = ssh_run(
-            "mkdir -p ~/.rework && touch ~/.rework/rework.env && chmod 600 ~/.rework/rework.env"
-        )
-        _ = mkdir
+    if send_keys or local_doc is not None:
+        ssh_run("mkdir -p ~/.rework")
+    if send_keys:
+        ssh_run("touch ~/.rework/rework.env && chmod 600 ~/.rework/rework.env")
         ssh_run(
             "cat > ~/.rework/rework.env && chmod 600 ~/.rework/rework.env", input_text=merged_text
         )
         typer.echo(f"merged rework.env written to {host} (mode 600 preserved)")
-    if exists:
-        _sp.run(["scp", str(models), f"{host}:.rework/models.json"], check=True)
-        typer.echo("models.json copied")
+    if local_doc is not None:
+        ssh_run(
+            "cat > ~/.rework/models.json && chmod 600 ~/.rework/models.json",
+            input_text=json.dumps(merged_doc, indent=2) + "\n",
+        )
+        typer.echo(f"merged models.json written to {host}:~/.rework/models.json (mode 600)")
+
+
+def _models_doc_entries(doc: Any) -> list[dict[str, Any]]:
+    """The catalog entry list inside a models.json document: the document
+    itself when it is a JSON list, or its `entries` list when it is an object.
+    A malformed shape gives [] (and non-dict items are dropped) rather than
+    crashing a sync."""
+    if isinstance(doc, list):
+        raw = doc
+    elif isinstance(doc, dict) and isinstance(doc.get("entries"), list):
+        raw = doc["entries"]
     else:
-        typer.echo(f"no local {models}: models.json not copied")
+        return []
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def _models_doc_with(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The document to write for `entries`: ALWAYS the flat list, the one shape
+    the loader can read (ModelCatalog.from_config). The object shape
+    `{"version": 2, "entries": [...]}` is deliberately NOT preserved: rework
+    cannot read it, so reproducing it would only corrupt the target's catalog.
+    """
+    return entries
+
+
+def _entry_key_env(entry: dict[str, Any]) -> str:
+    """The env var a raw models.json entry's key lives in ("" when the provider
+    needs none). Goes through api_key_env_name so the loopback filter can never
+    drift from the lookup the adapters use; an entry too malformed to validate
+    contributes no key instead of crashing the sync."""
+    from rework.kernel.llm.catalog import ModelEntry, api_key_env_name
+
+    try:
+        return api_key_env_name(ModelEntry(**entry))
+    except Exception:
+        return ""
 
 
 @app.command()

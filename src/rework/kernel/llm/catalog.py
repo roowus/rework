@@ -6,15 +6,115 @@ tiers within the same provider (cross-provider promotion is config-gated, ADR 00
 
 from __future__ import annotations
 
+import re
 from typing import Any, Protocol, runtime_checkable
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
 
 from rework.kernel.llm.types import ChatRequest, ChatResult
 
+# hosts that mean "this machine": a catalog entry pointing at one of them is
+# callable only where it was written, never on a machine it is synced to
+LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
 
 class UnknownModelError(KeyError):
     pass
+
+
+# the env var a provider's adapter looks in when an entry names none
+DEFAULT_KEY_ENVS = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
+
+
+def api_key_env_name(entry: ModelEntry) -> str:
+    """The env var holding this entry's key ("" when the provider needs none).
+    Mirrors build_provider's lookup, so `sync-config` can tell which keys an
+    entry actually needs."""
+    if entry.provider == "fake":
+        return ""
+    return entry.api_key_env or DEFAULT_KEY_ENVS.get(entry.provider, "")
+
+
+def base_url_host(base_url: str | None) -> str:
+    """The host of a base_url, lowercased; "" when there is none.
+
+    Handles a full URL (scheme + port), a bare `host:port`, and a bare host.
+    urlsplit cannot parse a bare `::1`, so that case is split by hand."""
+    text = (base_url or "").strip()
+    if not text:
+        return ""
+    try:
+        host = (urlsplit(text if "//" in text else "//" + text).hostname or "").lower()
+    except ValueError:  # unparseable (a bare IPv6 literal): fall through
+        host = ""
+    if host:
+        return host
+    head = text.split("/")[0]
+    if head.startswith("["):  # [::1]:20128
+        return head[1 : head.index("]")].lower() if "]" in head else head[1:].lower()
+    if head.count(":") == 1:  # host:port, not IPv6
+        head = head.split(":")[0]
+    return head.lower()
+
+
+def is_loopback_url(base_url: str | None) -> bool:
+    """Whether base_url points at THIS machine (localhost / 127.0.0.1 / ::1).
+
+    Used by `rework sync-config`: an entry on a loopback endpoint is reachable
+    only on the machine whose catalog it is, so syncing it to another host
+    would hand that host models it can never call."""
+    return base_url_host(base_url) in LOOPBACK_HOSTS
+
+
+_VERSION_RE = re.compile(r"\d+")
+
+# Version keys are a FIXED-WIDTH tuple: every id's numeric segments, zero-padded
+# (or truncated to the most significant ones) to exactly this many slots.
+# Fixed width is what makes them safe to NEGATE for a cheapest-first ranking:
+# variable-length tuples do not compare the way negation needs (`(-5, -5)`
+# sorts GREATER than `(-5,)`, so min() would prefer the older model). With one
+# width, `(-5, -5, 0, ...)` < `(-5, 0, 0, ...)`, so `_rank_cheap`'s min() picks
+# the newer model and `_rank_strong`'s max() picks it too. Real catalog ids
+# carry two or three segments; six leaves room for a dated snapshot.
+_VERSION_WIDTH = 6
+
+
+def version_key(catalog_id: str) -> tuple[int, ...]:
+    """The numeric version segments of a catalog id, as a FIXED-WIDTH tuple.
+
+    `claude-sonnet-5-5` -> (5, 5, 0, 0, 0, 0), which sorts above
+    `claude-sonnet-5` -> (5, 0, 0, 0, 0, 0); a dated id is newer than its
+    undated sibling (`...-20250929` -> (5, 20250929, 0, ...) > (5, 0, ...)).
+    An id with no digits (`flash`, `pro`) gives all zeros and never raises, so
+    ranking is always total and two such ids fall through to the id tie-break.
+    No model name is special-cased: the id is parsed, never matched."""
+    parts = tuple(int(part) for part in _VERSION_RE.findall(catalog_id))
+    if len(parts) >= _VERSION_WIDTH:
+        return parts[:_VERSION_WIDTH]
+    return parts + (0,) * (_VERSION_WIDTH - len(parts))
+
+
+def _negated_version(catalog_id: str) -> tuple[int, ...]:
+    """The version key negated element-wise, for a cheapest-first (min) rank.
+    Only correct because `version_key` is fixed-width; see _VERSION_WIDTH."""
+    return tuple(-part for part in version_key(catalog_id))
+
+
+def _price(entry: ModelEntry) -> tuple[float, float]:
+    return (entry.cost_in_per_mtok, entry.cost_out_per_mtok)
+
+
+def _rank_cheap(entry: ModelEntry) -> tuple[Any, ...]:
+    """Cheapest first: low tier, low price, then the NEWEST version, then id
+    (deterministic even when two entries tie on everything)."""
+    return (entry.tier, *_price(entry), _negated_version(entry.id), entry.id)
+
+
+def _rank_strong(entry: ModelEntry) -> tuple[Any, ...]:
+    """Strongest first: high tier, then low price, then the NEWEST version,
+    then id."""
+    return (entry.tier, *(-c for c in _price(entry)), version_key(entry.id), entry.id)
 
 
 class ModelEntry(BaseModel):
@@ -56,8 +156,7 @@ class ModelEntry(BaseModel):
 
         if self.provider == "fake":
             return True
-        default = {"anthropic": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY"}
-        env = self.api_key_env or default.get(self.provider, "")
+        env = api_key_env_name(self)
         return bool(env and os.environ.get(env))
 
 
@@ -89,6 +188,28 @@ class ModelCatalog:
 
     def all(self) -> list[ModelEntry]:
         return list(self._entries.values())
+
+    def usable(self) -> list[ModelEntry]:
+        """Entries this process can actually call, real providers first: real
+        + keyed, else anything keyed, else the whole catalog (a deployment of
+        fakes only, as in tests). ONE implementation for every "which model may
+        I use" site (the orchestrator's own model, role defaults, TUI knob)."""
+        entries = self.all()
+        real = [e for e in entries if e.provider != "fake" and e.has_credentials()]
+        return real or [e for e in entries if e.has_credentials()] or entries
+
+    def cheapest_usable(self) -> ModelEntry | None:
+        """The cheapest entry this process can call. The fallback for a
+        configured default model that is missing or has no key here."""
+        entries = self.usable()
+        return min(entries, key=_rank_cheap) if entries else None
+
+    def strongest_usable(self) -> ModelEntry | None:
+        """The strongest entry this process can call: highest tier, then lower
+        price, then the newest version. The fallback for a configured
+        escalation model that is missing or has no key here."""
+        entries = self.usable()
+        return max(entries, key=_rank_strong) if entries else None
 
     def cheapest(self) -> ModelEntry | None:
         """Lowest-tier entry (ties: first registered). The stub/echo fallback:

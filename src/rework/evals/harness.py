@@ -126,7 +126,6 @@ def builtin_tasks() -> list[EvalTask]:
                     {
                         "step": "investigate",
                         "role": "investigator",
-                        "model": "flash",
                         "context": {
                             "brief": "make add(2, 3) == 5 in the toy calculator",
                             "depth": "quick",
@@ -136,14 +135,12 @@ def builtin_tasks() -> list[EvalTask]:
                     {
                         "step": "code",
                         "role": "coder",
-                        "model": "flash",
                         "context": {"brief": "make add(2, 3) == 5 in the toy calculator"},
                         "context_from": {"investigation": {"step": "investigate"}},
                     },
                     {
                         "step": "audit",
                         "role": "auditor",
-                        "model": "pro",
                         "context": {"brief": "make add(2, 3) == 5 in the toy calculator"},
                         "context_from": {
                             "diff": {"step": "code", "field": "diff"},

@@ -74,7 +74,9 @@ class CoderSpec(RoleSpec):
         " implement it properly, prove it with real test runs, and report"
         " exactly what passed and what failed."
     )
-    default_model = "flash"
+    # empty = the configured default (REWORK_DEFAULT_MODEL); no literal id in
+    # a default path, so switching models is env-only
+    default_model = ""
     context_manifest: ClassVar[set[str]] = {"brief", "investigation", "requested_scope"}
 
     def build_graph(self, ctx: RoleBuildCtx) -> CompiledStateGraph:
@@ -85,7 +87,7 @@ class CoderSpec(RoleSpec):
         branch = "rework/" + ctx.run.id.replace(":", "-")
         worktree_path = ctx.workdir / "worktree"
         executor = LazyExecutor(mission_id=ctx.mission.id)
-        catalog_id = str(ctx.run.model_ref.get("id") or self.default_model)
+        catalog_id = self.resolve_model(ctx)
 
         system_prompt = (
             f"GOAL: {self.goal}\n\n"
