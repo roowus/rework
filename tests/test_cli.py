@@ -1289,6 +1289,248 @@ def test_new_with_unknown_priority_is_a_clean_cli_error(rework_db: Path) -> None
     assert asyncio.run(all_missions()) == []
 
 
+# --- main()'s dispatch of the help flags ------------------------------------
+# `rework --help` / `rework -h` used to open the TUI: parse_target_flag dropped
+# the leading flag, so main() saw an empty rest and took its "bare rework"
+# branch before typer ever ran. CliRunner invokes app() directly and cannot see
+# that dispatch, so these call the real main() with run_tui monkeypatched to
+# fail loudly instead of opening a dashboard.
+
+
+@pytest.fixture()
+def dispatched_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A throwaway HOME/state dir for a real main() run, with no targets.toml.
+
+    The REWORK_* vars resolve_target would setdefault are pinned to empty
+    strings first: on an empty value setdefault leaves them alone, and
+    monkeypatch restores whatever the session had before.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("REWORK_TARGETS", str(home / "targets.toml"))
+    # TARGETS_PATH is read from the env at import time, so the env var alone
+    # does not redirect an already-imported rework.targets: patch the constant.
+    monkeypatch.setattr("rework.targets.TARGETS_PATH", home / "targets.toml")
+    monkeypatch.setenv("REWORK_ENV_FILE", str(home / "rework.env"))
+    monkeypatch.setenv("REWORK_LOG_DIR", str(home / "logs"))
+    monkeypatch.delenv("REWORK_TARGET", raising=False)
+    for name in (
+        "REWORK_DB",
+        "REWORK_DAEMON_URL",
+        "REWORK_LIBRARY_DIR",
+        "REWORK_TARGET_NAME",
+        "REWORK_CHECKPOINTS_DB",
+    ):
+        monkeypatch.setenv(name, "")
+    return home
+
+
+def _tui_must_not_start(*_args: object, **_kwargs: object) -> None:
+    raise AssertionError("run_tui() was called: this argv belongs to the CLI, not the TUI")
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_main_help_flag_prints_help_and_does_not_start_the_tui(
+    flag: str,
+    dispatched_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BLOCKER: `rework --help` and `rework -h` print typer help, exit 0, no TUI."""
+    import rework.tui as tui
+    from rework.cli import main
+
+    monkeypatch.setattr(tui, "run_tui", _tui_must_not_start)
+    monkeypatch.setattr(sys, "argv", ["rework", flag])
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 0
+    out = capsys.readouterr().out
+    # launcher-agnostic: click's "Usage: <prog>" prefix is derived from
+    # sys.modules["__main__"].__package__, so under `python -m pytest` it reads
+    # "Usage: python -m pytest.rework". Assert the usage header plus a real help
+    # body line, so an error panel cannot satisfy it either.
+    assert "Usage:" in out
+    assert "COMMAND" in out
+    assert "--target" in out  # the real help body, not an error panel
+    assert "No such option" not in out
+
+
+def test_main_bare_and_target_only_argv_still_open_the_tui(
+    dispatched_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control: the TUI path keeps working for a bare `rework` and `--target NAME`."""
+    import rework.tui as tui
+    from rework.cli import main
+
+    (dispatched_home / "targets.toml").write_text(
+        "[targets.sandbox]\n"
+        f'db = "sqlite:///{dispatched_home / "sandbox.db"}"\n'
+        'daemon_url = "http://127.0.0.1:8941"\n'
+    )
+
+    calls: list[str] = []
+
+    def fake_run_tui() -> None:
+        calls.append("started")
+
+    monkeypatch.setattr(tui, "run_tui", fake_run_tui)
+
+    for argv in (["rework"], ["rework", "--target", "sandbox"]):
+        calls.clear()
+        monkeypatch.setattr(sys, "argv", argv)
+        main()
+        assert calls == ["started"], argv
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_main_help_flag_before_a_subcommand_still_prints_help(
+    flag: str,
+    dispatched_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """REGRESSION: `rework --help update --target rewvis` is still a help request.
+
+    Leading flags are now KEPT in rest, so `_rest[0]` can be a flag: keying the
+    `update` exemption off it read the subcommand as "--help", fired the --target
+    usage-error guard, and turned a help request that printed help at base
+    eb7556c into a red usage error. The command name must come from the first
+    non-flag token.
+    """
+    import rework.tui as tui
+    from rework.cli import main
+
+    monkeypatch.setattr(tui, "run_tui", _tui_must_not_start)
+    monkeypatch.setattr(sys, "argv", ["rework", flag, "update", "--target", "rewvis"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 0
+    captured = capsys.readouterr()
+    assert "Usage:" in captured.out  # launcher-agnostic: see the test above
+    assert "COMMAND" in captured.out
+    assert "needs a name" not in captured.out
+    assert "needs a name" not in captured.err
+
+
+def test_main_update_target_stays_exempt_from_the_guard(
+    dispatched_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Positive control: `rework update --target NAME` is still exempt.
+
+    The update command owns its own --target, so the guard must not fire: the
+    command itself runs and reports the unknown target (exit 1), never the
+    "needs a name" usage error (exit 2).
+    """
+    import rework.tui as tui
+    from rework.cli import main
+
+    monkeypatch.setattr(tui, "run_tui", _tui_must_not_start)
+    monkeypatch.setattr(sys, "argv", ["rework", "update", "--target", "rewvis"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 1
+    captured = capsys.readouterr()
+    assert "no target named 'rewvis'" in captured.err
+    assert "needs a name" not in captured.err
+
+
+class _StopLogging(Exception):
+    """Sentinel: the logging branch ran, so stop main() before the typer app."""
+
+
+def _logging_spy(calls: list[str]):
+    """A setup_logging stand-in that records its component and halts main().
+
+    main() imports setup_logging inside the function, so patching the module
+    attribute is what it resolves; raising the sentinel keeps the test away
+    from app() (and therefore from any daemon or TUI start).
+    """
+
+    def spy(component: str, **_kwargs: object) -> None:
+        calls.append(component)
+        raise _StopLogging
+
+    return spy
+
+
+@pytest.mark.parametrize("argv", [["rework", "--", "serve"], ["rework", "--", "logs"]])
+def test_main_double_dash_shapes_take_the_logging_path(
+    argv: list[str],
+    dispatched_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REGRESSION: `rework -- serve` / `rework -- logs` still log like base.
+
+    `--` is the end-of-options marker, so `serve` is a POSITIONAL and not the
+    subcommand: the "serve/logs/library-mcp already log themselves" exemption
+    must not fire and the CLI logging path must run. Reading rest[0] as the
+    subcommand skipped setup_logging("cli") for exactly these shapes.
+    """
+    import rework.logs
+    import rework.tui as tui
+    from rework.cli import main
+
+    calls: list[str] = []
+    monkeypatch.setattr(rework.logs, "setup_logging", _logging_spy(calls))
+    monkeypatch.setattr(tui, "run_tui", _tui_must_not_start)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(_StopLogging):
+        main()
+
+    assert calls == ["cli"], argv  # exactly once, and for the CLI component
+
+
+def test_main_exempt_subcommand_skips_the_cli_logging(
+    dispatched_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Complement: `rework serve` does NOT take the CLI logging branch.
+
+    `serve` IS the subcommand here, and it configures its own ("daemon")
+    logging, so main() must leave setup_logging alone and go straight to the
+    app. The spy raises on its first call, which stops main() inside the serve
+    command body, before the daemon can boot: the recorded call list therefore
+    shows whose logging ran (serve's own, never "cli").
+    """
+    import rework.logs
+    import rework.tui as tui
+    from rework.cli import main
+
+    calls: list[str] = []
+    monkeypatch.setattr(rework.logs, "setup_logging", _logging_spy(calls))
+    monkeypatch.setattr(tui, "run_tui", _tui_must_not_start)
+    monkeypatch.setattr(sys, "argv", ["rework", "serve"])
+
+    with pytest.raises(_StopLogging):
+        main()
+
+    # exactly serve's own call: main() did not log for "cli" first
+    assert calls == ["daemon"]
+
+
+def test_main_target_after_a_subcommand_still_errors(
+    dispatched_home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Positive control: the guard itself is unchanged for `rework ls --target sandbox`."""
+    from rework.cli import main
+
+    monkeypatch.setattr(sys, "argv", ["rework", "ls", "--target", "sandbox"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 2
+    assert "must come before the subcommand" in capsys.readouterr().err
+
+
 def test_message_publishes_an_owner_message(rework_db: Path) -> None:
     """`rework message ID TEXT` appends an OWNER_MESSAGE for that mission;
     an unknown id fails loudly and publishes nothing."""

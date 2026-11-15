@@ -24,6 +24,9 @@ app = typer.Typer(
     ),
     no_args_is_help=True,
     add_completion=False,
+    # `-h` as well as `--help`: without this only the long form is registered
+    # and `rework -h` was a "No such option" error (no command claims -h)
+    context_settings={"help_option_names": ["-h", "--help"]},
 )
 
 
@@ -133,6 +136,11 @@ def default_orchestrator_model(catalog: Any = None) -> str:
 
 project_app = typer.Typer(no_args_is_help=True, add_completion=False, help="Projects (ADR 0005).")
 app.add_typer(project_app, name="project")
+
+mission_app = typer.Typer(
+    no_args_is_help=True, add_completion=False, help="Mission owner actions (retry-pr)."
+)
+app.add_typer(mission_app, name="mission")
 
 
 @project_app.command("assign")
@@ -1025,6 +1033,42 @@ def _set_mission_status(mission_id: str, status: str) -> None:
     typer.echo(f"{mission_id}: {asyncio.run(go())}")
 
 
+@app.command("retry-pr")
+def retry_pr_cmd(mission_id: str) -> None:
+    """Retry the PR delivery of a mission that finished but whose push or
+    `gh pr create` failed (a transient remote hiccup must not cost the work).
+
+    Pushes the recorded branch and opens the missing PR with the persisted
+    title/body; on success the pending marker is cleared, on failure the
+    remote's FULL message is printed and nothing else is touched.
+    """
+    from rework.orchestrator.delivery import retry_pr
+
+    async def go() -> tuple[bool, str]:
+        from rework.config import Config, open_store_from_config
+        from rework.kernel.events.bus import InProcessEventBus
+
+        store = await open_store_from_config(Config.from_env())
+        try:
+            return await retry_pr(store, InProcessEventBus(store), mission_id)
+        finally:
+            await store.aclose()
+
+    ok, detail = asyncio.run(go())
+    if ok:
+        typer.echo(f"{mission_id}: PR opened: {detail}")
+        return
+    # the whole error, every line: the useful one is the LAST (git prints the
+    # rejection reason after the remote banner and the forge's hints)
+    typer.echo(f"{mission_id}: PR still not delivered:\n{detail}", err=True)
+    raise typer.Exit(1)
+
+
+# the same command under the `mission` group the docs use (`rework mission
+# retry-pr ID`); the top-level spelling stays, like every other mission command
+mission_app.command("retry-pr")(retry_pr_cmd)
+
+
 @app.command()
 def complaints(
     status: str | None = typer.Option(
@@ -1548,34 +1592,60 @@ def parse_target_flag(argv: list[str]) -> tuple[str | None, list[str]]:
     Global options belong BEFORE the subcommand, so the scan stops at the
     first non-flag token (the command name) or at `--`: `rework --target
     sandbox ls` parses to ("sandbox", ["ls"]), while `rework ls --target
-    sandbox` parses to (None, ["ls", ...]) — main() turns that into a usage
+    sandbox` parses to (None, ["ls", ...]); main() turns that into a usage
     error before anything is applied (the silent wrong-target run this
     feature exists to prevent). The NAME itself is only consumed when it
     cannot be a command: anything starting with `-` (like `--help`) is left
     alone, so `rework --target --help` is a missing name, not a target
     literally called `--help`. Returns (name_or_None, rest): rest is the
-    argv AFTER the parsed global prefix (empty = no subcommand, the TUI).
+    argv with the parsed global prefix removed. Every OTHER leading flag is
+    KEPT in rest, in its original order: an empty rest means "no arguments,
+    open the TUI", so silently dropping `--help` / `-h` made `rework --help`
+    look like a bare `rework` and start the dashboard instead of printing help.
+    Because they are kept, rest's FIRST element is not necessarily the
+    subcommand: `rework --help update` parses to ["--help", "update"], so the
+    command name comes from _subcommand() and never from rest[0]. A glued
+    short option such as `-n3` is kept in rest like any other foreign leading
+    flag (it used to be skipped together with its glued value).
     """
+    kept: list[str] = []  # leading flags that are not ours, preserved in order
     i = 0
     while i < len(argv):
         arg = argv[i]
         if arg == "--":
-            return None, argv[i:]  # end of options, by definition
+            return None, kept + argv[i:]  # end of options, by definition
         if arg.startswith("-") and arg != "-":
             if arg == "--target":
                 if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
-                    return argv[i + 1], argv[i + 2 :]
-                return None, argv[i:]  # a missing NAME: env/default decide
+                    return argv[i + 1], kept + argv[i + 2 :]
+                return None, kept + argv[i:]  # a missing NAME: env/default decide
             if arg.startswith("--target="):
                 value = arg[len("--target=") :]
-                return (value or None), argv[i + 1 :]  # --target= is a missing name
-            if not arg.startswith("--") and len(arg) > 2:
-                i += 2  # a short option with a value glued on (-n3), not a flag
-            else:
-                i += 1  # some other global flag; its args are not ours to parse
+                return (value or None), kept + argv[i + 1 :]  # --target= is a missing name
+            # some other global flag (--help, -h, a glued short option like
+            # -n3): kept in rest, never dropped, so typer decides what it means
+            kept.append(arg)
+            i += 1
             continue
-        return None, argv[i:]  # the subcommand: the global-option scan is over
-    return None, []
+        return None, kept + argv[i:]  # the subcommand: the global-option scan is over
+    return None, kept
+
+
+def _subcommand(rest: list[str]) -> str:
+    """The first NON-FLAG token of rest: the subcommand itself, or "" when rest
+    is flags only. Leading flags are kept in rest, so rest[0] can be `--help`.
+
+    Stops at the `--` end-of-options marker and yields "": every token after
+    `--` is a positional, so none of them can claim to be the subcommand. That
+    is what click resolves (`rework -- serve` runs no `serve` command), so the
+    helper mirrors click instead of reading `serve` out of the operands.
+    """
+    for arg in rest:
+        if arg == "--":
+            return ""
+        if not arg.startswith("-"):
+            return arg
+    return ""
 
 
 def _subcommand_names() -> set[str]:
@@ -1604,7 +1674,7 @@ def main() -> None:
     # `rework update --target NAME` is NOT the global target flag: the update
     # command owns a --target of its own (a remote host to update over ssh), so
     # the after-the-subcommand rejection below must not fire for it.
-    _sub = _rest[0] if _rest else ""
+    _sub = _subcommand(_rest)
     if _explicit and _flag is None and _sub != "update":
         # --target on the argv line without a consumable NAME: either it was
         # left off entirely (`rework --target --help`, `rework --target=`, the
@@ -1641,7 +1711,7 @@ def main() -> None:
 
         run_tui()
         return
-    if _rest[0] not in ("serve", "logs", "library-mcp"):
+    if _sub not in ("serve", "logs", "library-mcp"):
         from rework.logs import setup_logging
 
         setup_logging("cli")

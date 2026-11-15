@@ -129,14 +129,27 @@ specified in `docs/tui/DESIGN.md`; every view is built from that kit.
 
 - **Work**: Claude-Code-style conversation with the orchestrator. Saved chats
   on the left (persisted in the store, synced across devices); the transcript
-  shows your messages, the orchestrator's tool calls and results live, proposal
-  cards (Launch / Scrap; nothing runs until you confirm, or type "yes") and
-  live mission cards (status, last steps, inline gate answers, pause/cancel).
-  Project / model / effort knobs under the prompt. Opens with no chat selected.
+  shows your messages, the orchestrator's tool calls and results live, one
+  proposal card per proposed mission (each with its own Launch and Scrap, so a
+  request that spans separate pieces of work never has to squeeze all of it
+  through one card), a "Launch all" action on the group, and live mission cards
+  (status, last steps, inline gate answers, pause/cancel). Nothing runs until
+  you confirm: typing "yes" launches every pending proposal and "no" scraps
+  every one of them. Project / model / effort knobs under the prompt. Opens
+  with no chat selected.
 - **Dashboard**: overview (stats strip, projects, missions grouped needs-you →
-  running → paused → recent) and a mission drill-down: header + flow strip,
+  queued → running → paused → recent) and a mission drill-down: header + flow strip,
   sessions (one per run) on the left, and Trajectory / Graph (LangGraph-style
   node view, click a node to focus its run) / Output / Diff / Report / Gates.
+  A section is derived from the store, never from a remembered label: **needs
+  you** means the mission has an OPEN gate (any status), **running** means
+  status `running` or `awaiting_gate` with no open gate left (its gate was
+  already decided, so nobody owes an answer), **queued** means status `pending`
+  (waiting for a runner slot, not for you), **paused** means `on_hold`, and
+  **recent** collects `done`, `failed` and `cancelled`. The stats strip and the
+  per-project badges count those same sections through one helper, so the
+  Dashboard cannot list a mission under "needs you" while the Gates tab is
+  empty.
 - **Gates**: inbox oldest-first with full decision context (mission, the run it
   unblocks, the diff + audit verdict for ship gates, recent steps) and an answer
   box; the typed answer reaches the paused role as `Gate.decision`.
@@ -154,6 +167,114 @@ and `ReworkApp._handle_exception` turns surprises into toasts. Gate
 notifications are configurable (`REWORK_NOTIFY=toast,bell,os|none`, or File ›
 Settings). What the TUI still needs from the engine is tracked in
 `docs/plans/m7-dogfood-loop.md`.
+
+**What a poll carries.** The poll is small on purpose (one open TUI over a
+tailnet once pulled 3 MB/s, 17.5 GB in 1h40m, from
+`SELECT * FROM missions ... LIMIT 200` every 2 s):
+
+- *Slim mission list.* The snapshot's missions come from
+  `StateStore.list_missions_light` (sqlite and postgres): id, title, objective
+  clipped to 200 chars, status, project_id, chat_id, priority, created_at,
+  updated_at, repo_path. `plan` and `result` are not selected; on those rows
+  `Mission.light` is True and both are `None` (never a silent `{}`). `repo_path`
+  stays because the PR preview default reads it off the snapshot. Same
+  filters, order and limit as `list_missions`, which still returns full rows.
+  `Mission.light` is excluded from serialization, so it never reaches an API
+  payload or persisted JSON. Because the objective is clipped, dashboard search
+  matches only the first 200 characters of the objective in the list: a token
+  that appears only after character 200 is not found (the full row, opened,
+  still has all of it).
+- *Full row on demand.* A view that needs `plan` or `result` calls
+  `TuiData.get_mission`: the dashboard when a mission is opened (kept on
+  `full_mission`, refetched only when the row's `updated_at` moves, which any
+  plan or result write bumps), the Work view's mission cards, and the Gates
+  view when a gate is selected. Never per keypress or per tick.
+- *List row.* The dashboard's mission row no longer shows the plan label
+  (`fix`, `auto orchestrated`): that was the one list-level read of `plan`.
+  The label is still in the mission header and on Work cards.
+- *Gates are left alone.* A gate record carries only bounded fields (question,
+  decision, note, spec); the diff and audit verdict are fetched per selection.
+- *Repaint skip.* `Hub` compares missions, gates, projects, chats, spend and
+  the online/error state with the previous broadcast and skips the broadcast
+  when nothing changed (the first refresh always broadcasts). Views get
+  `on_tick` instead, so live detail polls (events, steps, shared chats,
+  history, cost, the library index) keep running without repainting the lists.
+  The live paints respect the skip too: an open dashboard mission repaints its
+  header, run list and tabs only when something they are drawn from changed
+  (mission status or `updated_at`, runs, budget, gates, per-run cost, event
+  count, selected run or tab), and a live Work card repaints only when its
+  spend moved (new events paint themselves). The Cost view reloads at most
+  every 60 s regardless of ticks; the Library recheck is one index read per
+  poll that repaints only when its fingerprint moves.
+- *Time text.* `ago()`/`duration()` text would freeze on an unchanged
+  snapshot, so `on_tick` repaints the text that carries time every
+  `TIME_REPAINT_SECONDS` (20 s, a monotonic stamp in `View.time_repaint_due`,
+  reset by every `on_snapshot`): the dashboard overview rows, the open mission
+  (header, runs, tabs), the gates list and the selected gate, the Work mission
+  cards and the Work chat list, and the Library list and reader line. Nothing
+  else repaints on a tick. Absolute values (Cost, and the artifact line, which shows a fixed
+  run duration `wall_s` and no relative time) do not move and are not
+  repainted.
+- *Idle backoff.* The app timer ticks every `poll_seconds` (2 s). A tick polls
+  when `now - last_poll >= interval`, less one tenth of `poll_seconds` for
+  timer jitter, where `interval` is `poll_interval()`: `poll_seconds` while the
+  owner is active, `max(poll_seconds, IDLE_POLL_SECONDS)` once they have been
+  away (`reload.IDLE_SECONDS` = 30 s with no key, no modal, no chat turn).
+  `last_poll` moves only in the branch that polls, so a skipped tick cannot
+  starve the next poll. In numbers: active, every tick polls (every 2 s); after
+  30 s idle the app still polls, every 10 s (every 5th tick, 6 a minute, an
+  overnight TUI keeps discovering missions, gates and offline/online changes);
+  a key after idle polls at once (`_kick(force=True)`) and restores 2 s, as does
+  ctrl+r. The offline backoff in `Hub.refresh` composes with it (it only ever
+  delays a poll further). A tick that lands during teardown (`App.is_running`
+  false, or `_closing` set first thing in `on_unmount`) polls nothing.
+- *Failed full-row fetch.* If `get_mission` fails for an open mission or a
+  Work card, the header shows the light facts and "could not load plan/result
+  (retrying)". The same notice is appended to a stale full row when a refetch
+  fails after a successful open (the old plan stays visible, marked stale). The retry backs off (2 s, 4 s, ... capped at 30 s, the
+  `Hub._next_try` idiom) so an unreadable row is not re-SELECTed on every
+  tick, and recovers on its own when the fetch succeeds.
+
+`scripts/measure_poll_bytes.py` prints bytes per poll before and after.
+
+### Several missions from one conversation
+
+One owner request can span separate pieces of work (a bug in one repo, a doc in
+another), so the orchestrator may call `propose_mission` more than once in one
+turn. The Work tab then shows one proposal card per call, each with its own
+Launch and Scrap, plus a "Launch all" action on the group.
+
+- `OrchestratorChat.proposals` is the pending list, in call order. A later turn
+  that proposes REPLACES the pending list (`self.proposal` remains a
+  compatibility view of the first entry).
+- A typed "yes" launches every pending proposal and a typed "no" scraps every
+  pending one; `ChatResult.launched_all` / `ChatResult.scrapped_all` carry that
+  signal so the UI never has to re-derive which proposal was meant.
+- Launching or scrapping ONE card settles only that card; its siblings stay
+  pending. Each launch still goes through `Conversation.launch` ->
+  `missions.create_mission`, so the per-mission kwargs are unchanged.
+- `Chat.mission_id` stays a scalar and keeps the FIRST mission the chat
+  launched (a non-NULL value is never overwritten). It is only the denormalised
+  pointer the chat list uses for a status glyph; `Mission.chat_id` is the real
+  one-chat-to-many-missions link that `WorkView.active_missions()` queries.
+- Proposals have no table of their own: they ride in `chat_messages.body` as the
+  assistant message's `tool_calls`, so several proposals replay from one stored
+  message with no migration. A launch note reads
+  `launched <mission id> · <plan> · <objective>`; on replay a proposal is settled
+  when such a note names its plan AND its objective (an objective alone cannot
+  tell two proposals apart, and a chat may hold two with the same objective and
+  a different plan because the model re-proposes when the owner changes their
+  mind). A note with only two fields is a legacy `launched <id> · <objective>`
+  note: its second field is the objective, so it settles on the objective alone.
+  A legacy bare `launched <id>` note settles the OLDEST still-pending proposal.
+  In every case a note that matches nothing settles the oldest pending proposal,
+  and two proposals that are identical settle the oldest of them (they are
+  interchangeable). Everything left pending is restored into the engine by
+  `Conversation.ensure_engine`, so a reloaded chat shows and can launch all of
+  them. Replay is idempotent: the Work view keeps a high-water mark of the
+  `chat_messages` ids it has already rendered, per store connection, so
+  reopening a saved chat or reconnecting the store never paints a pending
+  proposal card twice.
 
 ### The Library
 

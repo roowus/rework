@@ -140,6 +140,9 @@ class CostView(View):
         if self.rw.active_tab == "cost" and time.time() - self._loaded_at > 60:
             self._load()
 
+    def on_tick(self, snap: Snapshot) -> None:
+        self.on_snapshot(snap)
+
     def on_chip_group_changed(self, event: ChipGroup.Changed) -> None:
         event.stop()
         if event.group.id == "cost-range":

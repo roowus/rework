@@ -17,6 +17,7 @@ import psycopg
 from psycopg.rows import DictRow
 
 from rework.kernel.state.records import (
+    MISSION_LIGHT_COLUMNS,
     BudgetState,
     Charge,
     Chat,
@@ -317,6 +318,23 @@ class PostgresStore:
         )
 
     @staticmethod
+    def _mission_light(row: DictRow) -> Mission:
+        # plan/result were not selected: None, and `light` says so
+        return Mission(
+            id=row["id"],
+            objective=row["objective"],
+            repo_path=row["repo_path"],
+            project_id=row["project_id"],
+            chat_id=row["chat_id"],
+            title=row["title"],
+            status=MissionStatus(row["status"]),
+            priority=coerce_priority(row["priority"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            light=True,
+        )
+
+    @staticmethod
     def _project(row: DictRow) -> Project:
         return Project(
             id=row["id"],
@@ -455,6 +473,30 @@ class PostgresStore:
             f"SELECT * FROM missions{clause} ORDER BY created_at DESC LIMIT %s", tuple(params)
         )
         return [self._mission(r) for r in rows]
+
+    @_serialized
+    async def list_missions_light(
+        self,
+        status: MissionStatus | None = None,
+        limit: int = 200,
+        chat_id: str | None = None,
+    ) -> list[Mission]:
+        where: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            where.append("status = %s")
+            params.append(status.value)
+        if chat_id is not None:
+            where.append("chat_id = %s")
+            params.append(chat_id)
+        clause = f" WHERE {' AND '.join(where)}" if where else ""
+        params.append(limit)
+        rows = await self._fetch_all(
+            f"SELECT {MISSION_LIGHT_COLUMNS} FROM missions{clause} "
+            "ORDER BY created_at DESC LIMIT %s",
+            tuple(params),
+        )
+        return [self._mission_light(r) for r in rows]
 
     @_serialized
     async def next_pending_missions(self, limit: int = 100) -> list[Mission]:
