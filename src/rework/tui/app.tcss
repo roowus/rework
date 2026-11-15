@@ -290,6 +290,8 @@ MarkdownH1, MarkdownH2, MarkdownH3 { background: transparent; color: $fg; }
 #m-pages { height: 1fr; }
 .doc { height: 1fr; padding: 0 2 1 2; }
 #m-gates-body { height: auto; }
+#m-msgbar { height: 1; padding: 0 2; margin: 0 0 1 0; }
+#m-msgbar Input { width: 1fr; }
 
 .graphview { height: 1fr; padding: 1 2; align-horizontal: left; }
 .gnode {

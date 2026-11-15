@@ -38,6 +38,7 @@ from rework.kernel.state.records import (
 from rework.kernel.state.records import run_id as make_run_id
 from rework.logs import bind
 from rework.nodes.report_sections import blocking_findings, open_blockers
+from rework.orchestrator.engine import MAX_SEND_BACKS
 
 log = logging.getLogger("rework.orchestrator")
 
@@ -721,43 +722,64 @@ class MissionOrchestrator:
             self.finished = self._recorded_finish()
             if self.finished is None:
                 await self._finish_interrupted_turn()
-        if self.finished is None:
-            await self._loop()
-        if self.finished is None:
-            return  # cancelled by the owner or the burn gate
-        outcome, summary = self.finished
-        results = await self._results_by_role()
-        audit = results.get("audit")
-        ship, pr_url = (None, None)
-        if outcome == "done":
-            # Persist the orchestrator's finish summary and accepted_findings
-            # into mission.result BEFORE _final_gates runs, so _create_pr /
-            # _pr_body reads the real summary instead of falling back to the
-            # coder's handoff text. (Fix: PR #21 — _synthesize was called after
-            # _final_gates, so result["summary"] was empty when _pr_body ran.)
-            _current = await self.r._store.get_mission(self.mid)
-            _pre = dict((_current.result if _current else None) or {})
-            if summary:
-                _pre["summary"] = summary
-            if self.accepted_findings:
-                _pre["accepted_findings"] = self.accepted_findings
-            await self.r._store.update_mission(self.mid, result=_pre)
-            ship, pr_url = await self.r._final_gates(
-                self.mission,
-                results,
-                audit.artifact if audit else None,
-                ask_before_pr=self.ask_before_pr,
-                reason=self.pr_reason,
-                gate_category=self.pr_gate_category,
+        send_backs = 0
+        while True:
+            if self.finished is None:
+                await self._loop()
+            if self.finished is None:
+                return  # cancelled by the owner or the burn gate
+            outcome, summary = self.finished
+            results = await self._results_by_role()
+            audit = results.get("audit")
+            ship, pr_url = (None, None)
+            if outcome == "done":
+                # Persist the orchestrator's finish summary and accepted_findings
+                # into mission.result BEFORE _final_gates runs, so _create_pr /
+                # _pr_body reads the real summary instead of falling back to the
+                # coder's handoff text. (Fix: PR #21 — _synthesize was called after
+                # _final_gates, so result["summary"] was empty when _pr_body ran.)
+                _current = await self.r._store.get_mission(self.mid)
+                _pre = dict((_current.result if _current else None) or {})
+                if summary:
+                    _pre["summary"] = summary
+                if self.accepted_findings:
+                    _pre["accepted_findings"] = self.accepted_findings
+                await self.r._store.update_mission(self.mid, result=_pre)
+                ship, pr_url, sent_back = await self.r._final_gates(
+                    self.mission,
+                    results,
+                    audit.artifact if audit else None,
+                    ask_before_pr=self.ask_before_pr,
+                    reason=self.pr_reason,
+                    gate_category=self.pr_gate_category,
+                )
+                if sent_back:
+                    # the owner sent the work back: the engine already queued their
+                    # feedback as an owner message and flipped the mission to
+                    # RUNNING. Un-finish and re-enter the turn loop so the
+                    # orchestrator revises, re-audits and reaches a FRESH gate.
+                    send_backs += 1
+                    if send_backs > MAX_SEND_BACKS:
+                        await self.r._synthesize(
+                            self.mid,
+                            None,
+                            outcome="failed",
+                            summary=f"owner sent the mission back more than {MAX_SEND_BACKS} "
+                            "times; giving up",
+                        )
+                        return
+                    await self._note(f"owner sent the mission back (#{send_backs}); resuming")
+                    self.finished = None
+                    continue
+            self.r._pr_url = pr_url
+            await self.r._synthesize(
+                self.mid,
+                ship,
+                outcome=outcome,
+                summary=summary,
+                accepted_findings=self.accepted_findings,
             )
-        self.r._pr_url = pr_url
-        await self.r._synthesize(
-            self.mid,
-            ship,
-            outcome=outcome,
-            summary=summary,
-            accepted_findings=self.accepted_findings,
-        )
+            return
 
     async def _loop(self) -> None:
         idle = 0
@@ -965,6 +987,8 @@ class MissionOrchestrator:
             m.get("tool_call_id"): m.get("content") for m in self.history if m.get("role") == "tool"
         }
         for message in reversed(self.history):
+            if message.get("role") == "user" and message.get("owner_seq"):
+                return None  # the owner spoke after any finish (send-back): not finished
             for call in message.get("tool_calls") or []:
                 if call.get("name") == "finish" and answered.get(call.get("id")) == "finished":
                     args = call.get("arguments") or {}

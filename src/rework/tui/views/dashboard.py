@@ -234,6 +234,12 @@ class DashboardView(View):
                                 yield Markdown("", id="m-report-body")
                             with VerticalScroll(id="m-gates", classes="doc"):
                                 yield Vertical(id="m-gates-body")
+                with Horizontal(id="m-msgbar"):
+                    yield Input(
+                        placeholder="Message this mission's orchestrator…  (enter to send)",
+                        id="m-msg",
+                    )
+                    yield Btn("Send", "msg-send", variant="primary")
 
     def on_mount(self) -> None:
         self._paint_head()
@@ -475,6 +481,10 @@ class DashboardView(View):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Enter in the bar: run the plain filter now, or the ✦ ranking when the
         ✦ button is armed. Down moves into the results, as in the Library."""
+        if event.input.id == "m-msg":
+            event.stop()
+            self._send_message()
+            return
         if event.input.id != "mission-search":
             return
         event.stop()
@@ -691,6 +701,9 @@ class DashboardView(View):
             return
         event.stop()
         if self._gate_button(event.btn):
+            return
+        if event.action == "msg-send":
+            self._send_message()
             return
         verb = event.action
         if verb == "copy-id":
@@ -1158,6 +1171,27 @@ class DashboardView(View):
                         Btn("Answer in Gates…", "gate-answer", variant="ghost", payload=gate.id),
                     ]
                 )
+
+    def _send_message(self) -> None:
+        box = self.query_one("#m-msg", Input)
+        text = box.value.strip()
+        if not text or not self.mission_id:
+            return
+        self.run_worker(self._deliver_message(self.mission_id, text), group="owner-message")
+
+    async def _deliver_message(self, mission_id: str, text: str) -> None:
+        """Talk to the OPEN mission, whatever chat it came from: the shared
+        owner-message publisher (ADR 0007), the same one `rework message` uses."""
+        from rework.missions import send_owner_message
+
+        try:
+            await send_owner_message(mission_id, text, store=await self.hub.data.store())
+        except Exception as exc:
+            self.toast(f"Could not reach the mission: {clip(str(exc), 200)}", severity="error")
+            return
+        with self.painting():
+            self.query_one("#m-msg", Input).value = ""
+        self.toast(f"Sent to {mission_id}'s orchestrator")
 
     def _gate_button(self, btn: Btn) -> bool:
         if not btn.action.startswith("gate-"):

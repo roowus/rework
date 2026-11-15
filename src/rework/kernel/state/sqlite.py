@@ -508,12 +508,15 @@ class SqliteStore:
         approved: bool,
         note: str | None = None,
         decision: dict[str, Any] | None = None,
+        send_back: bool = False,
     ) -> Gate | None:
         await self._db.execute(
             "UPDATE gates SET status = ?, decision_note = ?, decision = ?, decided_at = ?"
             " WHERE id = ? AND status = ?",
             (
-                GateStatus.APPROVED.value if approved else GateStatus.REJECTED.value,
+                GateStatus.SENT_BACK.value
+                if send_back
+                else (GateStatus.APPROVED.value if approved else GateStatus.REJECTED.value),
                 note,
                 _j(decision),
                 time.time(),

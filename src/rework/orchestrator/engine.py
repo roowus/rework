@@ -55,6 +55,9 @@ from rework.roles.registry import RoleRegistry
 
 log = logging.getLogger("rework.engine")
 
+# how many times the owner may send a mission back from a final gate in one run
+MAX_SEND_BACKS = 5
+
 DEFAULT_PLAN: dict[str, Any] = {"steps": [{"step": "echo", "role": "echo"}]}
 
 # a callable returning (checkpointer, close_fn) for one run's checkpoint thread
@@ -615,7 +618,39 @@ class MissionRunner:
         return f"Project files updated: {', '.join(changed)}", ""
 
     async def _run_steps(self, mission: Mission) -> None:
-        steps = list(_plan_steps(mission))
+        """The plan's steps then the final gates, looped: an owner SEND-BACK at a
+        final gate re-runs the plan with the owner's feedback in every step's
+        context and reaches the final gates again, where a FRESH gate opens.
+        Bounded by MAX_SEND_BACKS so a never-satisfied owner cannot spin it."""
+        base_steps = list(_plan_steps(mission))
+        self._send_back_feedback = ""
+        for attempt in range(MAX_SEND_BACKS + 1):
+            steps = base_steps
+            if attempt:
+                steps = [
+                    {
+                        **s,
+                        "context": {
+                            **(s.get("context") or {}),
+                            "_revision": 1000 + attempt,
+                            "owner_feedback": self._send_back_feedback,
+                        },
+                    }
+                    for s in base_steps
+                ]
+            if await self._run_steps_once(mission, list(steps)) != "sent_back":
+                return
+        await self._synthesize(
+            mission.id,
+            None,
+            outcome="failed",
+            summary=f"owner sent the mission back more than {MAX_SEND_BACKS} times; giving up",
+        )
+
+    async def _run_steps_once(self, mission: Mission, steps: list[dict[str, Any]]) -> str:
+        """One pass: all steps, then the final gates. Returns "sent_back" when
+        the owner sent the work back (mission is RUNNING again, not
+        synthesized), else "done" (synthesized)."""
         results: dict[str, Run] = {}  # step_name -> latest terminal run
         audit_rounds: dict[str, int] = {}
         last_audit_artifact: dict[str, Any] | None = None
@@ -625,18 +660,18 @@ class MissionRunner:
             signal = await self._owner_signal()
             if signal == "cancelled":
                 await self._synthesize(mission.id, ship_decision=None)
-                return
+                return "done"
             if signal == "paused":
                 if await self._pause_until_resumed() == "cancelled":
                     await self._synthesize(mission.id, ship_decision=None)
-                    return
+                    return "done"
             step = steps[index]
             step_name = str(step.get("step") or step["role"])
             runs = await self._dispatch_step(mission, step)
             pump_result = await self._pump_until_terminal(runs)
             if pump_result == "cancelled":
                 await self._synthesize(mission.id, ship_decision=None)
-                return
+                return "done"
             fresh = await self._store.get_run(runs[-1].id)
             if fresh is not None:
                 results[step_name] = fresh
@@ -703,9 +738,14 @@ class MissionRunner:
 
         # the mechanical path has no orchestrator to ask for the gate, so it
         # uses _final_gates' defaults (the plan and the project setting decide)
-        ship_decision, pr_url = await self._final_gates(mission, results, last_audit_artifact)
+        ship_decision, pr_url, send_back_status = await self._final_gates(
+            mission, results, last_audit_artifact
+        )
+        if send_back_status:
+            return "sent_back"
         self._pr_url = pr_url
         await self._synthesize(mission.id, ship_decision)
+        return "done"
 
     async def _final_gates(
         self,
@@ -716,7 +756,7 @@ class MissionRunner:
         ask_before_pr: bool = False,
         reason: str = "",
         gate_category: str = "",
-    ) -> tuple[bool | None, str | None]:
+    ) -> tuple[bool | None, str | None, str | None]:
         """The plan's fixed final human decisions (ship / open_pr), shared by
         the mechanical runner and the orchestrator (ADR 0007: the model never
         decides these). Returns (ship_decision, pr_url)."""
@@ -749,6 +789,9 @@ class MissionRunner:
             if gate.status == GateStatus.OPEN:
                 await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
             ship_decision = await self._gate_decision(mission.id, gate.id)
+            if ship_decision is None:
+                # Send-back: mission back to running, don't synthesize
+                return None, None, "sent_back"
             if ship_decision:
                 await self._deliver_branch(mission, results)
 
@@ -814,12 +857,15 @@ class MissionRunner:
             if gate.status == GateStatus.OPEN:
                 await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
             pr_approved = await self._gate_decision(mission.id, gate.id)
+            if pr_approved is None:
+                # Send-back: mission back to running, don't synthesize
+                return None, None, "sent_back"
             if pr_approved:
                 pr_url = await self._create_pr(mission, results)
         elif publishes:
             pr_url = await self._create_pr(mission, results)
 
-        return ship_decision, pr_url
+        return ship_decision, pr_url, None
 
     async def _deliver_branch(self, mission: Mission, results: dict[str, Run]) -> None:
         """Honor the project's `results` setting on ship (ADR 0005): for a
@@ -1107,29 +1153,43 @@ class MissionRunner:
         docs/ops.md#rewvis: a mission parked at a gate, waiting for the owner or
         on hold must not occupy a REWORK_CONCURRENCY slot, or an approved gate
         waits behind a mission that is doing nothing at all. The slot comes back
-        at the back of the queue before work resumes (MissionSlot.while_waiting).
+        ahead of never-started missions before work resumes
+        (MissionSlot.while_waiting).
         """
         if self._slot is None:
             return nullcontext()
         return self._slot.while_waiting()
 
-    async def _gate_decision(self, mission_id: str, gate_id: str) -> bool:
-        """Read the decision from the gate ROW (the source of truth). The
-        row-update and its event commit separately, so the event log can lag
+    async def _gate_decision(self, mission_id: str, gate_id: str) -> bool | None:
+        """Read the decision from the gate ROW (the source of truth). Returns:
+        - True if APPROVED
+        - False if REJECTED
+        - None if SENT_BACK (the mission returns to running with the owner's
+          feedback queued as an owner message)
+
+        The row-update and its event commit separately, so the event log can lag
         the empty-open-gates check by a beat; polling the row closes that race
         (found as a rare CI-only 'ship rejected despite approval')."""
+        from rework.missions import send_owner_message
+
         async with self._waiting():
             while True:
                 gate = await self._store.get_gate(gate_id)
                 if gate is not None and gate.status != GateStatus.OPEN:
-                    decided = gate.status == GateStatus.APPROVED
                     break
                 await asyncio.sleep(self._poll)
             # The decision is in: nothing waits for the owner any more. Say so on
             # the ROW now, before the mission waits for its slot back, or the TUI
             # keeps listing it under "needs you" with an empty Gates tab.
             await self._clear_awaiting_gate(mission_id)
-        return decided
+        if gate.status == GateStatus.SENT_BACK:
+            feedback = str(gate.decision_note or "Mission sent back for revision")
+            self._send_back_feedback = feedback
+            await send_owner_message(mission_id, feedback, store=self._store)
+            # back to running, so the orchestrator reaches _final_gates again
+            await self._store.update_mission(mission_id, status=MissionStatus.RUNNING)
+            return None
+        return gate.status == GateStatus.APPROVED
 
     async def _clear_awaiting_gate(self, mission_id: str) -> None:
         """AWAITING_GATE -> RUNNING once no gate of the mission is open. A
@@ -1505,14 +1565,24 @@ class MissionRunner:
         return gates[-1] if gates else None
 
     async def _latest_gate_of_kind(self, kind: GateKind) -> Any:
-        """The mission's most recent gate of this kind, any status (ship and
+        """The mission's most recent gate of this kind that is reusable (ship and
         open_pr recovery: a restart must read the EXISTING gate, not open a
         duplicate for a decision the owner already made).
+
+        Reusable gates are: OPEN (naturally reusable, awaiting decision),
+        APPROVED/REJECTED (restart-safe: a second run after approval or
+        rejection should still respect that decision), but NOT SENT_BACK
+        (which must open a fresh gate so the orchestrator can revise and reach
+        this gate again).
 
         Reads the ROWS, not the event stream: the row is committed before any
         event is published, and a 5000-event scan can also miss a gate on a
         long mission while the table cannot."""
-        gates = [g for g in await self._store.list_gates(self.mission_id) if g.kind == kind]
+        gates = [
+            g
+            for g in await self._store.list_gates(self.mission_id)
+            if g.kind == kind and g.status != GateStatus.SENT_BACK
+        ]
         return gates[-1] if gates else None
 
     def escalation_entry(self, current_id: str) -> Any:

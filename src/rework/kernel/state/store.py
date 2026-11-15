@@ -119,10 +119,13 @@ class StateStore(Protocol):
         approved: bool,
         note: str | None = None,
         decision: dict[str, Any] | None = None,
+        send_back: bool = False,
     ) -> Gate | None:
         """Resolve an open gate. `note` is for humans; `decision` is the TYPED
         answer handed to the paused role as its interrupt() result (None =
-        the role receives a plain bool, as before)."""
+        the role receives a plain bool, as before). `send_back` marks the gate
+        `sent_back` instead of approved/rejected (the third final-gate verdict:
+        the mission returns to `running` with the owner's feedback)."""
         ...
 
     async def list_open_gates(self, mission_id: str | None = None) -> list[Gate]: ...
