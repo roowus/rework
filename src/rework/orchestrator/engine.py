@@ -1122,8 +1122,24 @@ class MissionRunner:
             while True:
                 gate = await self._store.get_gate(gate_id)
                 if gate is not None and gate.status != GateStatus.OPEN:
-                    return gate.status == GateStatus.APPROVED
+                    decided = gate.status == GateStatus.APPROVED
+                    break
                 await asyncio.sleep(self._poll)
+            # The decision is in: nothing waits for the owner any more. Say so on
+            # the ROW now, before the mission waits for its slot back, or the TUI
+            # keeps listing it under "needs you" with an empty Gates tab.
+            await self._clear_awaiting_gate(mission_id)
+        return decided
+
+    async def _clear_awaiting_gate(self, mission_id: str) -> None:
+        """AWAITING_GATE -> RUNNING once no gate of the mission is open. A
+        mission the owner paused or cancelled meanwhile is left alone."""
+        mission = await self._store.get_mission(mission_id)
+        if mission is None or mission.status != MissionStatus.AWAITING_GATE:
+            return
+        if await self._store.list_open_gates(mission_id):
+            return
+        await self._store.update_mission(mission_id, status=MissionStatus.RUNNING)
 
     async def _dispatch_step(self, mission: Mission, step: dict[str, Any]) -> list[Run]:
         role = str(step["role"])

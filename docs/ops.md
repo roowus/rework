@@ -476,10 +476,16 @@ command (`role commands run in a systemd system scope with MemoryMax=5G: …`, o
 commands run'`.
 
 `REWORK_CONCURRENCY` caps WORKING missions only. A mission that is waiting — at
-a gate, for the owner, or on hold — gives its slot back and takes a new one at
-the back of the queue before it works again. Before that, with
+a gate, for the owner, or on hold — gives its slot back and takes a new one
+before it works again, AHEAD of missions that never started
+(`PrioritySlots`; order is FIFO inside each class). Before that, with
 `REWORK_CONCURRENCY=1`, an approved `open_pr` gate could sit for hours behind a
-mission that was merely parked at its own gate.
+mission that was merely parked at its own gate, and on 2026-11-14 behind every
+never-started mission even at 5 slots (the mission also kept saying
+`awaiting_gate` while the Gates tab was empty). The engine now sets the mission
+back to `running` the moment its last gate is decided, and the daemon corrects
+any `awaiting_gate` row with no open gate on every poll (a log line and an INFO
+event say so).
 
 A sqlite deployment keeps its historical concurrency of 1 unless the env says
 otherwise; Postgres deployments get the host-aware default.
