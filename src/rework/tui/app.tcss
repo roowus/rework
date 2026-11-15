@@ -291,6 +291,8 @@ MarkdownH1, MarkdownH2, MarkdownH3 { background: transparent; color: $fg; }
 #m-pages { height: 1fr; }
 .doc { height: 1fr; padding: 0 2 1 2; }
 #m-gates-body { height: auto; }
+#m-msgbar { height: 1; padding: 0 2; margin: 0 0 1 0; }
+#m-msgbar Input { width: 1fr; }
 
 .graphview { height: 1fr; padding: 1 2; align-horizontal: left; }
 .gnode {
@@ -306,7 +308,9 @@ MarkdownH1, MarkdownH2, MarkdownH3 { background: transparent; color: $fg; }
 .gnode.-s-failed, .gnode.-s-rejected { border: round $danger; }
 .gnode.-s-halted_escalated, .gnode.-s-open { border: round $warn; }
 .gnode.-selected { background: $accent-dim 50%; }
-.gedge { width: 64; height: 2; content-align: center top; text-align: center; color: $faint; }
+/* auto, never 2: a labelled edge is '│ / ▼ / label' (3 rows) and a fixed
+   height silently clipped the label off the screen. */
+.gedge { width: 64; height: auto; content-align: center top; text-align: center; color: $faint; }
 
 /* ---------------------------------------------------------------- library */
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -38,6 +39,7 @@ from rework.kernel.state.records import (
 from rework.kernel.state.records import run_id as make_run_id
 from rework.logs import bind
 from rework.nodes.report_sections import blocking_findings, open_blockers
+from rework.orchestrator.engine import MAX_SEND_BACKS
 
 log = logging.getLogger("rework.orchestrator")
 
@@ -56,6 +58,21 @@ PROVIDER_FAILURE_LIMIT = 2  # failed runs on one model before spawn_role refuses
 STRICTNESS_LEVELS = ("light", "standard", "strict")
 DEFAULT_STRICTNESS = "standard"
 
+# The ONLY reasons a PR gate may be asked for (issue #36, owner decision
+# 2026-11-14: most fixes -- especially ones the owner asked for -- ship with no
+# gate). Single source of truth: the finish tool's schema enum, its validation
+# and the prompt text all read this.
+GATE_CATEGORIES: dict[str, str] = {
+    "data_loss": "data loss or a destructive data migration",
+    "security": "security, credentials, auth or permissions",
+    "money": "money (billing, payments, paid resources)",
+    "production_infrastructure": (
+        "irreversible or production infrastructure (deploys, DNS, cloud resources, "
+        "deleting user files)"
+    ),
+}
+GATE_CATEGORY_NAMES = ", ".join(GATE_CATEGORIES)
+
 
 def model_policy() -> tuple[str, str]:
     """(default model id, escalation model id) from config, read at RUNTIME so
@@ -67,9 +84,13 @@ def model_policy() -> tuple[str, str]:
 
 
 def render(text: str) -> str:
-    """Fill the model-policy placeholders in prompt/tool text from config."""
+    """Fill the model-policy and gate-category placeholders in prompt/tool text."""
     default, escalation = model_policy()
-    return text.replace("$DEFAULT_MODEL", default).replace("$ESCALATION_MODEL", escalation)
+    return (
+        text.replace("$DEFAULT_MODEL", default)
+        .replace("$ESCALATION_MODEL", escalation)
+        .replace("$GATE_CATEGORIES", GATE_CATEGORY_NAMES)
+    )
 
 
 def _render_schema(node: Any) -> Any:
@@ -126,9 +147,34 @@ PLAYBOOKS: dict[str, str] = {
         "medium-or-higher findings you are not willing to ship (ask_owner after three "
         "rounds). Pick each audit's `strictness` from risk (size, blast radius, prior "
         "findings) and re-decide it every round from the latest report, never once for "
-        "the whole mission. After a clean audited done, the ENGINE pushes the last coder's "
-        "branch and opens the pull request itself, with no gate; pass ask_before_pr=true "
-        "with a reason to put the owner in front of it first. Agents never merge."
+        "the whole mission.\n\n"
+        "After a clean audited done, the ENGINE pushes the last coder's branch and opens "
+        "the pull request itself, with no gate. Asking for a gate is the exception, and it "
+        "is strict: pass ask_before_pr=true ONLY when the change falls in one of these four "
+        "high-stakes categories ("
+        + GATE_CATEGORY_NAMES
+        + "), and set `gate_category` to that category: the `reason` must name it. A change "
+        "the owner asked for is NEVER gated for being large, unusual, touching many files, "
+        "or because the audit had findings you accepted: put those in the finish `summary`, "
+        "which becomes the PR body the owner reads before merging. Agents never merge."
+    ),
+    "draft": (
+        "Document work, not code: the deliverable is WRITING. Usual shape: (1) "
+        "RESEARCH: spawn an investigator whose brief is to gather the facts with "
+        "`web_search` and `fetch_url`, and to RECORD the source url of every claim it "
+        "makes; (2) DRAFT: spawn a coder (it owns the worktree and can write files, so "
+        "use it here too) to write the deliverables into the project as real files "
+        "(Markdown or whatever format the objective asks for), citing those sources; "
+        "(3) REVIEW: spawn an auditor to check the draft claim by claim against the "
+        "cited sources, to check any constraint the objective states (length, format, "
+        "tone, audience), and to check that nothing about the OWNER is invented, "
+        "assumed or guessed -- an unsupported personal detail is a high finding; "
+        "(4) REVISE: while the audit requests changes, respawn the coder with the audit "
+        "findings in its brief and review again (pick each audit's `strictness` from "
+        "risk and re-decide it every round, as with fix). Use `ask_owner` for facts "
+        "only the owner knows (their own details, preferences, commitments) BEFORE "
+        "finalising: never guess them. THERE IS NO BRANCH PUSH AND NO PR: the results "
+        "are the project's files, so the mission finishes with no gate."
     ),
 }
 
@@ -171,13 +217,16 @@ How you work:
   the cap is passed.
 - Call `finish` when the mission's goal is met, or when it cannot be met (say why).
   You never open PRs and never merge. After a clean audited `done` the engine
-  pushes the last coder's branch and opens the PR itself, with no gate. Pass
-  `ask_before_pr=true` plus a short `reason` when the change is risky, unusual,
-  or you are unsure the owner wants it shipped unreviewed: that puts a human
-  decision in front of the PR. A project setting can force that gate always or
-  never. Merging is always the owner's decision. Never spawn a role to push,
-  commit, or open PRs (each coder run also creates a new branch, so a "push"
-  coder only adds noise).
+  pushes the last coder's branch and opens the PR itself, with no gate. Asking
+  for a gate is the strict exception: pass `ask_before_pr=true` plus a `reason`
+  ONLY when the change falls in one of the four high-stakes categories
+  ($GATE_CATEGORIES), and set `gate_category` to it. A change the owner asked for
+  is NEVER gated for being large, unusual, touching many files, or because the
+  audit had findings you accepted: those go in the finish `summary`, which
+  becomes the PR body. A project setting can force that gate always or never.
+  Merging is always the owner's decision. Never spawn a role to push, commit, or
+  open PRs (each coder run also creates a new branch, so a "push" coder only adds
+  noise).
 - Respond with tool calls. Text without a tool call wastes a turn."""
 
 
@@ -380,17 +429,31 @@ _TOOLS: list[ToolSpec] = [
                 "summary": {
                     "type": "string",
                     "description": "What happened, for the owner: what changed, why, and what "
-                    "the audit found. This leads the PR body, so write it for a reviewer.",
+                    "the audit found. This becomes the PR body ('## What changed') that a "
+                    "reviewer reads, so write it for them; a status note such as 'finished', "
+                    "'done' or 'all good' is rejected.",
                 },
                 "ask_before_pr": {
                     "type": "boolean",
-                    "description": "Ask the owner to review before the PR opens. Default false: "
-                    "after a clean audited `done` the engine opens the PR itself.",
+                    "description": "Ask the owner to review before the PR opens. Default "
+                    "false: after a clean audited `done` the engine opens the PR itself. "
+                    "Reserved for the high-stakes categories below; a change the owner "
+                    "asked for is never gated for size, unusualness or accepted findings "
+                    "(say those in `summary`, which becomes the PR body).",
+                },
+                "gate_category": {
+                    "type": "string",
+                    "enum": list(GATE_CATEGORIES),
+                    "description": "Only set when ask_before_pr is true; it names which "
+                    "high-stakes category the change falls in: "
+                    + "; ".join(f"{k} = {v}" for k, v in GATE_CATEGORIES.items())
+                    + ". Anything else belongs in `summary`.",
                 },
                 "reason": {
                     "type": "string",
-                    "description": "Why the owner should look before the PR opens (risky, "
-                    "unusual, unsure it should ship). Ignored unless ask_before_pr is true.",
+                    "description": "Required with ask_before_pr: one sentence naming the "
+                    "high-stakes category and why this change is in it. Ignored unless "
+                    "ask_before_pr is true.",
                 },
                 "accepted_findings": {
                     "type": "array",
@@ -436,6 +499,34 @@ class ToolError(Exception):
     """A tool call the orchestrator got wrong: returned to it as text."""
 
 
+GATE_ASK_REFUSED = (
+    "ask_before_pr is refused: a PR gate is only for the four high-stakes "
+    f"categories ({GATE_CATEGORY_NAMES}). The engine requires BOTH a non-empty "
+    "`reason` (meant to name the category; the owner sees it in the gate question, "
+    "next to the category) AND a `gate_category` from that list. Call finish again "
+    "with both set, or with ask_before_pr unset or false and the engine opens the PR "
+    "without a gate; anything else that makes the owner look twice (a large diff, "
+    "many files, an unusual-looking change, audit findings you accepted) belongs in "
+    "the `summary`, which becomes the PR body."
+)
+
+
+def _gate_ask(args: dict[str, Any]) -> tuple[bool, str, str]:
+    """Read and STRICTLY validate finish's PR-gate request (issue #36): the owner
+    decided most fixes -- especially ones the owner asked for -- ship ungated, so
+    a gate is only for the four high-stakes categories. The mechanical rule is a
+    non-empty `reason` plus a `gate_category` in the enum (the reason is meant to
+    name it, and is shown to the owner beside it). Returns (ask, reason, category);
+    raises ToolError when the ask is invalid."""
+    if not bool(args.get("ask_before_pr")):
+        return False, "", ""
+    reason = str(args.get("reason") or "").strip()
+    category = str(args.get("gate_category") or "").strip().lower()
+    if not reason or category not in GATE_CATEGORIES:
+        raise ToolError(GATE_ASK_REFUSED)
+    return True, reason, category
+
+
 def orchestrator_chat_id(mission_id: str) -> str:
     return f"orch-{mission_id}"
 
@@ -449,6 +540,52 @@ def orchestrator_run_id(mission_id: str) -> str:
 def _short(value: Any, limit: int) -> str:
     text = value if isinstance(value, str) else json.dumps(value, default=str)
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+# a finish summary leads the PR body ("## What changed"), so a status note like
+# "FINISHED ALREADY." (PR #34) is refused: it says nothing to a reviewer.
+_MIN_SUMMARY_CHARS = 20
+_STATUS_WORDS = frozenset(
+    {"done", "finished", "complete", "completed", "merged", "ok", "okay", "lgtm", "good", "shipped"}
+)
+_STATUS_FILLER = frozenset(
+    {
+        "a",
+        "all",
+        "already",
+        "and",
+        "been",
+        "everything",
+        "for",
+        "has",
+        "have",
+        "here",
+        "i",
+        "is",
+        "it",
+        "its",
+        "just",
+        "now",
+        "s",
+        "the",
+        "to",
+        "up",
+        "we",
+    }
+)
+
+
+def _reads_like_status_note(summary: str) -> bool:
+    """`done!`, `FINISHED ALREADY.`, `all good`, `LGTM`: a state, not a change."""
+    words = re.sub(r"[^a-z0-9 ]+", " ", summary.lower()).split()
+    rest = [w for w in words if w not in _STATUS_FILLER]
+    return bool(rest) and all(w in _STATUS_WORDS for w in rest)
+
+
+def _substantive_summary(summary: str) -> bool:
+    """Usable as a PR body: not blank, not very short, not a status note."""
+    text = " ".join(summary.split())
+    return len(text) >= _MIN_SUMMARY_CHARS and not _reads_like_status_note(text)
 
 
 # where an entry's calls go when it leaves base_url unset (the adapters'
@@ -522,6 +659,11 @@ class MissionOrchestrator:
         self._events: list[Any] = []
         self._event_cursor = 0
         self.finished: tuple[str, str] | None = None
+        # the finish this mission had ALREADY recorded when this run loaded, if
+        # its summary would lead a PR body. The status-note rail reuses ONLY
+        # this: a finish accepted earlier in THIS run is an intermediate note,
+        # not a restart boundary (see _load and the finish branch of _dispatch)
+        self._resumed_finish_summary: str | None = None
         # findings the orchestrator shipped with, and its reason for each: the
         # one mechanical rail that blocks finish(done) requires them (see
         # _enforce_findings_accepted), and they lead the mission report/PR body
@@ -530,6 +672,7 @@ class MissionOrchestrator:
         # opens (engine opens the PR directly after a clean audited `done`)
         self.ask_before_pr = False
         self.pr_reason = ""
+        self.pr_gate_category = ""
         self._providers: dict[str, Any] = {}
         # built once per orchestrator: the model-policy text is rendered from
         # config and the system prompt stays byte-stable for prompt caching
@@ -587,6 +730,16 @@ class MissionOrchestrator:
         self.owner_seq = max(
             [int(m.get("owner_seq") or 0) for m in self.history if m.get("role") == "user"] + [0]
         )
+        # what this mission had recorded BEFORE this run started: the only
+        # summary a status-note finish may reuse (PR #34). Captured here, from
+        # the freshly loaded history, so a finish accepted later in THIS run
+        # cannot masquerade as a pre-restart one.
+        recorded = self._recorded_finish()
+        self._resumed_finish_summary = (
+            " ".join(recorded[1].split())
+            if recorded is not None and _substantive_summary(recorded[1])
+            else None
+        )
 
     async def _append(self, message: dict[str, Any], display: str = "") -> None:
         self.history.append(message)
@@ -633,42 +786,64 @@ class MissionOrchestrator:
             self.finished = self._recorded_finish()
             if self.finished is None:
                 await self._finish_interrupted_turn()
-        if self.finished is None:
-            await self._loop()
-        if self.finished is None:
-            return  # cancelled by the owner or the burn gate
-        outcome, summary = self.finished
-        results = await self._results_by_role()
-        audit = results.get("audit")
-        ship, pr_url = (None, None)
-        if outcome == "done":
-            # Persist the orchestrator's finish summary and accepted_findings
-            # into mission.result BEFORE _final_gates runs, so _create_pr /
-            # _pr_body reads the real summary instead of falling back to the
-            # coder's handoff text. (Fix: PR #21 — _synthesize was called after
-            # _final_gates, so result["summary"] was empty when _pr_body ran.)
-            _current = await self.r._store.get_mission(self.mid)
-            _pre = dict((_current.result if _current else None) or {})
-            if summary:
-                _pre["summary"] = summary
-            if self.accepted_findings:
-                _pre["accepted_findings"] = self.accepted_findings
-            await self.r._store.update_mission(self.mid, result=_pre)
-            ship, pr_url = await self.r._final_gates(
-                self.mission,
-                results,
-                audit.artifact if audit else None,
-                ask_before_pr=self.ask_before_pr,
-                reason=self.pr_reason,
+        send_backs = 0
+        while True:
+            if self.finished is None:
+                await self._loop()
+            if self.finished is None:
+                return  # cancelled by the owner or the burn gate
+            outcome, summary = self.finished
+            results = await self._results_by_role()
+            audit = results.get("audit")
+            ship, pr_url = (None, None)
+            if outcome == "done":
+                # Persist the orchestrator's finish summary and accepted_findings
+                # into mission.result BEFORE _final_gates runs, so _create_pr /
+                # _pr_body reads the real summary instead of falling back to the
+                # coder's handoff text. (Fix: PR #21 — _synthesize was called after
+                # _final_gates, so result["summary"] was empty when _pr_body ran.)
+                _current = await self.r._store.get_mission(self.mid)
+                _pre = dict((_current.result if _current else None) or {})
+                if summary:
+                    _pre["summary"] = summary
+                if self.accepted_findings:
+                    _pre["accepted_findings"] = self.accepted_findings
+                await self.r._store.update_mission(self.mid, result=_pre)
+                ship, pr_url, sent_back = await self.r._final_gates(
+                    self.mission,
+                    results,
+                    audit.artifact if audit else None,
+                    ask_before_pr=self.ask_before_pr,
+                    reason=self.pr_reason,
+                    gate_category=self.pr_gate_category,
+                )
+                if sent_back:
+                    # the owner sent the work back: the engine already queued their
+                    # feedback as an owner message and flipped the mission to
+                    # RUNNING. Un-finish and re-enter the turn loop so the
+                    # orchestrator revises, re-audits and reaches a FRESH gate.
+                    send_backs += 1
+                    if send_backs > MAX_SEND_BACKS:
+                        await self.r._synthesize(
+                            self.mid,
+                            None,
+                            outcome="failed",
+                            summary=f"owner sent the mission back more than {MAX_SEND_BACKS} "
+                            "times; giving up",
+                        )
+                        return
+                    await self._note(f"owner sent the mission back (#{send_backs}); resuming")
+                    self.finished = None
+                    continue
+            self.r._pr_url = pr_url
+            await self.r._synthesize(
+                self.mid,
+                ship,
+                outcome=outcome,
+                summary=summary,
+                accepted_findings=self.accepted_findings,
             )
-        self.r._pr_url = pr_url
-        await self.r._synthesize(
-            self.mid,
-            ship,
-            outcome=outcome,
-            summary=summary,
-            accepted_findings=self.accepted_findings,
-        )
+            return
 
     async def _loop(self) -> None:
         idle = 0
@@ -876,12 +1051,21 @@ class MissionOrchestrator:
             m.get("tool_call_id"): m.get("content") for m in self.history if m.get("role") == "tool"
         }
         for message in reversed(self.history):
+            if message.get("role") == "user" and message.get("owner_seq"):
+                return None  # the owner spoke after any finish (send-back): not finished
             for call in message.get("tool_calls") or []:
                 if call.get("name") == "finish" and answered.get(call.get("id")) == "finished":
                     args = call.get("arguments") or {}
                     self.accepted_findings = _accepted_findings(args.get("accepted_findings"))
-                    self.ask_before_pr = bool(args.get("ask_before_pr"))
-                    self.pr_reason = str(args.get("reason") or "")
+                    # a replay of a pre-strictness record must not resurrect a
+                    # gate the live rule would have refused: downgrade to no ask
+                    try:
+                        ask, reason, category = _gate_ask(args)
+                    except ToolError:
+                        ask, reason, category = False, "", ""
+                    self.ask_before_pr = ask
+                    self.pr_reason = reason
+                    self.pr_gate_category = category
                     return (str(args.get("outcome") or "done"), str(args.get("summary") or ""))
         return None
 
@@ -942,14 +1126,35 @@ class MissionOrchestrator:
                     + ". Wait for them or cancel them first."
                 )
             accepted: list[dict[str, str]] = []
+            # the PR gate is strict (issue #36): validated BEFORE self.finished
+            # is set, so a refused ask leaves the mission unfinished and the
+            # orchestrator can retry.
+            ask, reason, category = _gate_ask(args)
             if outcome == "done":
                 accepted = _accepted_findings(args.get("accepted_findings"))
                 await self._enforce_audit_fresh()
                 await self._enforce_findings_accepted(accepted)
-            self.finished = (outcome, str(args.get("summary") or ""))
+            summary = " ".join(str(args.get("summary") or "").split())
+            if not _substantive_summary(summary):
+                # a restart must not degrade the PR body to "finished": reuse
+                # the summary this mission had recorded BEFORE this run loaded
+                # (_load captured it and only kept a substantive one). A thin
+                # finish accepted earlier in THIS run is an intermediate note,
+                # not the mission's story, so it is never promoted here.
+                previous = self._resumed_finish_summary
+                if previous is None:
+                    raise ToolError(
+                        "summary must say what changed for the owner: it becomes the PR body "
+                        "('## What changed'), so name the change and why it was made. A status "
+                        "note such as 'finished', 'done' or 'all good' is refused."
+                    )
+                await self._note("finish summary was a status note; reusing the earlier one")
+                summary = previous
+            self.finished = (outcome, summary)
             self.accepted_findings = accepted
-            self.ask_before_pr = bool(args.get("ask_before_pr"))
-            self.pr_reason = str(args.get("reason") or "")
+            self.ask_before_pr = ask
+            self.pr_reason = reason
+            self.pr_gate_category = category
             await self._note(f"finished ({outcome}): {self.finished[1]}"[:400], to_owner=True)
             return "finished"
         raise ToolError(f"unknown tool {name!r}")

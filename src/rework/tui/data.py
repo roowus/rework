@@ -294,13 +294,18 @@ class TuiData:
         *,
         note: str | None = None,
         decision: dict[str, Any] | None = None,
+        send_back: bool = False,
     ) -> bool:
         """Answer a gate. `note` is human-facing; `decision` is a TYPED answer
         the paused role receives as its interrupt() result (e.g. free-text
         feedback, or a choice among options the gate offered)."""
         store = await self.store()
-        gate = await store.decide_gate(gate_id, approved, note, decision)
-        return gate is not None and gate.status.value == ("approved" if approved else "rejected")
+        gate = await store.decide_gate(gate_id, approved, note, decision, send_back)
+        if gate is None:
+            return False
+        if send_back:  # the third verdict: the mission resumes with `note` as feedback
+            return gate.status.value == "sent_back"
+        return gate.status.value == ("approved" if approved else "rejected")
 
     async def set_mission_status(self, mission_id: str, status: str) -> Any:
         """Owner controls: cancel / pause / resume. The daemon reads the row, so
@@ -448,12 +453,9 @@ class TuiData:
     async def send_owner_message(self, mission_id: str, text: str) -> Any:
         """Talk to a running mission's orchestrator (ADR 0007): it is woken and
         sees the message before its next turn."""
-        from rework.kernel.state.records import EventRecord, EventType
+        from rework.missions import send_owner_message
 
-        store = await self.store()
-        return await store.append_event(
-            EventRecord(mission_id=mission_id, type=EventType.OWNER_MESSAGE, payload={"text": text})
-        )
+        return await send_owner_message(mission_id, text, store=await self.store())
 
     async def mission_budget(self, mission_id: str) -> Any:
         """BudgetState (spent_usd, input/output/cached tokens)."""
@@ -544,14 +546,31 @@ class TuiData:
 
     # -- writes ------------------------------------------------------------
 
-    async def create_project(self, name: str, transport: str = "git") -> Project:
+    async def create_project(self, name: str, repos: list[dict[str, Any]] | None = None) -> Project:
+        """Store settings that are always self-consistent: the transport and
+        the results handling are DERIVED from the repos, never hardcoded. No
+        repo means an upload project (rework keeps the files, results are
+        fetched); a repo means git/push_branch."""
         from rework.kernel.state.records import Project as ProjectRecord
+        from rework.missions import derive_transport
 
+        repo_list = [dict(r) for r in repos or []]
+        transport, results = derive_transport({"repos": repo_list})
         store = await self.store()
         project = ProjectRecord(
-            name=name, settings={"transport": transport, "results": "push_branch", "repos": []}
+            name=name,
+            settings={"transport": transport, "results": results, "repos": repo_list},
         )
         return await store.create_project(project)
+
+    async def add_project_files(self, project_id: str, paths: list[str]) -> list[str]:
+        """Push local paths into a repo-less project's files area. The HTTP
+        helper is sync (shared with the CLI), so it runs off the event loop."""
+        import asyncio
+
+        from rework.project_files import add_project_files as _add
+
+        return await asyncio.to_thread(_add, project_id, paths)
 
     async def create_mission(self, **kwargs: Any) -> Mission:
         from rework.missions import create_mission as _create

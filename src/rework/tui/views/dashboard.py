@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import time
 from functools import partial
+from pathlib import Path
 from typing import Any, ClassVar
 
 from textual import work
@@ -59,6 +60,7 @@ from rework.tui.widgets.graph import (
     mission_layers,
     mission_nodes,
 )
+from rework.tui.widgets.modals import Field, Form
 from rework.tui.widgets.trajectory import Trajectory, role_of
 
 ALL = "*"
@@ -82,6 +84,36 @@ MTABS = [
     ("Report", "report"),
     ("Gates", "gates"),
 ]
+
+
+def parse_paths(raw: str) -> list[str]:
+    """The Add-files form's value -> paths ready to hand to `add-files`.
+
+    ONE PATH PER LINE is the primary form, so a path containing spaces
+    (`/Users/me/My Papers`) can finally be entered at all; a line that is a
+    shell-ish list is split like a shell (`shlex`), and the historical
+    comma/space-separated single line still works. `~` is expanded.
+
+    Splitting the whole input on spaces was the bug: a path with a space in it
+    was unenterable. A line that DOES exist on disk is never split, so the two
+    readings cannot disagree about a real path."""
+    import shlex
+
+    paths: list[str] = []
+    for line in raw.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        if Path(text).expanduser().exists():
+            paths.append(str(Path(text).expanduser()))
+            continue  # the line IS one real path, spaces and all
+        try:
+            parts = shlex.split(text)
+        except ValueError:  # unbalanced quote: take the line literally
+            parts = [text]
+        for part in parts:
+            paths.extend(str(Path(p).expanduser()) for p in part.replace(",", " ").split())
+    return [p for p in paths if p.strip()]
 
 
 class DashboardView(View):
@@ -154,6 +186,10 @@ class DashboardView(View):
                     yield Stat("spend · 7d", id="st-week")
                 with Horizontal():
                     with Vertical(classes="sidebar", id="dash-side"):
+                        with Horizontal(classes="side-actions"):
+                            # only an upload-transport (repo-less) project has a
+                            # files area to add to; a git project is told to push
+                            yield Btn("Add files", "add-files", variant="ghost")
                         yield Label("Projects")
                         yield Input(placeholder="Filter projects…  (tab ⇥)", id="proj-search")
                         yield RowList(id="proj-list")
@@ -208,6 +244,12 @@ class DashboardView(View):
                                 yield Markdown("", id="m-report-body")
                             with VerticalScroll(id="m-gates", classes="doc"):
                                 yield Vertical(id="m-gates-body")
+                with Horizontal(id="m-msgbar"):
+                    yield Input(
+                        placeholder="Message this mission's orchestrator…  (enter to send)",
+                        id="m-msg",
+                    )
+                    yield Btn("Send", "msg-send", variant="primary")
 
     def on_mount(self) -> None:
         self._paint_head()
@@ -513,6 +555,10 @@ class DashboardView(View):
         """Enter in the bar always means the same thing: filter the list on the
         query (the ✦ ranking, when it is there, stays as the list's order).
         Down moves into the results, as in the Library."""
+        if event.input.id == "m-msg":
+            event.stop()
+            self._send_message()
+            return
         if event.input.id == "proj-search":
             event.stop()
             self._focus_projects()
@@ -765,10 +811,18 @@ class DashboardView(View):
             bar.focus()
             bar.cursor_position = len(bar.value)
             return
+        if event.action == "add-files":
+            # the selected PROJECT decides, not a mission: works with nothing open
+            event.stop()
+            self.add_project_files()
+            return
         if not self.mission_id:
             return
         event.stop()
         if self._gate_button(event.btn):
+            return
+        if event.action == "msg-send":
+            self._send_message()
             return
         verb = event.action
         if verb == "copy-id":
@@ -789,6 +843,56 @@ class DashboardView(View):
             self.run_worker(actions.prioritize(self.rw, self.mission_id, current), group="control")
             return
         self.run_worker(actions.control(self.rw, self.mission_id, verb), group="control")
+
+    def add_project_files(self) -> None:
+        """Push local files into the selected project's files area (upload
+        transport only). The daemon keeps them; missions seed from there."""
+        from rework.missions import project_is_upload
+
+        project = next((p for p in self.snap.projects if p.id == self.project), None)
+        if project is None:
+            self.toast("Select a project first", severity="warning")
+            return
+        if not project_is_upload(project.settings):
+            self.toast("this project uses git: push a branch instead", severity="warning")
+            return
+
+        def done(values: dict[str, str] | None) -> None:
+            if values is None:
+                return
+            paths = parse_paths(values.get("paths", ""))
+            if not paths:
+                self.toast("No paths given", severity="warning")
+                return
+            self.run_worker(self._add_project_files(project.id, paths), group="add-files")
+
+        self.rw.push_screen(
+            Form(
+                f"Add files to {project.name}",
+                [
+                    Field(
+                        "paths",
+                        "Local files/folders on this machine: one path per line"
+                        " (~ is expanded; commas and spaces also separate paths)",
+                        kind="area",
+                    )
+                ],
+                submit="Add",
+            ),
+            done,
+        )
+
+    async def _add_project_files(self, project_id: str, paths: list[str]) -> None:
+        try:
+            changed = await self.hub.data.add_project_files(project_id, paths)
+        except Exception as exc:
+            self.toast(f"Could not add files: {exc}", severity="error")
+            return
+        if changed:
+            self.toast(f"{len(changed)} path(s) added to the project files")
+        else:
+            self.toast("no changes (identical)")
+        await self.hub.refresh()
 
     def _disarm(self, btn: Btn) -> None:
         btn.remove_class("-armed")
@@ -1200,6 +1304,27 @@ class DashboardView(View):
                         Btn("Answer in Gates…", "gate-answer", variant="ghost", payload=gate.id),
                     ]
                 )
+
+    def _send_message(self) -> None:
+        box = self.query_one("#m-msg", Input)
+        text = box.value.strip()
+        if not text or not self.mission_id:
+            return
+        self.run_worker(self._deliver_message(self.mission_id, text), group="owner-message")
+
+    async def _deliver_message(self, mission_id: str, text: str) -> None:
+        """Talk to the OPEN mission, whatever chat it came from: the shared
+        owner-message publisher (ADR 0007), the same one `rework message` uses."""
+        from rework.missions import send_owner_message
+
+        try:
+            await send_owner_message(mission_id, text, store=await self.hub.data.store())
+        except Exception as exc:
+            self.toast(f"Could not reach the mission: {clip(str(exc), 200)}", severity="error")
+            return
+        with self.painting():
+            self.query_one("#m-msg", Input).value = ""
+        self.toast(f"Sent to {mission_id}'s orchestrator")
 
     def _gate_button(self, btn: Btn) -> bool:
         if not btn.action.startswith("gate-"):

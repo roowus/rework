@@ -22,6 +22,7 @@ from rework.nodes.report_writer import make_report_writer_node
 from rework.nodes.toolloop import make_toolloop_node
 from rework.nodes.tools import ComplaintAwareExecutor, LocalExecutor
 from rework.roles.base import RoleBuildCtx, RoleSpec
+from rework.web.tools import web_executor
 
 if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
@@ -41,7 +42,8 @@ class InvestigatorSpec(RoleSpec):
     name = "investigator"
     description = (
         "Investigates a brief against a workspace and reports structured"
-        " findings with evidence: issues, feasibility, unknowns."
+        " findings with evidence: issues, feasibility, unknowns. Can search the"
+        " public web (`web_search`) and read pages (`fetch_url`)."
     )
     goal = (
         "Investigate any brief: issues, feasibility, unknowns. Find as much"
@@ -106,17 +108,19 @@ class InvestigatorSpec(RoleSpec):
             provider=ctx.provider,
             catalog=ctx.catalog,
             catalog_id=catalog_id,
-            executor=library_executor(
-                ctx,
-                ComplaintAwareExecutor(
-                    EscalationAwareExecutor(
-                        LocalExecutor(ctx.read_root, mission_id=ctx.mission.id), ctx
+            executor=web_executor(
+                library_executor(
+                    ctx,
+                    ComplaintAwareExecutor(
+                        EscalationAwareExecutor(
+                            LocalExecutor(ctx.read_root, mission_id=ctx.mission.id), ctx
+                        ),
+                        ctx.store,
+                        ctx.mission.id,
+                        ctx.run.id,
+                        self.name,
                     ),
-                    ctx.store,
-                    ctx.mission.id,
-                    ctx.run.id,
-                    self.name,
-                ),
+                )
             ),
             system_prompt=with_library_menu(ctx, system_prompt),
             store=ctx.store,

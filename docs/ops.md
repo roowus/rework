@@ -100,9 +100,31 @@ describe the change. The orchestrator proposes; Launch starts it. The local
 daemon clones `github.com/roowus/rework`, runs the roles in
 `~/.rework/work/`, and — after a clean audited `done` — pushes the last coder's
 branch and opens the PR with your local `gh` login. **No gate by default**: the
-audit rail already guarantees the change was reviewed. The orchestrator can ask
-for one (`finish(ask_before_pr=true, reason=...)`) when the change is risky or
-unusual, and a project setting controls it globally:
+audit rail already guarantees the change was reviewed, and most fixes —
+especially ones you asked for — ship without a gate. A gate is only for the most
+crucial cases.
+
+Asking for a gate is strict (owner decision, 2026-11-14). The orchestrator may
+pass `finish(ask_before_pr=true, gate_category=..., reason=...)` ONLY when the
+change falls in one of four high-stakes categories, and the `reason` should name
+that category. What the engine mechanically enforces is narrower: a non-empty
+`reason` and a `gate_category` from the list below. Your gate question shows
+both — the category first, then the reason — so you can judge the request.
+Anything else is refused with a tool error telling the orchestrator to open the
+PR without a gate; a change you asked for is never gated for being large,
+unusual, or touching many files, and audit findings the orchestrator accepted
+belong in the finish `summary` — which becomes the PR body you read before
+merging.
+
+| `gate_category` | the change does... |
+| --- | --- |
+| `data_loss` | data loss or a destructive data migration |
+| `security` | security, credentials, auth or permissions |
+| `money` | money (billing, payments, paid resources) |
+| `production_infrastructure` | irreversible or production infrastructure (deploys, DNS, cloud resources, deleting user files) |
+
+The gate question then leads with the category and the orchestrator's reason
+("Gate category: security — ..."), so you can decide from the inbox.
 
 Only a plan that publishes (`"publish": "pr"` — the `fix-pr` playbook; older
 plans carrying `"gates": ["open_pr"]` count too) pushes a branch or opens a PR
@@ -111,7 +133,7 @@ at all. `echo` and `fix` missions deliver their result and stop.
 | project `settings.pr_gate` | effect |
 | --- | --- |
 | `auto` (default) | gate only when the orchestrator asks (or the plan lists `open_pr`) |
-| `always` | always gate before opening the PR |
+| `always` | always gate before opening the PR (overrides the orchestrator) |
 | `never` | never gate; an `ask_before_pr` is noted and overridden |
 
 Merging is always the owner's decision; no agent merges.
@@ -140,6 +162,79 @@ offers models whose key is present (`ModelEntry.has_credentials`).
 Stop the daemon with ctrl+c in its terminal. Never leave a local daemon
 running against the deployment DB: it holds the leader lock and idle
 transactions that block migrations (this happened once, for 1d20h).
+
+## Repo-less projects (documents, no code repo)
+
+A project with no repo is an **upload** project: `rework` keeps its working
+files itself, on the daemon host, so missions on it need no repo at all (ADR
+0005, Amendment). Create one by leaving `--repo` off:
+
+```bash
+rework project create applications   # -> transport=upload, results=fetch
+rework project ls                    # verify: transport=upload results=fetch
+```
+
+In the TUI: **File > New project...** and leave the repo field empty — the
+form says rework keeps the project's files itself and results are fetched, not
+pushed. (A project created *with* a repo is `git`/`push_branch`; the transport
+and results are derived from the repos and cannot be set against them.)
+
+Put files in from any machine, any number of times, before or between
+missions:
+
+```bash
+rework project add-files applications ./docs ./notes.md
+```
+
+In the TUI: the dashboard project sidebar's **Add files** button, or **File >
+Add project files...**, takes one local path per line (a path containing
+spaces is fine; home-relative `~` is expanded). It refuses a git project: for
+those, push a branch.
+
+Run a mission on it — no `--repo` needed:
+
+```bash
+rework new --plan fix --project applications "tidy the applications folder"
+```
+
+In the TUI, a chat proposal that names an upload project launches the same
+mission (a repo the model names is dropped). The mission starts from the
+project's files and saves its new/changed files back when it finishes; the
+mission report then ends with a line naming them, e.g. `Project files
+updated: a.md (new), b.md (changed)`. Deletions are not carried back: the
+save-back adds and updates only.
+
+Files are saved back **only when the mission ends DONE**: a cancelled or
+ship-rejected mission leaves the area untouched (its worktree is half-finished,
+not a deliverable). If the save-back itself fails, the mission still ends DONE
+but its report says `Project files NOT updated: <reason>` — never a silent
+success.
+
+Do **not** run two missions of the same project against the same files at the
+same time. The area is locked per operation, so they serialise rather than
+corrupt each other, but the later mission seeds from the state the earlier one
+has left so far, i.e. it starts from a mix of the two.
+
+Get results back on whichever machine you work from:
+
+```bash
+rework project pull applications ./out    # the whole project files area
+rework fetch m-0d75f495121a               # one mission's own final worktree
+```
+
+The files area lives on the **daemon host** (rewvis) at
+`~/.rework/projects/<project-id>/files`; `REWORK_PROJECTS_DIR` overrides the
+root. It is a plain directory and a git repository (local history, no remote),
+so back it up like any data directory — copy or archive it:
+
+```bash
+ssh ubuntu@100.107.125.118 'tar czf ~/backups/projects-$(date +%F).tar.gz -C ~/.rework projects'
+```
+
+Files are **never pushed anywhere**: the area has no remote and nothing ever
+uploads it. Code still travels through git only — a project that carries code
+gets a repo and the git/push_branch transport, and its deliverable is a pushed
+branch, not this area.
 
 ## Logs
 
@@ -381,10 +476,16 @@ command (`role commands run in a systemd system scope with MemoryMax=5G: …`, o
 commands run'`.
 
 `REWORK_CONCURRENCY` caps WORKING missions only. A mission that is waiting — at
-a gate, for the owner, or on hold — gives its slot back and takes a new one at
-the back of the queue before it works again. Before that, with
+a gate, for the owner, or on hold — gives its slot back and takes a new one
+before it works again, AHEAD of missions that never started
+(`PrioritySlots`; order is FIFO inside each class). Before that, with
 `REWORK_CONCURRENCY=1`, an approved `open_pr` gate could sit for hours behind a
-mission that was merely parked at its own gate.
+mission that was merely parked at its own gate, and on 2026-11-14 behind every
+never-started mission even at 5 slots (the mission also kept saying
+`awaiting_gate` while the Gates tab was empty). The engine now sets the mission
+back to `running` the moment its last gate is decided, and the daemon corrects
+any `awaiting_gate` row with no open gate on every poll (a log line and an INFO
+event say so).
 
 A sqlite deployment keeps its historical concurrency of 1 unless the env says
 otherwise; Postgres deployments get the host-aware default.
@@ -470,7 +571,7 @@ ssh ubuntu@100.107.125.118 "docker exec rework-dev-pg psql -U postgres -d rework
 
 Tests never touch `rework_state`. Postgres tests use the dedicated
 `rework_test` database:
-`REWORK_TEST_POSTGRES=postgresql://postgres:rework@100.107.125.118:5433/rework_test`.
+`REWORK_TEST_POSTGRES=postgresql://postgres:<password>@<host>:5433/rework_test`.
 
 ## Preview a PR
 
