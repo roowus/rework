@@ -2433,6 +2433,59 @@ async def test_foreign_row_written_during_own_turn_is_rendered_once(
         assert not app.swallowed
 
 
+async def test_a_replayed_chat_does_not_duplicate_its_proposal_cards(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A replay must place every stored row ONCE, however it was reached.
+
+    The poller and the live render of `_send` can both see the rows this
+    process wrote (the engine persists them before `_send` paints them), and a
+    replay can start from a fresh cursor (a reopened chat, a swapped store).
+    Rendering therefore has to be idempotent per chat_messages id: before the
+    high-water mark, re-reaching the proposing row put every `propose_mission`
+    in it on screen a second time, which is the duplicate-card symptom
+    (`4 cards` for one two-proposal turn).
+    """
+    script_provider(
+        monkeypatch,
+        [
+            propose_many(
+                {"objective": "say hello", "plan": "echo", "title": "Greeting"},
+                {"objective": "say goodbye", "plan": "echo", "title": "Farewell"},
+            )
+        ],
+    )
+    from rework.tui.widgets.cards import ProposalCard
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        work = app.view("work")
+        for ch in "hello and goodbye":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        await _settle(pilot, 1.0)
+        assert len(app.query(ProposalCard)) == 2, "the turn rendered its two cards"
+        chat_id = work.convo.id
+        messages = await app.hub.data.chat_messages(chat_id)
+        row_ids = [int(m.id or 0) for m in messages]
+        assert work._rendered_max_id == max(row_ids), (work._rendered_max_id, row_ids)
+
+        # the reopen path: this process no longer knows which rows it wrote, and
+        # the transcript is re-reached from a fresh cursor with the log intact
+        app.hub.data.own_chat_ids.clear()
+        work._chat_cursor = 0
+        await work._tick_chat(chat_id).wait()
+        await _settle(pilot, 0.6)
+        cards = list(app.query(ProposalCard))
+        assert len(cards) == 2, (
+            f"{len(cards)} cards after a replay of rows {row_ids}"
+            f" with cursor {work._chat_cursor} and mark {work._rendered_max_id}"
+        )
+        assert [c.proposal.objective for c in cards] == ["say hello", "say goodbye"]
+        assert not app.swallowed
+
+
 async def test_gates_history_list_and_detail_follow_other_instances(
     ids: dict[str, str], env: Path
 ) -> None:

@@ -89,9 +89,23 @@ class WorkView(View):
         self._streamed: list[Step] = []
         self._loading_chat: str | None = None
         # cursor for the open transcript: the highest chat_messages.id already
-        # rendered. The table is append-only, so a tick only has to ask for
+        # fetched. The table is append-only, so a tick only has to ask for
         # rows newer than this (indexed, O(log n)) and append those.
         self._chat_cursor: int = 0
+        # The cursor is only the QUERY boundary; this is the RENDER authority,
+        # and the two differ because of `_send`. The engine persists the turn's
+        # rows (and `TuiData` records them as our own) inside `engine.send`,
+        # while the live render runs after it returns. A tick landing in that
+        # window sees rows it must not paint, and the old code pruned the
+        # own-id set at the same moment, so a later replay from a fresh cursor
+        # (a reopened chat, a swapped store) could paint that assistant
+        # tool_calls row again and mint a second card for every
+        # `propose_mission` in it. Nothing at or below this mark is ever
+        # painted twice.
+        self._rendered_max_id: int = 0
+        # which store connection the mark above belongs to: chat_messages ids
+        # are only comparable within one connection
+        self._store_epoch: int = 0
         # where the next message goes: None = the chat orchestrator (proposes
         # missions); a mission id = that mission's orchestrator (ADR 0007)
         self.target: str | None = None
@@ -172,6 +186,15 @@ class WorkView(View):
     @work(exclusive=True, group="chat-poll")
     async def _tick_chat(self, chat_id: str) -> None:
         data = self.hub.data
+        if data.store_epoch != self._store_epoch:
+            # the connection (possibly the whole store) was swapped under us, so
+            # the ids in `_chat_cursor` and `_rendered_max_id` no longer line up
+            # with what the store holds. Re-read the transcript instead, which
+            # re-seeds both from the rows it paints; rows written while we were
+            # disconnected are included, and nothing already on screen repeats.
+            self._store_epoch = data.store_epoch
+            self._load_chat(chat_id)
+            return
         head = await self.hub.guard(partial(data.chat_messages_max_id, chat_id), None)
         if head is None or head <= self._chat_cursor:
             return  # None = the probe failed; <= means nothing new
@@ -187,9 +210,18 @@ class WorkView(View):
         # rows THIS instance wrote (a streaming turn, a note) are already on
         # screen, rendered live; only foreign rows are new to this view. This
         # holds during our own turn too, so it also covers a tick that was in
-        # flight while we persisted.
+        # flight while we persisted. The mark is the authority: a row at or
+        # below it is already placed, whatever `own_chat_ids` says by now.
         own = data.own_chat_ids
-        fresh = [m for m in messages if int(m.id or 0) not in own]
+        fresh = [
+            m
+            for m in messages
+            if int(m.id or 0) > self._rendered_max_id and int(m.id or 0) not in own
+        ]
+        # everything fetched is accounted for at this point: the foreign rows
+        # are painted below and the own ones were (or are about to be) painted
+        # by the live render, so no later replay may paint them again
+        self._rendered_max_id = self._chat_cursor
         own.difference_update(i for i in list(own) if i <= self._chat_cursor)
         items = items_from_messages(fresh)
         if items:
@@ -320,6 +352,10 @@ class WorkView(View):
             return
         self.convo = convo
         self._chat_cursor = cursor
+        # the replay below clears the log and paints exactly these rows, so the
+        # mark can start from them: anything newer polls in, nothing repeats
+        self._rendered_max_id = cursor
+        self._store_epoch = self.hub.data.store_epoch
         self._target_auto = True
         self.project_id = chat.project_id
         self.model_id = chat.model_id or self.model_id
@@ -340,6 +376,7 @@ class WorkView(View):
     def new_chat(self) -> None:
         self.convo = None
         self._chat_cursor = 0
+        self._rendered_max_id = 0
         self._target_auto = True
         self.target = None
         self.query_one("#chat-log", Trajectory).clear()
@@ -480,6 +517,11 @@ class WorkView(View):
                 )
                 self.convo = Conversation(self.hub.data, chat)
                 log.clear()
+                # a brand new chat has no transcript: nothing is placed yet, so
+                # neither mark may carry over from the chat we just left
+                self._chat_cursor = 0
+                self._rendered_max_id = 0
+                self._store_epoch = self.hub.data.store_epoch
                 self._show_chat(True)
                 self._paint_head()
             convo = self.convo
