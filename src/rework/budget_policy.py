@@ -34,7 +34,9 @@ original one (`ensure_original`).
 from __future__ import annotations
 
 import logging
+import math
 import os
+import re
 import time
 from typing import Any
 
@@ -101,6 +103,168 @@ def budget_policy(project_settings: dict[str, Any] | None = None) -> tuple[int, 
     if factor is None:
         factor = DEFAULT_CEILING_FACTOR
     return max_auto_raises, factor
+
+
+# -- estimating the opening cap ---------------------------------------------
+#
+# The cap decides how much work happens before the owner is asked, so it should
+# follow the SIZE OF THE TASK, not the deployment default: a typo fix does not
+# need a feature's budget and a migration does not fit in a typo's. A keyword
+# heuristic on purpose: `rework new` must not spend money (or wait on a
+# provider) just to price a mission it has not started yet.
+
+DOCS_USD = (1.0, 2.0)
+FEATURE_USD = (3.0, 5.0)
+RISKY_USD = (8.0, 10.0)
+NO_TEXT_USD = 2.0
+MIN_USD = 0.5
+
+SHORT_TEXT_CHARS = 120  # a one-line change
+FEATURE_TEXT_CHARS = 300  # past this it is probably more than one file
+LONG_TEXT_CHARS = 1500  # a long brief is a big brief
+HUGE_TEXT_CHARS = 3000
+MANY_REQUIREMENTS = 4  # a numbered list this long is a programme, not a fix
+
+# "this is small" signals: a docs/typo/comment/readme-level change.
+_DOCS_SIGNALS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\bdocs?\b",
+        r"\bdocumentation\b",
+        r"\btypos?\b",
+        r"\bcomments?\b",
+        r"\brenames?\b",
+        r"\bone-liner?\b",
+        r"\breadme\b",
+        r"\bsmall fix\b",
+        r"\bbumps?\b",
+        r"\bversions?\b",
+    )
+)
+
+# "this is large and risky" signals, named the way the reason line names them.
+_RISK_SIGNALS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("migration", re.compile(r"\bmigrations?\b")),
+    ("schema", re.compile(r"\bschemas?\b")),
+    ("auth", re.compile(r"\bauth\b")),
+    ("authentication", re.compile(r"\bauthentication\b")),
+    ("permission", re.compile(r"\bpermissions?\b")),
+    ("security", re.compile(r"\bsecurity\b")),
+    ("rewrite", re.compile(r"\brewrites?\b")),
+    ("refactor everything", re.compile(r"\brefactor\b[^.!?\n]{0,30}\beverything\b")),
+    ("every", re.compile(r"\bevery\b")),
+    ("all of", re.compile(r"\ball of\b")),
+    ("architecture", re.compile(r"\barchitecture\b")),
+    ("concurrency", re.compile(r"\bconcurren\w*\b")),
+    ("race", re.compile(r"\brace\b")),
+    ("performance across", re.compile(r"\bperformance\b[^.!?\n]{0,30}\bacross\b")),
+)
+
+_NUMBERED_REQUIREMENT = re.compile(r"(?m)^\s*\d+[.)]")
+
+
+def _round_half(value: float) -> float:
+    """Nearest $0.50, never below the floor a mission needs to start."""
+    return max(MIN_USD, round(float(value) * 2) / 2)
+
+
+def _history_usd(cost_history: Any) -> float | None:
+    """A usable typical mission cost, or None: garbage, NaN, inf and <= 0 are
+    ignored rather than raised on (an estimate must never stop a mission)."""
+    if cost_history is None or isinstance(cost_history, bool):
+        return None
+    try:
+        value = float(cost_history)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return value
+
+
+def _in_band(value: float, band: tuple[float, float], history: float | None) -> float:
+    """`value` nudged toward a typical finished-mission cost, INSIDE `band`:
+    history says whether this shop's missions run cheap or expensive, it does
+    not get to turn a typo into a migration."""
+    low, high = band
+    if history is None:
+        return min(max(value, low), high)
+    window_low, window_high = history * 0.75, history * 1.5
+    if window_high < low:  # history runs cheaper than this band: its floor
+        return low
+    if window_low > high:  # history runs dearer: its ceiling, not beyond it
+        return high
+    return min(max(value, max(low, window_low)), min(high, window_high))
+
+
+def estimate_budget(text: str, *, cost_history: float | None = None) -> tuple[float, str]:
+    """(usd rounded to 0.5, one-line reason) sized to the task's complexity.
+
+    A keyword/structural heuristic on the lowercased text: same text, same
+    answer, always (no model call, no store, no network, never raises).
+
+      * a RISKY signal — migration, schema, auth, authentication, permission,
+        security, rewrite, "refactor ... everything", "every", "all of",
+        architecture, concurrency, race, "performance ... across" — or a brief
+        with >= 4 numbered requirements (`1.`, `2)` at line starts) or one
+        longer than 1500 chars, costs $8.00; more than one such signal (or a
+        brief over 3000 chars) $10.00. A risky signal OUTRANKS a smallness
+        signal on purpose: "auth docs" is a large job, not a docs job.
+      * docs / typo / comment / rename / one-line / readme / small fix / bump /
+        version costs $1.00 for a one-liner (< 120 chars), $2.00 otherwise.
+      * everything else is a normal feature: $3.00 when the text is short,
+        $5.00 when it looks like more than one file (> 300 chars).
+      * empty (or non-text) input is $2.00 — the blanket default this replaces
+        — with a "no task text: default" reason.
+
+    `cost_history` (a typical finished-mission cost) only nudges WITHIN the
+    chosen band, clamped to [0.75x, 1.5x] of the history, so an estimate
+    without history is identical to one with it at the band's own value and no
+    band is ever crossed. The reason names the signal that chose the band."""
+    raw = text if isinstance(text, str) else ""
+    stripped = raw.strip()
+    if not stripped:
+        return NO_TEXT_USD, "no task text: default"
+    history = _history_usd(cost_history)
+    lowered = stripped.lower()
+    length = len(stripped)
+
+    signals = list(dict.fromkeys(name for name, pat in _RISK_SIGNALS if pat.search(lowered)))
+    requirements = len(_NUMBERED_REQUIREMENT.findall(raw))
+    weight = len(signals)
+    if requirements >= MANY_REQUIREMENTS:
+        weight += 1
+    if length > LONG_TEXT_CHARS:
+        weight += 1
+    if length > HUGE_TEXT_CHARS:
+        weight += 1
+    if weight:
+        named = ", ".join(signals)
+        if not named:
+            named = (
+                f"{requirements} numbered requirements"
+                if requirements >= MANY_REQUIREMENTS
+                else f"{length}-character brief"
+            )
+        usd = RISKY_USD[1] if weight > 1 else RISKY_USD[0]
+        return _round_half(_in_band(usd, RISKY_USD, history)), f"risky change: {named}"
+
+    if any(pattern.search(lowered) for pattern in _DOCS_SIGNALS):
+        tiny = length < SHORT_TEXT_CHARS
+        reason = (
+            "docs/typo-sized change: small, one-file"
+            if tiny
+            else "docs/typo-sized change: still one small change"
+        )
+        usd = DOCS_USD[0] if tiny else DOCS_USD[1]
+        return _round_half(_in_band(usd, DOCS_USD, history)), reason
+
+    short = length < FEATURE_TEXT_CHARS
+    usd = FEATURE_USD[0] if short else FEATURE_USD[1]
+    return (
+        _round_half(_in_band(usd, FEATURE_USD, history)),
+        "normal feature-sized change",
+    )
 
 
 def ensure_original(plan: dict[str, Any]) -> dict[str, Any]:

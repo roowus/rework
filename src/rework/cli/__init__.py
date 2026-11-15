@@ -13,6 +13,7 @@ from typing import Any
 import typer
 
 from rework import __version__
+from rework.budget_policy import estimate_budget
 from rework.config import default_results_dir
 from rework.nodes.report_sections import accepted_findings_section, mechanical_verdict
 
@@ -72,7 +73,9 @@ def new(
     ),
     effort: str | None = typer.Option(None, help="Orchestrator effort: low | medium | high"),
     budget: float | None = typer.Option(
-        None, help="USD cap before the mission pauses to ask (default $2, REWORK_BUDGET_USD)."
+        None,
+        help="USD cap before the mission pauses to ask (default: estimated from the"
+        " task's size, or REWORK_BUDGET_USD when that is set).",
     ),
     mechanical: bool = typer.Option(
         False,
@@ -91,6 +94,11 @@ def new(
     audit, then a ship gate; `fix-pr` opens a PR instead (no gate by default,
     unless the project's `pr_gate` setting or the orchestrator asks for one)."""
 
+    cap, why = _opening_budget(objective, budget)
+    # stderr on purpose: stdout is the bare mission id, so `rework new ...` in
+    # a script keeps printing exactly one machine-readable line
+    typer.echo(f"budget: ${cap:.2f} ({why})", err=True)
+
     async def go() -> str:
         from rework.missions import create_mission, resolve_project
 
@@ -108,7 +116,7 @@ def new(
             priority=priority,
             orchestrator_model=orch_model,
             orchestrator_effort=effort,
-            budget_usd=budget,
+            budget_usd=cap,
         )
         return mission.id
 
@@ -116,6 +124,27 @@ def new(
         typer.echo(asyncio.run(go()))
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+
+
+def _opening_budget(objective: str, budget: float | None) -> tuple[float, str]:
+    """(usd, why) for a new mission: explicit --budget, else REWORK_BUDGET_USD,
+    else the estimate for a task of this size.
+
+    An explicit cap always wins (the owner said a number), and so does a
+    deployment-wide REWORK_BUDGET_USD: the estimate is only the fallback for
+    a deployment that configured nothing, so setting the env var keeps meaning
+    exactly what it meant before."""
+    import os as _os
+
+    if budget is not None:
+        return float(budget), "from --budget"
+    configured = _os.environ.get("REWORK_BUDGET_USD")
+    if configured:
+        try:
+            return float(configured), "REWORK_BUDGET_USD, the deployment default"
+        except ValueError:
+            pass  # a broken env var must not block creating the mission
+    return estimate_budget(objective)
 
 
 def default_orchestrator_model(catalog: Any = None) -> str:

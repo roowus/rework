@@ -102,7 +102,7 @@ def test_new_accepts_git_url_without_local_path(rework_db: Path) -> None:
 
     assert result.exit_code == 0, result.output
     assert "repo not found" not in result.output
-    mission_id = result.output.strip()
+    mission_id = result.stdout.strip()
     assert mission_id.startswith("m-")
 
     mission = _get_mission(rework_db, mission_id)
@@ -117,7 +117,7 @@ def test_new_accepts_git_url_without_plan(rework_db: Path) -> None:
 
     assert result.exit_code == 0, result.output
     assert "repo not found" not in result.output
-    mission = _get_mission(rework_db, result.output.strip())
+    mission = _get_mission(rework_db, result.stdout.strip())
     assert mission is not None
     assert mission.repo_origin == url
     assert mission.repo_path is None
@@ -183,7 +183,7 @@ def test_new_without_a_title_stores_a_derived_short_title(rework_db: Path) -> No
     result = runner.invoke(app, ["new", objective, "--repo", url])
 
     assert result.exit_code == 0, result.output
-    mission = _get_mission(rework_db, result.output.strip())
+    mission = _get_mission(rework_db, result.stdout.strip())
     assert mission is not None
     assert mission.title
     assert "\n" not in mission.title
@@ -197,7 +197,7 @@ def test_new_title_option_wins(rework_db: Path) -> None:
     )
 
     assert result.exit_code == 0, result.output
-    mission = _get_mission(rework_db, result.output.strip())
+    mission = _get_mission(rework_db, result.stdout.strip())
     assert mission is not None
     assert mission.title == "My Title"
 
@@ -362,7 +362,7 @@ def test_new_creates_an_orchestrated_mission_by_default(rework_db: Path) -> None
         app, ["new", "fix it", "--repo", url, "--plan", "fix-pr", "--budget", "3"]
     )
     assert result.exit_code == 0, result.output
-    mission = _get_mission(rework_db, result.output.strip())
+    mission = _get_mission(rework_db, result.stdout.strip())
     assert mission is not None
     plan = mission.plan or {}
     assert plan["kind"] == "auto" and plan["playbook"] == "fix-pr"
@@ -375,7 +375,7 @@ def test_new_mechanical_keeps_the_legacy_pipeline(rework_db: Path) -> None:
     url = "https://github.com/example/repo.git"
     result = runner.invoke(app, ["new", "fix it", "--repo", url, "--plan", "fix", "--mechanical"])
     assert result.exit_code == 0, result.output
-    mission = _get_mission(rework_db, result.output.strip())
+    mission = _get_mission(rework_db, result.stdout.strip())
     assert mission is not None
     assert "orchestrator" not in (mission.plan or {})
     assert [s["step"] for s in (mission.plan or {})["steps"]] == ["investigate", "code", "audit"]
@@ -1117,12 +1117,12 @@ def test_new_with_priority_high_and_prioritize_command(rework_db: Path) -> None:
     url = "https://github.com/example/repo.git"
     result = runner.invoke(app, ["new", "urgent fix", "--repo", url, "--priority", "high"])
     assert result.exit_code == 0, result.output
-    mission = _get_mission(rework_db, result.output.strip())
+    mission = _get_mission(rework_db, result.stdout.strip())
     assert mission is not None and mission.priority == "high"
 
     plain = runner.invoke(app, ["new", "a later fix", "--repo", url])
     assert plain.exit_code == 0, plain.output
-    other = _get_mission(rework_db, plain.output.strip())
+    other = _get_mission(rework_db, plain.stdout.strip())
     assert other is not None and other.priority == "normal"
 
     # focusing a mission is a flag: default high, --priority normal goes back
@@ -1159,3 +1159,84 @@ def test_new_with_unknown_priority_is_a_clean_cli_error(rework_db: Path) -> None
             await store.aclose()
 
     assert asyncio.run(all_missions()) == []
+
+
+def test_new_estimates_the_budget_and_keeps_stdout_the_bare_mission_id(
+    rework_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No --budget: the cap follows the task's size, the reason goes to stderr
+    so stdout stays one machine-readable line (the mission id)."""
+    monkeypatch.delenv("REWORK_BUDGET_USD", raising=False)
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(app, ["new", "fix the typo in the readme", "--repo", url, "--plan", "fix"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.strip().startswith("m-")  # stdout is the bare id
+    assert "budget: $1.00 (docs/typo-sized change" in result.stderr
+    mission = _get_mission(rework_db, result.stdout.strip())
+    assert mission is not None
+    budget = (mission.plan or {})["budget"]
+    assert budget["max_usd"] == 1.0
+    assert budget["original_max_usd"] == 1.0
+
+
+def test_new_explicit_budget_wins_over_the_estimate(
+    rework_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("REWORK_BUDGET_USD", raising=False)
+    url = "https://github.com/example/repo.git"
+    # a migration would be estimated at >= $8; --budget 7 must win
+    result = runner.invoke(app, ["new", "migrate the schema", "--repo", url, "--budget", "7"])
+
+    assert result.exit_code == 0, result.output
+    assert "budget: $7.00 (from --budget)" in result.stderr
+    mission = _get_mission(rework_db, result.stdout.strip())
+    assert mission is not None
+    assert (mission.plan or {})["budget"]["max_usd"] == 7.0
+    assert (mission.plan or {})["budget"]["original_max_usd"] == 7.0
+
+
+def test_new_honours_rework_budget_usd_over_the_estimate(
+    rework_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The env default keeps meaning what it meant: an estimator must not
+    silently override a deployment that configured a cap."""
+    monkeypatch.setenv("REWORK_BUDGET_USD", "4")
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(app, ["new", "migrate the schema", "--repo", url, "--plan", "fix"])
+
+    assert result.exit_code == 0, result.output
+    assert "budget: $4.00 (REWORK_BUDGET_USD" in result.stderr
+    mission = _get_mission(rework_db, result.stdout.strip())
+    assert mission is not None
+    assert (mission.plan or {})["budget"]["max_usd"] == 4.0
+
+
+def test_template_plan_carries_an_explicit_budget(rework_db: Path) -> None:
+    """`--plan fix --mechanical` used to drop --budget on the floor: the cap
+    only reached plan['budget'] through orchestrated_plan."""
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(
+        app, ["new", "fix it", "--repo", url, "--plan", "fix", "--mechanical", "--budget", "4"]
+    )
+    assert result.exit_code == 0, result.output
+    mission = _get_mission(rework_db, result.stdout.strip())
+    assert mission is not None
+    budget = (mission.plan or {})["budget"]
+    assert budget["max_usd"] == 4.0
+    assert budget["original_max_usd"] == 4.0
+    assert budget["auto_raises"] == 0
+    assert budget["raises"] == []
+
+
+def test_template_plan_without_a_budget_has_no_budget_key(rework_db: Path) -> None:
+    """No regression: a template mission created WITHOUT a cap keeps no
+    plan['budget'], because engine._build_graph would then enforce one."""
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(
+        app, ["new", "fix it", "--repo", url, "--plan", "fix", "--mechanical"]
+    )
+    assert result.exit_code == 0, result.output
+    mission = _get_mission(rework_db, result.stdout.strip())
+    assert mission is not None
+    assert "budget" not in (mission.plan or {})

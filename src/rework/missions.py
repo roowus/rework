@@ -124,6 +124,24 @@ def default_budget() -> tuple[float, float]:
     return cap, step
 
 
+def budget_rail(max_usd: float, step_usd: float | None = None) -> dict[str, Any]:
+    """The plan's budget dict: the cap, how much spend asks again, and the
+    raise policy's baseline (`original_max_usd` + an empty raise trail).
+
+    Shared by every plan that carries a cap: `orchestrated_plan` hands its
+    rail to ADR 0007 orchestrator missions and `create_mission` to a template
+    plan that was created WITH a budget, so both read the same keys."""
+    return {
+        "max_usd": float(max_usd),
+        "ask_every_usd": float(max_usd if step_usd is None else step_usd),
+        # the raise policy's baseline: automatic raises are capped at
+        # original_max_usd * ceiling_factor, so the ceiling cannot creep
+        "original_max_usd": float(max_usd),
+        "auto_raises": 0,
+        "raises": [],
+    }
+
+
 def orchestrated_plan(
     playbook: str,
     orchestrator_model: str,
@@ -146,15 +164,7 @@ def orchestrated_plan(
         "orchestrator": {"model": orchestrator_model, "effort": orchestrator_effort},
         "gates": list(PLAYBOOK_GATES.get(playbook, [])),
         "publish": PLAYBOOK_PUBLISH.get(playbook, ""),
-        "budget": {
-            "max_usd": max_usd,
-            "ask_every_usd": step if budget_step_usd is None else budget_step_usd,
-            # the raise policy's baseline: automatic raises are capped at
-            # original_max_usd * ceiling_factor, so the ceiling cannot creep
-            "original_max_usd": max_usd,
-            "auto_raises": 0,
-            "raises": [],
-        },
+        "budget": budget_rail(max_usd, step if budget_step_usd is None else budget_step_usd),
     }
     if model:
         spec["model"] = model
@@ -402,6 +412,12 @@ async def create_mission(
         template = PLAN_FIX_PR if plan == "fix-pr" else PLAN_FIX
         plan_spec = json.loads(json.dumps(template).replace("$OBJECTIVE", objective))
         plan_spec["kind"] = plan
+        if budget_usd is not None:
+            # ONLY when the caller passed a cap: engine._build_graph enforces
+            # plan["budget"]["max_usd"] whenever the key exists, and template
+            # missions have never had one, so inventing a default here would
+            # put a new cap on every existing `--plan fix` mission.
+            plan_spec["budget"] = budget_rail(budget_usd, budget_step_usd)
         if model:
             # a mission-wide model choice replaces the template's per-step pins
             for step in plan_spec["steps"]:
