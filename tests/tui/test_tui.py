@@ -2486,6 +2486,128 @@ async def test_a_replayed_chat_does_not_duplicate_its_proposal_cards(
         assert not app.swallowed
 
 
+async def test_a_store_swap_repaints_the_transcript_without_loss_or_duplication(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The RECONNECT path, through the real epoch counter.
+
+    A swapped store invalidates the row ids the view is holding, so the tick
+    cannot page on from its cursor: it has to re-read the whole transcript.
+    This drives the actual `TuiData.drop_store()` epoch bump (not a hand-set
+    field), writes a plain row and a foreign proposing row while the view holds
+    the dead handle, and then ticks once. What must hold: nothing written
+    during the outage is lost, and every proposal already on screen comes back
+    exactly once, in transcript order.
+    """
+    script_provider(
+        monkeypatch,
+        [
+            propose_many(
+                {"objective": "say hello", "plan": "echo", "title": "Greeting"},
+                {"objective": "say goodbye", "plan": "echo", "title": "Farewell"},
+            )
+        ],
+    )
+    from rework.kernel.state.records import ChatMessage
+    from rework.tui.widgets.cards import ProposalCard
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        work = app.view("work")
+        # a fresh chat, the way the duplicate test makes one: the seeded chat
+        # already carries a proposal of its own, which would muddy the count
+        for ch in "hello and goodbye":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        for _ in range(60):  # wait for the scripted turn, not for a fixed time
+            await _settle(pilot, 0.1)
+            if len(app.query(ProposalCard)) >= 2 and not work._sending:
+                break
+        await _settle(pilot, 0.5)
+        assert [c.proposal.objective for c in app.query(ProposalCard)] == [
+            "say hello",
+            "say goodbye",
+        ]
+        chat_id = work.convo.id  # the chat this process created with the turn
+        # A swapped connection hands back ids from a DIFFERENT sequence (another
+        # database, a re-created row), so the pointers the view kept can land
+        # above everything the store now holds. Paging on from them could never
+        # reach these rows again, which is exactly what the epoch re-read is
+        # for; without it the assertions below cannot pass.
+        work._chat_cursor = work._rendered_max_id = 10_000
+        epoch_before = app.hub.data.store_epoch
+
+        await app.hub.data.drop_store()  # the real swap: closes the handle, bumps the epoch
+        assert app.hub.data.store_epoch == epoch_before + 1
+        assert app.hub.data.store_epoch != work._store_epoch, "the view is stale now"
+
+        # another instance writes while this one holds the dead handle: a plain
+        # row and a proposing one, both of which the replay has to pick up
+        store = await _store(env)
+        try:
+            await store.append_chat_message(
+                ChatMessage(
+                    chat_id=chat_id,
+                    role="user",
+                    body={"role": "user", "content": "while you were swapped"},
+                    display="while you were swapped",
+                )
+            )
+            await store.append_chat_message(
+                ChatMessage(
+                    chat_id=chat_id,
+                    role="assistant",
+                    body={
+                        "role": "assistant",
+                        "content": "One more thing.",
+                        "tool_calls": [
+                            {
+                                "id": "c3",
+                                "type": "function",
+                                "function": {
+                                    "name": "propose_mission",
+                                    "arguments": json.dumps(
+                                        {
+                                            "objective": "say thanks",
+                                            "plan": "echo",
+                                            "title": "Thanks",
+                                        }
+                                    ),
+                                },
+                            }
+                        ],
+                    },
+                    display="One more thing.",
+                )
+            )
+        finally:
+            await store.aclose()
+
+        await work._tick_chat(chat_id).wait()  # the epoch branch of the tick
+        await _settle(pilot, 0.8)
+
+        def shown() -> str:
+            return "\n".join(str(s.render()) for s in app.query("#chat-log Step"))
+
+        cards = list(app.query(ProposalCard))
+        # three proposals are in the transcript (the two from the turn plus the
+        # one written during the outage) and NOT four: 4 would be the replayed
+        # pair painted on top of the pair already on screen
+        assert len(cards) == 3, f"{len(cards)} cards for three stored proposals"
+        assert [c.proposal.objective for c in cards] == [
+            "say hello",
+            "say goodbye",
+            "say thanks",
+        ]  # the two originals survive, in order, and the foreign one follows
+        assert "while you were swapped" in shown(), "the row written during the outage was lost"
+        # the view consumed the swap and re-seeded its pointers from the rows,
+        # instead of keeping the stale ones it held across the reconnect
+        assert work._store_epoch == app.hub.data.store_epoch
+        assert work._chat_cursor < 10_000 and work._rendered_max_id < 10_000
+        assert not app.swallowed
+
+
 async def test_gates_history_list_and_detail_follow_other_instances(
     ids: dict[str, str], env: Path
 ) -> None:
