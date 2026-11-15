@@ -1259,3 +1259,95 @@ def test_new_with_unknown_priority_is_a_clean_cli_error(rework_db: Path) -> None
             await store.aclose()
 
     assert asyncio.run(all_missions()) == []
+
+
+# --- main()'s dispatch of the help flags ------------------------------------
+# `rework --help` / `rework -h` used to open the TUI: parse_target_flag dropped
+# the leading flag, so main() saw an empty rest and took its "bare rework"
+# branch before typer ever ran. CliRunner invokes app() directly and cannot see
+# that dispatch, so these call the real main() with run_tui monkeypatched to
+# fail loudly instead of opening a dashboard.
+
+
+@pytest.fixture()
+def dispatched_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A throwaway HOME/state dir for a real main() run, with no targets.toml.
+
+    The REWORK_* vars resolve_target would setdefault are pinned to empty
+    strings first: on an empty value setdefault leaves them alone, and
+    monkeypatch restores whatever the session had before.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("REWORK_TARGETS", str(home / "targets.toml"))
+    # TARGETS_PATH is read from the env at import time, so the env var alone
+    # does not redirect an already-imported rework.targets: patch the constant.
+    monkeypatch.setattr("rework.targets.TARGETS_PATH", home / "targets.toml")
+    monkeypatch.setenv("REWORK_ENV_FILE", str(home / "rework.env"))
+    monkeypatch.setenv("REWORK_LOG_DIR", str(home / "logs"))
+    monkeypatch.delenv("REWORK_TARGET", raising=False)
+    for name in (
+        "REWORK_DB",
+        "REWORK_DAEMON_URL",
+        "REWORK_LIBRARY_DIR",
+        "REWORK_TARGET_NAME",
+        "REWORK_CHECKPOINTS_DB",
+    ):
+        monkeypatch.setenv(name, "")
+    return home
+
+
+def _tui_must_not_start(*_args: object, **_kwargs: object) -> None:
+    raise AssertionError("run_tui() was called: this argv belongs to the CLI, not the TUI")
+
+
+@pytest.mark.parametrize("flag", ["--help", "-h"])
+def test_main_help_flag_prints_help_and_does_not_start_the_tui(
+    flag: str,
+    dispatched_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """BLOCKER: `rework --help` and `rework -h` print typer help, exit 0, no TUI."""
+    import rework.tui as tui
+    from rework.cli import main
+
+    monkeypatch.setattr(tui, "run_tui", _tui_must_not_start)
+    monkeypatch.setattr(sys, "argv", ["rework", flag])
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 0
+    out = capsys.readouterr().out
+    assert "Usage: rework" in out
+    assert "--target" in out  # the real help body, not an error panel
+    assert "No such option" not in out
+
+
+def test_main_bare_and_target_only_argv_still_open_the_tui(
+    dispatched_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Control: the TUI path keeps working for a bare `rework` and `--target NAME`."""
+    import rework.tui as tui
+    from rework.cli import main
+
+    (dispatched_home / "targets.toml").write_text(
+        "[targets.sandbox]\n"
+        f'db = "sqlite:///{dispatched_home / "sandbox.db"}"\n'
+        'daemon_url = "http://127.0.0.1:8941"\n'
+    )
+
+    calls: list[str] = []
+
+    def fake_run_tui() -> None:
+        calls.append("started")
+
+    monkeypatch.setattr(tui, "run_tui", fake_run_tui)
+
+    for argv in (["rework"], ["rework", "--target", "sandbox"]):
+        calls.clear()
+        monkeypatch.setattr(sys, "argv", argv)
+        main()
+        assert calls == ["started"], argv

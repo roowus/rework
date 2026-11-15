@@ -24,6 +24,9 @@ app = typer.Typer(
     ),
     no_args_is_help=True,
     add_completion=False,
+    # `-h` as well as `--help`: without this only the long form is registered
+    # and `rework -h` was a "No such option" error (no command claims -h)
+    context_settings={"help_option_names": ["-h", "--help"]},
 )
 
 
@@ -1518,34 +1521,38 @@ def parse_target_flag(argv: list[str]) -> tuple[str | None, list[str]]:
     Global options belong BEFORE the subcommand, so the scan stops at the
     first non-flag token (the command name) or at `--`: `rework --target
     sandbox ls` parses to ("sandbox", ["ls"]), while `rework ls --target
-    sandbox` parses to (None, ["ls", ...]) — main() turns that into a usage
+    sandbox` parses to (None, ["ls", ...]); main() turns that into a usage
     error before anything is applied (the silent wrong-target run this
     feature exists to prevent). The NAME itself is only consumed when it
     cannot be a command: anything starting with `-` (like `--help`) is left
     alone, so `rework --target --help` is a missing name, not a target
     literally called `--help`. Returns (name_or_None, rest): rest is the
-    argv AFTER the parsed global prefix (empty = no subcommand, the TUI).
+    argv with the parsed global prefix removed. Every OTHER leading flag is
+    KEPT in rest, in its original order: an empty rest means "no arguments,
+    open the TUI", so silently dropping `--help` / `-h` made `rework --help`
+    look like a bare `rework` and start the dashboard instead of printing help.
     """
+    kept: list[str] = []  # leading flags that are not ours, preserved in order
     i = 0
     while i < len(argv):
         arg = argv[i]
         if arg == "--":
-            return None, argv[i:]  # end of options, by definition
+            return None, kept + argv[i:]  # end of options, by definition
         if arg.startswith("-") and arg != "-":
             if arg == "--target":
                 if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
-                    return argv[i + 1], argv[i + 2 :]
-                return None, argv[i:]  # a missing NAME: env/default decide
+                    return argv[i + 1], kept + argv[i + 2 :]
+                return None, kept + argv[i:]  # a missing NAME: env/default decide
             if arg.startswith("--target="):
                 value = arg[len("--target=") :]
-                return (value or None), argv[i + 1 :]  # --target= is a missing name
-            if not arg.startswith("--") and len(arg) > 2:
-                i += 2  # a short option with a value glued on (-n3), not a flag
-            else:
-                i += 1  # some other global flag; its args are not ours to parse
+                return (value or None), kept + argv[i + 1 :]  # --target= is a missing name
+            # some other global flag (--help, -h, a glued short option like
+            # -n3): kept in rest, never dropped, so typer decides what it means
+            kept.append(arg)
+            i += 1
             continue
-        return None, argv[i:]  # the subcommand: the global-option scan is over
-    return None, []
+        return None, kept + argv[i:]  # the subcommand: the global-option scan is over
+    return None, kept
 
 
 def _subcommand_names() -> set[str]:

@@ -178,8 +178,27 @@ def test_parse_target_flag_forms() -> None:
     assert parse_target_flag(["--target", "--help"]) == (None, ["--target", "--help"])
     assert parse_target_flag(["--target"]) == (None, ["--target"])
     assert parse_target_flag(["--target="]) == (None, [])
-    # other global flags are skipped without eating their neighbours
-    assert parse_target_flag(["--help", "--target", "sandbox", "ls"]) == ("sandbox", ["ls"])
+    # other leading flags are KEPT (never dropped: an empty rest means "open
+    # the TUI", so dropping `--help` started the dashboard instead of help)
+    assert parse_target_flag(["--help", "--target", "sandbox", "ls"]) == (
+        "sandbox",
+        ["--help", "ls"],
+    )
+
+
+
+def test_parse_target_flag_keeps_help() -> None:
+    """A lone leading flag must survive the scan, so main() does not see "bare rework".
+
+    Regression: an empty rest means "open the TUI", so dropping `--help` / `-h`
+    here made `rework --help` start the dashboard instead of printing help.
+    """
+    assert parse_target_flag(["--help"]) == (None, ["--help"])
+    assert parse_target_flag(["-h"]) == (None, ["-h"])
+    assert parse_target_flag(["--version"]) == (None, ["--version"])
+    flag, rest = parse_target_flag(["--help"])
+    assert flag is None
+    assert rest  # non-empty: main() must reach the typer app, not run_tui()
 
 
 def test_sqlite_db_path_forms() -> None:
