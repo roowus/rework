@@ -227,9 +227,13 @@ class Proposal:
         return " · ".join(bits)
 
 
-def proposal_budget(args: dict[str, Any], text: str = "") -> tuple[float, str]:
+def proposal_budget(
+    args: dict[str, Any], text: str = "", *, cost_history: float | None = None
+) -> tuple[float, str]:
     """(usd, reason) for a proposal: the model's own sizing when it gave a
-    usable one, else `estimate_budget` on the task text.
+    usable one, else `estimate_budget` on the task text, calibrated with what
+    finished missions actually cost here (`cost_history`, only nudges inside
+    the estimate's own band).
 
     Model output is never trusted to be well-formed, and it must never raise
     here: garbage falls back to the estimate, which always answers."""
@@ -239,7 +243,7 @@ def proposal_budget(args: dict[str, Any], text: str = "") -> tuple[float, str]:
     reason = str(args.get("budget_reason") or "").strip()
     if usd is not None:
         return usd, reason or f"model priced this at ${usd:.2f}"
-    estimated, why = estimate_budget(text)
+    estimated, why = estimate_budget(text, cost_history=cost_history)
     return float(estimated), reason or why
 
 
@@ -644,11 +648,18 @@ class OrchestratorChat:
             self._history.append(assistant_msg)
         asked = ""
         proposal: Proposal | None = None
+        history: float | None = None
+        if any(c.name == "propose_mission" for c in result.tool_calls) and self._store:
+            # the same calibration `rework new` uses (median finished cost), so
+            # a proposal is sized against real spend and not just the keywords
+            from rework.budget_policy import typical_finished_cost
+
+            history = await typical_finished_cost(self._store)
         for call in result.tool_calls:
             args = call.arguments or {}
             if call.name == "propose_mission":
                 objective = str(args.get("objective", "")).strip()
-                budget_usd, budget_reason = proposal_budget(args, objective)
+                budget_usd, budget_reason = proposal_budget(args, objective, cost_history=history)
                 proposal = Proposal(
                     objective=objective,
                     title=str(args.get("title", "")).strip(),

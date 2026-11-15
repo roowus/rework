@@ -49,6 +49,7 @@ from rework.kernel.state.records import (
     GateKind,
     GateStatus,
     Mission,
+    MissionStatus,
     new_id,
 )
 from rework.kernel.state.store import StateStore
@@ -182,6 +183,22 @@ def _history_usd(cost_history: Any) -> float | None:
     return value
 
 
+def finite_usd(value: Any) -> float | None:
+    """A finite amount of money, or None: NaN / inf / non-numeric / bool all
+    count as "not a number the owner said" and must never reach a cap.
+
+    Found live: NaN passed the old `float(args["max_usd"])` guard, `NaN <= cap`
+    and `NaN > ceiling` are both False, so a NaN cap was persisted and
+    `spent > max_usd` was False for ever — a mission with no cap at all."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _in_band(value: float, band: tuple[float, float], history: float | None) -> float:
     """`value` nudged toward a typical finished-mission cost, INSIDE `band`:
     history says whether this shop's missions run cheap or expensive, it does
@@ -267,6 +284,40 @@ def estimate_budget(text: str, *, cost_history: float | None = None) -> tuple[fl
     )
 
 
+FINISHED_SAMPLE = 20  # missions sampled to calibrate an estimate
+
+
+async def typical_finished_cost(store: StateStore, *, limit: int = FINISHED_SAMPLE) -> float | None:
+    """The MEDIAN total cost of this store's last `limit` finished missions, or
+    None when there is no history (a fresh deployment).
+
+    This is the calibration half of requirement 1: `estimate_budget`'s keyword
+    bands say how big a task looks, this says what missions actually cost here,
+    and `_in_band` uses it only to nudge INSIDE the chosen band. Never raises
+    and never blocks a mission: an unreadable ledger is simply "no history"."""
+    try:
+        missions = await store.list_missions(status=MissionStatus.DONE, limit=limit)
+    except Exception:  # the ledger is an optimisation, not a requirement
+        log.warning("could not read finished missions to calibrate the estimate", exc_info=True)
+        return None
+    costs: list[float] = []
+    for mission in missions or []:
+        try:
+            spend = await store.mission_spend(mission.id)
+        except Exception:
+            continue
+        cost = finite_usd(getattr(spend, "spent_usd", None))
+        if cost is not None and cost > 0:
+            costs.append(cost)
+    if not costs:
+        return None
+    costs.sort()
+    middle = len(costs) // 2
+    if len(costs) % 2:
+        return costs[middle]
+    return (costs[middle - 1] + costs[middle]) / 2.0
+
+
 def ensure_original(plan: dict[str, Any]) -> dict[str, Any]:
     """The plan's budget dict, with `original_max_usd` / `auto_raises` / `raises`
     filled in, and stored back on `plan`.
@@ -344,6 +395,11 @@ async def record_raise(
     dict so a caller holding a stale plan copy can refresh it."""
     if mission is None:
         return {}
+    if finite_usd(new) is None or finite_usd(old) is None:
+        # never write a cap nobody can compare against: NaN/inf would make
+        # every later `spent > max_usd` False, i.e. no cap at all
+        log.warning("refusing a non-finite budget raise %r -> %r", old, new)
+        return {}
     fresh = await store.get_mission(mission.id) or mission
     plan = dict(fresh.plan or {})
     budget = ensure_original(plan)
@@ -401,7 +457,13 @@ async def try_auto_raise(
     cap = float(budget.get("max_usd") or 0.0)
     original = float(budget.get("original_max_usd") or 0.0)
     already = int(budget.get("auto_raises") or 0)
-    wanted = float(wanted)
+    finite = finite_usd(wanted)
+    if finite is None:
+        # NaN/inf compares False both ways: `NaN <= cap` and `NaN > ceiling`
+        # would both let it through, and the cap would become unbounded
+        log.warning("refusing to auto-raise to a non-finite cap %r", wanted)
+        return False
+    wanted = finite
     if wanted <= cap:  # not a raise
         return False
     if already >= limit:  # the owner's turn

@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 from rework.budget_policy import (
     budget_policy,
     ensure_original,
+    finite_usd,
     raises_summary,
     record_raise,
     try_auto_raise,
@@ -1481,10 +1482,13 @@ class MissionOrchestrator:
         kept the old $2 cap and would have asked the owner again."""
         from rework.kernel.state.records import GateKind
 
-        try:
-            wanted = float(args.get("max_usd") or 0)
-        except (TypeError, ValueError) as exc:
-            raise ToolError("max_usd must be a number") from exc
+        # NaN/inf used to get through this: `NaN <= cap` is False (so it read
+        # as a raise) and `NaN > original*factor` is False (so the ceiling let
+        # it through), and a NaN cap then makes `spent > max_usd` False for
+        # ever — a mission with no cap. Reject anything not a finite number.
+        wanted = finite_usd(args.get("max_usd"))
+        if wanted is None or wanted <= 0:
+            raise ToolError("max_usd must be a finite number greater than 0")
         mission = await self.store.get_mission(self.mid) or self.mission
         plan = dict(mission.plan or {})
         budget = ensure_original(plan)

@@ -75,7 +75,8 @@ def new(
     budget: float | None = typer.Option(
         None,
         help="USD cap before the mission pauses to ask (default: estimated from the"
-        " task's size, or REWORK_BUDGET_USD when that is set).",
+        " task's size, calibrated from what finished missions cost; a template"
+        " plan with --mechanical gets no cap unless you pass one here).",
     ),
     mechanical: bool = typer.Option(
         False,
@@ -94,30 +95,51 @@ def new(
     audit, then a ship gate; `fix-pr` opens a PR instead (no gate by default,
     unless the project's `pr_gate` setting or the orchestrator asks for one)."""
 
-    cap, why = _opening_budget(objective, budget)
-    # stderr on purpose: stdout is the bare mission id, so `rework new ...` in
-    # a script keeps printing exactly one machine-readable line
-    typer.echo(f"budget: ${cap:.2f} ({why})", err=True)
-
     async def go() -> str:
+        from rework.config import Config, open_store_from_config
         from rework.missions import create_mission, resolve_project
+
+        # a template plan has NEVER carried a cap of its own: stamping an
+        # estimated one on it (see create_mission's comment) would make every
+        # `--plan fix` mission pause at a burn gate it never used to have. So
+        # the estimate is only for the orchestrated default path; a template
+        # mission gets a cap only when the owner asked for one with --budget.
+        # `--mechanical` runs the canned template pipeline; without it the plan
+        # name is just the orchestrator's playbook (ADR 0007). (an unknown plan
+        # is create_mission's error to raise, one place)
+        template = mechanical
+        store = None
+        if template and budget is None:
+            typer.echo("budget: no cap (a template plan runs uncapped unless --budget)", err=True)
+            cap, why = None, ""
+        else:
+            store = await open_store_from_config(Config.from_env())
+            cap, why = await _opening_budget(store, objective, budget)
+            # stderr on purpose: stdout is the bare mission id, so `rework new
+            # ...` in a script keeps printing exactly one machine-readable line
+            typer.echo(f"budget: ${cap:.2f} ({why})", err=True)
 
         orch_model = None
         if not mechanical:
             orch_model = orchestrator or default_orchestrator_model()
         project_id = await resolve_project(project)
-        mission = await create_mission(
-            objective,
-            repo=repo,
-            repo_dir=repo_dir,
-            project_id=project_id,
-            title=title,
-            plan=plan,
-            priority=priority,
-            orchestrator_model=orch_model,
-            orchestrator_effort=effort,
-            budget_usd=cap,
-        )
+        try:
+            mission = await create_mission(
+                objective,
+                repo=repo,
+                repo_dir=repo_dir,
+                project_id=project_id,
+                title=title,
+                plan=plan,
+                priority=priority,
+                orchestrator_model=orch_model,
+                orchestrator_effort=effort,
+                budget_usd=cap,
+                store=store,
+            )
+        finally:
+            if store is not None:
+                await store.aclose()
         return mission.id
 
     try:
@@ -126,25 +148,38 @@ def new(
         raise typer.BadParameter(str(exc)) from exc
 
 
-def _opening_budget(objective: str, budget: float | None) -> tuple[float, str]:
-    """(usd, why) for a new mission: explicit --budget, else REWORK_BUDGET_USD,
-    else the estimate for a task of this size.
+async def _opening_budget(store: Any, objective: str, budget: float | None) -> tuple[float, str]:
+    """(usd, why) for a new mission: explicit --budget, else the estimate for a
+    task of this size, else REWORK_BUDGET_USD for a mission with no task text.
 
-    An explicit cap always wins (the owner said a number), and so does a
-    deployment-wide REWORK_BUDGET_USD: the estimate is only the fallback for
-    a deployment that configured nothing, so setting the env var keeps meaning
-    exactly what it meant before."""
-    import os as _os
+    An explicit cap always wins (the owner said a number). Otherwise the
+    ESTIMATE wins and `REWORK_BUDGET_USD` is only the fallback when there is no
+    text to size (an empty objective): a deployment that still carries the old
+    blanket default must not flatten `rework new` back to a single number.
+    The estimate is calibrated with what finished missions actually cost here
+    (`typical_finished_cost`), which only nudges it inside its own band."""
+    from rework.budget_policy import typical_finished_cost
 
     if budget is not None:
         return float(budget), "from --budget"
+    history: float | None = None
+    if (objective or "").strip():
+        try:  # a slow/unreadable ledger must not block creating a mission
+            history = await typical_finished_cost(store)
+        except Exception:  # pragma: no cover - typical_finished_cost never raises
+            history = None
+    usd, why = estimate_budget(objective, cost_history=history)
+    import os as _os
+
     configured = _os.environ.get("REWORK_BUDGET_USD")
-    if configured:
+    if not (objective or "").strip() and configured:
         try:
-            return float(configured), "REWORK_BUDGET_USD, the deployment default"
+            return float(configured), "REWORK_BUDGET_USD, the deployment default (no task text)"
         except ValueError:
             pass  # a broken env var must not block creating the mission
-    return estimate_budget(objective)
+    if history:
+        why = f"{why}; nudged by typical finished-mission cost ${history:.2f}"
+    return usd, why
 
 
 def default_orchestrator_model(catalog: Any = None) -> str:

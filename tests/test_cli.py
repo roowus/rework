@@ -1198,20 +1198,82 @@ def test_new_explicit_budget_wins_over_the_estimate(
     assert (mission.plan or {})["budget"]["original_max_usd"] == 7.0
 
 
-def test_new_honours_rework_budget_usd_over_the_estimate(
+def test_new_estimates_over_the_stale_env_default(
     rework_db: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The env default keeps meaning what it meant: an estimator must not
-    silently override a deployment that configured a cap."""
-    monkeypatch.setenv("REWORK_BUDGET_USD", "4")
+    """A deployment that still carries the OLD blanket default ($2) must not
+    flatten every `rework new` back to $2: the estimate wins, the env var is
+    only the fallback for a mission with no task text to size."""
+    monkeypatch.setenv("REWORK_BUDGET_USD", "2")
     url = "https://github.com/example/repo.git"
     result = runner.invoke(app, ["new", "migrate the schema", "--repo", url, "--plan", "fix"])
+
+    from rework.budget_policy import estimate_budget
+
+    estimated, why = estimate_budget("migrate the schema")
+    assert estimated > 2.0, "the estimate must differ from the stale default"
+    assert result.exit_code == 0, result.output
+    assert f"budget: ${estimated:.2f} ({why})" in result.stderr
+    mission = _get_mission(rework_db, result.stdout.strip())
+    assert mission is not None
+    assert (mission.plan or {})["budget"]["max_usd"] == estimated
+
+
+def test_new_without_task_text_falls_back_to_the_env_default(
+    rework_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing to size: the deployment default is still the last word."""
+    monkeypatch.setenv("REWORK_BUDGET_USD", "4")
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(app, ["new", "  ", "--repo", url, "--plan", "fix"])
 
     assert result.exit_code == 0, result.output
     assert "budget: $4.00 (REWORK_BUDGET_USD" in result.stderr
     mission = _get_mission(rework_db, result.stdout.strip())
     assert mission is not None
     assert (mission.plan or {})["budget"]["max_usd"] == 4.0
+
+
+def test_new_is_sized_from_what_finished_missions_really_cost(
+    rework_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The calibration half of the estimate: two finished missions that really
+    cost ~$3 each pull a long feature brief from the band's $5 down to $4.50 on
+    the CLI path, which is what makes "sized from the charges table" true."""
+    from rework.kernel.state.records import Charge
+
+    monkeypatch.delenv("REWORK_BUDGET_USD", raising=False)
+
+    async def seed() -> None:
+        store = await open_sqlite(str(rework_db))
+        try:
+            for mid, cost in (("m-done1", 2.0), ("m-done2", 4.0)):
+                await store.create_mission(
+                    Mission(id=mid, objective="earlier mission", status=MissionStatus.DONE)
+                )
+                await store.charge(
+                    Charge(
+                        mission_id=mid,
+                        model="m",
+                        input_tokens=10,
+                        output_tokens=10,
+                        cost_usd=cost,
+                    )
+                )
+        finally:
+            await store.aclose()
+
+    asyncio.run(seed())
+    url = "https://github.com/example/repo.git"
+    brief = "add a feature to the parser, " * 20  # > 300 chars: the top of the band
+    result = runner.invoke(app, ["new", brief, "--repo", url, "--plan", "fix"])
+
+    assert result.exit_code == 0, result.output
+    assert "budget: $4.50 (normal feature-sized change" in result.stderr
+    assert "typical finished-mission cost $3.00" in result.stderr
+    mission = _get_mission(rework_db, result.stdout.strip())
+    assert mission is not None
+    assert (mission.plan or {})["budget"]["max_usd"] == 4.5
 
 
 def test_template_plan_carries_an_explicit_budget(rework_db: Path) -> None:
@@ -1231,15 +1293,23 @@ def test_template_plan_carries_an_explicit_budget(rework_db: Path) -> None:
     assert budget["raises"] == []
 
 
-def test_template_plan_without_a_budget_has_no_budget_key() -> None:
+def test_template_plan_without_a_budget_gets_no_budget_through_the_cli(
+    rework_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """No regression: a template mission created WITHOUT a cap keeps no
-    plan['budget'], because engine._build_graph would then enforce one.
+    plan['budget'], because engine._build_graph would then enforce one and the
+    mission would pause at a burn gate it never had.
 
-    `create_mission` is called directly on purpose: `rework new` always passes
-    an estimated cap now, so the CLI cannot reach this path any more."""
-    from rework.missions import create_mission
-
-    mission = asyncio.run(
-        create_mission("fix it", repo="https://github.com/example/repo.git", plan="fix")
-    )
-    assert "budget" not in (mission.plan or {})
+    Through the CLI on purpose: the estimate is for the orchestrated default
+    path only, so `--plan fix --mechanical` without --budget must stay
+    uncapped — and must not CLAIM a budget on stderr either."""
+    monkeypatch.delenv("REWORK_BUDGET_USD", raising=False)
+    url = "https://github.com/example/repo.git"
+    for extra in (["--plan", "fix"], ["--plan", "fix-pr"], ["--plan", "echo"]):
+        result = runner.invoke(app, ["new", "fix it", "--repo", url, "--mechanical", *extra])
+        assert result.exit_code == 0, result.output
+        mission = _get_mission(rework_db, result.stdout.strip())
+        assert mission is not None
+        assert "budget" not in (mission.plan or {}), extra
+        assert "no cap" in result.stderr, extra
+        assert "$" not in result.stderr, extra

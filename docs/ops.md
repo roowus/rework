@@ -572,9 +572,30 @@ to the estimate, so a proposal always carries a budget and a one-line reason.
   is pressed (or when a typed `yes` auto-launches) is the cap the mission is
   created with. An unparseable or `<= 0` value keeps the previous number.
 - `rework new "…" --budget 6` overrides the estimate, and it says which rule
-  won on stderr (`budget: $6.00 (from --budget)`). `REWORK_BUDGET_USD` is the
-  deployment-wide default and wins over the estimate but not over `--budget`;
-  an explicit budget always wins.
+  won on stderr (`budget: $6.00 (from --budget)`). An explicit budget always
+  wins.
+- Otherwise the ESTIMATE is the cap. `REWORK_BUDGET_USD` is NOT a blanket
+  default any more: it is only the fallback for a mission with no task text to
+  size (an empty objective), reported as `budget: $4.00 (REWORK_BUDGET_USD,
+  the deployment default (no task text))`. A deployment that still carries the
+  old `REWORK_BUDGET_USD=2` therefore no longer flattens every `rework new` to
+  $2 — the task's size decides.
+- The estimate is CALIBRATED from the real ledger: the median total cost of
+  the last 20 `done` missions (`typical_finished_cost`, read from `charges` via
+  `mission_spend`) nudges it *inside* the band the keywords chose, never across
+  a band (a typo where this shop's missions cost $9 still costs $1-2; a risky
+  change where they cost $1 still costs $8). The stderr line names the nudge
+  (`…; nudged by typical finished-mission cost $3.00`). With no finished
+  missions the estimate is exactly the keyword one. The TUI proposal card is
+  sized the same way (`proposal_budget(..., cost_history=...)`).
+- `rework new … --plan fix --mechanical` (a TEMPLATE plan: `fix`, `fix-pr`,
+  `echo`) is a different path: it has never carried a cap of its own, and it
+  still does not get one unless you ask for it with `--budget`. `create_mission`
+  only stamps `plan["budget"]` for a template when a cap was passed explicitly,
+  because `engine._build_graph` enforces `max_usd` whenever the key exists —
+  inventing one would make every template mission pause at a burn gate it never
+  had. stderr says so: `budget: no cap (a template plan runs uncapped unless
+  --budget)`.
 
 **The first raises are free.** The first two raises of a mission are approved
 automatically, as long as the new cap stays within 2x the ORIGINAL budget

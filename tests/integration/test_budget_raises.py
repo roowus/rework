@@ -260,6 +260,38 @@ async def test_a_project_can_turn_auto_raises_off(
     assert budget["auto_raises"] == 0
 
 
+async def test_a_non_finite_or_non_positive_max_usd_is_rejected(world: dict[str, Any]) -> None:
+    """NaN/inf used to sail through: `NaN <= cap` is False (so it looked like a
+    raise) and `NaN > original*factor` is False (so the ceiling allowed it), the
+    NaN was persisted, and `spent > max_usd` was then False for ever — a mission
+    with NO cap. Every bad number must come back as a tool error and leave the
+    stored cap exactly where it was."""
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+    provider.route(
+        MARKER,
+        [
+            turn(call("request_budget", "b1", max_usd=float("nan"), reason="nan")),
+            turn(call("request_budget", "b2", max_usd=float("inf"), reason="inf")),
+            turn(call("request_budget", "b3", max_usd=-1, reason="negative")),
+            turn(call("request_budget", "b4", max_usd="a lot", reason="garbage")),
+            turn(call("finish", "b5", outcome="failed", summary="checked budget")),
+        ],
+    )
+    await asyncio.wait_for(asyncio.create_task(runner(world).run()), timeout=60)
+
+    budget = _budget(await store.get_mission("mo"))
+    assert budget["max_usd"] == 2.0, "nothing may move the cap"
+    assert budget["auto_raises"] == 0
+    assert budget["raises"] == []
+    assert await store.list_open_gates("mo") == [], "a bad number is not a question"
+    events = await store.events_since(0, mission_id="mo")
+    assert not [e for e in events if e.type == EventType.BUDGET_RAISED]
+
+    msgs = await store.chat_messages(orchestrator_chat_id("mo"))
+    assert _tool_text(msgs, "max_usd must be a finite number greater than 0")
+
+
 # -- the burn gate ----------------------------------------------------------
 
 

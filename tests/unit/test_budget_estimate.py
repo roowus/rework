@@ -4,6 +4,8 @@ deployment default. Pure, predictable (same text -> same answer), never raises.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from rework.budget_policy import estimate_budget
@@ -127,3 +129,72 @@ def test_every_answer_is_rounded_to_half_a_dollar_and_never_below_it() -> None:
 def test_it_is_deterministic() -> None:
     text = "migrate the schema and fix the auth flow"
     assert estimate_budget(text) == estimate_budget(text)
+
+
+# -- calibrating from what missions actually cost ---------------------------
+#
+# requirement 1: "calibrate from the real costs in the charges table". The
+# estimate's bands say how big a task LOOKS; this says what missions cost here.
+
+
+class _FakeStore:
+    """The two store calls the calibration makes, nothing else: finished
+    missions and their ledger totals (that is all `typical_finished_cost`
+    reads, so no sqlite is needed)."""
+
+    def __init__(self, finished: dict[str, float], spend_raises: bool = False) -> None:
+        self.finished = finished
+        self.spend_raises = spend_raises
+
+    async def list_missions(self, status: Any = None, limit: int = 50) -> list[Any]:
+        from rework.kernel.state.records import MissionStatus
+
+        if status is not MissionStatus.DONE:
+            return []
+        return [_Row(mid) for mid in self.finished][:limit]
+
+    async def mission_spend(self, mission_id: str) -> Any:
+        from rework.kernel.state.records import BudgetState
+
+        if self.spend_raises:
+            raise RuntimeError("the ledger is unreadable")
+        return BudgetState(spent_usd=self.finished[mission_id])
+
+
+class _Row:
+    def __init__(self, mission_id: str) -> None:
+        self.id = mission_id
+
+
+async def test_typical_finished_cost_is_the_median_of_finished_missions() -> None:
+    from rework.budget_policy import typical_finished_cost
+
+    store = _FakeStore({"a": 1.0, "b": 2.0, "c": 9.0})
+    assert await typical_finished_cost(store) == 2.0
+    assert await typical_finished_cost(_FakeStore({"a": 1.0, "b": 3.0})) == 2.0  # even count
+
+
+async def test_typical_finished_cost_is_none_without_history_and_never_raises() -> None:
+    from rework.budget_policy import typical_finished_cost
+
+    assert await typical_finished_cost(_FakeStore({})) is None
+    assert await typical_finished_cost(_FakeStore({"a": 4.0}, spend_raises=True)) is None
+    assert await typical_finished_cost(_FakeStore({"a": 0.0, "b": 0.0})) is None  # no real cost
+
+
+async def test_a_finished_mission_average_nudges_the_estimate_within_band() -> None:
+    """A shop whose missions really finish around $3 gets $4.50 for a long
+    feature brief instead of the band's $5 — and still $1-2 for a typo, $8 for
+    a risky change: the calibration never crosses a band."""
+    from rework.budget_policy import typical_finished_cost
+
+    history = await typical_finished_cost(_FakeStore({"a": 2.0, "b": 4.0}))
+    assert history == 3.0
+    assert estimate_budget(LONG)[0] == 5.0
+    assert estimate_budget(LONG, cost_history=history)[0] == 4.5
+    assert estimate_budget("fix the typo", cost_history=history)[0] == 2.0  # docs band
+    assert estimate_budget("migrate the schema", cost_history=history)[0] == 8.0
+    # ...and with no history at all the answer is exactly what it was before
+    assert estimate_budget(LONG, cost_history=await typical_finished_cost(_FakeStore({}))) == (
+        estimate_budget(LONG)
+    )
