@@ -59,7 +59,7 @@ class View(Container):
     def on_snapshot(self, snap: Snapshot) -> None:
         pass
 
-    def animate(self, frame: str, now: float) -> None:
+    def tick(self, frame: str, now: float) -> None:
         """Called by the app's ONE animation timer with the current frame.
 
         `frame` comes from the shared clock (spinner.frame_for), never from a

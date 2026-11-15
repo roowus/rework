@@ -243,7 +243,7 @@ class ReworkApp(App[None]):
         # the ONLY animation timer: 10fps, feeding one frame from the shared
         # clock to the active view. It does no I/O, no DB access and mounts
         # nothing; a view with nothing running returns immediately.
-        self.set_interval(ANIMATION_SECONDS, self._animate)
+        self.set_interval(ANIMATION_SECONDS, self._tick_frames)
         self._restore_ui_state()
 
     def get_theme_variable_defaults(self) -> dict[str, str]:
@@ -260,7 +260,7 @@ class ReworkApp(App[None]):
     def current(self) -> View:
         return self.view(self.active_tab)
 
-    def _animate(self) -> None:
+    def _tick_frames(self) -> None:
         """One spinner frame to the ACTIVE view only.
 
         The frame value comes from a monotonic clock read HERE, at paint time,
@@ -271,9 +271,12 @@ class ReworkApp(App[None]):
         is not available without tracking screens ourselves."""
         if not self.app_focus:
             return
-        now = time.time()
-        frame = spinner.frame_for(time.monotonic())
-        self.current.animate(frame, now)
+        try:
+            view = self.current
+        except NoMatches:
+            # the app is closing: the timer can outlive the mounted views
+            return
+        view.tick(spinner.frame_for(time.monotonic()), time.time())
 
     async def on_event(self, event: events.Event) -> None:
         if isinstance(event, events.Key) and not event.is_forwarded:

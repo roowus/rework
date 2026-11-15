@@ -393,7 +393,7 @@ class DashboardView(View):
             return glyph(status)
         return run_mark(spinner.is_stalled(now, last), frame)
 
-    def animate(self, frame: str, now: float) -> None:
+    def tick(self, frame: str, now: float) -> None:
         """Repaint only the rows that carry a running marker (10fps).
 
         Rebuilding the markup string with the next frame IS the repaint:
@@ -402,11 +402,11 @@ class DashboardView(View):
         mounts nothing and touches the store not at all."""
         with self.painting():
             if self.mission_id is None:
-                self._animate_overview(frame, now)
+                self._tick_overview(frame, now)
             else:
-                self._animate_mission(frame, now)
+                self._tick_mission(frame, now)
 
-    def _animate_overview(self, frame: str, now: float) -> None:
+    def _tick_overview(self, frame: str, now: float) -> None:
         missions = self._filtered()
         mrows: list[RowData] = []
         for title, statuses in SECTIONS:
@@ -439,7 +439,7 @@ class DashboardView(View):
             else:
                 self.query_one("#st-running", Stat).set(f"{mark} {running}", "working")
 
-    def _animate_mission(self, frame: str, now: float) -> None:
+    def _tick_mission(self, frame: str, now: float) -> None:
         mission = self.snap.mission(self.mission_id)
         if mission is None:
             return
@@ -466,7 +466,13 @@ class DashboardView(View):
         return rows
 
     def _proj_row(
-        self, name: str, missions: list[Any], dim: bool = False, *, frame: str = "", now: float = 0.0
+        self,
+        name: str,
+        missions: list[Any],
+        dim: bool = False,
+        *,
+        frame: str = "",
+        now: float = 0.0,
     ) -> str:
         running = sum(1 for m in missions if status_value(m.status) == "running")
         waiting = sum(1 for m in missions if status_value(m.status) == "awaiting_gate")
@@ -1018,9 +1024,7 @@ class DashboardView(View):
         else:
             head = status_text(st)
         header.update(
-            f"[b]{esc(mission.objective)}[/b]\n{head}  [{MUTED}]"
-            + esc("  ·  ".join(bits))
-            + "[/]"
+            f"[b]{esc(mission.objective)}[/b]\n{head}  [{MUTED}]" + esc("  ·  ".join(bits)) + "[/]"
         )
         # same run-derived round structure as the graph tab, so the two
         # cannot drift (the strip is compact, the graph is the full flow)

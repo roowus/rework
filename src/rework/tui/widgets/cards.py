@@ -180,7 +180,7 @@ class MissionCard(Vertical):
             self.last_seq = max(self.last_seq, max(int(ev.seq or 0) for ev in events))
         self.paint()
 
-    def animate(self, frame: str, now: float, last_event: float | None) -> None:
+    def tick(self, frame: str, now: float, last_event: float | None) -> None:
         """Repaint the card head with the current spinner frame (surface d).
 
         Nothing but a genuinely running mission animates; the frame itself comes
@@ -208,7 +208,9 @@ class MissionCard(Vertical):
             )
             if mark and spinner.is_stalled(self._now, self._last_event):
                 mark += f" [{FAINT}]idle"
-                mark += f" {spinner.human_duration(spinner.silence(self._now, self._last_event))}[/]"
+                mark += (
+                    f" {spinner.human_duration(spinner.silence(self._now, self._last_event))}[/]"
+                )
             elif mark:
                 mark += f" [{FAINT}]working[/]"
             bits = [esc(self.mission_id), esc(plan_label(m.plan))]

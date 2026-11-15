@@ -216,7 +216,10 @@ class RowList(VerticalScroll, can_focus=True):
     def set_rows(self, rows: list[RowData]) -> None:
         keys = [r.key for r in rows]
         existing = {row.key: row for row in self.query(Row)}
-        if keys == self._keys:
+        # `mount_all` is deferred, so `_keys` can be ahead of the DOM for a
+        # moment; a 10Hz repaint can land in that gap. Only take the in-place
+        # path when the rows it wants to update are really there.
+        if keys == self._keys and all(key in existing for key in keys):
             for data in rows:
                 existing[data.key].refresh_data(data)
         else:
