@@ -77,6 +77,15 @@ async def _write_result(
     return await store.update_mission(mission_id, result=result)
 
 
+async def _safe_write(store: StateStore, mission_id: str, updates: dict[str, Any]) -> None:
+    """Delivery bookkeeping must never escape: a store failure here would
+    re-create the original bug (a finished mission dying in the runner)."""
+    try:
+        await _write_result(store, mission_id, updates)
+    except Exception:
+        log.exception("could not record PR delivery state for %s: %r", mission_id, updates)
+
+
 async def deliver_pr(
     store: StateStore,
     bus: Any,
@@ -104,7 +113,7 @@ async def deliver_pr(
         error = _error_text(exc)
         attempts = int(getattr(exc, "attempts", 1) or 1)
         log.warning("PR delivery for %s failed: %s", mission_id, error)
-        await _write_result(
+        await _safe_write(
             store,
             mission_id,
             {
@@ -126,7 +135,7 @@ async def deliver_pr(
             },
         )
         return None
-    await _write_result(
+    await _safe_write(
         store,
         mission_id,
         {
@@ -158,6 +167,15 @@ def _pr_title(mission: Mission) -> str:
     return f"rework: {name if len(name) <= 72 else name[:71].rstrip() + '…'}"
 
 
+def _is_checkout(path: str) -> bool:
+    """A usable git checkout: an existing dir with a `.git` (dir, or the file a
+    linked worktree has)."""
+    if not path:
+        return False
+    p = Path(path)
+    return p.is_dir() and (p / ".git").exists()
+
+
 async def retry_pr(store: StateStore, bus: Any, mission_id: str) -> tuple[bool, str]:
     """Retry push+PR for a finished mission from its persisted delivery record.
 
@@ -180,11 +198,25 @@ async def retry_pr(store: StateStore, bus: Any, mission_id: str) -> tuple[bool, 
             f"mission {mission_id} has no recorded branch to push; "
             "its PR delivery state is unknown (nothing to retry)"
         )
-    worktree = str(result.get("pr_worktree") or mission.repo_path or "")
-    if not worktree or not Path(worktree).is_dir():  # noqa: ASYNC240 - one stat, not I/O worth offloading
+    recorded = str(result.get("pr_worktree") or "")
+    worktree = recorded
+    if not _is_checkout(recorded):
         # the coder worktree may have been reclaimed since the failure: the
         # branch is usually still a ref of the mission's own repo
-        worktree = str(mission.repo_path or worktree)
+        worktree = str(mission.repo_path or "")
+    if not _is_checkout(worktree):
+        checked = [p for p in dict.fromkeys([recorded, str(mission.repo_path or "")]) if p]
+        error = (
+            f"the worktree for branch {branch} of mission {mission_id} is gone "
+            f"(checked: {', '.join(checked) or 'no recorded path'}), so the delivery "
+            "cannot be retried automatically; re-create a checkout containing that "
+            "branch (or push it by hand) and run retry-pr again"
+        )
+        previous = str(result.get("pr_error") or "")
+        if previous:
+            error += f"\nunderlying error from the original attempt:\n{previous}"
+        log.warning("%s", error)
+        return False, error
     url = await deliver_pr(
         store,
         bus,

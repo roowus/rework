@@ -10,7 +10,7 @@ from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.widgets import Static
 
-from rework.tui.actions import can, delivery_pending
+from rework.tui.actions import can
 from rework.tui.theme import (
     ACCENT,
     FAINT,
@@ -222,10 +222,6 @@ class MissionCard(Vertical):
             pr.update(f"PR: {esc(pr_url)}")
         for btn in self.query(".mc-previewbtn").results(Btn):
             btn.display = bool(pr_url)
-        # finished, work kept, PR not delivered: the one button that fixes it
-        pending = delivery_pending(getattr(m, "result", None) or {})
-        for btn in self.query(".mc-retrypr").results(Btn):
-            btn.display = pending and not pr_url
         yes_no = self.gate is not None and self.gate.kind.value in (
             "ship",
             "open_pr",
@@ -239,10 +235,13 @@ class MissionCard(Vertical):
             else:
                 btn.display = yes_no  # questions and choices need the Gates tab
         status = self.status
-        for verb in ("pause", "resume", "cancel"):
+        result = getattr(m, "result", None) or {}
+        # the ONE writer of these buttons' visibility ("retry-pr": finished,
+        # work kept, PR not delivered)
+        for verb in ("pause", "resume", "cancel", "retry-pr"):
             for btn in self.query(Btn):
                 if btn.action == verb:
-                    btn.display = can(verb, status)
+                    btn.display = can(verb, status, result)
 
     def on_btn_pressed(self, event: Btn.Pressed) -> None:
         event.stop()

@@ -11,6 +11,7 @@ import contextlib
 import re
 from pathlib import Path
 
+from rework.nodes.failure_text import marker_regex, scrub
 from rework.nodes.tools import ToolExecutor
 
 
@@ -256,7 +257,10 @@ _PUSH_REJECTION_MARKERS = (
     "authentication failed",
     "denied to",
 )
-_PUSH_REJECTION_PATTERNS = (re.compile(r"\b403\b"),)
+_PUSH_REJECTION_PATTERNS = (
+    re.compile(r"\b(?:http|status|error|returned error)[/:\s.\d]*\b403\b"),
+    re.compile(r"\b403\s+forbidden\b"),
+)
 
 # The transport (or the forge behind it) hiccuped: a retry IS the fix.
 _PUSH_TRANSIENT_MARKERS = (
@@ -283,7 +287,11 @@ _PUSH_TRANSIENT_MARKERS = (
 )
 # `! [remote rejected] b -> b (failed)`: the remote refused the ref update and
 # did NOT say why. This is the live case; treat it as transient.
-_PUSH_REASONLESS_REJECTION = re.compile(r"\[remote rejected\].*\(failed\)")
+# Anchored to the END of the line so `(failed)` can never be the tail of a
+# reasoned refusal such as `(stale info)` / `(fetch first)`.
+_PUSH_REASONLESS_REJECTION = re.compile(r"\[remote rejected\][^\n]*\(failed\)\s*$", re.MULTILINE)
+_PUSH_REJECTION_RE = marker_regex(_PUSH_REJECTION_MARKERS)
+_PUSH_TRANSIENT_RE = marker_regex(_PUSH_TRANSIENT_MARKERS)
 
 
 class PushError(RuntimeError):
@@ -307,12 +315,12 @@ def push_failure_is_transient(output: str, code: int = 1) -> bool:
     protected-branch or auth failure also mentions hosts, TLS and timeouts."""
     if code == 124:  # git was killed on timeout: no answer is a transient answer
         return True
-    text = (output or "").lower()
-    if any(marker in text for marker in _PUSH_REJECTION_MARKERS):
+    text = scrub(output)
+    if _PUSH_REJECTION_RE.search(text):
         return False
     if any(pattern.search(text) for pattern in _PUSH_REJECTION_PATTERNS):
         return False
-    if any(marker in text for marker in _PUSH_TRANSIENT_MARKERS):
+    if _PUSH_TRANSIENT_RE.search(text):
         return True
     return bool(_PUSH_REASONLESS_REJECTION.search(text))
 

@@ -160,6 +160,25 @@ def _remote_refs(bare: Path) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _toyrepo_with_remote(tmp_path: Path) -> tuple[Path, Path]:
+    """A committed copy of examples/toyrepo whose `origin` is a bare repo."""
+    source = Path(__file__).parents[2] / "examples" / "toyrepo"
+    dest = tmp_path / "mission" / "toyrepo"
+    dest.mkdir(parents=True)
+    for f in source.iterdir():
+        if f.is_file():
+            shutil.copy(f, dest / f.name)
+    bare = tmp_path / "origin.git"
+    bare.mkdir()
+    _git("init", "--bare", "-b", "main", cwd=bare)
+    _git("init", "-b", "main", cwd=dest)
+    _git("add", "-A", cwd=dest)
+    _git("-c", "user.email=r@r", "-c", "user.name=r", "commit", "-m", "init", cwd=dest)
+    _git("remote", "add", "origin", str(bare), cwd=dest)
+    _git("push", "-u", "origin", "main", cwd=dest)
+    return dest, bare
+
+
 async def test_push_branch_retries_a_transient_rejection_and_succeeds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -180,20 +199,7 @@ async def test_mission_delivery_retries_a_reject_once_remote_and_records_the_pr_
     still finishes DONE with a PR URL, and the retry is what got it there."""
     import json
 
-    source = Path(__file__).parents[2] / "examples" / "toyrepo"
-    dest = tmp_path / "mission" / "toyrepo"
-    dest.mkdir(parents=True)
-    for f in source.iterdir():
-        if f.is_file():
-            shutil.copy(f, dest / f.name)
-    bare = tmp_path / "origin.git"
-    bare.mkdir()
-    _git("init", "--bare", "-b", "main", cwd=bare)
-    _git("init", "-b", "main", cwd=dest)
-    _git("add", "-A", cwd=dest)
-    _git("-c", "user.email=r@r", "-c", "user.name=r", "commit", "-m", "init", cwd=dest)
-    _git("remote", "add", "origin", str(bare), cwd=dest)
-    _git("push", "-u", "origin", "main", cwd=dest)
+    dest, bare = _toyrepo_with_remote(tmp_path)
 
     fake_gh = tmp_path / "fake-gh"
     fake_gh.write_text("#!/bin/sh\necho https://github.com/roowus/toyrepo/pull/11\n")
@@ -680,3 +686,257 @@ def test_pr_failure_classification_is_conservative() -> None:
     assert pr_failure_is_transient("HTTP 503 Service Unavailable") is True
     assert pr_failure_is_transient('a pull request for branch "x" already exists') is False
     assert pr_failure_is_transient("gh: Authentication failed") is False
+
+
+# ---------------------------------------------------------------------------
+# audit round 2: no-raise guarantee, dead worktree, end-to-end DONE write
+# ---------------------------------------------------------------------------
+
+
+async def _done_mission(store: Any, work: Path, mid: str, **result: Any) -> Mission:
+    return await store.create_mission(
+        Mission(
+            id=mid,
+            objective="deliver the thing",
+            title="Deliver",
+            status=MissionStatus.DONE,
+            plan={"kind": "fix-pr", "publish": "pr"},
+            repo_path=str(work),
+            result={"summary": "kept", **result},
+        )
+    )
+
+
+async def test_a_plain_runtime_error_from_pr_create_still_leaves_the_mission_done(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Not a PushError/GHError: a bare RuntimeError must be recorded, not raised."""
+    _, work = _make_repo(tmp_path)
+    long_error = "".join(f"gh line {i:04d}\n" for i in range(400)) + "the LAST line"
+
+    async def boom(*_a: Any, **_k: Any) -> str:
+        raise RuntimeError(long_error)
+
+    monkeypatch.setattr("rework.orchestrator.delivery.pr_create", boom)
+    store = await open_sqlite(str(tmp_path / "d.sqlite3"))
+    try:
+        mission = await _done_mission(store, work, "mplainerr0001")
+        url = await deliver_pr(
+            store,
+            InProcessEventBus(store),
+            mission.id,
+            branch="rework/test",
+            worktree=str(work),
+            title="t",
+            body="b",
+        )
+        assert url is None
+        stored = await store.get_mission(mission.id)
+        assert stored is not None
+        assert stored.status == MissionStatus.DONE
+        assert stored.result["summary"] == "kept"
+        assert stored.result["pr_pending"] is True
+        assert stored.result["pr_error"].endswith("the LAST line"), "untruncated"
+        assert len(stored.result["pr_error"]) > 2000
+    finally:
+        await store.aclose()
+
+
+async def test_a_store_or_bus_failure_in_delivery_bookkeeping_does_not_escape(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, work = _make_repo(tmp_path)
+
+    class ExplodingBus:
+        async def publish(self, *_a: Any, **_k: Any) -> None:
+            raise OSError("bus is down")
+
+    async def boom(*_a: Any, **_k: Any) -> str:
+        raise RuntimeError("gh exploded")
+
+    store = await open_sqlite(str(tmp_path / "d.sqlite3"))
+    try:
+        mission = await _done_mission(store, work, "mstorefail001")
+
+        async def write_fails(*_a: Any, **_k: Any) -> Any:
+            raise OSError("disk is full")
+
+        monkeypatch.setattr(store, "update_mission", write_fails)
+        # failure path: write fails AND the bus fails -> still returns None
+        monkeypatch.setattr("rework.orchestrator.delivery.pr_create", boom)
+        args: dict[str, Any] = {"branch": "rework/test", "worktree": str(work)}
+        args |= {"title": "t", "body": "b"}
+        assert await deliver_pr(store, ExplodingBus(), mission.id, **args) is None
+
+        # success path: the PR exists, so the URL is returned even if the
+        # bookkeeping that records it fails
+        async def ok(*_a: Any, **_k: Any) -> str:
+            return "https://x/pull/1"
+
+        monkeypatch.setattr("rework.orchestrator.delivery.pr_create", ok)
+        assert await deliver_pr(store, ExplodingBus(), mission.id, **args) == "https://x/pull/1"
+    finally:
+        await store.aclose()
+
+
+async def test_retry_pr_with_both_worktree_and_repo_gone_returns_an_explicit_error(
+    tmp_path: Path,
+) -> None:
+    store = await open_sqlite(str(tmp_path / "d.sqlite3"))
+    try:
+        gone = tmp_path / "deleted-worktree"
+        gone_repo = tmp_path / "deleted-repo"  # neither exists
+        mission = await store.create_mission(
+            Mission(
+                id="mgone0000001",
+                objective="deliver the thing",
+                status=MissionStatus.DONE,
+                plan={"kind": "fix-pr", "publish": "pr"},
+                repo_path=str(gone_repo),
+                result={
+                    "summary": "kept",
+                    "pr_pending": True,
+                    "pr_branch": "rework/gone",
+                    "pr_worktree": str(gone),
+                    "pr_error": "PushError: the original failure text",
+                },
+            )
+        )
+        ok, detail = await retry_pr(store, None, mission.id)  # must not raise
+        assert ok is False
+        assert "worktree" in detail and "is gone" in detail
+        assert "cannot be retried automatically" in detail
+        assert "rework/gone" in detail
+        assert str(gone) in detail and str(gone_repo) in detail
+        assert "PushError: the original failure text" in detail, "underlying error kept whole"
+        assert "FileNotFoundError" not in detail
+    finally:
+        await store.aclose()
+
+
+async def test_retry_pr_falls_back_to_the_repo_when_the_recorded_worktree_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bare, work = _make_repo(tmp_path)
+    fake_gh = tmp_path / "fake-gh"
+    fake_gh.write_text("#!/bin/sh\necho https://x/pull/8\n")
+    fake_gh.chmod(0o755)
+    monkeypatch.setenv("REWORK_GH_BIN", str(fake_gh))
+    store = await open_sqlite(str(tmp_path / "d.sqlite3"))
+    try:
+        mission = await _done_mission(
+            store,
+            work,
+            "mfallback0001",
+            pr_pending=True,
+            pr_branch="rework/test",
+            pr_worktree=str(tmp_path / "deleted-worktree"),
+        )
+        ok, detail = await retry_pr(store, None, mission.id)
+        assert ok, detail
+        assert detail == "https://x/pull/8"
+        assert "rework/test" in _remote_refs(bare)
+    finally:
+        await store.aclose()
+
+
+async def test_mission_whose_delivery_persistently_fails_stays_done_with_the_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through MissionRunner/Agent: the FINAL persisted row, after
+    `_synthesize` rebuilds the result, still says DONE + pr_pending + the whole
+    error (git's reason is the last line). Guards `DELIVERY_RESULT_KEYS` in
+    `_synthesize`: without that copy the marker is overwritten and this fails."""
+    import json
+
+    dest, bare = _toyrepo_with_remote(tmp_path)
+    fake_gh = tmp_path / "fake-gh"
+    fake_gh.write_text("#!/bin/sh\necho https://github.com/roowus/toyrepo/pull/12\n")
+    fake_gh.chmod(0o755)
+    monkeypatch.setenv("REWORK_GH_BIN", str(fake_gh))
+    monkeypatch.setattr("rework.nodes.git_ops.PUSH_BACKOFF_S", FAST)
+    bindir, counter = _fail_push_shim(tmp_path, GITHUB_TRANSIENT_FAILURE, times=99)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+
+    from rework.orchestrator.daemon import sqlite_checkpointer_factory
+
+    store = await open_sqlite(str(tmp_path / "pr.sqlite3"))
+    try:
+        objective = "write docs: add a line to README saying hello from rework"
+        plan = json.loads(json.dumps(PLAN_FIX_PR).replace("$OBJECTIVE", objective))
+        mission = await store.create_mission(
+            Mission(id="mpersistent01", objective=objective, repo_path=str(dest), plan=plan)
+        )
+        provider = ScriptedProvider()
+        provider.route("Investigate any brief", _investigator_script())
+        provider.route("Fulfill the task", _coder_script("docs line added, tests still green"))
+        provider.route("Find issues", _auditor_script(AUDIT_CLEAN))
+        runner = MissionRunner(
+            mission.id,
+            store,
+            InProcessEventBus(store),
+            autodiscover(),
+            role_catalog(),
+            sqlite_checkpointer_factory(str(tmp_path / "ck.sqlite3")),
+            tmp_path / "work",
+            poll_interval_s=0.05,
+            provider=provider,
+        )
+        await asyncio.wait_for(asyncio.create_task(runner.run()), timeout=60)
+
+        final = await store.get_mission(mission.id)
+        assert final is not None
+        assert final.status == MissionStatus.DONE, "a persistent push failure must not fail it"
+        assert final.status != MissionStatus.FAILED
+        # PLAN_FIX_PR has no orchestrator, so the summary is the coder's artifact
+        assert any(k.startswith("coder") for k in final.result["artifacts"]), "the work is kept"
+        assert final.result["pr_pending"] is True
+        assert final.result["pr_status"] == "failed"
+        assert not final.result.get("pr_url")
+        error = final.result["pr_error"]
+        assert "[remote rejected]" in error
+        assert error.splitlines()[-1].strip().startswith("error: failed to push some refs"), (
+            "git's LAST line survives, untruncated"
+        )
+        assert final.result["pr_branch"], "everything needed to retry is persisted"
+        assert _push_attempts(counter) == 3, "retried up to the cap, then gave up"
+        assert _remote_refs(bare) == ["main"]
+    finally:
+        await store.aclose()
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        # a branch/path that merely CONTAINS a marker word is not a rejection
+        "To https://github.com/o/r.git\n"
+        " ! [remote rejected] rework/fix-permission-denied-gate"
+        " -> rework/fix-permission-denied-gate (failed)\n",
+        # progress counters are not HTTP statuses; a path containing `ssl` is not TLS
+        "Writing objects: 100% (512/512)\n ! [remote rejected] wip -> wip (failed)",
+    ],
+)
+def test_marker_words_inside_names_do_not_flip_the_classification(output: str) -> None:
+    assert push_failure_is_transient(output) is True
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        " ! [remote rejected] wip -> wip (stale info)",
+        " ! [remote rejected] wip -> wip (fetch first)",
+        " ! [remote rejected] wip -> wip (pre-receive hook declined)",
+        " ! [remote rejected] wip -> wip (failed to update ref: locked)",
+        "error: refs 5432 pushed to /var/ssl-ca/timeout-box.git",
+    ],
+)
+def test_reasoned_or_unrelated_output_is_not_mistaken_for_a_transient_failure(
+    output: str,
+) -> None:
+    assert push_failure_is_transient(output) is False
+
+
+def test_pr_classification_ignores_marker_words_in_names_and_numbers() -> None:
+    assert pr_failure_is_transient("created 512 objects, 5432 bytes") is False
+    assert pr_failure_is_transient("could not open /tmp/server-permission/x: timed out") is True
+    assert pr_failure_is_transient("HTTP 502: Bad Gateway for branch rework/permission-fix") is True

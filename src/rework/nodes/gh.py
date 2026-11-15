@@ -14,6 +14,8 @@ import os
 import re
 from pathlib import Path
 
+from rework.nodes.failure_text import marker_regex, scrub
+
 PR_ATTEMPTS = 3
 PR_BACKOFF_S: tuple[float, ...] = (1.0, 2.0, 4.0)
 
@@ -52,7 +54,9 @@ _PR_DEFINITIVE_MARKERS = (
     "no commits between",
     "invalid",
 )
-_PR_5XX = re.compile(r"\b5\d\d\b")
+_PR_5XX = re.compile(r"\b(?:http|status|error|returned error)[/:\s.\d]*\b5\d\d\b")
+_PR_TRANSIENT_RE = marker_regex(_PR_TRANSIENT_MARKERS)
+_PR_DEFINITIVE_RE = marker_regex(_PR_DEFINITIVE_MARKERS)
 
 
 class GHError(RuntimeError):
@@ -68,12 +72,12 @@ class GHError(RuntimeError):
 def pr_failure_is_transient(output: str) -> bool:
     """Is this `gh pr create` failure worth another attempt? Conservative on
     purpose: only a timeout or a 5xx, never "already exists" or an auth error."""
-    text = (output or "").lower()
-    if any(marker in text for marker in _PR_DEFINITIVE_MARKERS):
+    text = scrub(output)
+    if _PR_DEFINITIVE_RE.search(text):
         return False
     if _PR_5XX.search(text):
         return True
-    return any(marker in text for marker in _PR_TRANSIENT_MARKERS)
+    return bool(_PR_TRANSIENT_RE.search(text))
 
 
 async def pr_create(

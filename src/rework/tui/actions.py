@@ -19,6 +19,8 @@ VERBS = {
     "pause": ("pause_mission", "Paused", "Pausing stops the roles; everything stays resumable."),
     "resume": ("resume_mission", "Resumed", ""),
     "cancel": ("cancel_mission", "Cancelled", ""),
+    # handled by `retry_pr` below; listed so every verb has one registry entry
+    "retry-pr": ("", "PR delivered", "Re-runs push + PR from the recorded delivery state."),
 }
 
 # "Finished, but the PR was never delivered": the state the delivery helper
@@ -33,8 +35,11 @@ def delivery_pending(result: dict[str, Any] | None) -> bool:
 ACTIVE = {"pending", "running", "awaiting_gate", "on_hold"}
 
 
-def can(verb: str, status: str) -> bool:
-    """Which controls make sense for a mission status."""
+def can(verb: str, status: str, result: dict[str, Any] | None = None) -> bool:
+    """Which controls make sense for a mission status (and, for `retry-pr`,
+    its recorded delivery state)."""
+    if verb == "retry-pr":
+        return status == "done" and delivery_pending(result) and not (result or {}).get("pr_url")
     if verb == "pause":
         return status in {"pending", "running", "awaiting_gate"}
     if verb == "resume":
