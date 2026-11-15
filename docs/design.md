@@ -75,9 +75,10 @@ as chat `orch-<mission>`, each turn's system prompt carries a digest rebuilt
 from store rows, spawns are idempotent by tool-call id, and a restart re-runs
 an interrupted turn's unanswered calls. Its events and charges carry the pseudo
 run id `<mission>:orchestrate:orchestrator:1`. `rework new` creates orchestrated
-missions by default; `--mechanical` keeps the canned runner. Still to come
-(M7 P2): redirect, answering escalations itself, asking the owner, and owner
-messages to a running mission.
+missions by default; `--mechanical` keeps the canned runner. The orchestrator
+can also `redirect` a running role, answer escalations itself
+(`answer_escalation`), ask the owner (`ask_owner`, `message_owner`), and it
+receives the owner's messages to a running mission.
 
 The engine (`orchestrator/engine.py`) is the heart: MissionRunner streams the graph,
 materializes interrupts as gate rows, waits on store-derived wake conditions, resumes with

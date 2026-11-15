@@ -154,3 +154,26 @@ audits and unit tests.
 What worked: the orchestrator asked for budget before running out with an
 honest status, cancelled a coder and switched to `flash` on the owner's word,
 and gave its coders tight briefs after two of them explored instead of editing.
+
+## 2026-11-14, running rework on rewvis (a day of PRs, then two outages)
+
+| # | finding | cause | status |
+|---|---|---|---|
+| 31 | Pending missions starved behind newer ones | pickup listed newest first and hid the rest behind a limit | fixed: oldest first, none hidden (#35) |
+| 32 | Every PR waited on a gate the owner did not want | `open_pr` gated by default | fixed: PRs open without a gate unless the orchestrator or the project asks; missions get a priority (#36) |
+| 33 | The TUI chat "ghosted" the owner twice | Library store did not reconnect, the chat reply budget was too small, a cut-off turn ended silently | fixed: reconnect, bigger budget with a cut-off retry, every turn ends visibly (#33) |
+| 34 | Costs escalated to expensive models by default | the cheap strong model was not the default everywhere | fixed: it is now, and escalation goes to a stronger model only when needed (#32) |
+| 35 | The orchestrator fails missions when its model thinks too long (token cut-offs, empty text) | the orchestrator's output budget was too small for long reasoning | open: PR #30 waits on mission m-aea59e6edac5 (empty-text fix) |
+| 36 | The TUI asked the owner to restart after a merge | the code watcher only said "restart to load" | fixed: it reloads itself when the owner is idle; verified in a real pty by touching a module with a short idle threshold (#34) |
+| 37 | A finished mission's push was rejected once and the work was lost | a transient push failure failed the mission | open: mission m-962354ede976 (retry, and a push failure must not fail a finished mission) |
+| 38 | Roles took the whole VM down | no limit on what role commands use, and waiting missions held a slot | fixed in part: role cap, niced and memory-capped commands, waiting missions hold no slot (#38) |
+| 39 | rewvis froze twice in two days (not a power-off) | slow memory exhaustion: available RAM fell from 6.2 GB to 0.17 GB over about 26 hours, committed memory reached 180% of RAM, load average hit 80 just before the freeze; sshd and tailscaled were starved | mitigated: sshd/tailscaled `OOMScoreAdjust=-900`, rework.service `MemoryHigh=5G`/`MemoryMax=7G`, earlyoom, seven unused services stopped; the single growing process is not yet identified |
+| 40 | The only evidence of the outage was outside the VM | the kernel OOM lines did not survive the hang | fixed for next time: the OCI CLI gives CPU/memory metrics and the console log without SSH; documented in the todo list |
+| 41 | `scripts/ci-local` cannot pass on a Mac | a test reads `/proc/self/limits`, which only exists on Linux | open: skip it off Linux |
+| 42 | A PR added `tests/unit/test_hub_teardown.py` next to main's `tests/tui/test_hub_teardown.py` | pytest cannot import two test files with the same basename | fixed in #38 by removing the duplicate; no rule stops a coder from doing this again |
+| 43 | CI on main is red for a non-code reason | GitHub billing (failed payment / spending limit): jobs never start | open: owner to fix billing; `scripts/ci-local` is the check meanwhile |
+| 44 | The dashboard search's fuzzy fallback matches almost anything | a query counts as matching when its letters appear in order anywhere in a long objective | open |
+
+Not recorded here: the crash loop and the docker/tailscale race named in
+the todo list. Their details were not in anything read for this entry;
+add them from the owner's notes.
