@@ -286,4 +286,82 @@ async def test_daemon_wires_both_caps_from_the_config(tmp_path: Any) -> None:
         cfg,
     )
     assert daemon._limiter.cap == 3, "REWORK_MAX_ROLES caps RUNNING roles daemon-wide"
-    assert daemon._sem._value == 2, "REWORK_CONCURRENCY caps WORKING missions"  # type: ignore[attr-defined]
+    assert daemon._sem._free == 2, "REWORK_CONCURRENCY caps WORKING missions"  # type: ignore[attr-defined]
+
+
+async def test_a_gated_mission_resumes_ahead_of_never_started_missions() -> None:
+    """The invisible-gate bug end to end: the mission steps aside at a gate, a
+    never-started mission queues for its slot, then the gate is decided. The
+    resumed mission must run its tail BEFORE the never-started one."""
+    from rework.orchestrator.limits import PrioritySlots
+
+    slots = PrioritySlots(1)
+    order: list[str] = []
+    gated = MissionSlot(slots, "m-gated")
+    await gated.acquire()
+
+    release_gate = asyncio.Event()
+
+    async def gated_mission() -> None:
+        async with gated.while_waiting():  # parked at the gate: slot given up
+            await release_gate.wait()  # ... the owner approves
+        order.append("gated-tail")  # the post-gate work (push, open the PR)
+        gated.release()
+
+    async def new_mission() -> None:
+        slot = MissionSlot(slots, "m-new")
+        await slot.acquire()
+        order.append("new-mission")
+        slot.release()
+
+    waiter = asyncio.create_task(gated_mission())
+    await asyncio.sleep(0)
+    # the slot is free right now, so occupy it with a long-running mission and
+    # queue the never-started one behind it
+    busy = MissionSlot(slots, "m-busy")
+    await busy.acquire()
+    newcomer = asyncio.create_task(new_mission())
+    await asyncio.sleep(0)
+    release_gate.set()  # decided: gated now queues for its slot back
+    await asyncio.sleep(0)
+    busy.release()
+    await asyncio.wait_for(asyncio.gather(waiter, newcomer), timeout=2)
+    assert order == ["gated-tail", "new-mission"], order
+
+
+async def test_resumed_acquire_jumps_the_fresh_queue() -> None:
+    from rework.orchestrator.limits import PrioritySlots
+
+    slots = PrioritySlots(1)
+    await slots.acquire()  # the slot is busy
+    order: list[str] = []
+
+    async def take(name: str, resumed: bool) -> None:
+        await slots.acquire(resumed=resumed)
+        order.append(name)
+        slots.release()
+
+    fresh = [asyncio.create_task(take(f"fresh-{i}", False)) for i in range(3)]
+    await asyncio.sleep(0)
+    resumed = asyncio.create_task(take("resumed", True))
+    await asyncio.sleep(0)
+    slots.release()
+    await asyncio.wait_for(asyncio.gather(resumed, *fresh), timeout=2)
+    assert order == ["resumed", "fresh-0", "fresh-1", "fresh-2"]
+
+
+async def test_priority_slots_never_exceed_the_cap_and_survive_cancellation() -> None:
+    from rework.orchestrator.limits import PrioritySlots
+
+    slots = PrioritySlots(1)
+    await slots.acquire()
+    queued = asyncio.create_task(slots.acquire())
+    await asyncio.sleep(0)
+    queued.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await queued
+    slots.release()
+    # the cancelled waiter must not have swallowed the slot
+    await asyncio.wait_for(slots.acquire(), timeout=1)
+    slots.release()
+    assert slots._free == 1

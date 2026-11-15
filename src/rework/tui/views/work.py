@@ -168,10 +168,44 @@ class WorkView(View):
 
     def on_snapshot(self, snap: Snapshot) -> None:
         self.snap = snap
+        self.mark_time_painted()
         self._paint_chat_list()
         self._paint_head()
         self._paint_knobs()
         self._refresh_cards()
+        self._poll_chat()
+
+    def tick(self, frame: str, now: float) -> None:
+        """Animate the running mission cards (10fps): no store, no remounting.
+
+        The frame comes from the shared clock; the last event time comes from
+        the snapshot the view already holds, so a poll cannot reset the spinner.
+        Each card is judged by ITS mission's own stamp. A mission with no stamp
+        is unknown and animates; the "*" aggregate (newest event of any running
+        mission) is never borrowed, or a dead card would animate whenever any
+        other mission worked."""
+        cards = [c for c in self.query(MissionCard) if c.status == "running"]
+        if not cards:
+            return
+        stamps = self.snap.last_event
+        with self.painting():
+            for card in cards:
+                last = stamps.get(card.mission_id)
+                card.tick(frame, last)
+
+    def on_tick(self, snap: Snapshot) -> None:
+        self.snap = snap
+        cards = list(self.query(MissionCard))
+        if self.time_repaint_due():
+            self._paint_chat_list()  # "4m ago" on each chat row
+            for card in cards:  # "started 3m ago" on each live card
+                card.paint()
+        else:
+            for card in cards:  # a moved event stamp can flip a card to idle
+                if card.observe(snap.last_event.get(card.mission_id)):
+                    card.paint()
+        if cards:
+            self._poll_cards(cards)
         self._poll_chat()
 
     def _poll_chat(self) -> None:
@@ -799,21 +833,56 @@ class WorkView(View):
         if not cards:
             return
         for card in cards:
-            mission = self.snap.mission(card.mission_id)
-            if mission is not None:
-                card.update_from(mission, self.snap.gates_for(card.mission_id))
+            row = self.snap.mission(card.mission_id)
+            if row is None:
+                continue
+            last = self.snap.last_event.get(card.mission_id)
+            if getattr(row, "light", False):
+                # a light row has no plan or result: keep the full mission the
+                # card already holds while it is current, else _poll_cards
+                # fetches it (never paint the light row over a full one)
+                if self._card_is_current(card, row):
+                    card.update_from(card.mission, self.snap.gates_for(card.mission_id), last)
+            else:
+                card.update_from(row, self.snap.gates_for(card.mission_id), last)
         self._poll_cards(cards)
+
+    def _card_is_current(self, card: MissionCard, row: Any) -> bool:
+        """Does the card hold a full mission at the snapshot row's updated_at?"""
+        have = card.mission
+        return (
+            have is not None
+            and not getattr(have, "light", False)
+            and have.updated_at == row.updated_at
+        )
 
     @work(exclusive=True, group="cards")
     async def _poll_cards(self, cards: list[MissionCard]) -> None:
         for card in cards:
-            if card.mission is None:
+            row = self.snap.mission(card.mission_id)
+            if (
+                card.mission is None
+                or (
+                    row is not None
+                    and getattr(row, "light", False)
+                    and not self._card_is_current(card, row)
+                )
+            ) and time.monotonic() >= card.fetch_next_try:
                 mission = await self.hub.guard(
                     partial(self.hub.data.get_mission, card.mission_id), None
                 )
                 if mission is not None:
+                    card.fetch_failures = 0
+                    card.fetch_next_try = 0.0
                     with self.painting():  # the app can close during the await above
-                        card.update_from(mission, self.snap.gates_for(card.mission_id))
+                        card.update_from(
+                            mission,
+                            self.snap.gates_for(card.mission_id),
+                            self.snap.last_event.get(card.mission_id),
+                        )
+                else:  # a row that cannot be read is not re-SELECTed every tick
+                    card.fetch_failures += 1
+                    card.fetch_next_try = time.monotonic() + min(30.0, 2.0**card.fetch_failures)
             if card.status not in actions.ACTIVE:
                 # Finished (done/failed/cancelled): nothing more will arrive,
                 # so the card is never polled again. Whatever lines it had
@@ -832,7 +901,6 @@ class WorkView(View):
                     if evs is not None:
                         with self.painting():
                             card.rebuild_tail(evs)
-                        card.tail_filled = True
                     # its cost too, once: the finished path skips the live
                     # poll below (found live: a done card lost its $7.07)
                     card.spend = await self.hub.guard(
@@ -840,6 +908,12 @@ class WorkView(View):
                     )
                     with self.painting():
                         card.paint()
+                    # the card counts as filled only AFTER the cost is in. This
+                    # worker is exclusive: the next poll cancels it at any await,
+                    # and a flag set before the spend fetch left a finished card
+                    # at $0 forever (an intermittent CI failure on Python 3.12).
+                    if evs is not None:
+                        card.tail_filled = True
                 continue
             evs = await self.hub.guard(
                 partial(self.hub.data.events_tail, card.mission_id, card.last_seq), []
@@ -847,11 +921,13 @@ class WorkView(View):
             if evs:
                 with self.painting():
                     card.add_events(evs)
+            spent = card.spend
             card.spend = await self.hub.guard(
                 partial(self.hub.data.mission_spend, card.mission_id), card.spend
             )
-            with self.painting():
-                card.paint()
+            if card.spend != spent:  # add_events painted its own change; time has its cadence
+                with self.painting():
+                    card.paint()
 
     def on_mission_card_act(self, event: MissionCard.Act) -> None:
         event.stop()
@@ -868,7 +944,7 @@ class WorkView(View):
             self.rw.view("gates").select_gate(event.gate_id)
         elif verb == "preview":
             self.run_worker(actions.preview(self.rw, mid), group="preview")
-        elif verb in ("pause", "resume", "cancel"):
+        elif verb in ("pause", "resume", "cancel", "retry-pr"):
             self.run_worker(actions.control(self.rw, mid, verb), group="control")
 
     def last_mission_id(self) -> str | None:

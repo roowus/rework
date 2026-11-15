@@ -24,7 +24,7 @@ from textual.css.query import NoMatches
 from textual.timer import Timer
 from textual.widgets import ContentSwitcher, Input, Markdown, Static
 
-from rework.tui import actions, search
+from rework.tui import actions, search, spinner
 from rework.tui.hub import Snapshot
 from rework.tui.theme import (
     ACCENT,
@@ -38,6 +38,7 @@ from rework.tui.theme import (
     glyph,
     money,
     plan_label,
+    run_mark,
     status_text,
     status_value,
     tokens,
@@ -131,17 +132,34 @@ class DashboardView(View):
         self.snap = Snapshot()
         self.project: str = ALL
         self.filter = "all"
-        # mission search: the live text filter + the ✦ ranking
+        # mission search: one query, one list. `_filtered()` is the only way a
+        # mission reaches the list; the ✦ ranking orders the same list instead of
+        # forking a second render path.
         self.query_text = ""
-        self.ai_results: list[dict[str, str]] | None = None  # None = normal list
-        self.ai_note = ""
-        self.ai_armed = False  # set by the ✦ button: Enter then ranks
+        self.ai_results: list[dict[str, str]] | None = None  # None = plain filter
+        self.ai_query = ""  # the query the current ✦ search/ranking is for
+        self.ai_note = ""  # AI status/error, shown on the one search status line
         self._ai_busy = False
-        # bumped when a ranking is dismissed, so an in-flight worker's result is
-        # dropped instead of landing on a bar the user has already moved past
+        # bumped when a ranking is dismissed or the query moves on, so an
+        # in-flight worker's result is dropped instead of landing on a bar the
+        # user has already moved past
         self._ai_gen = 0
+        # projects sidebar: plain name filter (no ranking, no closeness)
+        self.project_query = ""
         self._debounce: Timer | None = None
         self.mission_id: str | None = None
+        # the open mission's FULL row (plan, result): the snapshot only carries
+        # light rows, so _poll_mission fetches this once per open and again only
+        # when the mission's updated_at moves
+        self.full_mission: Any = None
+        self.full_failed = False  # the last full-row fetch came back empty
+        # backoff for a failing full-row fetch (the Hub._next_try idiom): a row
+        # that cannot be read must not be re-SELECTed on every tick
+        self._full_failures = 0
+        self._full_next_try = 0.0
+        # what the open mission's detail was last painted from; an unchanged
+        # poll (same key, cadence not due) repaints nothing
+        self._painted_key: tuple[Any, ...] | None = None
         self.run_id: str | None = None
         self.mtab = "traj"
         # mission page state
@@ -186,6 +204,7 @@ class DashboardView(View):
                             # files area to add to; a git project is told to push
                             yield Btn("Add files", "add-files", variant="ghost")
                         yield Label("Projects")
+                        yield Input(placeholder="Filter projects…  (tab ⇥)", id="proj-search")
                         yield RowList(id="proj-list")
                     with Vertical(classes="main"):
                         with Horizontal(classes="subbar"):
@@ -203,6 +222,10 @@ class DashboardView(View):
                             yield Input(
                                 placeholder="Search missions…  (/ to focus)",
                                 id="mission-search",
+                                # focus must never select-all: after ✦ the query
+                                # is the ranking's, and one keystroke has to
+                                # extend it, not wipe it
+                                select_on_focus=False,
                             )
                             yield Btn("Search", "search", variant="ghost")
                             yield Btn("✦", "ai-search", variant="ghost", tooltip="AI search")
@@ -234,6 +257,12 @@ class DashboardView(View):
                                 yield Markdown("", id="m-report-body")
                             with VerticalScroll(id="m-gates", classes="doc"):
                                 yield Vertical(id="m-gates-body")
+                with Horizontal(id="m-msgbar"):
+                    yield Input(
+                        placeholder="Message this mission's orchestrator…  (enter to send)",
+                        id="m-msg",
+                    )
+                    yield Btn("Send", "msg-send", variant="primary")
 
     def on_mount(self) -> None:
         self._paint_head()
@@ -242,7 +271,13 @@ class DashboardView(View):
     def hints(self) -> list[tuple[str, str]]:
         if self.mission_id:
             return [("click", "focus a session"), ("esc", "back"), ("ctrl+c", "copy")]
-        return [("/", "search"), ("click", "open mission"), ("↑↓", "move"), ("enter", "open")]
+        return [
+            ("/", "search"),
+            ("tab ⇥", "cycle focus"),
+            ("click", "open mission"),
+            ("↑↓", "move"),
+            ("enter", "open"),
+        ]
 
     def shown(self) -> None:
         target = "#run-list" if self.mission_id else "#mission-list"
@@ -258,6 +293,7 @@ class DashboardView(View):
 
     def on_snapshot(self, snap: Snapshot) -> None:
         self.snap = snap
+        self.mark_time_painted()
         self._paint_overview()
         self._paint_head()
         if time.time() - self._enriched_at > 15:
@@ -265,6 +301,19 @@ class DashboardView(View):
             self._enrich()
         if self.mission_id:
             self._paint_mission_static()
+            self._poll_mission()
+
+    def on_tick(self, snap: Snapshot) -> None:
+        self.snap = snap
+        if self.time_repaint_due():
+            # the data is unchanged but `ago(...)` text is not: repaint only what
+            # carries time (the list rows, the open mission's header)
+            self._paint_overview()
+            self._painted_key = None  # the open mission repaints below
+        if time.time() - self._enriched_at > 15:
+            self._enriched_at = time.time()
+            self._enrich()
+        if self.mission_id:
             self._poll_mission()
 
     @work(exclusive=True, group="dash-enrich")
@@ -299,21 +348,53 @@ class DashboardView(View):
     # -- overview -------------------------------------------------------------------
 
     def _filtered(self) -> list[Any]:
-        out = []
-        for m in self.snap.missions:
-            if self.project == NONE and m.project_id:
-                continue
-            if self.project not in (ALL, NONE) and m.project_id != self.project:
-                continue
-            st = status_value(m.status)
-            if self.filter == "active" and st not in actions.ACTIVE:
-                continue
-            if self.filter == "done" and st != "done":
-                continue
-            if self.filter == "failed" and st not in ("failed", "cancelled"):
-                continue
-            out.append(m)
+        out = [m for m in self.snap.missions if self._passes(m)]
+        ranked = self._ranking()
+        if ranked is not None:
+            return self._in_rank_order(out, ranked)
         return search.search_missions(out, self.query_text)
+
+    def _passes(self, mission: Any) -> bool:
+        """Does the project/status filter let this mission into the list?"""
+        if self.project == NONE and mission.project_id:
+            return False
+        if self.project not in (ALL, NONE) and mission.project_id != self.project:
+            return False
+        st = status_value(mission.status)
+        if self.filter == "active" and st not in actions.ACTIVE:
+            return False
+        if self.filter == "done" and st != "done":
+            return False
+        if self.filter == "failed" and st not in ("failed", "cancelled"):
+            return False
+        return True
+
+    def _ranking(self) -> list[dict[str, str]] | None:
+        """The ✦ ranking, but only while it still answers the query in the box:
+        typing a new query (or clearing it) expires the old ordering."""
+        if self.ai_results is None:
+            return None
+        if self.ai_query != self.query_text.strip():
+            return None
+        return self.ai_results
+
+    def _in_rank_order(self, missions: list[Any], ranked: list[dict[str, str]]) -> list[Any]:
+        """The ranked missions that survive the project/status filters, best
+        first. Same list object as the plain search: the model decides the ORDER
+        of the hits only. The query still decides who is in the list, so a pick
+        that is not a strict match for it is dropped, never resurrected (a
+        zero-match query must never grow rows because ✦ was pressed)."""
+        order = {hit["id"]: i for i, hit in enumerate(ranked)}
+        hits = [m for m in search.search_missions(missions, self.query_text) if m.id in order]
+        hits.sort(key=lambda m: order[m.id])
+        return hits
+
+    def _reason(self, mission_id: str) -> str:
+        ranking = self._ranking() or []
+        for hit in ranking:
+            if hit["id"] == mission_id:
+                return str(hit.get("reason") or "")
+        return ""
 
     def _paint_overview(self) -> None:
         snap = self.snap
@@ -331,7 +412,7 @@ class DashboardView(View):
             for sid in ("st-running", "st-gates", "st-paused", "st-done", "st-today", "st-week"):
                 self.query_one(f"#{sid}", Stat).set("—", note)
             return
-        self.query_one("#st-running", Stat).set(str(counts.get("running", 0)))
+        self._paint_running_tile()
         self.query_one("#st-gates", Stat).set(str(len(snap.gates)))
         self.query_one("#st-paused", Stat).set(str(counts.get("on_hold", 0)))
         self.query_one("#st-done", Stat).set(str(done_week))
@@ -341,17 +422,16 @@ class DashboardView(View):
         )
         self.query_one("#st-gates").set_class(bool(snap.gates), "-warn")
 
-        # projects
-        rows = [RowData(ALL, self._proj_row("All projects", snap.missions))]
-        for p in snap.projects:
-            ms = [m for m in snap.missions if m.project_id == p.id]
-            rows.append(RowData(p.id, self._proj_row(p.name, ms)))
-        loose = [m for m in snap.missions if not m.project_id]
-        if loose:
-            rows.append(RowData(NONE, self._proj_row("No project", loose, dim=True)))
+        # projects (built by the same helper the spinner tick uses): a plain
+        # case-insensitive name filter, with the pinned rows (All projects / No
+        # project) always there so a filter never strands the owner without a
+        # way back to everything.
         plist = self.query_one("#proj-list", RowList)
-        plist.set_rows(rows)
-        plist.select(self.project)
+        plist.set_rows(self._proj_rows())
+        # the selection lives in self.project, not in the row list, so a project
+        # filtered out of view keeps filtering missions and comes back selected
+        # when the filter clears
+        plist.select(self.project if self.project in plist.keys else None)
 
         # missions, grouped
         missions = self._filtered()
@@ -371,27 +451,182 @@ class DashboardView(View):
             for m in group:
                 mrows.append(RowData(m.id, self._mission_row(m)))
         mlist = self.query_one("#mission-list", RowList)
-        if self.ai_results is not None:
-            mrows = self._ai_rows()
+        # an empty list must say WHY it is empty: a search miss, a project/status
+        # filter that left nothing, or a store with no missions yet
+        query = esc(self.query_text.strip())
+        cause = self._filter_label()  # "" when only the text search narrows
+        if missions or not snap.missions:
+            mlist.set_empty(f"[{FAINT}]No missions here yet. Start one from Work.[/]")
+        elif query and cause:
+            mlist.set_empty(f"[{FAINT}]No missions match “{query}” in {cause}.[/]")
+        elif query:
+            mlist.set_empty(f"[{FAINT}]No missions match “{query}”.[/]")
+        else:
+            mlist.set_empty(f"[{FAINT}]No missions in {cause}.[/]")
         mlist.set_rows(mrows)
+        self._paint_search_note()
 
-    def _proj_row(self, name: str, missions: list[Any], dim: bool = False) -> str:
+    def _scope(self) -> list[Any]:
+        """The missions the project/status chips let through, BEFORE the text
+        search or the ✦ ranking: what a query is answered against."""
+        return [m for m in self.snap.missions if self._passes(m)]
+
+    def _filter_label(self) -> str:
+        """The project/status filter that narrows the list, as words ('project
+        “rework”', 'the failed filter'), or "" when only the text search does."""
+        project = ""
+        if self.project == NONE:
+            project = "the no-project filter"
+        elif self.project != ALL:
+            project = f"project “{esc(self.snap.project_name(self.project))}”"
+        status = f"the {self.filter} filter" if self.filter != "all" else ""
+        if project and status:
+            return f"{status} in {project}"
+        return status or project
+
+    # -- spinner ---------------------------------------------------------------------
+
+    def _stamp(self, key: str | None) -> float | None:
+        """Newest event epoch for ONE entity (a mission id, a run id, the
+        orchestrator pseudo id, or "*" for the aggregate), from the snapshot.
+
+        Events are the only live signal a role gives: a run row's `updated_at`
+        moves when its status changes and then stays put for the whole session,
+        so it cannot tell "working" from "wedged".
+
+        Strictly that entity's own stamp. It is never a max over several keys
+        (every run event also stamps its mission, so a max would let one live
+        run make a wedged sibling look busy) and never falls back to another
+        entity's stamp. No key means UNKNOWN, and unknown animates. "*" is the
+        newest across all running missions: use it only where an aggregate is
+        genuinely meant (the stats tile, the project badge)."""
+        return self.snap.last_event.get(key) if key else None
+
+    def _mark(
+        self, status: Any, last: float | None, frame: str | None = None, now: float | None = None
+    ) -> str:
+        """The marker for a status: a frame when it is genuinely running, the
+        static idle glyph when it is a zombie. Everything else keeps the
+        existing status glyph (pending/on_hold/gate never animate).
+
+        `frame`/`now` of None mean "compute it now": the store poll paints
+        without a tick, and it must still render a real one-cell frame (never
+        an empty span), also while the terminal is unfocused and no tick runs."""
+        if status_value(status) != "running":
+            return glyph(status)
+        clock = time.time() if now is None else now
+        return run_mark(spinner.is_stalled(clock, last), frame)
+
+    def _paint_running_tile(self, frame: str | None = None, now: float | None = None) -> None:
+        """The dashboard "running" tile. ONE rendering shared by the poll and the
+        tick, so the tile cannot alternate between two texts."""
+        stat = self.query_one("#st-running", Stat)
+        running = sum(1 for m in self.snap.missions if status_value(m.status) == "running")
+        if not running:
+            stat.set("0")
+            return
+        clock = time.time() if now is None else now
+        last = self._stamp("*")
+        if spinner.is_stalled(clock, last):
+            human = spinner.human_duration(spinner.silence(clock, last))
+            stat.set(str(running), f"idle {human}")
+        else:
+            stat.set(f"{run_mark(False, frame)} {running}", "working", markup=True)
+
+    def tick(self, frame: str, now: float) -> None:
+        """Repaint only the rows that carry a running marker (10fps).
+
+        Rebuilding the markup string with the next frame IS the repaint:
+        RowList.set_rows updates in place (Row.refresh_data only calls
+        update() when the markup changed) and Stat.set does the same, so this
+        mounts nothing and touches the store not at all."""
+        with self.painting():
+            if self.mission_id is None:
+                self._tick_overview(frame, now)
+            else:
+                self._tick_mission(frame, now)
+
+    def _tick_overview(self, frame: str, now: float) -> None:
+        missions = self._filtered()
+        mrows: list[RowData] = []
+        for title, statuses in SECTIONS:
+            group = [m for m in missions if status_value(m.status) in statuses]
+            if not group:
+                continue
+            colour = WARN if title == "needs you" else FAINT
+            mrows.append(
+                RowData(
+                    f"{HEADER}{title}",
+                    f"[{colour}][b]{title.upper()}[/b]  {len(group)}[/]",
+                    classes="-header",
+                )
+            )
+            for m in group:
+                mrows.append(RowData(m.id, self._mission_row(m, frame=frame, now=now)))
+        if self.ai_results is not None:
+            mrows = self._ai_rows(frame=frame, now=now)
+        # the same key list as the poll's paint, so set_rows takes the cheap
+        # in-place path instead of remounting the list
+        self.query_one("#mission-list", RowList).set_rows(mrows)
+        self.query_one("#proj-list", RowList).set_rows(self._proj_rows(frame, now))
+        self._paint_running_tile(frame, now)
+
+    def _tick_mission(self, frame: str, now: float) -> None:
+        mission = self.snap.mission(self.mission_id)
+        if mission is None:
+            return
+        if status_value(mission.status) == "running":
+            self._paint_mission_static(frame=frame, now=now)
+        self.query_one("#run-list", RowList).set_rows(self._run_rows(frame, now))
+        if self.mtab == "traj":
+            self._paint_traj_tail(frame, now)
+
+    def _proj_rows(self, frame: str | None = None, now: float | None = None) -> list[RowData]:
+        """The project pane's rows. Split out so the spinner tick and the poll
+        build them the same way (and with the same keys)."""
+        snap = self.snap
+        rows = [RowData(ALL, self._proj_row("All projects", snap.missions, frame=frame, now=now))]
+        needle = self.project_query.strip().lower()
+        for p in snap.projects:
+            if needle and needle not in str(p.name).lower():
+                continue
+            ms = [m for m in snap.missions if m.project_id == p.id]
+            rows.append(RowData(p.id, self._proj_row(p.name, ms, frame=frame, now=now)))
+        loose = [m for m in snap.missions if not m.project_id]
+        if loose:
+            rows.append(
+                RowData(NONE, self._proj_row("No project", loose, dim=True, frame=frame, now=now))
+            )
+        return rows
+
+    def _proj_row(
+        self,
+        name: str,
+        missions: list[Any],
+        dim: bool = False,
+        *,
+        frame: str | None = None,
+        now: float | None = None,
+    ) -> str:
         running = sum(1 for m in missions if status_value(m.status) == "running")
         waiting = sum(1 for m in missions if status_value(m.status) == "awaiting_gate")
         badges = []
         if running:
-            badges.append(f"[{ACCENT}]● {running}[/]")
+            # the project badge is the second running glyph on the overview
+            last = self._stamp("*")
+            mark = self._mark("running", last, frame, now)
+            badges.append(f"{mark} {running}")
         if waiting:
             badges.append(f"[{WARN}]◆ {waiting}[/]")
         label = f"[{MUTED}]{esc(name)}[/]" if dim else esc(name)
         return f"{label}  [{FAINT}]{len(missions)}[/]  " + " ".join(badges)
 
-    def _mission_row(self, m: Any) -> str:
+    def _mission_row(self, m: Any, *, frame: str | None = None, now: float | None = None) -> str:
         st = status_value(m.status)
+        last = self._stamp(m.id)
         bits = []
         if self.project == ALL and m.project_id:
             bits.append(self.snap.project_name(m.project_id))
-        bits.append(plan_label(m.plan))
         role = self.mission_role.get(m.id)
         if role and st in actions.ACTIVE:
             bits.append(role)
@@ -404,12 +639,16 @@ class DashboardView(View):
             gates = self.snap.gates_for(m.id)
             if gates:
                 gate_note = f"\n  [{WARN}]◆ {esc(clip(gates[0].question, 90))}[/]"
-        return (
-            f"{glyph(st)} [b]{esc(clip(m.objective, 100))}[/b]\n"
-            f"  [{FAINT}]{esc('  ·  '.join(bits))}[/]{gate_note}"
-        )
+        meta = f"[{FAINT}]{esc('  ·  '.join(bits))}[/]"
+        # the ✦ reason is OUR markup, not mission text: escaping it with the
+        # rest of the line printed "[#a394f7]closest to the query[/]" literally
+        reason = esc(clip(self._reason(m.id), 120))
+        if reason:
+            meta += f"  [{ACCENT}]{reason}[/]"
+        mark = self._mark(st, last, frame, now)
+        return f"{mark} [b]{esc(clip(m.objective, 100))}[/b]\n  {meta}{gate_note}"
 
-    def _ai_rows(self) -> list[RowData]:
+    def _ai_rows(self, *, frame: str | None = None, now: float | None = None) -> list[RowData]:
         """The ✦ ranking: one row per ranked mission, objective + its reason.
         Built from the snapshot so a mission that vanished mid-search drops."""
         rows: list[RowData] = []
@@ -419,10 +658,11 @@ class DashboardView(View):
                 continue
             st = status_value(mission.status)
             reason = esc(hit.get("reason") or "")
+            mark = self._mark(st, self._stamp(mission.id), frame, now)
             rows.append(
                 RowData(
                     mission.id,
-                    f"{glyph(st)} [b]{esc(clip(mission.objective, 100))}[/b]\n"
+                    f"{mark} [b]{esc(clip(mission.objective, 100))}[/b]\n"
                     f"  [{FAINT}]{esc(clip(mission.id, 60))}[/]"
                     + (f"  [{ACCENT}]{reason}[/]" if reason else ""),
                 )
@@ -462,54 +702,99 @@ class DashboardView(View):
         self.query_one("#mission-search", Input).focus()
 
     def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "proj-search":
+            event.stop()
+            self.project_query = event.value
+            with self.painting():
+                self._paint_overview()
+            return
         if event.input.id != "mission-search":
             return
         event.stop()
         self.query_text = event.value
-        self.ai_results = None  # typing means the plain filter again
-        self.ai_armed = False
+        self._expire_ranking()  # typing means the plain filter again
         if self._debounce is not None:
             self._debounce.stop()
         self._debounce = self.set_timer(0.25, self._apply_search)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        """Enter in the bar: run the plain filter now, or the ✦ ranking when the
-        ✦ button is armed. Down moves into the results, as in the Library."""
+        """Enter in the bar always means the same thing: filter the list on the
+        query (the ✦ ranking, when it is there, stays as the list's order).
+        Down moves into the results, as in the Library."""
+        if event.input.id == "m-msg":
+            event.stop()
+            self._send_message()
+            return
+        if event.input.id == "proj-search":
+            event.stop()
+            self._focus_projects()
+            return
         if event.input.id != "mission-search":
             return
         event.stop()
         self.query_text = event.value
-        if self.ai_armed:
-            self._run_ai_search()
-        else:
-            self._apply_search()
+        if self.query_text.strip() != self.ai_query:
+            # a different query: whatever ✦ produced no longer answers it
+            self._expire_ranking()
+        self._apply_search()
 
     def on_key(self, event: Any) -> None:
-        if event.key == "down" and isinstance(self.screen.focused, Input):
-            rows = self.query_one("#mission-list", RowList)
-            if rows.selectable:
-                event.stop()
-                rows.focus()
-                rows.select(rows.selectable[0])
+        """↓ out of either search bar lands on that bar's list."""
+        if event.key != "down":
+            return
+        focused = self.screen.focused
+        if not isinstance(focused, Input):
+            return
+        rows = self.query_one(
+            "#proj-list" if focused.id == "proj-search" else "#mission-list", RowList
+        )
+        if not rows.selectable:
+            return
+        event.stop()
+        rows.focus()
+        if focused.id == "proj-search":
+            rows.select(self.project if self.project in rows.selectable else None)
+        else:
+            rows.select(rows.selectable[0])
+
+    def _focus_projects(self) -> None:
+        rows = self.query_one("#proj-list", RowList)
+        rows.focus()
+        rows.select(self.project if self.project in rows.selectable else None)
+
+    def _expire_ranking(self) -> None:
+        """The ✦ order belongs to the query it was asked for. Any change to the
+        query drops it (and any in-flight search), so AI-ordered rows can never
+        impersonate the plain filter's result."""
+        if self.ai_results is None and not self.ai_note and not self._ai_busy:
+            return
+        self._ai_gen += 1  # an in-flight worker's answer is stale from here on
+        self.ai_results = None
+        self.ai_query = ""
+        self.ai_note = ""
+        if self._ai_busy:
+            self._ai_busy = False
+            self.workers.cancel_group(self, "dash-ai-search")
 
     def _apply_search(self) -> None:
-        with self.painting():
-            self._paint_overview()
-            self._paint_search_note()
+        self._paint_overview()
 
     def _paint_search_note(self) -> None:
-        """The one line under the bar: the ✦ state (searching…, a result count,
-        a failure) or nothing at all, so the normal list stays uncluttered."""
+        """The ONE status line under the search bar: the ✦ state (searching…, a
+        result count, a failure) or the plain filter's count / no-match state."""
+        plain = self._filtered()
         note = ""
         if self._ai_busy:
             note = f"[{ACCENT}]✦ searching…[/]"
         elif self.ai_note:
             note = f"[{WARN}]{esc(self.ai_note)}[/]"
-        elif self.ai_results is not None:
-            note = (
-                f"[{ACCENT}]✦ {len(self.ai_results)} ranked[/]  "
-                f"[{FAINT}]enter opens · esc dismisses[/]"
-            )
+        elif self._ranking() is not None:
+            # the model returns at most MAX_RESULTS ids, so this list is its
+            # picks out of the matches, not the whole match set: say so
+            count = len(plain)
+            matched = len(search.search_missions(self._scope(), self.query_text))
+            scope = f"{count} of {matched}" if matched > count else f"{count}"
+            note = f"[{ACCENT}]✦ top {scope} from AI[/]  [{FAINT}]esc clears[/]"
         with self.painting():
             widget = self.query_one("#mission-note", Static)
             widget.update(note)
@@ -530,11 +815,18 @@ class DashboardView(View):
         from rework.kernel.llm.adapters import build_provider
 
         gen = self._ai_gen
+        # A query must isolate, including here: with no strict match there is
+        # nothing to rank, so the model is not called and the list keeps saying
+        # why it is empty.
+        if not search.search_missions(self._scope(), query):
+            self.ai_note = f"✦ no missions match “{query}” — nothing to rank"
+            self._apply_search()
+            return
         self._ai_busy = True
         self.ai_results = None
+        self.ai_query = query  # this search answers this query, nothing else
         self.ai_note = ""
-        self.ai_armed = True
-        self._paint_search_note()
+        self._apply_search()
         # One clock over BOTH halves: the per-candidate run fetch is a query per
         # mission, so leaving it unbounded would let "✦ searching…" outlive the
         # budget the model call is already held to.
@@ -560,7 +852,7 @@ class DashboardView(View):
                     self._budget(deadline),
                 )
                 if gen != self._ai_gen:
-                    return  # dismissed while it ran: the note is already clear
+                    return  # dismissed/expired while it ran: the note is clear
                 self.ai_results = ranked
                 if not ranked:
                     self.ai_note = "✦ found no mission for that query"
@@ -616,10 +908,7 @@ class DashboardView(View):
     def _dismiss_ai(self) -> None:
         if self.ai_results is None and not self.ai_note and not self._ai_busy:
             return
-        self._ai_gen += 1  # any in-flight worker's result is now stale
-        self.ai_results = None
-        self.ai_note = ""
-        self.ai_armed = False
+        self._expire_ranking()
         self._apply_search()
 
     # -- head -------------------------------------------------------------------------
@@ -671,16 +960,22 @@ class DashboardView(View):
         if event.action == "search":
             event.stop()
             self.query_text = self.query_one("#mission-search", Input).value
-            self.ai_results = None
-            self.ai_note = ""
+            if self.query_text.strip() != self.ai_query:
+                self._expire_ranking()
             self._apply_search()
             self.query_one("#mission-search", Input).focus()
             return
         if event.action == "ai-search":
+            # the ✦ button runs on the SAME query text, into the SAME list. It
+            # hands focus back to the bar, so Enter means "filter" here exactly
+            # as it does after typing (it is a button, not a mode).
             event.stop()
             self.query_text = self.query_one("#mission-search", Input).value
-            self.ai_armed = True
+            self._expire_ranking()
             self._run_ai_search()
+            bar = self.query_one("#mission-search", Input)
+            bar.focus()
+            bar.cursor_position = len(bar.value)
             return
         if event.action == "add-files":
             # the selected PROJECT decides, not a mission: works with nothing open
@@ -691,6 +986,9 @@ class DashboardView(View):
             return
         event.stop()
         if self._gate_button(event.btn):
+            return
+        if event.action == "msg-send":
+            self._send_message()
             return
         verb = event.action
         if verb == "copy-id":
@@ -777,11 +1075,16 @@ class DashboardView(View):
             self.budget = None
             self.run_cost = {}
             self.mission_gates = []
+            self.full_mission = None
+            self.full_failed = False
+            self._full_failures = 0
+            self._full_next_try = 0.0
             self.report_loaded_for = None
             self.query_one("#m-traj", Trajectory).clear()
             self.query_one("#run-list", RowList).set_rows([])
         self.mission_id = mission_id
         self.run_id = run_id
+        self._painted_key = None
         self.query_one("#dash-pages", ContentSwitcher).current = "dash-mission"
         self._paint_head()
         self._paint_mission_static()
@@ -791,6 +1094,9 @@ class DashboardView(View):
 
     def close_mission(self) -> None:
         self.mission_id = None
+        self.full_mission = None
+        self.full_failed = False
+        self._painted_key = None
         self.run_id = None
         self.query_one("#dash-pages", ContentSwitcher).current = "dash-overview"
         self._paint_overview()
@@ -800,27 +1106,41 @@ class DashboardView(View):
 
     def back(self) -> bool:
         if self._ai_busy:
-            # an in-flight ranking is dismissable state: drop it and stay put
-            self.workers.cancel_group(self, "dash-ai-search")
-            self._ai_busy = False
-            self.ai_results = None
-            self.ai_note = ""
-            self.ai_armed = False
+            # an in-flight ranking is dismissable state: drop it and stay put.
+            # _expire_ranking also bumps _ai_gen, so a worker finishing inside
+            # the cancellation window cannot land stale rows on the list.
+            self._expire_ranking()
             self._apply_search()
             return True
         if self.ai_results is not None or self.ai_note:
             self._dismiss_ai()
             return True
+        proj_bar = self.query_one("#proj-search", Input)
         bar = self.query_one("#mission-search", Input)
+        # esc acts on the bar the user is actually typing in: checking the
+        # project filter first cleared the sidebar filter out from under a query
+        # typed into the mission bar
         if bar.has_focus:
             bar.value = ""
             self.query_text = ""
-            self.ai_armed = False
+            self._expire_ranking()
             self._apply_search()
             if self.mission_id:
                 self.query_one("#run-list", RowList).focus()
             else:
                 self.query_one("#mission-list", RowList).focus()
+            return True
+        if proj_bar.has_focus:
+            proj_bar.value = ""
+            self.project_query = ""
+            self._focus_projects()
+            return True
+        if proj_bar.value:
+            # esc from the mission list also clears a project-name filter, so a
+            # hidden sidebar never looks like a broken mission list
+            proj_bar.value = ""
+            self.project_query = ""
+            self._paint_overview()
             return True
         if self.run_id:
             self.run_id = None
@@ -845,6 +1165,9 @@ class DashboardView(View):
         if not mission_id:
             return
         data = self.hub.data
+        await self._load_full_mission(mission_id)
+        if self.mission_id != mission_id:
+            return
         fresh = await self.hub.guard(lambda: data.mission_events(mission_id, self.last_seq), [])
         if self.mission_id != mission_id:
             return
@@ -873,18 +1196,106 @@ class DashboardView(View):
         # first, so the view is still attached while '#m-header' (composed
         # statically, so only ever missing then) is gone; painting raised
         # NoMatches and failed tests under load (m7 findings #19: 2 of 8 runs)
+        key = self._paint_key()
+        if key == self._painted_key:
+            return  # nothing this poll read has changed since the last paint
+        self._painted_key = key
         try:
             self._paint_mission_static()
             self._paint_runs()
             self._paint_detail_tabs()
+            # the poll supplies correctness (also while unfocused, when no tick
+            # runs, and whichever detail tab is open); the tick supplies motion
+            self._paint_traj_tail()
         except NoMatches:
             return
 
-    def _paint_mission_static(self) -> None:
-        mission = self.snap.mission(self.mission_id)
+    def _paint_key(self) -> tuple[Any, ...]:
+        """Everything the open mission's header, run list and detail tabs are
+        painted from. Time text is not in it: the cadence clears the key."""
+        mission = self._detail_mission()
+        budget = self.budget
+        return (
+            self.run_id,
+            self.mtab,
+            self.full_failed,
+            None
+            if mission is None
+            else (
+                status_value(mission.status),
+                mission.updated_at,
+                getattr(mission, "light", False),
+            ),
+            tuple((r.id, status_value(r.status), r.step, r.updated_at) for r in self.runs),
+            None
+            if budget is None
+            else (budget.spent_usd, budget.input_tokens, budget.output_tokens),
+            tuple((g.id, status_value(g.status), g.decided_at) for g in self.mission_gates),
+            tuple(sorted(self.run_cost.items())),
+            len(self.events),
+            self._report_key(),
+            # the spinner reads "working" vs "idle 7m" off this stamp: a poll alone
+            # (no tick while unfocused) must repaint the header when it moves
+            self._stamp(self.mission_id),
+        )
+
+    async def _load_full_mission(self, mission_id: str) -> None:
+        """Fetch the open mission's full row (plan, result) off the light
+        snapshot row. Once per open, then only when updated_at moves (any plan or
+        result write bumps it); a snapshot row that is already full is used as is."""
+        row = self.snap.mission(mission_id)
+        if row is not None and not getattr(row, "light", False):
+            self.full_mission = row
+            return
+        if self.full_failed and time.monotonic() < self._full_next_try:
+            return  # the last fetch failed: wait out the backoff
+        have = self.full_mission
+        if (
+            have is not None
+            and have.id == mission_id
+            and (row is None or have.updated_at == row.updated_at)
+        ):
+            return
+        data = self.hub.data
+        got = await self.hub.guard(lambda: data.get_mission(mission_id), None)
+        if self.mission_id != mission_id:
+            return
+        self.full_failed = got is None  # offline or a store error: say so, retry later
+        if got is not None:
+            self.full_mission = got
+            self._full_failures = 0
+            self._full_next_try = 0.0
+        else:
+            self._full_failures += 1
+            self._full_next_try = time.monotonic() + min(30.0, 2.0**self._full_failures)
+
+    def _detail_mission(self) -> Any:
+        """The open mission for plan/result reads: the full row once fetched,
+        else the snapshot's light row (plan and result are None on it)."""
+        full = self.full_mission
+        if full is not None and full.id == self.mission_id:
+            return full
+        return self.snap.mission(self.mission_id)
+
+    def _paint_mission_static(self, *, frame: str | None = None, now: float | None = None) -> None:
+        mission = self._detail_mission()
         header = self.query_one("#m-header", Static)
-        if mission is None:
+        if mission is None or (getattr(mission, "light", False) and not self.full_failed):
             header.update(f"[{FAINT}]loading {esc(self.mission_id)}…[/]")
+            return
+        if getattr(mission, "light", False):
+            # the full row could not be fetched: show the light facts we hold
+            # and say what is missing, instead of a permanent "loading"
+            st = status_value(mission.status)
+            end = time.time() if st in actions.ACTIVE else mission.updated_at
+            header.update(
+                f"[b]{esc(mission.objective)}[/b]\n{status_text(st)}  [{MUTED}]"
+                + esc(
+                    f"started {ago(mission.created_at)} · {duration(end - mission.created_at)}"
+                    "  ·  could not load plan/result (retrying)"
+                )
+                + "[/]"
+            )
             return
         st = status_value(mission.status)
         plan = mission.plan or {}
@@ -905,10 +1316,29 @@ class DashboardView(View):
             )
         end = time.time() if st in actions.ACTIVE else mission.updated_at
         bits.append(f"started {ago(mission.created_at)} · {duration(end - mission.created_at)}")
+        if self.full_failed:
+            # a refetch failed after this row was fetched: it is stale, say so
+            bits.append("could not load plan/result (retrying)")
+        # The header represents the MISSION, so it is judged by the mission's own
+        # stamp (any event of any of its runs or its orchestrator). That stamp
+        # cannot say that ONE run went quiet while its siblings work, so a
+        # silent run is named next to "working" instead of being masked.
+        last = self._stamp(mission.id)
+        clock = time.time() if now is None else now
+        stalled = st == "running" and spinner.is_stalled(clock, last)
+        if st == "running":
+            mark = self._mark(st, last, frame, clock)
+            if stalled:
+                head = f"{mark} idle {spinner.human_duration(spinner.silence(clock, last))}"
+            else:
+                head = f"{mark} working"
+                quiet = self._quiet_runs(clock)
+                if quiet:
+                    head += f"  [{FAINT}]" + esc(", ".join(quiet)) + "[/]"
+        else:
+            head = status_text(st)
         header.update(
-            f"[b]{esc(mission.objective)}[/b]\n{status_text(st)}  [{MUTED}]"
-            + esc("  ·  ".join(bits))
-            + "[/]"
+            f"[b]{esc(mission.objective)}[/b]\n{head}  [{MUTED}]" + esc("  ·  ".join(bits)) + "[/]"
         )
         # same run-derived round structure as the graph tab, so the two
         # cannot drift (the strip is compact, the graph is the full flow)
@@ -929,38 +1359,106 @@ class DashboardView(View):
             bits.append(money(self.run_cost[run.id]))
         return " · ".join(bits)
 
-    def _paint_runs(self) -> None:
+    def _run_rows(self, frame: str | None = None, now: float | None = None) -> list[RowData]:
+        """The sessions list. Split out so the spinner tick and the poll build
+        the same rows (same keys, in-place update)."""
         rows = [RowData(ALL, f"[b]All activity[/b]\n[{FAINT}]{len(self.events)} events[/]")]
         orch_id = self._orchestrator_id()
         if orch_id:
-            mission = self.snap.mission(self.mission_id)
+            mission = self._detail_mission()
             st = status_value(mission.status) if mission else "running"
             model = ((mission.plan or {}).get("orchestrator") or {}).get("model") if mission else ""
             cost = self.run_cost.get(orch_id, 0.0)
             sub = " · ".join(x for x in (str(model or ""), money(cost) if cost else "") if x)
+            mark = self._mark(
+                "running" if st in actions.ACTIVE else st,
+                self._stamp(orch_id),
+                frame,
+                now,
+            )
             rows.append(
                 RowData(
                     orch_id,
-                    f"{glyph('running' if st in actions.ACTIVE else st)} [b]orchestrator[/b]\n"
-                    f"  [{FAINT}]{esc(sub)}[/]",
+                    f"{mark} [b]orchestrator[/b]\n  [{FAINT}]{esc(sub)}[/]",
                 )
             )
         for run in self.runs:
+            mark = self._mark(run.status, self._stamp(run.id), frame, now)
             rows.append(
                 RowData(
                     run.id,
-                    f"{glyph(run.status)} [b]{esc(role_of(run.id))}[/b]  "
+                    f"{mark} [b]{esc(role_of(run.id))}[/b]  "
                     f"[{FAINT}]{esc(run.step)}[/]\n"
                     f"  [{FAINT}]{esc(self._run_sub(run))}[/]",
                 )
             )
+        return rows
+
+    def _paint_runs(self) -> None:
         lst = self.query_one("#run-list", RowList)
-        lst.set_rows(rows)
+        lst.set_rows(self._run_rows())
         lst.select(self.run_id or ALL)
+
+    def _quiet_runs(self, clock: float) -> list[str]:
+        """ "coder idle 7m" for each RUNNING run whose own stamp is past the stall
+        threshold. A run with no stamp is unknown, not quiet."""
+        out = []
+        for run in self.runs:
+            if status_value(run.status) != "running":
+                continue
+            last = self._stamp(run.id)
+            if spinner.is_stalled(clock, last):
+                age = spinner.human_duration(spinner.silence(clock, last))
+                out.append(f"{role_of(run.id)} idle {age}")
+        return out
+
+    def _paint_traj_tail(self, frame: str | None = None, now: float | None = None) -> None:
+        """The ONE trailing spinner step on the trajectory (surface c).
+
+        It is a single Step updated in place: `update()` with a new markup is a
+        one-line repaint, and removing it when nothing runs keeps a finished
+        mission's log clean. With a run selected it reflects THAT run (its own
+        stamp); otherwise it reflects the mission (the mission stamp).
+
+        Called by the tick (motion) and by the store poll (correctness, also
+        while unfocused), so a run that finished or wedged while the terminal
+        was in the background cannot keep a stale "working" claim."""
+        traj = self.query_one("#m-traj", Trajectory)
+        mission = self.snap.mission(self.mission_id)
+        if mission is None or status_value(mission.status) != "running":
+            traj.spinner(None)
+            return
+        running = [r for r in self.runs if status_value(r.status) == "running"]
+        orch_id = self._orchestrator_id()
+        if self.run_id is not None:
+            if self.run_id == orch_id:
+                subject, key, step = "orchestrator", orch_id, ""
+            else:
+                picked = [r for r in running if r.id == self.run_id]
+                if not picked:
+                    traj.spinner(None)
+                    return
+                subject, key, step = role_of(picked[0].id), picked[0].id, str(picked[0].step or "")
+        else:
+            if not running:
+                traj.spinner(None)
+                return
+            # name the run that is actually talking (an unknown stamp counts as
+            # fresh), not whichever happens to be last in the list
+            lead = max(running, key=lambda r: self._stamp(r.id) or float("inf"))
+            subject, key, step = role_of(lead.id), mission.id, str(lead.step or "")
+        clock = time.time() if now is None else now
+        last = self._stamp(key)
+        age = spinner.human_duration(spinner.silence(clock, last))
+        if spinner.is_stalled(clock, last):
+            label = " ".join(x for x in (f"idle {age}", subject, step) if x)
+        else:
+            label = " ".join(x for x in ("working", subject, step, age) if x)
+        traj.spinner(f"{self._mark('running', last, frame, clock)} [{FAINT}]{esc(label)}[/]")
 
     def _orchestrator_id(self) -> str | None:
         """The orchestrator's pseudo run id (its events and charges carry it)."""
-        mission = self.snap.mission(self.mission_id)
+        mission = self._detail_mission()
         if mission is None or not (mission.plan or {}).get("orchestrator"):
             return None
         return f"{mission.id}:orchestrate:orchestrator:1"
@@ -985,8 +1483,8 @@ class DashboardView(View):
     # -- detail tabs ----------------------------------------------------------------------------
 
     def _paint_detail_tabs(self) -> None:
-        mission = self.snap.mission(self.mission_id)
-        if mission is None:
+        mission = self._detail_mission()
+        if mission is None or getattr(mission, "light", False):
             return
         tab = self.mtab
         if tab == "graph":
@@ -1158,6 +1656,27 @@ class DashboardView(View):
                         Btn("Answer in Gates…", "gate-answer", variant="ghost", payload=gate.id),
                     ]
                 )
+
+    def _send_message(self) -> None:
+        box = self.query_one("#m-msg", Input)
+        text = box.value.strip()
+        if not text or not self.mission_id:
+            return
+        self.run_worker(self._deliver_message(self.mission_id, text), group="owner-message")
+
+    async def _deliver_message(self, mission_id: str, text: str) -> None:
+        """Talk to the OPEN mission, whatever chat it came from: the shared
+        owner-message publisher (ADR 0007), the same one `rework message` uses."""
+        from rework.missions import send_owner_message
+
+        try:
+            await send_owner_message(mission_id, text, store=await self.hub.data.store())
+        except Exception as exc:
+            self.toast(f"Could not reach the mission: {clip(str(exc), 200)}", severity="error")
+            return
+        with self.painting():
+            self.query_one("#m-msg", Input).value = ""
+        self.toast(f"Sent to {mission_id}'s orchestrator")
 
     def _gate_button(self, btn: Btn) -> bool:
         if not btn.action.startswith("gate-"):

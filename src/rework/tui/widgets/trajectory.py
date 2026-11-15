@@ -192,6 +192,8 @@ class Trajectory(VerticalScroll):
     def __init__(self, *, id: str | None = None, classes: str = "") -> None:
         super().__init__(id=id, classes=f"trajectory {classes}".strip())
         self.can_focus = True
+        # the ONE trailing "working" line, updated in place by the spinner tick
+        self._spinner: Step | None = None
 
     def _at_bottom(self) -> bool:
         return self.scroll_y >= self.max_scroll_y - 2
@@ -212,5 +214,29 @@ class Trajectory(VerticalScroll):
         steps = [s for s in (event_step(e, show_role=show_role) for e in evs) if s is not None]
         self.add(*steps)
 
+    def spinner(self, markup: str | None) -> None:
+        """Show/refresh/remove the trailing working line.
+
+        `markup=None` removes it. The step is mounted once and then updated in
+        place, so a 10fps tick costs one Static.update, not a remount (and the
+        list does not flicker or jump)."""
+        if markup is None:
+            if self._spinner is not None:
+                self._spinner.remove()
+                self._spinner = None
+            return
+        if self._spinner is not None and self._spinner.parent is None:
+            self._spinner = None  # trimmed as overflow by add()
+        if self._spinner is None:
+            step = Step(markup, kind="spinner")
+            step.add_class("-spinner")
+            self._spinner = step
+            self.add(step)
+            return
+        if self._spinner._head != markup:
+            self._spinner._head = markup
+            self._spinner.update(markup)
+
     def clear(self) -> None:
         self.remove_children()
+        self._spinner = None

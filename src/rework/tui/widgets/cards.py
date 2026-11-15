@@ -3,6 +3,7 @@ mission (status, last steps, its gate with answer buttons, controls)."""
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from textual.app import ComposeResult
@@ -10,6 +11,7 @@ from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.widgets import Static
 
+from rework.tui import spinner
 from rework.tui.actions import can
 from rework.tui.theme import (
     ACCENT,
@@ -21,6 +23,7 @@ from rework.tui.theme import (
     esc,
     money,
     plan_label,
+    run_mark,
     status_text,
     status_value,
 )
@@ -146,8 +149,14 @@ class MissionCard(Vertical):
         self.last_seq = 0
         self.tail: list[str] = []
         self.active_role = ""
+        # spinner state: the frame comes from the app's shared clock every tick
+        self._frame: str | None = None
+        self._last_event: float | None = None
         # a finished card backfills its tail once, then is never polled again
         self.tail_filled = False
+        # backoff for a failing full-row fetch (monotonic seconds)
+        self.fetch_failures = 0
+        self.fetch_next_try = 0.0
 
     def compose(self) -> ComposeResult:
         yield Static(f"[{MUTED}]mission {esc(self.mission_id)}[/]", classes="card-body mc-head")
@@ -157,6 +166,7 @@ class MissionCard(Vertical):
         with Horizontal(classes="card-actions mc-actions"):
             yield Btn("Open", "open")
             yield Btn("Preview", "preview", classes="mc-previewbtn")
+            yield Btn("Retry PR", "retry-pr", variant="primary", classes="mc-retrypr")
             yield Btn("Approve", "approve", variant="primary", classes="mc-gatebtn")
             yield Btn("Reject", "reject", variant="danger", classes="mc-gatebtn")
             yield Btn("Answer…", "answer", variant="ghost", classes="mc-gatebtn")
@@ -171,8 +181,12 @@ class MissionCard(Vertical):
     def status(self) -> str:
         return status_value(self.mission.status) if self.mission is not None else ""
 
-    def update_from(self, mission: Any, gates: list[Any]) -> None:
+    def update_from(self, mission: Any, gates: list[Any], last_event: float | None = None) -> None:
+        """Take the poll's snapshot. `last_event` is this mission's newest event
+        stamp from THAT snapshot (None = unknown), so a poll alone can flip a
+        silent card to idle even while the app is unfocused and no tick runs."""
         self.mission = mission
+        self._last_event = last_event
         self.gate = gates[0] if gates else None
         self.paint()
 
@@ -203,6 +217,25 @@ class MissionCard(Vertical):
             self.last_seq = max(self.last_seq, max(int(ev.seq or 0) for ev in events))
         self.paint()
 
+    def observe(self, last_event: float | None) -> bool:
+        """Take this poll's event stamp. True when it moved (the caller repaints),
+        so an UNCHANGED poll still flips a silent card to idle without a tick."""
+        if self.status != "running" or last_event == self._last_event:
+            return False
+        self._last_event = last_event
+        return True
+
+    def tick(self, frame: str, last_event: float | None) -> None:
+        """Repaint the card head with the current spinner frame (surface d).
+
+        Nothing but a genuinely running mission animates; the frame itself comes
+        from the shared clock, so a store poll repainting the card cannot reset
+        it. The tick supplies motion only: the stall clock is read at paint."""
+        if self.status != "running":
+            return
+        self._frame, self._last_event = frame, last_event
+        self.paint()
+
     def paint(self) -> None:
         # children may not be composed yet (or already gone during teardown)
         if not self.is_mounted or not self.query(".mc-head"):
@@ -213,6 +246,17 @@ class MissionCard(Vertical):
             head.update(f"[{MUTED}]mission {esc(self.mission_id)} · loading…[/]")
         else:
             status = status_value(m.status)
+            # a running card always paints a real frame (computed now when no
+            # tick has supplied one), never an empty span. The stall clock is
+            # read NOW on every paint, never frozen at the last tick.
+            clock = time.time()
+            stalled = spinner.is_stalled(clock, self._last_event)
+            mark = run_mark(stalled, self._frame) if status == "running" else ""
+            if mark and stalled:
+                mark += f" [{FAINT}]idle"
+                mark += f" {spinner.human_duration(spinner.silence(clock, self._last_event))}[/]"
+            elif mark:
+                mark += f" [{FAINT}]working[/]"
             bits = [esc(self.mission_id), esc(plan_label(m.plan))]
             if self.active_role and status in {"running", "awaiting_gate"}:
                 bits.append(f"[b]{esc(self.active_role)}[/b]")
@@ -224,7 +268,9 @@ class MissionCard(Vertical):
                 if getattr(m, "title", None)
                 else f"[b]{esc(clip(m.objective, 200))}[/b]"
             )
-            head.update(f"{status_text(status)}  [{MUTED}]" + "  ·  ".join(bits) + f"[/]\n{name}")
+            shown = mark if mark else status_text(status)
+            head.update(f"{shown}  [{MUTED}]" + "  ·  ".join(bits) + f"[/]\n{name}")
+
             for cls in ("-accent", "-warn", "-ok", "-danger"):
                 self.remove_class(cls)
             self.add_class(
@@ -263,10 +309,13 @@ class MissionCard(Vertical):
             else:
                 btn.display = yes_no  # questions and choices need the Gates tab
         status = self.status
-        for verb in ("pause", "resume", "cancel"):
+        result = getattr(m, "result", None) or {}
+        # the ONE writer of these buttons' visibility ("retry-pr": finished,
+        # work kept, PR not delivered)
+        for verb in ("pause", "resume", "cancel", "retry-pr"):
             for btn in self.query(Btn):
                 if btn.action == verb:
-                    btn.display = can(verb, status)
+                    btn.display = can(verb, status, result)
 
     def on_btn_pressed(self, event: Btn.Pressed) -> None:
         event.stop()

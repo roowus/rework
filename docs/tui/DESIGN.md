@@ -59,12 +59,46 @@ badges). Defined once in `theme.py::STATUS`.
 | state | glyph | colour |
 |---|---|---|
 | pending / intent | `○` | `$faint` |
-| running | `●` | `$accent` |
+| running (live) | braille spinner `⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏` (one cell, 10 frames, 0.1s each) | `$accent` |
+| running (idle) | `◌` | `$faint` |
 | awaiting gate / halted | `◆` | `$warn` |
 | on hold (paused) | `‖` | `$warn` |
 | done / completed / approved | `✓` | `$ok` |
 | failed / rejected | `✗` | `$danger` |
 | cancelled / aborted | `⊘` | `$faint` |
+
+A running mission or run shows the spinner only while it is producing events.
+With no event for 5 minutes (`spinner.STALL_SECONDS`, 300s) the spinner stops
+and the row shows the static idle marker `◌` plus `idle 7m`. Pending, on hold
+and awaiting-gate states never animate. The frame set and the 5 minute rule
+live in `tui/spinner.py`.
+
+What "idle" means depends on the surface, because every run event also counts
+as an event of its mission:
+
+- **Run level** (a run row, the orchestrator row, the trajectory tail with a
+  run selected) is judged by THAT entity's own newest event only. A wedged run
+  shows `◌ idle 7m` even while a sibling run or the orchestrator keeps the
+  mission busy. Stamps are never merged with a max and never borrowed from
+  another entity.
+- **Mission level** (the Work tab card, the dashboard mission row, the
+  drill-down header, the trajectory tail with no run selected) represents the
+  whole mission, so it is judged by the newest event of that mission and stays
+  animated while anything in the mission works. Neither the card nor the mission
+  row carries a per-run annotation: a silent run among active siblings is
+  visible through the drill-down header, which adds `tester idle 7m` next to
+  `working` for each running run past the threshold, and through the per-run
+  rows, which carry the per-run truth.
+- **Aggregate** (the running stats tile and the project badge) uses the newest
+  event across all running missions; it reads idle only when every one is.
+
+No stamp for an entity means UNKNOWN, and unknown animates (no event data at
+all, a failed query, a run whose newest event fell outside the sampled window).
+It is never replaced by the mission stamp or the aggregate. A store hiccup
+therefore never falsely reports silence. Every paint, the store poll included,
+computes a real frame; an unfocused terminal shows a still frame, not a blank,
+and the poll also repaints or removes the trajectory tail, so the still state
+is current as of the last poll.
 
 Trajectory glyphs (Claude-Code familiar):
 
@@ -75,6 +109,26 @@ Trajectory glyphs (Claude-Code familiar):
   ⎿ 112 lines · def add(a, b): …        (tool result; $muted, red when error)
   turn 3 · 3.8k tok                      (turn footer; $faint)
 ```
+
+## 3b. Two levels in the Graph
+
+The Graph draws two levels and they must never be confused:
+
+- **Inside one run**: the role's own LangGraph node names, shown as a strip
+  prefixed `inside this run:` in `$faint`, with TUI-only friendly names
+  (`prepare` -> `set up`, `loop` -> `working (tool calls)`, `report` ->
+  `report`, `handoff` -> `hand off`; unknown names pass through unchanged).
+  Only the current step is `▶` + `$accent` bold.
+- **The mission**: review rounds, coder(s) -> audit -> revision. The edge into
+  an audit carries its findings (`request changes: 2 high`); the edge leaving
+  an audit carries the round's verdicts (`request changes`, `approve`) and
+  nothing more, joined with ` / ` when a round has several auditors. Which
+  direction it means is implied by where the arrow points, toward a revision
+  or on to the gates/end (a mission capped by `max_rounds` ends on `request
+  changes` too, and the arrow says so). The leaving edge stays unlabelled while
+  an audit has not yet produced a verdict (still running, failed, aborted): the
+  into-audit edge already carries that state. An edge is `│ ▼ label`, so its
+  height is auto: a fixed height clipped the label.
 
 ## 4. Layout
 
@@ -146,7 +200,10 @@ Each lives in `src/rework/tui/widgets/` and is the only way that thing is drawn.
   anything that escapes into a toast.
 - Long work (model calls, fetch, library index) runs in workers; the UI never
   blocks.
-- Motion: the running glyph pulses; nothing else animates.
+- Motion: only the running spinner animates (dashboard rows, the trajectory
+  tail `working · role · Ns`, Work tab mission cards). One 10fps app timer
+  (`ReworkApp._tick_frames`) paints the active tab only, never touches the
+  store, and takes the frame from the monotonic clock so a poll cannot reset it.
 
 ## 8. Notifications
 
