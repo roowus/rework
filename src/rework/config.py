@@ -29,20 +29,23 @@ ESCALATION_MODEL_ENV = "REWORK_ESCALATION_MODEL"
 ESCALATION_MODEL_ID = "claude-sonnet-5-5"
 
 
-def load_env_file(path: Path | None = None) -> list[str]:
-    """Read KEY=VALUE lines from ~/.rework/rework.env (REWORK_ENV_FILE) into
-    the environment without overriding anything already set. The same file
-    systemd loads on rewvis, so provider keys live in one place per machine
-    instead of the owner's shell profile (where every program inherits them).
-    Returns the names it set (never the values)."""
-    import os
+def default_env_file() -> Path:
+    """The env file this process reads: REWORK_ENV_FILE, else
+    ~/.rework/rework.env (the same file systemd loads on rewvis)."""
+    return Path(os.environ.get("REWORK_ENV_FILE", str(DEFAULT_STATE_DIR / "rework.env")))
 
-    path = path or Path(os.environ.get("REWORK_ENV_FILE", str(DEFAULT_STATE_DIR / "rework.env")))
+
+def parse_env_file(path: Path | None = None) -> dict[str, str]:
+    """Parse KEY=VALUE lines from the env file and return them as a dict,
+    WITHOUT touching the environment. A missing or unreadable file is an empty
+    dict, like load_env_file's empty list. Values come back as written (quotes
+    stripped), so a caller decides what to do with them."""
+    path = path if path is not None else default_env_file()
     try:
         lines = path.expanduser().read_text().splitlines()
-    except OSError:
-        return []
-    added: list[str] = []
+    except (OSError, UnicodeDecodeError, ValueError):
+        return {}
+    values: dict[str, str] = {}
     for raw in lines:
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -53,7 +56,25 @@ def load_env_file(path: Path | None = None) -> list[str]:
         name, value = name.strip(), value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
             value = value[1:-1]
-        if name and name not in os.environ:
+        if name:
+            values[name] = value
+    return values
+
+
+def load_env_file(path: Path | None = None, *, override: bool = False) -> list[str]:
+    """Read KEY=VALUE lines from ~/.rework/rework.env (REWORK_ENV_FILE) into
+    the environment without overriding anything already set. The same file
+    systemd loads on rewvis, so provider keys live in one place per machine
+    instead of the owner's shell profile (where every program inherits them).
+    Returns the names it set (never the values).
+
+    `override=True` replaces names that are already set; that is the credential
+    rotation path (a rotated password must beat the stale value in this
+    process), and it is opt-in so the existing setdefault contract and its
+    callers stay exactly as they were."""
+    added: list[str] = []
+    for name, value in parse_env_file(path).items():
+        if override or name not in os.environ:
             os.environ[name] = value
             added.append(name)
     return added

@@ -5,6 +5,7 @@ local sqlite or the deployment Postgres over the tailnet)."""
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from rework.config import (
     default_results_dir,
     open_store_from_config,
 )
+from rework.credentials import CREDENTIALS_RELOADED, is_auth_error, recover_db_credentials
 from rework.kernel.state.records import Mission, Project, Run
 from rework.kernel.state.store import StateStore
 from rework.library.store import (
@@ -32,6 +34,8 @@ def library_root() -> Path:
         os.environ.get("REWORK_LIBRARY_DIR", str(DEFAULT_STATE_DIR / "library"))
     ).expanduser()
 
+
+log = logging.getLogger("rework.tui")
 
 # A read that has not answered in this long is treated as a dead connection
 # (found live: an unreachable host made the first query hang for minutes).
@@ -80,7 +84,10 @@ class TuiData:
     """Lazy single connections + thin query methods. All async; the Textual
     loop is the only caller (single-connection stores are safe here)."""
 
-    def __init__(self) -> None:
+    def __init__(self, store_factory: Any | None = None) -> None:
+        # How the store is opened. The default is today's path exactly
+        # (Config.from_env, then the shared factory); a test injects a fake.
+        self._store_factory = store_factory or (lambda: open_store_from_config(Config.from_env()))
         self._store: StateStore | None = None
         self.own_chat_ids: set[int] = set()
         self._index: LibraryStore | None = None
@@ -93,7 +100,7 @@ class TuiData:
 
     async def store(self) -> StateStore:
         if self._store is None:
-            store = await open_store_from_config(Config.from_env())
+            store = await _maybe_await(self._store_factory())
             self._track_own_chat_writes(store)
             self._store = store
         return self._store
@@ -123,6 +130,31 @@ class TuiData:
                 await self._store.aclose()
             self._store = None
 
+    async def _reload_credentials(self) -> bool:
+        """Apply a rotated database URL from the env file. True when the file
+        holds a different URL and it was applied (so the reopen uses it). The
+        URL is never logged: it carries the password."""
+        try:
+            fresh = await asyncio.to_thread(recover_db_credentials)
+        except Exception:  # pragma: no cover - recovery must never mask the error
+            return False
+        if fresh is not None:
+            # the library index (library-mcp holds it for the whole session)
+            # reads a URL out of Config.from_env too, so drop the cached handle
+            # and let `library()` reopen on the fresh credentials
+            await self._drop_library()
+        return fresh is not None
+
+    async def _drop_library(self) -> None:
+        index = self._index
+        self._index = None
+        self._git = None
+        if index is not None:
+            import contextlib
+
+            with contextlib.suppress(Exception):
+                await index.aclose()
+
     async def _call(self, fn: Any) -> Any:
         """One query against the (possibly reopened) store."""
         store = await self.store()
@@ -143,6 +175,11 @@ class TuiData:
         except Exception as first:
             if not _is_connection_error(first):
                 raise
+            # Credentials rotated on disk (Postgres password change): the dead
+            # connection is not the whole problem, the URL in this process is
+            # stale too, so re-read the env file BEFORE reopening. An unchanged
+            # URL returns None and the reconnect below runs exactly as before.
+            reloaded = is_auth_error(first) and await self._reload_credentials()
             await self.drop_store()
             try:
                 result = await asyncio.wait_for(_maybe_await(call()), QUERY_TIMEOUT_S)
@@ -151,6 +188,8 @@ class TuiData:
                 if key in self._last_good:
                     return self._last_good[key]
                 raise
+            if reloaded:
+                log.info(CREDENTIALS_RELOADED)
         self._reconnecting_hint = ""
         self._last_good[key] = result
         return result

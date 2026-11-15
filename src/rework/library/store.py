@@ -15,6 +15,7 @@ import logging
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from rework.credentials import CREDENTIALS_RELOADED, is_auth_error, recover_db_credentials
 from rework.library.model import (
     ItemStatus,
     ItemType,
@@ -327,7 +328,19 @@ class PostgresLibraryStore:
         except Exception as first:
             if not self._dsn or not _is_connection_error(first):
                 raise
-            logger.warning("library store connection lost (%s); reconnecting", first)
+            if is_auth_error(first):
+                # the Postgres password was rotated: this process still holds
+                # the URL it started with, so reconnecting with it would fail
+                # identically. Re-read the env file and reconnect with the new
+                # URL (never logged: it carries the password).
+                fresh = await asyncio.to_thread(recover_db_credentials, current_url=self._dsn)
+                if fresh is None:
+                    logger.warning("library store connection lost; credentials unchanged")
+                else:
+                    self._dsn = fresh
+                    logger.info(CREDENTIALS_RELOADED)
+            else:
+                logger.warning("library store connection lost (%s); reconnecting", first)
         try:
             await self._reconnect()
             async with self._op_lock:

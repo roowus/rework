@@ -7,6 +7,7 @@ sets REWORK_DB to a tmp file before the app is constructed."""
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -3853,3 +3854,142 @@ async def test_dashboard_open_mission_sends_a_message_through_the_shared_publish
         assert owner == ["please also run the linter", "second note"]
     finally:
         await store.aclose()
+
+
+# -- rotated credentials: an auth failure re-reads the env file ----------------
+
+
+class _RotatingStore:
+    """A store whose first connection is refused with a Postgres auth error
+    (as a rotated password leaves it), then works. Records how many times the
+    factory opened it."""
+
+    def __init__(self, error: BaseException, *, fail_times: int = 1) -> None:
+        self._error = error
+        self.fail_times = fail_times
+        self.attempts = 0
+        self.row = [{"id": "p1", "name": "after rotation"}]
+
+    async def list_projects(self) -> list[dict[str, str]]:
+        return self.row
+
+    async def append_chat_message(self, message: Any) -> Any:
+        return message
+
+    async def aclose(self) -> None:
+        return None
+
+
+def _auth_failure() -> BaseException:
+    import psycopg
+
+    return psycopg.OperationalError('FATAL:  password authentication failed for user "postgres"')
+
+
+def _rotate_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: str) -> Path:
+    """Point REWORK_ENV_FILE at a tmp env file, as a real rotation edits it."""
+    env_file = tmp_path / "rework.env"
+    env_file.write_text(f"REWORK_DB={value}\n")
+    monkeypatch.setenv("REWORK_ENV_FILE", str(env_file))
+    return env_file
+
+
+async def test_an_auth_failure_reconnects_with_the_rotated_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Found live: after the Postgres password was rotated, every reconnect
+    failed with 28P01 and the TUI stayed offline until it was quit and
+    reopened. AUTH failures must re-read the env file and reconnect ONCE."""
+    import logging
+
+    from rework.tui.data import CREDENTIALS_RELOADED, TuiData
+
+    stale, fresh = (
+        "postgresql://postgres:STALEPASS@host:5433/rework_state",
+        "postgresql://postgres:LIVEHOSTPASS@host:5433/rework_state",
+    )
+    monkeypatch.setenv("REWORK_DB", stale)
+    _rotate_env(monkeypatch, tmp_path, fresh)
+    caplog.set_level(logging.DEBUG, logger="rework.tui")
+
+    store = _RotatingStore(_auth_failure())
+    opened: list[_RotatingStore] = []
+
+    async def factory() -> _RotatingStore:
+        store.attempts += 1
+        if store.attempts == 1:
+            raise _auth_failure()
+        assert os.environ["REWORK_DB"] == fresh, "the reopen sees the rotated URL"
+        opened.append(store)
+        return store
+
+    data = TuiData(store_factory=factory)
+    got = await data.projects()
+    assert got == [{"id": "p1", "name": "after rotation"}], "real data, not offline"
+    assert store.attempts == 2, "one reopen, exactly one retry"
+    assert opened == [store]
+    assert data._reconnecting_hint == "", "the offline note is cleared"
+
+    messages = [r.getMessage() for r in caplog.records if r.name == "rework.tui"]
+    assert CREDENTIALS_RELOADED in messages
+    blob = " ".join(messages) + " ".join(str(r.args) for r in caplog.records)
+    for secret in ("STALEPASS", "LIVEHOSTPASS", stale, fresh):
+        assert secret not in blob, "no password or URL ever reaches the log"
+    await data.aclose()
+
+
+async def test_a_non_auth_error_never_re_reads_the_env_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tailnet hiccup must keep exactly today's behaviour: no file read."""
+    from rework.tui import data as data_mod
+    from rework.tui.data import TuiData
+
+    monkeypatch.setenv("REWORK_DB", "postgresql://postgres:x@host:5433/rework_state")
+    _rotate_env(monkeypatch, tmp_path, "postgresql://postgres:y@host:5433/rework_state")
+
+    def must_not_run(**_kwargs: Any) -> Any:
+        pytest.fail("the env file must not be re-read for a non-auth failure")
+
+    monkeypatch.setattr(data_mod, "recover_db_credentials", must_not_run)
+
+    store = _RotatingStore(OSError("consuming input failed: Operation timed out"))
+    attempts: list[int] = []
+
+    async def factory() -> _RotatingStore:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise OSError("consuming input failed: Operation timed out")
+        return store
+
+    data = TuiData(store_factory=factory)
+    assert await data.projects() == store.row
+    assert len(attempts) == 2, "the existing drop/reopen/retry is unchanged"
+    await data.aclose()
+
+
+async def test_an_unchanged_url_does_not_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The env file still holds the URL that just failed (a rotation that has
+    not been saved yet): go offline exactly as today, do not retry again."""
+    from rework.tui.data import TuiData
+
+    same = "postgresql://postgres:same@host:5433/rework_state"
+    monkeypatch.setenv("REWORK_DB", same)
+    _rotate_env(monkeypatch, tmp_path, same)
+
+    attempts: list[int] = []
+
+    async def factory() -> Any:
+        attempts.append(1)
+        raise _auth_failure()
+
+    data = TuiData(store_factory=factory)
+    import psycopg
+
+    with pytest.raises(psycopg.OperationalError):
+        await data.projects()
+    assert len(attempts) == 2, "two attempts total, never a third"
+    assert data._reconnecting_hint, "and the offline note is set"
+    await data.aclose()

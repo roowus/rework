@@ -573,6 +573,29 @@ Tests never touch `rework_state`. Postgres tests use the dedicated
 `rework_test` database:
 `REWORK_TEST_POSTGRES=postgresql://postgres:<password>@<host>:5433/rework_test`.
 
+### Rotating the Postgres password
+
+A running TUI and the long-lived `rework library-mcp` process keep the database
+URL they started with, so a rotation used to leave them failing on
+`FATAL: password authentication failed for user "postgres"` (SQLSTATE 28P01)
+until they were quit and reopened.
+
+Now they pick the change up on their own. When a connection fails with an
+authentication error, the TUI re-reads the env file; if the URL there differs
+from the one in memory it drops the connection, reconnects once with the fresh
+URL and logs `database credentials changed on disk; reconnected`. An unchanged
+URL changes nothing, and any other kind of failure behaves exactly as before.
+
+The procedure:
+
+1. Change the password in Postgres.
+2. Edit `~/.rework/rework.env` on each machine (`REWORK_DB`; on the Mac the
+   target's `db_env` variable, for example `REWORK_REWVIS_DB`, which
+   `resolve_target` copies into `REWORK_DB`), mode 600.
+3. Restart the daemon on rewvis: `sudo systemctl restart rework`.
+4. Nothing else. Open TUIs reconnect on their next failed query, and a
+   `rework library-mcp` process that already holds a session does the same.
+
 ## Preview a PR
 
 `rework preview <n>` runs pull request <n>'s build as a fully isolated second
