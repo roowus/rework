@@ -181,8 +181,11 @@ class TuiData:
         return await self._resilient("projects", lambda: self._call(lambda s: s.list_projects()))
 
     async def missions(self, limit: int = 60) -> list[Mission]:
+        """The slim mission list the poll carries: no plan, no result, objective
+        clipped (`Mission.light` is True). A view that needs them calls
+        get_mission for the full row."""
         return await self._resilient(
-            f"missions:{limit}", lambda: self._call(lambda s: s.list_missions(limit=limit))
+            f"missions:{limit}", lambda: self._call(lambda s: s.list_missions_light(limit=limit))
         )
 
     async def open_gates(self, mission_id: str | None = None) -> list[Any]:
@@ -351,13 +354,18 @@ class TuiData:
         *,
         note: str | None = None,
         decision: dict[str, Any] | None = None,
+        send_back: bool = False,
     ) -> bool:
         """Answer a gate. `note` is human-facing; `decision` is a TYPED answer
         the paused role receives as its interrupt() result (e.g. free-text
         feedback, or a choice among options the gate offered)."""
         store = await self.store()
-        gate = await store.decide_gate(gate_id, approved, note, decision)
-        return gate is not None and gate.status.value == ("approved" if approved else "rejected")
+        gate = await store.decide_gate(gate_id, approved, note, decision, send_back)
+        if gate is None:
+            return False
+        if send_back:  # the third verdict: the mission resumes with `note` as feedback
+            return gate.status.value == "sent_back"
+        return gate.status.value == ("approved" if approved else "rejected")
 
     async def set_mission_status(self, mission_id: str, status: str) -> Any:
         """Owner controls: cancel / pause / resume. The daemon reads the row, so
@@ -375,6 +383,16 @@ class TuiData:
 
     async def resume_mission(self, mission_id: str) -> Any:
         return await self.set_mission_status(mission_id, "running")
+
+    async def retry_pr(self, mission_id: str) -> tuple[bool, str]:
+        """Retry push+PR for a finished mission whose delivery failed. Shares
+        `rework.orchestrator.delivery.retry_pr` with `rework mission retry-pr`,
+        so the button and the command can never disagree."""
+        from rework.kernel.events.bus import InProcessEventBus
+        from rework.orchestrator.delivery import retry_pr
+
+        store = await self.store()
+        return await retry_pr(store, InProcessEventBus(store), mission_id)
 
     async def prioritize_mission(self, mission_id: str, priority: str = "high") -> Any:
         """Pickup priority (normal | high): the daemon reads the row, so this
@@ -505,12 +523,9 @@ class TuiData:
     async def send_owner_message(self, mission_id: str, text: str) -> Any:
         """Talk to a running mission's orchestrator (ADR 0007): it is woken and
         sees the message before its next turn."""
-        from rework.kernel.state.records import EventRecord, EventType
+        from rework.missions import send_owner_message
 
-        store = await self.store()
-        return await store.append_event(
-            EventRecord(mission_id=mission_id, type=EventType.OWNER_MESSAGE, payload={"text": text})
-        )
+        return await send_owner_message(mission_id, text, store=await self.store())
 
     async def mission_budget(self, mission_id: str) -> Any:
         """BudgetState (spent_usd, input/output/cached tokens)."""

@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -158,6 +159,60 @@ def test_cause_chain_walks_causes_contexts_cycles_and_bad_str() -> None:
     blank = RuntimeError("x")
     blank.__cause__ = Blank()
     assert cause_chain(blank) == "Blank", "an empty message still names the type"
+
+
+# `~/.rework/work` holds the worktree of every mission rework has run (15 GB,
+# ~1.9M files on the owner's machine) and the running test session itself writes
+# into it; this test must not walk it. Everything else under the state dir --
+# logs, library, run, the config files -- is what a test run could pollute.
+_SKIP_STATE_DIRS = frozenset({"work"})
+
+
+def _snapshot(root: Path) -> dict[str, int]:
+    """The files under `root` a test run could write, with their mtime."""
+    if not root.exists():
+        return {}
+    found: dict[str, int] = {}
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir():
+            found[str(entry)] = entry.stat().st_mtime_ns
+        elif entry.name not in _SKIP_STATE_DIRS:
+            for path in sorted(entry.rglob("*")):
+                if path.is_file():
+                    found[str(path)] = path.stat().st_mtime_ns
+    return found
+
+
+def test_the_session_never_logs_into_the_owner_s_real_state_dir(
+    log_isolation: Path, reset_logs: Callable[[], None]
+) -> None:
+    """Follow-up: driving run_tui() in-process made the suite append to the
+    owner's ~/.rework/logs/tui.log. The autouse isolation fixture must keep this
+    whole session's logging in one tmp dir, and this test watches the real
+    directory to prove it. The `_configured` trap is the point: a component
+    configured earlier in the session keeps its stale handler and setup_logging()
+    returns early, so configuring "tui" twice must both land in the tmp dir."""
+    real = Path.home() / ".rework"
+    before = _snapshot(real)
+    real_state = str(real.resolve())
+
+    assert str(logs.log_dir().resolve()).startswith(str(log_isolation.resolve())), (
+        f"the session logs into {logs.log_dir()}, not into the isolated {log_isolation}"
+    )
+
+    # an earlier test of this session already configured "tui" (run_tui in-process)
+    first = logs.setup_logging("tui")
+    assert "tui" in logs._configured
+    reset_logs()
+    second = logs.setup_logging("tui")  # the early-return path, after the reset
+    assert first == second == log_isolation / "tui.log", f"{second} is not the isolated log file"
+    logging.getLogger("rework.tui").error("isolation probe")
+
+    written = {str(p) for p in log_isolation.rglob("*.log")}
+    assert str(second) in written, "the record went to the isolated log file"
+    assert second.read_text().count("isolation probe") == 1
+    assert not any(p.startswith(real_state) for p in written), f"a log landed under {real}"
+    assert _snapshot(real) == before, f"the test run wrote under {real}"
 
 
 def test_reader_filters_and_formats(log_env: Path) -> None:

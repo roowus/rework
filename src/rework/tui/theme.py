@@ -96,6 +96,7 @@ STATUS: dict[str, tuple[str, str]] = {
     "approved": ("✓", OK),
     "failed": ("✗", DANGER),
     "rejected": ("✗", DANGER),
+    "sent_back": ("↺", WARN),
     "cancelled": ("⊘", FAINT),
     "aborted": ("⊘", FAINT),
 }
@@ -126,6 +127,7 @@ STATUS_LABEL: dict[str, str] = {
     "halted_escalated": "needs you",
     "on_hold": "paused",
     "intent": "queued",
+    "sent_back": "sent back",
 }
 
 

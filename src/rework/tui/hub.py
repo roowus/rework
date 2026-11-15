@@ -2,6 +2,10 @@
 
 It polls the cheap global state (missions, open gates, projects, chats, spend
 today) on an interval, keeps the last good snapshot, and hands it to every view.
+The snapshot's missions are LIGHT rows (no plan, no result, objective clipped:
+`Mission.light`); a view that needs those fetches the full row with
+`TuiData.get_mission`. A refresh that changed nothing is not broadcast: views
+get `on_tick` instead.
 Views never run their own global polls; detail views (an open mission's events)
 use `Hub.guard` so a failed query degrades to "offline", never to a crash.
 
@@ -73,6 +77,10 @@ class Hub:
         self.data = data or TuiData()
         self.snapshot = Snapshot()
         self._listeners: list[Callable[[Snapshot], None]] = []
+        # called instead of the listeners when a refresh found nothing new
+        self._tick_listeners: list[Callable[[Snapshot], None]] = []
+        # what the listeners last saw (None until the first broadcast)
+        self._broadcast_key: tuple[Any, ...] | None = None
         self._busy = False
         # offline backoff (found live: an unreachable host was retried and
         # logged twice every 2s, 2,400+ warnings in tui.log)
@@ -91,6 +99,28 @@ class Hub:
     def unsubscribe(self, fn: Callable[[Snapshot], None]) -> None:
         if fn in self._listeners:
             self._listeners.remove(fn)
+        if fn in self._tick_listeners:
+            self._tick_listeners.remove(fn)
+
+    def subscribe_tick(self, fn: Callable[[Snapshot], None]) -> None:
+        """Called after a refresh that changed nothing (no repaint needed), so a
+        view can keep its live detail polls going without repainting the lists."""
+        self._tick_listeners.append(fn)
+
+    @staticmethod
+    def _data_key(snap: Snapshot) -> tuple[Any, ...]:
+        """What a repaint depends on. Never `at` (new every refresh) or `loaded`
+        (the first broadcast always goes out: no key yet). online and error are
+        in: a flip to offline must reach the status bar."""
+        return (
+            snap.missions,
+            snap.gates,
+            snap.projects,
+            snap.chats,
+            snap.spend_today,
+            snap.online,
+            snap.error,
+        )
 
     async def refresh(self) -> Snapshot:
         """One poll. Single-flight: an overlapping call returns the current
@@ -138,7 +168,11 @@ class Hub:
                 return self.snapshot
             snap.at = time.time()
             self.snapshot = snap
-            self._broadcast()
+            key = self._data_key(snap)
+            if key == self._broadcast_key:
+                self._notify(self._tick_listeners)  # same data: no repaint
+            else:
+                self._broadcast()
             return snap
         finally:
             self._busy = False
@@ -181,7 +215,13 @@ class Hub:
         return sum(float(r.get("cost_usd") or 0) for r in rows)
 
     def _broadcast(self) -> None:
-        for fn in list(self._listeners):
+        # record what the listeners are about to see (guard() broadcasts its own
+        # offline marker too, and the next refresh must compare against that)
+        self._broadcast_key = self._data_key(self.snapshot)
+        self._notify(self._listeners)
+
+    def _notify(self, listeners: list[Callable[[Snapshot], None]]) -> None:
+        for fn in list(listeners):
             try:
                 fn(self.snapshot)
             except NoMatches:

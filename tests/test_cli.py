@@ -31,6 +31,16 @@ runner = CliRunner()
 
 
 @pytest.fixture(autouse=True)
+def plain_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Typer/rich colour error panels when FORCE_COLOR is set (GitHub Actions
+    sets it), which splits messages with ANSI codes: asserting on
+    `result.output` then fails in CI only. Tests read plain text."""
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "dumb")
+
+
+@pytest.fixture(autouse=True)
 def rework_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point REWORK_DB at a tmp sqlite file for every test in this module.
 
@@ -87,6 +97,17 @@ def _get_project(db: Path, project_id: str):  # type: ignore[no-untyped-def]
         store = await open_sqlite(str(db))
         try:
             return await store.get_project(project_id)
+        finally:
+            await store.aclose()
+
+    return asyncio.run(go())
+
+
+def _get_chat(db: Path, chat_id: str):
+    async def go():
+        store = await open_sqlite(str(db))
+        try:
+            return await store.get_chat(chat_id)
         finally:
             await store.aclose()
 
@@ -469,6 +490,13 @@ def test_new_creates_an_orchestrated_mission_by_default(rework_db: Path) -> None
     assert plan["gates"] == []
     assert plan["orchestrator"]["model"]
     assert plan["budget"]["max_usd"] == 3.0
+    # a CLI-created mission gets a chat titled from the mission title, so it is
+    # reachable from the Work tab / Dashboard like any chat-backed mission
+    assert mission.chat_id is not None
+    chat = _get_chat(rework_db, mission.chat_id)
+    assert chat is not None
+    assert chat.title == mission.title
+    assert chat.mission_id == mission.id
 
 
 def test_new_mechanical_keeps_the_legacy_pipeline(rework_db: Path) -> None:
@@ -1259,3 +1287,33 @@ def test_new_with_unknown_priority_is_a_clean_cli_error(rework_db: Path) -> None
             await store.aclose()
 
     assert asyncio.run(all_missions()) == []
+
+
+def test_message_publishes_an_owner_message(rework_db: Path) -> None:
+    """`rework message ID TEXT` appends an OWNER_MESSAGE for that mission;
+    an unknown id fails loudly and publishes nothing."""
+    from rework.kernel.state.records import EventType
+
+    async def seed() -> None:
+        store = await open_sqlite(str(rework_db))
+        try:
+            await store.create_mission(Mission(id="m-msg", objective="talk to me"))
+        finally:
+            await store.aclose()
+
+    async def owner_texts(mission_id: str) -> list[str]:
+        store = await open_sqlite(str(rework_db))
+        try:
+            events = await store.events_since(0, mission_id=mission_id)
+            return [e.payload["text"] for e in events if e.type == EventType.OWNER_MESSAGE]
+        finally:
+            await store.aclose()
+
+    asyncio.run(seed())
+    result = runner.invoke(app, ["message", "m-msg", "please also add tests"])
+    assert result.exit_code == 0, result.output
+    assert asyncio.run(owner_texts("m-msg")) == ["please also add tests"]
+
+    missing = runner.invoke(app, ["message", "m-nope", "hello"])
+    assert missing.exit_code != 0
+    assert asyncio.run(owner_texts("m-nope")) == []

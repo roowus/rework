@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -38,6 +39,7 @@ from rework.kernel.state.records import (
 from rework.kernel.state.records import run_id as make_run_id
 from rework.logs import bind
 from rework.nodes.report_sections import blocking_findings, open_blockers
+from rework.orchestrator.engine import MAX_SEND_BACKS
 
 log = logging.getLogger("rework.orchestrator")
 
@@ -51,6 +53,12 @@ PREFERRED_FAILURE_LIMIT = 3  # failed turns in a row before leaving the chosen m
 # waits when EVERY model fails transiently (an outage), about 7.5 minutes in all
 OUTAGE_WAITS_S = (15.0, 30.0, 60.0, 120.0, 240.0)
 MAX_IDLE_NUDGES = 3
+# a reply cut off at max_tokens (typically all thinking) is not idleness: retry the
+# turn once with a bigger budget, then once more at a lower effort
+MAX_CUT_OFFS = 2
+EFFORT_FLOOR_TOKENS = 16_384  # turn budget floor when thinking effort is set
+MAX_TURN_TOKENS = 65_536  # ceiling for the bumped budget
+_LOWER_EFFORT = {"high": "medium", "medium": "low"}
 PROVIDER_FAILURE_LIMIT = 2  # failed runs on one model before spawn_role refuses it
 
 STRICTNESS_LEVELS = ("light", "standard", "strict")
@@ -427,7 +435,9 @@ _TOOLS: list[ToolSpec] = [
                 "summary": {
                     "type": "string",
                     "description": "What happened, for the owner: what changed, why, and what "
-                    "the audit found. This leads the PR body, so write it for a reviewer.",
+                    "the audit found. This becomes the PR body ('## What changed') that a "
+                    "reviewer reads, so write it for them; a status note such as 'finished', "
+                    "'done' or 'all good' is rejected.",
                 },
                 "ask_before_pr": {
                     "type": "boolean",
@@ -538,6 +548,52 @@ def _short(value: Any, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+# a finish summary leads the PR body ("## What changed"), so a status note like
+# "FINISHED ALREADY." (PR #34) is refused: it says nothing to a reviewer.
+_MIN_SUMMARY_CHARS = 20
+_STATUS_WORDS = frozenset(
+    {"done", "finished", "complete", "completed", "merged", "ok", "okay", "lgtm", "good", "shipped"}
+)
+_STATUS_FILLER = frozenset(
+    {
+        "a",
+        "all",
+        "already",
+        "and",
+        "been",
+        "everything",
+        "for",
+        "has",
+        "have",
+        "here",
+        "i",
+        "is",
+        "it",
+        "its",
+        "just",
+        "now",
+        "s",
+        "the",
+        "to",
+        "up",
+        "we",
+    }
+)
+
+
+def _reads_like_status_note(summary: str) -> bool:
+    """`done!`, `FINISHED ALREADY.`, `all good`, `LGTM`: a state, not a change."""
+    words = re.sub(r"[^a-z0-9 ]+", " ", summary.lower()).split()
+    rest = [w for w in words if w not in _STATUS_FILLER]
+    return bool(rest) and all(w in _STATUS_WORDS for w in rest)
+
+
+def _substantive_summary(summary: str) -> bool:
+    """Usable as a PR body: not blank, not very short, not a status note."""
+    text = " ".join(summary.split())
+    return len(text) >= _MIN_SUMMARY_CHARS and not _reads_like_status_note(text)
+
+
 # where an entry's calls go when it leaves base_url unset (the adapters'
 # defaults; see kernel/llm/adapters)
 _DEFAULT_ENDPOINTS = {
@@ -609,6 +665,11 @@ class MissionOrchestrator:
         self._events: list[Any] = []
         self._event_cursor = 0
         self.finished: tuple[str, str] | None = None
+        # the finish this mission had ALREADY recorded when this run loaded, if
+        # its summary would lead a PR body. The status-note rail reuses ONLY
+        # this: a finish accepted earlier in THIS run is an intermediate note,
+        # not a restart boundary (see _load and the finish branch of _dispatch)
+        self._resumed_finish_summary: str | None = None
         # findings the orchestrator shipped with, and its reason for each: the
         # one mechanical rail that blocks finish(done) requires them (see
         # _enforce_findings_accepted), and they lead the mission report/PR body
@@ -675,6 +736,16 @@ class MissionOrchestrator:
         self.owner_seq = max(
             [int(m.get("owner_seq") or 0) for m in self.history if m.get("role") == "user"] + [0]
         )
+        # what this mission had recorded BEFORE this run started: the only
+        # summary a status-note finish may reuse (PR #34). Captured here, from
+        # the freshly loaded history, so a finish accepted later in THIS run
+        # cannot masquerade as a pre-restart one.
+        recorded = self._recorded_finish()
+        self._resumed_finish_summary = (
+            " ".join(recorded[1].split())
+            if recorded is not None and _substantive_summary(recorded[1])
+            else None
+        )
 
     async def _append(self, message: dict[str, Any], display: str = "") -> None:
         self.history.append(message)
@@ -721,46 +792,76 @@ class MissionOrchestrator:
             self.finished = self._recorded_finish()
             if self.finished is None:
                 await self._finish_interrupted_turn()
-        if self.finished is None:
-            await self._loop()
-        if self.finished is None:
-            return  # cancelled by the owner or the burn gate
-        outcome, summary = self.finished
-        results = await self._results_by_role()
-        audit = results.get("audit")
-        ship, pr_url = (None, None)
-        if outcome == "done":
-            # Persist the orchestrator's finish summary and accepted_findings
-            # into mission.result BEFORE _final_gates runs, so _create_pr /
-            # _pr_body reads the real summary instead of falling back to the
-            # coder's handoff text. (Fix: PR #21 — _synthesize was called after
-            # _final_gates, so result["summary"] was empty when _pr_body ran.)
-            _current = await self.r._store.get_mission(self.mid)
-            _pre = dict((_current.result if _current else None) or {})
-            if summary:
-                _pre["summary"] = summary
-            if self.accepted_findings:
-                _pre["accepted_findings"] = self.accepted_findings
-            await self.r._store.update_mission(self.mid, result=_pre)
-            ship, pr_url = await self.r._final_gates(
-                self.mission,
-                results,
-                audit.artifact if audit else None,
-                ask_before_pr=self.ask_before_pr,
-                reason=self.pr_reason,
-                gate_category=self.pr_gate_category,
+        send_backs = 0
+        while True:
+            if self.finished is None:
+                await self._loop()
+            if self.finished is None:
+                return  # cancelled by the owner or the burn gate
+            outcome, summary = self.finished
+            results = await self._results_by_role()
+            audit = results.get("audit")
+            ship, pr_url = (None, None)
+            if outcome == "done":
+                # Persist the orchestrator's finish summary and accepted_findings
+                # into mission.result BEFORE _final_gates runs, so _create_pr /
+                # _pr_body reads the real summary instead of falling back to the
+                # coder's handoff text. (Fix: PR #21 — _synthesize was called after
+                # _final_gates, so result["summary"] was empty when _pr_body ran.)
+                _current = await self.r._store.get_mission(self.mid)
+                _pre = dict((_current.result if _current else None) or {})
+                if summary:
+                    _pre["summary"] = summary
+                if self.accepted_findings:
+                    _pre["accepted_findings"] = self.accepted_findings
+                await self.r._store.update_mission(self.mid, result=_pre)
+                ship, pr_url, sent_back = await self.r._final_gates(
+                    self.mission,
+                    results,
+                    audit.artifact if audit else None,
+                    ask_before_pr=self.ask_before_pr,
+                    reason=self.pr_reason,
+                    gate_category=self.pr_gate_category,
+                )
+                if sent_back:
+                    # the owner sent the work back: the engine already queued their
+                    # feedback as an owner message and flipped the mission to
+                    # RUNNING. Un-finish and re-enter the turn loop so the
+                    # orchestrator revises, re-audits and reaches a FRESH gate.
+                    send_backs += 1
+                    if send_backs > MAX_SEND_BACKS:
+                        await self.r._synthesize(
+                            self.mid,
+                            None,
+                            outcome="failed",
+                            summary=f"owner sent the mission back more than {MAX_SEND_BACKS} "
+                            "times; giving up",
+                        )
+                        return
+                    await self._note(f"owner sent the mission back (#{send_backs}); resuming")
+                    self.finished = None
+                    continue
+            self.r._pr_url = pr_url
+            await self.r._synthesize(
+                self.mid,
+                ship,
+                outcome=outcome,
+                summary=summary,
+                accepted_findings=self.accepted_findings,
             )
-        self.r._pr_url = pr_url
-        await self.r._synthesize(
-            self.mid,
-            ship,
-            outcome=outcome,
-            summary=summary,
-            accepted_findings=self.accepted_findings,
-        )
+            return
+
+    def _output_budget(self, entry: Any, effort: str | None) -> int:
+        """Output tokens for one turn: the entry's max_output; thinking shares it,
+        so with an effort set it is never below EFFORT_FLOOR_TOKENS."""
+        budget = int(getattr(entry, "max_output", 0) or 4096)
+        return max(budget, EFFORT_FLOOR_TOKENS) if effort else budget
 
     async def _loop(self) -> None:
         idle = 0
+        cut_offs = 0
+        budget: int | None = None  # per-turn overrides, set only by a cut-off retry
+        effort: str | None = None
         turns = sum(1 for m in self.history if m.get("role") == "assistant")
         while self.finished is None:
             signal = await self._owner_gate()
@@ -777,9 +878,38 @@ class MissionOrchestrator:
                 continue
             turns += 1
             await self._deliver_owner_messages()
-            result = await self._think()
+            result = await self._think(max_tokens=budget, effort=effort)
             if result is None:
                 return
+            if (
+                not result.tool_calls
+                and result.stop_reason == "max_tokens"
+                and cut_offs < MAX_CUT_OFFS
+            ):
+                # cut off mid-thought, not idle: retry with more room, then less effort
+                cut_offs += 1
+                used_effort = effort or self.effort
+                used_budget = budget or self._output_budget(self.entry, used_effort)
+                if cut_offs == 1:
+                    new_budget = min(max(used_budget * 2, used_budget), MAX_TURN_TOKENS)
+                    new_effort = used_effort
+                else:
+                    new_budget = used_budget
+                    new_effort = _LOWER_EFFORT.get(used_effort or "", used_effort and "low")
+                await self._note(
+                    f"orchestrator reply cut off at the output limit (retry {cut_offs}/"
+                    f"{MAX_CUT_OFFS}): effort {used_effort or 'none'} -> {new_effort or 'none'}, "
+                    f"budget {used_budget} -> {new_budget} tokens"
+                )
+                budget, effort = new_budget, new_effort
+                await self._append(
+                    {
+                        "role": "user",
+                        "content": "[Your reply hit the output limit and was cut off before "
+                        "you made a tool call. Think briefly, then respond with a tool call.]",
+                    }
+                )
+                continue
             if not result.tool_calls:
                 idle += 1
                 if idle >= MAX_IDLE_NUDGES:
@@ -795,6 +925,8 @@ class MissionOrchestrator:
                 )
                 continue
             idle = 0
+            cut_offs = 0
+            budget = effort = None
             await self._execute_calls(result.tool_calls)
 
     async def _owner_gate(self) -> str:
@@ -810,7 +942,7 @@ class MissionOrchestrator:
             return "cancelled"
         return "ok"
 
-    async def _think(self) -> Any:
+    async def _think(self, max_tokens: int | None = None, effort: str | None = None) -> Any:
         # the system prompt is STATIC for the whole mission (prompt caching
         # works on exact prefixes); the live state rides in a trailing message
         # that is never persisted
@@ -827,8 +959,8 @@ class MissionOrchestrator:
                 system=system,
                 messages=messages,
                 tools=self.tools,
-                max_tokens=min(int(entry.max_output or 4096), 4096),
-                effort=self.effort,
+                max_tokens=max_tokens or self._output_budget(entry, effort or self.effort),
+                effort=effort or self.effort,
                 session_id=self.run_id,
             )
             try:
@@ -965,6 +1097,8 @@ class MissionOrchestrator:
             m.get("tool_call_id"): m.get("content") for m in self.history if m.get("role") == "tool"
         }
         for message in reversed(self.history):
+            if message.get("role") == "user" and message.get("owner_seq"):
+                return None  # the owner spoke after any finish (send-back): not finished
             for call in message.get("tool_calls") or []:
                 if call.get("name") == "finish" and answered.get(call.get("id")) == "finished":
                     args = call.get("arguments") or {}
@@ -1046,7 +1180,23 @@ class MissionOrchestrator:
                 accepted = _accepted_findings(args.get("accepted_findings"))
                 await self._enforce_audit_fresh()
                 await self._enforce_findings_accepted(accepted)
-            self.finished = (outcome, str(args.get("summary") or ""))
+            summary = " ".join(str(args.get("summary") or "").split())
+            if not _substantive_summary(summary):
+                # a restart must not degrade the PR body to "finished": reuse
+                # the summary this mission had recorded BEFORE this run loaded
+                # (_load captured it and only kept a substantive one). A thin
+                # finish accepted earlier in THIS run is an intermediate note,
+                # not the mission's story, so it is never promoted here.
+                previous = self._resumed_finish_summary
+                if previous is None:
+                    raise ToolError(
+                        "summary must say what changed for the owner: it becomes the PR body "
+                        "('## What changed'), so name the change and why it was made. A status "
+                        "note such as 'finished', 'done' or 'all good' is refused."
+                    )
+                await self._note("finish summary was a status note; reusing the earlier one")
+                summary = previous
+            self.finished = (outcome, summary)
             self.accepted_findings = accepted
             self.ask_before_pr = ask
             self.pr_reason = reason
