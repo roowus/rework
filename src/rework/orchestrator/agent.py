@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -428,7 +429,9 @@ _TOOLS: list[ToolSpec] = [
                 "summary": {
                     "type": "string",
                     "description": "What happened, for the owner: what changed, why, and what "
-                    "the audit found. This leads the PR body, so write it for a reviewer.",
+                    "the audit found. This becomes the PR body ('## What changed') that a "
+                    "reviewer reads, so write it for them; a status note such as 'finished', "
+                    "'done' or 'all good' is rejected.",
                 },
                 "ask_before_pr": {
                     "type": "boolean",
@@ -539,6 +542,52 @@ def _short(value: Any, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+# a finish summary leads the PR body ("## What changed"), so a status note like
+# "FINISHED ALREADY." (PR #34) is refused: it says nothing to a reviewer.
+_MIN_SUMMARY_CHARS = 20
+_STATUS_WORDS = frozenset(
+    {"done", "finished", "complete", "completed", "merged", "ok", "okay", "lgtm", "good", "shipped"}
+)
+_STATUS_FILLER = frozenset(
+    {
+        "a",
+        "all",
+        "already",
+        "and",
+        "been",
+        "everything",
+        "for",
+        "has",
+        "have",
+        "here",
+        "i",
+        "is",
+        "it",
+        "its",
+        "just",
+        "now",
+        "s",
+        "the",
+        "to",
+        "up",
+        "we",
+    }
+)
+
+
+def _reads_like_status_note(summary: str) -> bool:
+    """`done!`, `FINISHED ALREADY.`, `all good`, `LGTM`: a state, not a change."""
+    words = re.sub(r"[^a-z0-9 ]+", " ", summary.lower()).split()
+    rest = [w for w in words if w not in _STATUS_FILLER]
+    return bool(rest) and all(w in _STATUS_WORDS for w in rest)
+
+
+def _substantive_summary(summary: str) -> bool:
+    """Usable as a PR body: not blank, not very short, not a status note."""
+    text = " ".join(summary.split())
+    return len(text) >= _MIN_SUMMARY_CHARS and not _reads_like_status_note(text)
+
+
 # where an entry's calls go when it leaves base_url unset (the adapters'
 # defaults; see kernel/llm/adapters)
 _DEFAULT_ENDPOINTS = {
@@ -610,6 +659,11 @@ class MissionOrchestrator:
         self._events: list[Any] = []
         self._event_cursor = 0
         self.finished: tuple[str, str] | None = None
+        # the finish this mission had ALREADY recorded when this run loaded, if
+        # its summary would lead a PR body. The status-note rail reuses ONLY
+        # this: a finish accepted earlier in THIS run is an intermediate note,
+        # not a restart boundary (see _load and the finish branch of _dispatch)
+        self._resumed_finish_summary: str | None = None
         # findings the orchestrator shipped with, and its reason for each: the
         # one mechanical rail that blocks finish(done) requires them (see
         # _enforce_findings_accepted), and they lead the mission report/PR body
@@ -675,6 +729,16 @@ class MissionOrchestrator:
         self.history = [m.body for m in await self.store.chat_messages(self.chat_id) if m.body]
         self.owner_seq = max(
             [int(m.get("owner_seq") or 0) for m in self.history if m.get("role") == "user"] + [0]
+        )
+        # what this mission had recorded BEFORE this run started: the only
+        # summary a status-note finish may reuse (PR #34). Captured here, from
+        # the freshly loaded history, so a finish accepted later in THIS run
+        # cannot masquerade as a pre-restart one.
+        recorded = self._recorded_finish()
+        self._resumed_finish_summary = (
+            " ".join(recorded[1].split())
+            if recorded is not None and _substantive_summary(recorded[1])
+            else None
         )
 
     async def _append(self, message: dict[str, Any], display: str = "") -> None:
@@ -1070,7 +1134,23 @@ class MissionOrchestrator:
                 accepted = _accepted_findings(args.get("accepted_findings"))
                 await self._enforce_audit_fresh()
                 await self._enforce_findings_accepted(accepted)
-            self.finished = (outcome, str(args.get("summary") or ""))
+            summary = " ".join(str(args.get("summary") or "").split())
+            if not _substantive_summary(summary):
+                # a restart must not degrade the PR body to "finished": reuse
+                # the summary this mission had recorded BEFORE this run loaded
+                # (_load captured it and only kept a substantive one). A thin
+                # finish accepted earlier in THIS run is an intermediate note,
+                # not the mission's story, so it is never promoted here.
+                previous = self._resumed_finish_summary
+                if previous is None:
+                    raise ToolError(
+                        "summary must say what changed for the owner: it becomes the PR body "
+                        "('## What changed'), so name the change and why it was made. A status "
+                        "note such as 'finished', 'done' or 'all good' is refused."
+                    )
+                await self._note("finish summary was a status note; reusing the earlier one")
+                summary = previous
+            self.finished = (outcome, summary)
             self.accepted_findings = accepted
             self.ask_before_pr = ask
             self.pr_reason = reason
