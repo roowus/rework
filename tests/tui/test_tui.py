@@ -3261,15 +3261,26 @@ async def test_dashboard_graph_owner_sequence_rounds(env: Path) -> None:
         coder6 = next(n for n in nodes if n.key == "m-ownerflow01:code:coder:6")
         assert "coders 5-6" in coder6.sub and "continues coder #5" in coder6.sub, coder6.sub
 
-        # the review verdict labels the edge into each round's audit
-        # an edge renders '│\n▼' plus its label on the last line, when it has one
+        # the review verdict labels BOTH sides of each audit at mission level:
+        # into the audit the findings ('approve with fixes: 2 high'), out of it
+        # the direction toward the next coder revision or the mission's gates
+        # ('request changes' -> 'approve'). An unlabelled edge is just '│\n▼';
+        # a labelled one carries the label on its last line.
         edge_labels = [str(e.render()).splitlines()[-1].strip() for e in app.query(".gedge")]
         assert len(edge_labels) == 9, edge_labels
         assert [label for label in edge_labels if label != "▼"] == [
-            "approve with fixes: 2 high",
-            "request changes: 1 critical",
-            "approve",
+            "approve with fixes: 2 high",  # into auditor 1
+            "approve with fixes",  # auditor 1 -> coder #3 (revision)
+            "request changes: 1 critical",  # into auditor 2
+            "request changes",  # auditor 2 -> coder #5 (revision)
+            "approve",  # into auditor 3
+            "approve",  # auditor 3 -> the mission proceeds to its gate
         ], edge_labels
+
+        # a labelled edge is tall enough to be seen: '│', '▼', label (3 rows)
+        for edge in app.query(".gedge"):
+            rows = str(edge.render()).splitlines()
+            assert edge.size.height >= len(rows), (edge.size, rows)
 
         # 3 review rounds is under the collapse threshold: the loop stays visible
         assert not [n for n in nodes if n.expandable], keys
