@@ -27,6 +27,11 @@ from rework.tui.data import TuiData
 
 log = logging.getLogger("rework.tui")
 
+# the spinner stamp sweep: at most this many running missions per poll, each one
+# small query of this many newest events
+STAMP_MISSIONS = 24
+EVENT_WINDOW = 40
+
 
 def midnight() -> float:
     lt = time.localtime()
@@ -44,6 +49,10 @@ class Snapshot:
     error: str = ""
     loaded: bool = False  # False until the first successful refresh
     at: float = 0.0
+    # newest event epoch per run. Events are the only live signal a role gives,
+    # so this is what tells a working run from a wedged one (spinner.STALL_SECONDS).
+    # "*" is the newest across every active mission.
+    last_event: dict[str, float] = field(default_factory=dict)
 
     def project_name(self, project_id: str | None) -> str:
         if not project_id:
@@ -136,6 +145,7 @@ class Hub:
                 snap.projects = await self.data.projects()
                 snap.chats = await self._chats()
                 snap.spend_today = await self._spend_today()
+                await self._event_stamps(snap)
                 snap.online = not self.data._reconnecting_hint
                 snap.error = self.data._reconnecting_hint
                 snap.loaded = True
@@ -166,6 +176,28 @@ class Hub:
             return snap
         finally:
             self._busy = False
+
+    async def _event_stamps(self, snap: Snapshot) -> None:
+        """Newest event ts per running mission and per run, for the spinner.
+
+        Cost, honestly: ONE store query per running mission per poll (the newest
+        EVENT_WINDOW events, no payload-heavy 200-row reads, no per-run queries)
+        for at most STAMP_MISSIONS missions, so at most 24 small queries. Runs
+        are read out of that one window in Python. A failed query leaves that
+        mission without a stamp ("unknown"), which animates; it never replays an
+        old stamp. The stamp only decides "animating frame" vs "idle 7m"."""
+        stamps: dict[str, float] = {}
+        active = [
+            m for m in snap.missions if str(getattr(m.status, "value", m.status)) == "running"
+        ]
+        for mission in active[:STAMP_MISSIONS]:
+            try:
+                stamps.update(await self.data.recent_event_stamps(mission.id, limit=EVENT_WINDOW))
+            except Exception:  # offline, old store: no stamps for it, never stale ones
+                continue
+        if stamps:
+            stamps["*"] = max(stamps.values())
+        snap.last_event = stamps
 
     async def _chats(self) -> list[Any]:
         try:

@@ -406,7 +406,10 @@ async def test_a_failed_full_fetch_shows_the_light_facts_backs_off_and_recovers(
         assert dash.full_mission is not None and not dash.full_failed
         assert dash._full_failures == 0
         assert "could not load" not in str(header.render())
-        assert "running  fix" in str(header.render()), "the plan label is back"
+        # the status word before the plan label is the spinner's now ("working",
+        # or "idle 7m" for a silent run), so assert on the label and its
+        # neighbours, not on the word "running"
+        assert "fix  ·  polystats" in str(header.render()), "the plan label is back"
 
         # mid-session: opened fine, then the row changes and the refetch fails.
         # The stale full row stays up, now with the notice, and recovery clears it.
@@ -419,7 +422,7 @@ async def test_a_failed_full_fetch_shows_the_light_facts_backs_off_and_recovers(
         assert dash.full_failed and not dash.full_mission.light
         stale = str(header.render())
         assert "could not load plan/result (retrying)" in stale, stale
-        assert "running  fix" in stale, "the stale plan label is still shown"
+        assert "fix  ·  polystats" in stale, "the stale plan label is still shown"
         broken = False
         dash._full_next_try = 0.0
         await app.hub.refresh()

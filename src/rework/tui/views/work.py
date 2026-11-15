@@ -160,6 +160,24 @@ class WorkView(View):
         self._refresh_cards()
         self._poll_chat()
 
+    def tick(self, frame: str, now: float) -> None:
+        """Animate the running mission cards (10fps): no store, no remounting.
+
+        The frame comes from the shared clock; the last event time comes from
+        the snapshot the view already holds, so a poll cannot reset the spinner.
+        Each card is judged by ITS mission's own stamp. A mission with no stamp
+        is unknown and animates; the "*" aggregate (newest event of any running
+        mission) is never borrowed, or a dead card would animate whenever any
+        other mission worked."""
+        cards = [c for c in self.query(MissionCard) if c.status == "running"]
+        if not cards:
+            return
+        stamps = self.snap.last_event
+        with self.painting():
+            for card in cards:
+                last = stamps.get(card.mission_id)
+                card.tick(frame, last)
+
     def on_tick(self, snap: Snapshot) -> None:
         self.snap = snap
         cards = list(self.query(MissionCard))
@@ -167,6 +185,10 @@ class WorkView(View):
             self._paint_chat_list()  # "4m ago" on each chat row
             for card in cards:  # "started 3m ago" on each live card
                 card.paint()
+        else:
+            for card in cards:  # a moved event stamp can flip a card to idle
+                if card.observe(snap.last_event.get(card.mission_id)):
+                    card.paint()
         if cards:
             self._poll_cards(cards)
         self._poll_chat()
@@ -618,14 +640,15 @@ class WorkView(View):
             row = self.snap.mission(card.mission_id)
             if row is None:
                 continue
+            last = self.snap.last_event.get(card.mission_id)
             if getattr(row, "light", False):
                 # a light row has no plan or result: keep the full mission the
                 # card already holds while it is current, else _poll_cards
                 # fetches it (never paint the light row over a full one)
                 if self._card_is_current(card, row):
-                    card.update_from(card.mission, self.snap.gates_for(card.mission_id))
+                    card.update_from(card.mission, self.snap.gates_for(card.mission_id), last)
             else:
-                card.update_from(row, self.snap.gates_for(card.mission_id))
+                card.update_from(row, self.snap.gates_for(card.mission_id), last)
         self._poll_cards(cards)
 
     def _card_is_current(self, card: MissionCard, row: Any) -> bool:
@@ -656,7 +679,11 @@ class WorkView(View):
                     card.fetch_failures = 0
                     card.fetch_next_try = 0.0
                     with self.painting():  # the app can close during the await above
-                        card.update_from(mission, self.snap.gates_for(card.mission_id))
+                        card.update_from(
+                            mission,
+                            self.snap.gates_for(card.mission_id),
+                            self.snap.last_event.get(card.mission_id),
+                        )
                 else:  # a row that cannot be read is not re-SELECTed every tick
                     card.fetch_failures += 1
                     card.fetch_next_try = time.monotonic() + min(30.0, 2.0**card.fetch_failures)

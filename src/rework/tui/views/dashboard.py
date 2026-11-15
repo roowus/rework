@@ -24,7 +24,7 @@ from textual.css.query import NoMatches
 from textual.timer import Timer
 from textual.widgets import ContentSwitcher, Input, Markdown, Static
 
-from rework.tui import actions, search
+from rework.tui import actions, search, spinner
 from rework.tui.hub import Snapshot
 from rework.tui.theme import (
     ACCENT,
@@ -38,6 +38,7 @@ from rework.tui.theme import (
     glyph,
     money,
     plan_label,
+    run_mark,
     status_text,
     status_value,
     tokens,
@@ -411,7 +412,7 @@ class DashboardView(View):
             for sid in ("st-running", "st-gates", "st-paused", "st-done", "st-today", "st-week"):
                 self.query_one(f"#{sid}", Stat).set("—", note)
             return
-        self.query_one("#st-running", Stat).set(str(counts.get("running", 0)))
+        self._paint_running_tile()
         self.query_one("#st-gates", Stat).set(str(len(snap.gates)))
         self.query_one("#st-paused", Stat).set(str(counts.get("on_hold", 0)))
         self.query_one("#st-done", Stat).set(str(done_week))
@@ -421,21 +422,12 @@ class DashboardView(View):
         )
         self.query_one("#st-gates").set_class(bool(snap.gates), "-warn")
 
-        # projects: a plain case-insensitive name filter, with the pinned rows
-        # (All projects / No project) always there so a filter never strands the
-        # owner without a way back to everything.
-        rows = [RowData(ALL, self._proj_row("All projects", snap.missions))]
-        needle = self.project_query.strip().lower()
-        for p in snap.projects:
-            if needle and needle not in str(p.name).lower():
-                continue
-            ms = [m for m in snap.missions if m.project_id == p.id]
-            rows.append(RowData(p.id, self._proj_row(p.name, ms)))
-        loose = [m for m in snap.missions if not m.project_id]
-        if loose:
-            rows.append(RowData(NONE, self._proj_row("No project", loose, dim=True)))
+        # projects (built by the same helper the spinner tick uses): a plain
+        # case-insensitive name filter, with the pinned rows (All projects / No
+        # project) always there so a filter never strands the owner without a
+        # way back to everything.
         plist = self.query_one("#proj-list", RowList)
-        plist.set_rows(rows)
+        plist.set_rows(self._proj_rows())
         # the selection lives in self.project, not in the row list, so a project
         # filtered out of view keeps filtering missions and comes back selected
         # when the filter clears
@@ -492,19 +484,146 @@ class DashboardView(View):
             return f"{status} in {project}"
         return status or project
 
-    def _proj_row(self, name: str, missions: list[Any], dim: bool = False) -> str:
+    # -- spinner ---------------------------------------------------------------------
+
+    def _stamp(self, key: str | None) -> float | None:
+        """Newest event epoch for ONE entity (a mission id, a run id, the
+        orchestrator pseudo id, or "*" for the aggregate), from the snapshot.
+
+        Events are the only live signal a role gives: a run row's `updated_at`
+        moves when its status changes and then stays put for the whole session,
+        so it cannot tell "working" from "wedged".
+
+        Strictly that entity's own stamp. It is never a max over several keys
+        (every run event also stamps its mission, so a max would let one live
+        run make a wedged sibling look busy) and never falls back to another
+        entity's stamp. No key means UNKNOWN, and unknown animates. "*" is the
+        newest across all running missions: use it only where an aggregate is
+        genuinely meant (the stats tile, the project badge)."""
+        return self.snap.last_event.get(key) if key else None
+
+    def _mark(
+        self, status: Any, last: float | None, frame: str | None = None, now: float | None = None
+    ) -> str:
+        """The marker for a status: a frame when it is genuinely running, the
+        static idle glyph when it is a zombie. Everything else keeps the
+        existing status glyph (pending/on_hold/gate never animate).
+
+        `frame`/`now` of None mean "compute it now": the store poll paints
+        without a tick, and it must still render a real one-cell frame (never
+        an empty span), also while the terminal is unfocused and no tick runs."""
+        if status_value(status) != "running":
+            return glyph(status)
+        clock = time.time() if now is None else now
+        return run_mark(spinner.is_stalled(clock, last), frame)
+
+    def _paint_running_tile(self, frame: str | None = None, now: float | None = None) -> None:
+        """The dashboard "running" tile. ONE rendering shared by the poll and the
+        tick, so the tile cannot alternate between two texts."""
+        stat = self.query_one("#st-running", Stat)
+        running = sum(1 for m in self.snap.missions if status_value(m.status) == "running")
+        if not running:
+            stat.set("0")
+            return
+        clock = time.time() if now is None else now
+        last = self._stamp("*")
+        if spinner.is_stalled(clock, last):
+            human = spinner.human_duration(spinner.silence(clock, last))
+            stat.set(str(running), f"idle {human}")
+        else:
+            stat.set(f"{run_mark(False, frame)} {running}", "working", markup=True)
+
+    def tick(self, frame: str, now: float) -> None:
+        """Repaint only the rows that carry a running marker (10fps).
+
+        Rebuilding the markup string with the next frame IS the repaint:
+        RowList.set_rows updates in place (Row.refresh_data only calls
+        update() when the markup changed) and Stat.set does the same, so this
+        mounts nothing and touches the store not at all."""
+        with self.painting():
+            if self.mission_id is None:
+                self._tick_overview(frame, now)
+            else:
+                self._tick_mission(frame, now)
+
+    def _tick_overview(self, frame: str, now: float) -> None:
+        missions = self._filtered()
+        mrows: list[RowData] = []
+        for title, statuses in SECTIONS:
+            group = [m for m in missions if status_value(m.status) in statuses]
+            if not group:
+                continue
+            colour = WARN if title == "needs you" else FAINT
+            mrows.append(
+                RowData(
+                    f"{HEADER}{title}",
+                    f"[{colour}][b]{title.upper()}[/b]  {len(group)}[/]",
+                    classes="-header",
+                )
+            )
+            for m in group:
+                mrows.append(RowData(m.id, self._mission_row(m, frame=frame, now=now)))
+        if self.ai_results is not None:
+            mrows = self._ai_rows(frame=frame, now=now)
+        # the same key list as the poll's paint, so set_rows takes the cheap
+        # in-place path instead of remounting the list
+        self.query_one("#mission-list", RowList).set_rows(mrows)
+        self.query_one("#proj-list", RowList).set_rows(self._proj_rows(frame, now))
+        self._paint_running_tile(frame, now)
+
+    def _tick_mission(self, frame: str, now: float) -> None:
+        mission = self.snap.mission(self.mission_id)
+        if mission is None:
+            return
+        if status_value(mission.status) == "running":
+            self._paint_mission_static(frame=frame, now=now)
+        self.query_one("#run-list", RowList).set_rows(self._run_rows(frame, now))
+        if self.mtab == "traj":
+            self._paint_traj_tail(frame, now)
+
+    def _proj_rows(self, frame: str | None = None, now: float | None = None) -> list[RowData]:
+        """The project pane's rows. Split out so the spinner tick and the poll
+        build them the same way (and with the same keys)."""
+        snap = self.snap
+        rows = [RowData(ALL, self._proj_row("All projects", snap.missions, frame=frame, now=now))]
+        needle = self.project_query.strip().lower()
+        for p in snap.projects:
+            if needle and needle not in str(p.name).lower():
+                continue
+            ms = [m for m in snap.missions if m.project_id == p.id]
+            rows.append(RowData(p.id, self._proj_row(p.name, ms, frame=frame, now=now)))
+        loose = [m for m in snap.missions if not m.project_id]
+        if loose:
+            rows.append(
+                RowData(NONE, self._proj_row("No project", loose, dim=True, frame=frame, now=now))
+            )
+        return rows
+
+    def _proj_row(
+        self,
+        name: str,
+        missions: list[Any],
+        dim: bool = False,
+        *,
+        frame: str | None = None,
+        now: float | None = None,
+    ) -> str:
         running = sum(1 for m in missions if status_value(m.status) == "running")
         waiting = sum(1 for m in missions if status_value(m.status) == "awaiting_gate")
         badges = []
         if running:
-            badges.append(f"[{ACCENT}]● {running}[/]")
+            # the project badge is the second running glyph on the overview
+            last = self._stamp("*")
+            mark = self._mark("running", last, frame, now)
+            badges.append(f"{mark} {running}")
         if waiting:
             badges.append(f"[{WARN}]◆ {waiting}[/]")
         label = f"[{MUTED}]{esc(name)}[/]" if dim else esc(name)
         return f"{label}  [{FAINT}]{len(missions)}[/]  " + " ".join(badges)
 
-    def _mission_row(self, m: Any) -> str:
+    def _mission_row(self, m: Any, *, frame: str | None = None, now: float | None = None) -> str:
         st = status_value(m.status)
+        last = self._stamp(m.id)
         bits = []
         if self.project == ALL and m.project_id:
             bits.append(self.snap.project_name(m.project_id))
@@ -526,7 +645,29 @@ class DashboardView(View):
         reason = esc(clip(self._reason(m.id), 120))
         if reason:
             meta += f"  [{ACCENT}]{reason}[/]"
-        return f"{glyph(st)} [b]{esc(clip(m.objective, 100))}[/b]\n  {meta}{gate_note}"
+        mark = self._mark(st, last, frame, now)
+        return f"{mark} [b]{esc(clip(m.objective, 100))}[/b]\n  {meta}{gate_note}"
+
+    def _ai_rows(self, *, frame: str | None = None, now: float | None = None) -> list[RowData]:
+        """The ✦ ranking: one row per ranked mission, objective + its reason.
+        Built from the snapshot so a mission that vanished mid-search drops."""
+        rows: list[RowData] = []
+        for hit in self.ai_results or []:
+            mission = self.snap.mission(hit["id"])
+            if mission is None:
+                continue
+            st = status_value(mission.status)
+            reason = esc(hit.get("reason") or "")
+            mark = self._mark(st, self._stamp(mission.id), frame, now)
+            rows.append(
+                RowData(
+                    mission.id,
+                    f"{mark} [b]{esc(clip(mission.objective, 100))}[/b]\n"
+                    f"  [{FAINT}]{esc(clip(mission.id, 60))}[/]"
+                    + (f"  [{ACCENT}]{reason}[/]" if reason else ""),
+                )
+            )
+        return rows
 
     def on_row_list_activated(self, event: RowList.Activated) -> None:
         event.stop()
@@ -1063,6 +1204,9 @@ class DashboardView(View):
             self._paint_mission_static()
             self._paint_runs()
             self._paint_detail_tabs()
+            # the poll supplies correctness (also while unfocused, when no tick
+            # runs, and whichever detail tab is open); the tick supplies motion
+            self._paint_traj_tail()
         except NoMatches:
             return
 
@@ -1090,6 +1234,9 @@ class DashboardView(View):
             tuple(sorted(self.run_cost.items())),
             len(self.events),
             self._report_key(),
+            # the spinner reads "working" vs "idle 7m" off this stamp: a poll alone
+            # (no tick while unfocused) must repaint the header when it moves
+            self._stamp(self.mission_id),
         )
 
     async def _load_full_mission(self, mission_id: str) -> None:
@@ -1130,7 +1277,7 @@ class DashboardView(View):
             return full
         return self.snap.mission(self.mission_id)
 
-    def _paint_mission_static(self) -> None:
+    def _paint_mission_static(self, *, frame: str | None = None, now: float | None = None) -> None:
         mission = self._detail_mission()
         header = self.query_one("#m-header", Static)
         if mission is None or (getattr(mission, "light", False) and not self.full_failed):
@@ -1172,10 +1319,26 @@ class DashboardView(View):
         if self.full_failed:
             # a refetch failed after this row was fetched: it is stale, say so
             bits.append("could not load plan/result (retrying)")
+        # The header represents the MISSION, so it is judged by the mission's own
+        # stamp (any event of any of its runs or its orchestrator). That stamp
+        # cannot say that ONE run went quiet while its siblings work, so a
+        # silent run is named next to "working" instead of being masked.
+        last = self._stamp(mission.id)
+        clock = time.time() if now is None else now
+        stalled = st == "running" and spinner.is_stalled(clock, last)
+        if st == "running":
+            mark = self._mark(st, last, frame, clock)
+            if stalled:
+                head = f"{mark} idle {spinner.human_duration(spinner.silence(clock, last))}"
+            else:
+                head = f"{mark} working"
+                quiet = self._quiet_runs(clock)
+                if quiet:
+                    head += f"  [{FAINT}]" + esc(", ".join(quiet)) + "[/]"
+        else:
+            head = status_text(st)
         header.update(
-            f"[b]{esc(mission.objective)}[/b]\n{status_text(st)}  [{MUTED}]"
-            + esc("  ·  ".join(bits))
-            + "[/]"
+            f"[b]{esc(mission.objective)}[/b]\n{head}  [{MUTED}]" + esc("  ·  ".join(bits)) + "[/]"
         )
         # same run-derived round structure as the graph tab, so the two
         # cannot drift (the strip is compact, the graph is the full flow)
@@ -1196,7 +1359,9 @@ class DashboardView(View):
             bits.append(money(self.run_cost[run.id]))
         return " · ".join(bits)
 
-    def _paint_runs(self) -> None:
+    def _run_rows(self, frame: str | None = None, now: float | None = None) -> list[RowData]:
+        """The sessions list. Split out so the spinner tick and the poll build
+        the same rows (same keys, in-place update)."""
         rows = [RowData(ALL, f"[b]All activity[/b]\n[{FAINT}]{len(self.events)} events[/]")]
         orch_id = self._orchestrator_id()
         if orch_id:
@@ -1205,25 +1370,91 @@ class DashboardView(View):
             model = ((mission.plan or {}).get("orchestrator") or {}).get("model") if mission else ""
             cost = self.run_cost.get(orch_id, 0.0)
             sub = " · ".join(x for x in (str(model or ""), money(cost) if cost else "") if x)
+            mark = self._mark(
+                "running" if st in actions.ACTIVE else st,
+                self._stamp(orch_id),
+                frame,
+                now,
+            )
             rows.append(
                 RowData(
                     orch_id,
-                    f"{glyph('running' if st in actions.ACTIVE else st)} [b]orchestrator[/b]\n"
-                    f"  [{FAINT}]{esc(sub)}[/]",
+                    f"{mark} [b]orchestrator[/b]\n  [{FAINT}]{esc(sub)}[/]",
                 )
             )
         for run in self.runs:
+            mark = self._mark(run.status, self._stamp(run.id), frame, now)
             rows.append(
                 RowData(
                     run.id,
-                    f"{glyph(run.status)} [b]{esc(role_of(run.id))}[/b]  "
+                    f"{mark} [b]{esc(role_of(run.id))}[/b]  "
                     f"[{FAINT}]{esc(run.step)}[/]\n"
                     f"  [{FAINT}]{esc(self._run_sub(run))}[/]",
                 )
             )
+        return rows
+
+    def _paint_runs(self) -> None:
         lst = self.query_one("#run-list", RowList)
-        lst.set_rows(rows)
+        lst.set_rows(self._run_rows())
         lst.select(self.run_id or ALL)
+
+    def _quiet_runs(self, clock: float) -> list[str]:
+        """ "coder idle 7m" for each RUNNING run whose own stamp is past the stall
+        threshold. A run with no stamp is unknown, not quiet."""
+        out = []
+        for run in self.runs:
+            if status_value(run.status) != "running":
+                continue
+            last = self._stamp(run.id)
+            if spinner.is_stalled(clock, last):
+                age = spinner.human_duration(spinner.silence(clock, last))
+                out.append(f"{role_of(run.id)} idle {age}")
+        return out
+
+    def _paint_traj_tail(self, frame: str | None = None, now: float | None = None) -> None:
+        """The ONE trailing spinner step on the trajectory (surface c).
+
+        It is a single Step updated in place: `update()` with a new markup is a
+        one-line repaint, and removing it when nothing runs keeps a finished
+        mission's log clean. With a run selected it reflects THAT run (its own
+        stamp); otherwise it reflects the mission (the mission stamp).
+
+        Called by the tick (motion) and by the store poll (correctness, also
+        while unfocused), so a run that finished or wedged while the terminal
+        was in the background cannot keep a stale "working" claim."""
+        traj = self.query_one("#m-traj", Trajectory)
+        mission = self.snap.mission(self.mission_id)
+        if mission is None or status_value(mission.status) != "running":
+            traj.spinner(None)
+            return
+        running = [r for r in self.runs if status_value(r.status) == "running"]
+        orch_id = self._orchestrator_id()
+        if self.run_id is not None:
+            if self.run_id == orch_id:
+                subject, key, step = "orchestrator", orch_id, ""
+            else:
+                picked = [r for r in running if r.id == self.run_id]
+                if not picked:
+                    traj.spinner(None)
+                    return
+                subject, key, step = role_of(picked[0].id), picked[0].id, str(picked[0].step or "")
+        else:
+            if not running:
+                traj.spinner(None)
+                return
+            # name the run that is actually talking (an unknown stamp counts as
+            # fresh), not whichever happens to be last in the list
+            lead = max(running, key=lambda r: self._stamp(r.id) or float("inf"))
+            subject, key, step = role_of(lead.id), mission.id, str(lead.step or "")
+        clock = time.time() if now is None else now
+        last = self._stamp(key)
+        age = spinner.human_duration(spinner.silence(clock, last))
+        if spinner.is_stalled(clock, last):
+            label = " ".join(x for x in (f"idle {age}", subject, step) if x)
+        else:
+            label = " ".join(x for x in ("working", subject, step, age) if x)
+        traj.spinner(f"{self._mark('running', last, frame, clock)} [{FAINT}]{esc(label)}[/]")
 
     def _orchestrator_id(self) -> str | None:
         """The orchestrator's pseudo run id (its events and charges carry it)."""

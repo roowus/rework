@@ -216,7 +216,10 @@ class RowList(VerticalScroll, can_focus=True):
     def set_rows(self, rows: list[RowData]) -> None:
         keys = [r.key for r in rows]
         existing = {row.key: row for row in self.query(Row)}
-        if keys == self._keys:
+        # `mount_all` is deferred, so `_keys` can be ahead of the DOM for a
+        # moment; a 10Hz repaint can land in that gap. Only take the in-place
+        # path when the rows it wants to update are really there.
+        if keys == self._keys and all(key in existing for key in keys):
             for data in rows:
                 existing[data.key].refresh_data(data)
         else:
@@ -351,15 +354,19 @@ class Stat(Static):
         self._label = label
         self._value = value
         self._sub = ""
+        self._raw = False
 
     def on_mount(self) -> None:
         self._paint()
 
-    def set(self, value: str, sub: str = "") -> None:
-        if (value, sub) != (self._value, self._sub):
-            self._value, self._sub = value, sub
+    def set(self, value: str, sub: str = "", *, markup: bool = False) -> None:
+        """`markup=True` means `value` is already safe Rich markup (a coloured
+        spinner glyph); otherwise it is escaped like any other text."""
+        if (value, sub, markup) != (self._value, self._sub, self._raw):
+            self._value, self._sub, self._raw = value, sub, markup
             self._paint()
 
     def _paint(self) -> None:
         sub = f"\n[{FAINT}]{esc(self._sub)}[/]" if self._sub else ""
-        self.update(f"[b]{esc(self._value)}[/b]\n[{MUTED}]{esc(self._label)}[/]{sub}")
+        value = self._value if self._raw else esc(self._value)
+        self.update(f"[b]{value}[/b]\n[{MUTED}]{esc(self._label)}[/]{sub}")
