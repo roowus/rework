@@ -8,6 +8,7 @@ import logging
 import os
 import shlex
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -487,6 +488,9 @@ def test_max_roles_on_the_config_object(monkeypatch: pytest.MonkeyPatch) -> None
 # -- wiring: run_command really executes the wrapper -----------------------
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="reads /proc/self/limits, which only exists on Linux"
+)
 async def test_run_command_executes_the_ulimit_wrapper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
