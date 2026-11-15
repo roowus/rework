@@ -50,11 +50,11 @@ async def _store(db: Path) -> Any:
 
 
 async def test_snapshot_rows_are_light_and_the_list_still_works(ids: dict[str, str]) -> None:
-    app = ReworkApp(poll_seconds=0.3)
+    app = ReworkApp(poll_seconds=3600.0)
     async with app.run_test(size=SIZE) as pilot:
-        await pilot.pause(0.6)
+        await _settle(app, pilot)
         await pilot.press("alt+2")
-        await pilot.pause(0.5)
+        await _settle(app, pilot)
         dash = app.view("dashboard")
         rows = dash.snap.missions
         assert rows and all(m.light and m.plan is None and m.result is None for m in rows)
@@ -67,7 +67,7 @@ async def test_snapshot_rows_are_light_and_the_list_still_works(ids: dict[str, s
         # search reads id/title/objective/project_id/status only
         dash.query_text = "flaky"
         dash._apply_search()
-        await pilot.pause(0.3)
+        await _settle(app, pilot)
         assert lst.selectable == [ids["running"]]
         assert not app.swallowed
 
@@ -88,13 +88,13 @@ async def test_drill_down_and_orchestrator_output_load_the_full_row(
     finally:
         await store.aclose()
 
-    app = ReworkApp(poll_seconds=0.3)
+    app = ReworkApp(poll_seconds=3600.0)
     async with app.run_test(size=SIZE) as pilot:
-        await pilot.pause(0.6)
+        await _settle(app, pilot)
         dash = app.view("dashboard")
         assert dash.snap.mission(mid).light, "the poll itself is light"
         app.open_mission(mid)
-        await pilot.pause(1.0)
+        await _settle(app, pilot)
         full = dash.full_mission
         assert full is not None and not full.light and full.id == mid
         assert full.plan["orchestrator"] == {"model": "pro"}
@@ -109,9 +109,9 @@ async def test_drill_down_and_orchestrator_output_load_the_full_row(
 
 async def test_the_full_row_is_fetched_once_not_per_poll(ids: dict[str, str]) -> None:
     mid = ids["running"]
-    app = ReworkApp(poll_seconds=0.2)
+    app = ReworkApp(poll_seconds=3600.0)  # the app's own timer never fires; the test polls
     async with app.run_test(size=SIZE) as pilot:
-        await pilot.pause(0.5)
+        await _settle(app, pilot)
         calls: list[str] = []
         data = app.hub.data
         real = data.get_mission
@@ -122,7 +122,10 @@ async def test_the_full_row_is_fetched_once_not_per_poll(ids: dict[str, str]) ->
 
         data.get_mission = counting  # type: ignore[method-assign]
         app.open_mission(mid)
-        await pilot.pause(2.0)  # many polls while the mission is open
+        for _ in range(5):  # five polls while the mission is open
+            await _settle(app, pilot)
+            await app.hub.refresh()
+        await _settle(app, pilot)
         assert calls.count(mid) == 1, calls
 
 
@@ -201,85 +204,206 @@ async def test_going_offline_and_back_repaints() -> None:
 
 
 # -- idle backoff -------------------------------------------------------------
+#
+# The arithmetic, with poll_seconds = 2 and IDLE_POLL_SECONDS = 10: the timer
+# ticks every 2 s. Active: every tick polls (2 s). Idle (no key for 30 s): a tick
+# polls once 10 s have passed since the last POLL (not the last tick), so every
+# 5th tick, 10 s apart, 6 polls a minute. A key polls at once and goes back to 2 s.
 
 
-async def test_idle_owner_is_polled_less_often_and_a_key_resets_it(
-    env: Path, monkeypatch: pytest.MonkeyPatch
+async def _settle(app: ReworkApp, pilot: Any) -> None:
+    await pilot.pause()
+    await app.workers.wait_for_complete()
+    await pilot.pause()
+
+
+def test_poll_due_arithmetic() -> None:
+    app = ReworkApp(poll_seconds=2.0)
+    app._last_poll = 100.0
+    app.idle_for_reload = lambda: False  # type: ignore[method-assign]
+    assert app.poll_interval() == 2.0
+    assert not app.poll_due(101.7) and app.poll_due(101.81) and app.poll_due(102.0)
+    app.idle_for_reload = lambda: True  # type: ignore[method-assign]
+    assert app.poll_interval() == app_mod.IDLE_POLL_SECONDS == 10.0
+    assert not app.poll_due(108.0), "one tick before: not due"
+    assert not app.poll_due(109.7) and app.poll_due(109.81) and app.poll_due(110.0)
+    # a configured rate slower than the idle one is never sped up
+    slow = ReworkApp(poll_seconds=30.0)
+    slow.idle_for_reload = lambda: True  # type: ignore[method-assign]
+    assert slow.poll_interval() == 30.0
+    # the first poll is always due
+    fresh = ReworkApp(poll_seconds=2.0)
+    fresh.idle_for_reload = lambda: False  # type: ignore[method-assign]
+    assert fresh.poll_due(0.0), "no poll yet: the first is due at any clock value"
+
+
+async def test_an_idle_app_keeps_polling_at_the_slow_rate_and_a_key_resumes_the_fast_one(
+    env: Path,
 ) -> None:
-    app = ReworkApp(poll_seconds=0.2)
+    app = ReworkApp(poll_seconds=3600.0)  # the real timer never fires: the test is the clock
     async with app.run_test(size=SIZE) as pilot:
-        await pilot.pause(0.5)
-        assert app.poll_interval() == 0.2, "active owner: the normal rate"
-
-        refreshes: list[float] = []
+        await _settle(app, pilot)
+        app.poll_seconds = 2.0
+        refreshes: list[int] = []
         real = app.hub.refresh
 
         async def counting() -> Any:
-            refreshes.append(time.monotonic())
+            refreshes.append(1)
             return await real()
 
         app.hub.refresh = counting  # type: ignore[method-assign]
         app._last_input = time.monotonic() - 3600  # away for an hour
-        app._last_poll = time.monotonic()
-        assert app.poll_interval() == app_mod.IDLE_POLL_SECONDS > app.poll_seconds
-        await pilot.pause(1.5)  # ~7 timer ticks
-        assert refreshes == [], "idle: the ticks skip the poll"
+        assert app.poll_interval() == 10.0
+        t0 = 1_000_000.0
+        app._last_poll = t0
 
-        await pilot.press("a")  # the owner is back
-        await pilot.pause(0.5)
-        assert app.poll_interval() == 0.2
-        assert len(refreshes) >= 2, "a key refreshes at once and returns to the fast rate"
+        def run_ticks(seconds: int, *, jitter: float = 0.0) -> list[float]:
+            """Timer ticks 2 s apart (each off by +/- jitter); returns poll times."""
+            polled: list[float] = []
+            for k in range(1, seconds // 2 + 1):
+                before = app._last_poll
+                app._kick(now=t0 + 2 * k + (jitter if k % 2 else -jitter))
+                if app._last_poll != before:
+                    polled.append(app._last_poll)
+            return polled
+
+        polled = run_ticks(60)
+        await _settle(app, pilot)
+        assert polled == [t0 + 10 * i for i in range(1, 7)], polled
+        assert len(refreshes) == 6, "idle: 6 polls in a minute, one every 10 s"
+
+        # timer jitter does not push a poll a whole tick late (10 s, not 12 s)
+        app._last_poll = t0
+        polled = run_ticks(60, jitter=0.05)
+        await _settle(app, pilot)
+        gaps = [b - a for a, b in zip([t0, *polled], polled, strict=False)]
+        assert len(polled) == 6 and all(9.8 <= g <= 10.2 for g in gaps), gaps
+
+        # the owner is back: a key polls AT ONCE and restores the fast rate
+        app._last_poll = time.monotonic()  # polled a moment ago: nothing is due
+        refreshes.clear()
+        await pilot.press("a")
+        await _settle(app, pilot)
+        assert len(refreshes) == 1, "a key after idle polls immediately"
+        assert app.poll_interval() == 2.0
+        now = app._last_poll
+        app._kick(now=now + 1.0)
+        assert app._last_poll == now, "active: one tick later is not due"
+        app._kick(now=now + 2.0)
+        assert app._last_poll == now + 2.0, "active: every 2 s tick polls"
+        await _settle(app, pilot)
+        assert len(refreshes) == 2
 
 
-async def test_idle_poll_never_beats_a_slower_configured_rate(env: Path) -> None:
-    app = ReworkApp(poll_seconds=30.0)
+async def test_a_skipped_tick_never_moves_the_poll_stamp(env: Path) -> None:
+    app = ReworkApp(poll_seconds=3600.0)
     async with app.run_test(size=SIZE) as pilot:
-        await pilot.pause(0.2)
+        await _settle(app, pilot)
+        app.poll_seconds = 2.0
         app._last_input = time.monotonic() - 3600
-        assert app.poll_interval() == 30.0
+        app._last_poll = 50.0
+        for now in (52.0, 54.0, 56.0, 58.0):
+            app._kick(now=now)
+            assert app._last_poll == 50.0
+        app._kick(now=60.0)
+        assert app._last_poll == 60.0
+
+
+async def test_a_tick_during_teardown_is_quiet(env: Path, caplog: pytest.LogCaptureFixture) -> None:
+    from textual.app import ScreenStackError
+    from textual.css.query import NoMatches
+
+    app = ReworkApp(poll_seconds=3600.0)
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(app, pilot)
+        app._last_poll = float("-inf")
+
+        # the screens are gone: debug log, no poll, no error
+        def gone(now: float) -> bool:
+            raise ScreenStackError("No screens on stack")
+
+        app.poll_due = gone  # type: ignore[method-assign]
+        with caplog.at_level("DEBUG", logger="rework.tui"):
+            app._kick()
+        assert app._last_poll == float("-inf")
+        assert any("no screens" in r.getMessage() for r in caplog.records)
+
+        # a real NoMatches (the Work view is missing) is NOT swallowed
+        def missing(now: float) -> bool:
+            raise NoMatches("no #view-work")
+
+        app.poll_due = missing  # type: ignore[method-assign]
+        with pytest.raises(NoMatches):
+            app._kick()
+        del app.poll_due
+        # the shutdown flag stops a tick before it reads any screen
+        app._closing = True
+        app._kick(force=True)
+        assert app._last_poll == float("-inf")
+        app._closing = False
+    app._kick()  # the app has exited: not running, nothing happens, nothing raised
+    assert app._last_poll == float("-inf")
 
 
 # -- a failed full-row fetch does not leave the header on "loading" -----------
 
 
-async def test_a_failed_full_fetch_shows_the_light_facts_and_recovers(
+async def test_a_failed_full_fetch_shows_the_light_facts_backs_off_and_recovers(
     ids: dict[str, str],
 ) -> None:
     from textual.widgets import Static
 
     mid = ids["running"]
-    app = ReworkApp(poll_seconds=0.2)
+    app = ReworkApp(poll_seconds=3600.0)  # the test drives every poll
     async with app.run_test(size=SIZE) as pilot:
-        await pilot.pause(0.5)
+        await _settle(app, pilot)
         data = app.hub.data
         real = data.get_mission
         broken = True
+        calls: list[str] = []
 
         async def flaky(mission_id: str) -> Any:
+            calls.append(mission_id)
             if broken:
                 raise RuntimeError("store unreachable")
             return await real(mission_id)
 
         data.get_mission = flaky  # type: ignore[method-assign]
+        t_open = time.monotonic()
         app.open_mission(mid)
+        await _settle(app, pilot)
         header = app.query_one("#m-header", Static)
         dash = app.view("dashboard")
         row = dash.snap.mission(mid)
-        for _ in range(30):
-            await pilot.pause(0.1)
-            if "could not load" in str(header.render()):
-                break
         text = str(header.render())
         assert "loading" not in text, text
         assert "could not load plan/result" in text, text
         assert row.objective in text, "the light objective is shown"
         assert "started" in text
-        # the store comes back: the next poll fetches the row and the header is full
+        assert len(calls) == 1 and dash._full_failures == 1
+        assert dash._full_next_try >= t_open + 2.0, "a 2 s backoff was set"
+
+        # inside the backoff window (held open: a loaded box must not close it)
+        dash._full_next_try = time.monotonic() + 3600
+        for _ in range(5):
+            await app.hub.refresh()
+            await _settle(app, pilot)
+        assert len(calls) == 1, calls
+
+        # the backoff expires: exactly one more attempt, and the wait grows
+        dash._full_next_try = 0.0
+        t_retry = time.monotonic()
+        await app.hub.refresh()
+        await _settle(app, pilot)
+        assert len(calls) == 2 and dash._full_failures == 2
+        assert dash._full_next_try >= t_retry + 4.0, "the backoff doubled"
+
+        # the store comes back: the next attempt after the backoff recovers the header
         broken = False
-        for _ in range(40):
-            await pilot.pause(0.1)
-            if "could not load" not in str(header.render()):
-                break
+        dash._full_next_try = 0.0
+        await app.hub.refresh()
+        await _settle(app, pilot)
         assert dash.full_mission is not None and not dash.full_failed
+        assert dash._full_failures == 0
         assert "could not load" not in str(header.render())
         assert "running  fix" in str(header.render()), "the plan label is back"

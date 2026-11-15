@@ -184,18 +184,41 @@ tailnet once pulled 3 MB/s, 17.5 GB in 1h40m, from
 - *Repaint skip.* `Hub` compares missions, gates, projects, chats, spend and
   the online/error state with the previous broadcast and skips the broadcast
   when nothing changed (the first refresh always broadcasts). Views get
-  `on_tick` instead, so live detail polls (events, steps, shared chats) keep
-  running without repainting the lists. `on_tick` also repaints only the text
-  that carries time (list rows, the open mission header, gate waiting time,
-  mission cards) every `TIME_REPAINT_SECONDS` (20 s, a monotonic stamp in
-  `View.time_repaint_due`), so "3m ago" keeps advancing on an idle night
-  without a 2 s repaint of everything.
-- *Idle backoff.* After `reload.IDLE_SECONDS` (30 s) with no key, no modal and
-  no chat turn, the app polls every `IDLE_POLL_SECONDS` (10 s) instead of
-  `poll_seconds` (2 s). The timer keeps ticking every `poll_seconds`; `_kick`
-  skips the ticks that are not due. Any key refreshes at once and restores the
-  fast rate. The offline backoff in `Hub.refresh` composes with it (it only
-  ever delays a poll further).
+  `on_tick` instead, so live detail polls (events, steps, shared chats,
+  history, cost, the library index) keep running without repainting the lists.
+  The live paints respect the skip too: an open dashboard mission repaints its
+  header, run list and tabs only when something they are drawn from changed
+  (mission status or `updated_at`, runs, budget, gates, per-run cost, event
+  count, selected run or tab), and a live Work card repaints only when its
+  spend moved (new events paint themselves). The Cost view reloads at most
+  every 60 s regardless of ticks; the Library recheck is one index read per
+  poll that repaints only when its fingerprint moves.
+- *Time text.* `ago()`/`duration()` text would freeze on an unchanged
+  snapshot, so `on_tick` repaints the text that carries time every
+  `TIME_REPAINT_SECONDS` (20 s, a monotonic stamp in `View.time_repaint_due`,
+  reset by every `on_snapshot`): the dashboard overview rows, the open mission
+  (header, runs, tabs), the gates list and the selected gate, the Work mission
+  cards and the Work chat list, and the Library list and reader line. Nothing
+  else repaints on a tick. Static timestamps (Cost, artifact wall time) do not
+  move and are not repainted.
+- *Idle backoff.* The app timer ticks every `poll_seconds` (2 s). A tick polls
+  when `now - last_poll >= interval`, less one tenth of `poll_seconds` for
+  timer jitter, where `interval` is `poll_interval()`: `poll_seconds` while the
+  owner is active, `max(poll_seconds, IDLE_POLL_SECONDS)` once they have been
+  away (`reload.IDLE_SECONDS` = 30 s with no key, no modal, no chat turn).
+  `last_poll` moves only in the branch that polls, so a skipped tick cannot
+  starve the next poll. In numbers: active, every tick polls (every 2 s); after
+  30 s idle the app still polls, every 10 s (every 5th tick, 6 a minute, an
+  overnight TUI keeps discovering missions, gates and offline/online changes);
+  a key after idle polls at once (`_kick(force=True)`) and restores 2 s, as does
+  ctrl+r. The offline backoff in `Hub.refresh` composes with it (it only ever
+  delays a poll further). A tick that lands during teardown (`App.is_running`
+  false, or `_closing` set first thing in `on_unmount`) polls nothing.
+- *Failed full-row fetch.* If `get_mission` fails for an open mission or a
+  Work card, the header shows the light facts and "could not load plan/result
+  (retrying)". The retry backs off (2 s, 4 s, ... capped at 30 s, the
+  `Hub._next_try` idiom) so an unreadable row is not re-SELECTed on every
+  tick, and recovers on its own when the fetch succeeds.
 
 `scripts/measure_poll_bytes.py` prints bytes per poll before and after.
 

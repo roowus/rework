@@ -53,6 +53,10 @@ CODE_CHECK_SECONDS = 60.0
 # the fast rate (App.poll_interval).
 POLL_SECONDS = 2.0
 IDLE_POLL_SECONDS = 10.0
+# Timer ticks land a few ms either side of their schedule: a poll counts as due
+# this fraction of one timer period early (0.1 x 2 s = 0.2 s), far more than the
+# jitter and far less than a tick, so idle polls are 10 s apart, not 10 or 12.
+POLL_JITTER_FRACTION = 0.1
 
 # How often the shell asks origin whether main moved (finding 28: the
 # checkout can be behind the code the owner expects). A `git fetch` is
@@ -163,7 +167,9 @@ class ReworkApp(App[None]):
         self.settings = Settings.load()
         self.hub = hub or Hub()
         self.poll_seconds = poll_seconds or float(self.settings.poll_seconds or POLL_SECONDS)
-        self._last_poll = 0.0  # monotonic time of the last refresh kick
+        # monotonic time of the last kick that polled; -inf so the first is due
+        self._last_poll = float("-inf")
+        self._closing = False  # set first thing in teardown (the Hub's shape)
         self.active_tab = "work"
         self._esc_armed_at = 0.0
         self._seen_gates: set[str] | None = None  # None until the first load
@@ -266,7 +272,7 @@ class ReworkApp(App[None]):
             was_idle = self.poll_interval() > self.poll_seconds
             self._last_input = time.monotonic()
             if was_idle:  # the owner is back: refresh now, then poll at full rate
-                self._kick()
+                self._kick(force=True)
             tab = OPTION_KEYS.get(event.key)
             if tab is not None:
                 self.action_tab(tab)
@@ -278,29 +284,47 @@ class ReworkApp(App[None]):
 
     # -- heartbeat -----------------------------------------------------------
 
-    def _kick(self) -> None:
+    def _kick(self, *, force: bool = False, now: float | None = None) -> None:
         """Start a refresh in a WORKER. Found live: the refresh used to be
         awaited on the App's own message queue, so a slow or unreachable
         database froze every key and click until it returned (rewvis offline =
         a dead TUI). Single-flight is the Hub's job; exclusive=False keeps a
-        hung refresh from being cancelled mid-query by the next tick."""
-        now = time.monotonic()
-        # the timer ticks every poll_seconds; an idle owner is polled less often
-        # (half a tick of slack so timer jitter never skips a due poll)
-        try:
-            interval = self.poll_interval()
-        except (ScreenStackError, NoMatches):
-            return  # a timer firing during teardown: the screens are already gone
-        if now - self._last_poll < interval - self.poll_seconds / 2:
-            return
+        hung refresh from being cancelled mid-query by the next tick.
+
+        The timer fires every `poll_seconds`; a tick polls only when
+        `poll_due(now)`. `force` (a key after idle, ctrl+r) polls regardless.
+        `_last_poll` moves ONLY here, in the branch that polls, so a skipped
+        tick can never push the next poll back. `now` is injectable for tests."""
+        if self._closing or not self.is_running:
+            return  # teardown has begun: the screens may already be gone
+        if now is None:
+            now = time.monotonic()
+        if not force:
+            try:
+                due = self.poll_due(now)
+            except ScreenStackError:
+                log.debug("poll skipped: no screens on the stack (teardown)")
+                return
+            if not due:
+                return
         self._last_poll = now
         self.run_worker(self._tick(), group="hub", exclusive=False)
+
+    def poll_due(self, now: float) -> bool:
+        """Is a poll due at monotonic time `now`? True once `poll_interval()`
+        seconds have passed since `_last_poll`, less POLL_JITTER_FRACTION of the
+        timer period: ticks land a few ms either side of their schedule, and
+        without that slack a tick 5 ms early would wait a whole extra tick
+        (idle polls every 12 s instead of 10)."""
+        slack = self.poll_seconds * POLL_JITTER_FRACTION
+        return now - self._last_poll >= self.poll_interval() - slack
 
     def poll_interval(self) -> float:
         """Seconds between refreshes right now: poll_seconds while the owner is
         active, IDLE_POLL_SECONDS once they have been away (same idle test as the
-        reload: no input for reload.IDLE_SECONDS, no modal, no chat turn). Any key
-        stamps `_last_input` and drops this back to poll_seconds."""
+        reload: no input for reload.IDLE_SECONDS, no modal, no chat turn). Never
+        shorter than poll_seconds. Any key stamps `_last_input` and drops this
+        back to poll_seconds."""
         if self.idle_for_reload():
             return max(self.poll_seconds, IDLE_POLL_SECONDS)
         return self.poll_seconds
@@ -702,7 +726,7 @@ class ReworkApp(App[None]):
         self.action_tab(event.name)
 
     def action_refresh(self) -> None:
-        self._kick()
+        self._kick(force=True)
 
     def action_go_back(self) -> None:
         if isinstance(self.screen, ModalScreen):
@@ -1016,6 +1040,7 @@ class ReworkApp(App[None]):
             return False
 
     async def on_unmount(self) -> None:
+        self._closing = True  # before the first await: a timer tick now polls nothing
         await self.hub.aclose()
 
 

@@ -255,6 +255,13 @@ class LibraryView(View):
         self._recheck()
 
     def on_tick(self, snap: Snapshot) -> None:
+        if self.rw.active_tab == self.TAB and self._loaded and self.time_repaint_due():
+            # the index is unchanged but "5m ago" is not: forget the list
+            # fingerprint so the recheck below repaints the rows, and refresh the
+            # reader's "updated ..." line
+            self._fingerprint = None
+            with self.painting():
+                self._paint_reader()
         self.on_snapshot(snap)
 
     @work(exclusive=True, group="lib-recheck")
