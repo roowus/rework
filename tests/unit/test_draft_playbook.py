@@ -48,9 +48,12 @@ def test_draft_yields_no_open_pr_gate() -> None:
     assert "ship" not in plan["gates"], "there is no diff to ship"
 
 
-def test_fix_pr_still_gates_on_open_pr() -> None:
-    """Negative control for the assertion above: the PR gate still exists."""
-    assert orchestrated_plan("fix-pr", "pro")["gates"] == ["open_pr"]
+def test_fix_pr_still_publishes_and_fix_still_ships() -> None:
+    """Negative control for the assertion above: fix-pr still publishes a PR
+    (no gate by default since #36) and fix still ends at the ship gate."""
+    fix_pr = orchestrated_plan("fix-pr", "pro")
+    assert fix_pr["gates"] == []
+    assert fix_pr["publish"] == "pr"
     assert orchestrated_plan("fix", "pro")["gates"] == ["ship"]
 
 
