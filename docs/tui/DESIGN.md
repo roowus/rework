@@ -30,13 +30,14 @@ variables. Never hard-code a hex value in a widget.
 | `$accent` | `#a394f7` | THE accent: focus, selection bar, live state, primary button |
 | `$accent-dim` | `#3a3360` | accent backgrounds (selected chip, active tab underline fill) |
 | `$ok` | `#76c893` | done, approved, success |
-| `$warn` | `#e3b66b` | needs you: awaiting gate, on hold, unread |
+| `$warn` | `#e3b66b` | needs you: an open gate, unread |
 | `$danger` | `#ec6a6a` | failed, reject, destructive |
 
 Rules:
 - `$accent` means **"this is live / this is where you are"**. Not decoration.
-- `$warn` means **"a human is needed"**. The gates badge, awaiting-gate missions,
-  gate cards. Nothing else is amber.
+- `$warn` means **"a human is needed"**. The gates badge, missions under "needs
+  you" (which means the mission has an OPEN gate, never merely an `awaiting_gate`
+  label), gate cards. Nothing else is amber.
 - Red is only for failure and destructive buttons.
 
 ## 2. Typography

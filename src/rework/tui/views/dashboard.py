@@ -1,7 +1,7 @@
 """Dashboard: every project and mission at a glance, then drill down.
 
 Overview: stats strip · projects (left) · missions grouped by what matters
-(needs you → running → paused → recent). Click a mission to open it.
+(needs you → queued → running → paused → recent). Click a mission to open it.
 
 Mission: header + flow strip · runs (left: one row per role session) · tabs
 for the live Trajectory, the LangGraph-style Graph, each role's Output, the
@@ -69,12 +69,35 @@ NONE = "-"
 #: blown deadline comes back as a clean "timed out" rather than an instant 0s call
 _MIN_BUDGET = 0.5
 
-SECTIONS = [
-    ("needs you", {"awaiting_gate"}),
-    ("running", {"running", "pending"}),
-    ("paused", {"on_hold"}),
-    ("recent", {"done", "failed", "cancelled"}),
-]
+#: The overview's mission sections, in display order. This list only fixes
+#: ORDER (and "needs you" is the amber one); which section a mission belongs to
+#: is `section_for`'s decision alone, so grouping, counts and the project
+#: badges below can never disagree.
+SECTIONS = ["needs you", "queued", "running", "paused", "recent"]
+
+
+def section_for(mission: Any, snap: Snapshot) -> str:
+    """The ONE rule that puts a mission in a Dashboard section.
+
+    "needs you" comes from the snapshot's OPEN gates, never from the stored
+    status label: an `awaiting_gate` mission whose gate was already decided is
+    not waiting for the owner (it is running), so the Dashboard can no longer
+    list a mission under "needs you" while the Gates tab is empty (found live
+    2026-11-14). `Snapshot.gates` holds open gates only, so this needs no I/O.
+
+    The stats strip, the project badges and the section headers all call this,
+    so one gate cannot be counted twice differently."""
+    if snap.gates_for(mission.id):
+        return "needs you"
+    st = status_value(mission.status)
+    if st == "pending":
+        return "queued"  # waiting for a runner slot, not for the owner
+    if st in ("running", "awaiting_gate"):
+        return "running"
+    if st == "on_hold":
+        return "paused"
+    return "recent"  # done / failed / cancelled (an unknown status stays visible)
+
 
 MTABS = [
     ("Trajectory", "traj"),
@@ -174,6 +197,7 @@ class DashboardView(View):
             with Vertical(id="dash-overview"):
                 with Horizontal(id="dash-stats"):
                     yield Stat("running", id="st-running")
+                    yield Stat("queued", id="st-queued")
                     yield Stat("need you", id="st-gates")
                     yield Stat("paused", id="st-paused")
                     yield Stat("done · 7d", id="st-done")
@@ -312,7 +336,9 @@ class DashboardView(View):
             if self.project not in (ALL, NONE) and m.project_id != self.project:
                 continue
             st = status_value(m.status)
-            if self.filter == "active" and st not in actions.ACTIVE:
+            # Active is exactly "everything the Dashboard does not file under
+            # recent": needs you + queued + running + paused.
+            if self.filter == "active" and section_for(m, self.snap) == "recent":
                 continue
             if self.filter == "done" and st != "done":
                 continue
@@ -323,9 +349,12 @@ class DashboardView(View):
 
     def _paint_overview(self) -> None:
         snap = self.snap
-        counts: dict[str, int] = {}
+        # the strip counts SECTIONS, not raw statuses, so a number here always
+        # matches the number of rows in that section
+        by_section: dict[str, int] = dict.fromkeys(SECTIONS, 0)
         for m in snap.missions:
-            counts[status_value(m.status)] = counts.get(status_value(m.status), 0) + 1
+            title = section_for(m, snap)
+            by_section[title] = by_section.get(title, 0) + 1
         week_ago = time.time() - 7 * 86400
         done_week = sum(
             1 for m in snap.missions if status_value(m.status) == "done" and m.updated_at > week_ago
@@ -334,12 +363,23 @@ class DashboardView(View):
             # owner screenshot: zeros everywhere looked like real data while the
             # first refresh was still pending (or the database was unreachable)
             note = "offline" if not snap.online else "connecting…"
-            for sid in ("st-running", "st-gates", "st-paused", "st-done", "st-today", "st-week"):
+            for sid in (
+                "st-running",
+                "st-queued",
+                "st-gates",
+                "st-paused",
+                "st-done",
+                "st-today",
+                "st-week",
+            ):
                 self.query_one(f"#{sid}", Stat).set("—", note)
             return
-        self.query_one("#st-running", Stat).set(str(counts.get("running", 0)))
+        self.query_one("#st-running", Stat).set(str(by_section["running"]))
+        self.query_one("#st-queued", Stat).set(str(by_section["queued"]))
+        # open gates == the decisions in the Gates tab, and exactly the missions
+        # filed under "needs you"
         self.query_one("#st-gates", Stat).set(str(len(snap.gates)))
-        self.query_one("#st-paused", Stat).set(str(counts.get("on_hold", 0)))
+        self.query_one("#st-paused", Stat).set(str(by_section["paused"]))
         self.query_one("#st-done", Stat).set(str(done_week))
         self.query_one("#st-today", Stat).set(money(snap.spend_today))
         self.query_one("#st-week", Stat).set(
@@ -360,10 +400,11 @@ class DashboardView(View):
         plist.select(self.project)
 
         # missions, grouped
-        missions = self._filtered()
+        groups: dict[str, list[Any]] = {title: [] for title in SECTIONS}
+        for m in self._filtered():
+            groups.setdefault(section_for(m, snap), []).append(m)
         mrows: list[RowData] = []
-        for title, statuses in SECTIONS:
-            group = [m for m in missions if status_value(m.status) in statuses]
+        for title, group in groups.items():
             if not group:
                 continue
             colour = WARN if title == "needs you" else FAINT
@@ -382,11 +423,17 @@ class DashboardView(View):
         mlist.set_rows(mrows)
 
     def _proj_row(self, name: str, missions: list[Any], dim: bool = False) -> str:
-        running = sum(1 for m in missions if status_value(m.status) == "running")
-        waiting = sum(1 for m in missions if status_value(m.status) == "awaiting_gate")
+        # the chips use section_for exactly like the sections, or a project
+        # could show ◆ while none of its missions sits under "needs you"
+        sections = [section_for(m, self.snap) for m in missions]
+        running = sections.count("running")
+        queued = sections.count("queued")
+        waiting = sections.count("needs you")
         badges = []
         if running:
             badges.append(f"[{ACCENT}]● {running}[/]")
+        if queued:
+            badges.append(f"[{MUTED}]○ {queued}[/]")
         if waiting:
             badges.append(f"[{WARN}]◆ {waiting}[/]")
         label = f"[{MUTED}]{esc(name)}[/]" if dim else esc(name)
@@ -406,10 +453,9 @@ class DashboardView(View):
         bits.append(ago(m.created_at))
         bits.append(m.id)
         gate_note = ""
-        if st == "awaiting_gate":
-            gates = self.snap.gates_for(m.id)
-            if gates:
-                gate_note = f"\n  [{WARN}]◆ {esc(clip(gates[0].question, 90))}[/]"
+        gates = self.snap.gates_for(m.id)
+        if gates:  # same predicate as "needs you": show what needs deciding
+            gate_note = f"\n  [{WARN}]◆ {esc(clip(gates[0].question, 90))}[/]"
         return (
             f"{glyph(st)} [b]{esc(clip(m.objective, 100))}[/b]\n"
             f"  [{FAINT}]{esc('  ·  '.join(bits))}[/]{gate_note}"
