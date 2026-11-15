@@ -131,15 +131,20 @@ class DashboardView(View):
         self.snap = Snapshot()
         self.project: str = ALL
         self.filter = "all"
-        # mission search: the live text filter + the ✦ ranking
+        # mission search: one query, one list. `_filtered()` is the only way a
+        # mission reaches the list; the ✦ ranking orders the same list instead of
+        # forking a second render path.
         self.query_text = ""
-        self.ai_results: list[dict[str, str]] | None = None  # None = normal list
-        self.ai_note = ""
-        self.ai_armed = False  # set by the ✦ button: Enter then ranks
+        self.ai_results: list[dict[str, str]] | None = None  # None = plain filter
+        self.ai_query = ""  # the query the current ✦ search/ranking is for
+        self.ai_note = ""  # AI status/error, shown on the one search status line
         self._ai_busy = False
-        # bumped when a ranking is dismissed, so an in-flight worker's result is
-        # dropped instead of landing on a bar the user has already moved past
+        # bumped when a ranking is dismissed or the query moves on, so an
+        # in-flight worker's result is dropped instead of landing on a bar the
+        # user has already moved past
         self._ai_gen = 0
+        # projects sidebar: plain name filter (no ranking, no closeness)
+        self.project_query = ""
         self._debounce: Timer | None = None
         self.mission_id: str | None = None
         self.run_id: str | None = None
@@ -186,6 +191,7 @@ class DashboardView(View):
                             # files area to add to; a git project is told to push
                             yield Btn("Add files", "add-files", variant="ghost")
                         yield Label("Projects")
+                        yield Input(placeholder="Filter projects…  (tab ⇥)", id="proj-search")
                         yield RowList(id="proj-list")
                     with Vertical(classes="main"):
                         with Horizontal(classes="subbar"):
@@ -203,6 +209,10 @@ class DashboardView(View):
                             yield Input(
                                 placeholder="Search missions…  (/ to focus)",
                                 id="mission-search",
+                                # focus must never select-all: after ✦ the query
+                                # is the ranking's, and one keystroke has to
+                                # extend it, not wipe it
+                                select_on_focus=False,
                             )
                             yield Btn("Search", "search", variant="ghost")
                             yield Btn("✦", "ai-search", variant="ghost", tooltip="AI search")
@@ -248,7 +258,13 @@ class DashboardView(View):
     def hints(self) -> list[tuple[str, str]]:
         if self.mission_id:
             return [("click", "focus a session"), ("esc", "back"), ("ctrl+c", "copy")]
-        return [("/", "search"), ("click", "open mission"), ("↑↓", "move"), ("enter", "open")]
+        return [
+            ("/", "search"),
+            ("tab ⇥", "cycle focus"),
+            ("click", "open mission"),
+            ("↑↓", "move"),
+            ("enter", "open"),
+        ]
 
     def shown(self) -> None:
         target = "#run-list" if self.mission_id else "#mission-list"
@@ -305,21 +321,53 @@ class DashboardView(View):
     # -- overview -------------------------------------------------------------------
 
     def _filtered(self) -> list[Any]:
-        out = []
-        for m in self.snap.missions:
-            if self.project == NONE and m.project_id:
-                continue
-            if self.project not in (ALL, NONE) and m.project_id != self.project:
-                continue
-            st = status_value(m.status)
-            if self.filter == "active" and st not in actions.ACTIVE:
-                continue
-            if self.filter == "done" and st != "done":
-                continue
-            if self.filter == "failed" and st not in ("failed", "cancelled"):
-                continue
-            out.append(m)
+        out = [m for m in self.snap.missions if self._passes(m)]
+        ranked = self._ranking()
+        if ranked is not None:
+            return self._in_rank_order(out, ranked)
         return search.search_missions(out, self.query_text)
+
+    def _passes(self, mission: Any) -> bool:
+        """Does the project/status filter let this mission into the list?"""
+        if self.project == NONE and mission.project_id:
+            return False
+        if self.project not in (ALL, NONE) and mission.project_id != self.project:
+            return False
+        st = status_value(mission.status)
+        if self.filter == "active" and st not in actions.ACTIVE:
+            return False
+        if self.filter == "done" and st != "done":
+            return False
+        if self.filter == "failed" and st not in ("failed", "cancelled"):
+            return False
+        return True
+
+    def _ranking(self) -> list[dict[str, str]] | None:
+        """The ✦ ranking, but only while it still answers the query in the box:
+        typing a new query (or clearing it) expires the old ordering."""
+        if self.ai_results is None:
+            return None
+        if self.ai_query != self.query_text.strip():
+            return None
+        return self.ai_results
+
+    def _in_rank_order(self, missions: list[Any], ranked: list[dict[str, str]]) -> list[Any]:
+        """The ranked missions that survive the project/status filters, best
+        first. Same list object as the plain search: the model decides the ORDER
+        of the hits only. The query still decides who is in the list, so a pick
+        that is not a strict match for it is dropped, never resurrected (a
+        zero-match query must never grow rows because ✦ was pressed)."""
+        order = {hit["id"]: i for i, hit in enumerate(ranked)}
+        hits = [m for m in search.search_missions(missions, self.query_text) if m.id in order]
+        hits.sort(key=lambda m: order[m.id])
+        return hits
+
+    def _reason(self, mission_id: str) -> str:
+        ranking = self._ranking() or []
+        for hit in ranking:
+            if hit["id"] == mission_id:
+                return str(hit.get("reason") or "")
+        return ""
 
     def _paint_overview(self) -> None:
         snap = self.snap
@@ -347,9 +395,14 @@ class DashboardView(View):
         )
         self.query_one("#st-gates").set_class(bool(snap.gates), "-warn")
 
-        # projects
+        # projects: a plain case-insensitive name filter, with the pinned rows
+        # (All projects / No project) always there so a filter never strands the
+        # owner without a way back to everything.
         rows = [RowData(ALL, self._proj_row("All projects", snap.missions))]
+        needle = self.project_query.strip().lower()
         for p in snap.projects:
+            if needle and needle not in str(p.name).lower():
+                continue
             ms = [m for m in snap.missions if m.project_id == p.id]
             rows.append(RowData(p.id, self._proj_row(p.name, ms)))
         loose = [m for m in snap.missions if not m.project_id]
@@ -357,7 +410,10 @@ class DashboardView(View):
             rows.append(RowData(NONE, self._proj_row("No project", loose, dim=True)))
         plist = self.query_one("#proj-list", RowList)
         plist.set_rows(rows)
-        plist.select(self.project)
+        # the selection lives in self.project, not in the row list, so a project
+        # filtered out of view keeps filtering missions and comes back selected
+        # when the filter clears
+        plist.select(self.project if self.project in plist.keys else None)
 
         # missions, grouped
         missions = self._filtered()
@@ -377,9 +433,38 @@ class DashboardView(View):
             for m in group:
                 mrows.append(RowData(m.id, self._mission_row(m)))
         mlist = self.query_one("#mission-list", RowList)
-        if self.ai_results is not None:
-            mrows = self._ai_rows()
+        # an empty list must say WHY it is empty: a search miss, a project/status
+        # filter that left nothing, or a store with no missions yet
+        query = esc(self.query_text.strip())
+        cause = self._filter_label()  # "" when only the text search narrows
+        if missions or not snap.missions:
+            mlist.set_empty(f"[{FAINT}]No missions here yet. Start one from Work.[/]")
+        elif query and cause:
+            mlist.set_empty(f"[{FAINT}]No missions match “{query}” in {cause}.[/]")
+        elif query:
+            mlist.set_empty(f"[{FAINT}]No missions match “{query}”.[/]")
+        else:
+            mlist.set_empty(f"[{FAINT}]No missions in {cause}.[/]")
         mlist.set_rows(mrows)
+        self._paint_search_note()
+
+    def _scope(self) -> list[Any]:
+        """The missions the project/status chips let through, BEFORE the text
+        search or the ✦ ranking: what a query is answered against."""
+        return [m for m in self.snap.missions if self._passes(m)]
+
+    def _filter_label(self) -> str:
+        """The project/status filter that narrows the list, as words ('project
+        “rework”', 'the failed filter'), or "" when only the text search does."""
+        project = ""
+        if self.project == NONE:
+            project = "the no-project filter"
+        elif self.project != ALL:
+            project = f"project “{esc(self.snap.project_name(self.project))}”"
+        status = f"the {self.filter} filter" if self.filter != "all" else ""
+        if project and status:
+            return f"{status} in {project}"
+        return status or project
 
     def _proj_row(self, name: str, missions: list[Any], dim: bool = False) -> str:
         running = sum(1 for m in missions if status_value(m.status) == "running")
@@ -410,30 +495,13 @@ class DashboardView(View):
             gates = self.snap.gates_for(m.id)
             if gates:
                 gate_note = f"\n  [{WARN}]◆ {esc(clip(gates[0].question, 90))}[/]"
-        return (
-            f"{glyph(st)} [b]{esc(clip(m.objective, 100))}[/b]\n"
-            f"  [{FAINT}]{esc('  ·  '.join(bits))}[/]{gate_note}"
-        )
-
-    def _ai_rows(self) -> list[RowData]:
-        """The ✦ ranking: one row per ranked mission, objective + its reason.
-        Built from the snapshot so a mission that vanished mid-search drops."""
-        rows: list[RowData] = []
-        for hit in self.ai_results or []:
-            mission = self.snap.mission(hit["id"])
-            if mission is None:
-                continue
-            st = status_value(mission.status)
-            reason = esc(hit.get("reason") or "")
-            rows.append(
-                RowData(
-                    mission.id,
-                    f"{glyph(st)} [b]{esc(clip(mission.objective, 100))}[/b]\n"
-                    f"  [{FAINT}]{esc(clip(mission.id, 60))}[/]"
-                    + (f"  [{ACCENT}]{reason}[/]" if reason else ""),
-                )
-            )
-        return rows
+        meta = f"[{FAINT}]{esc('  ·  '.join(bits))}[/]"
+        # the ✦ reason is OUR markup, not mission text: escaping it with the
+        # rest of the line printed "[#a394f7]closest to the query[/]" literally
+        reason = esc(clip(self._reason(m.id), 120))
+        if reason:
+            meta += f"  [{ACCENT}]{reason}[/]"
+        return f"{glyph(st)} [b]{esc(clip(m.objective, 100))}[/b]\n  {meta}{gate_note}"
 
     def on_row_list_activated(self, event: RowList.Activated) -> None:
         event.stop()
@@ -468,58 +536,99 @@ class DashboardView(View):
         self.query_one("#mission-search", Input).focus()
 
     def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "proj-search":
+            event.stop()
+            self.project_query = event.value
+            with self.painting():
+                self._paint_overview()
+            return
         if event.input.id != "mission-search":
             return
         event.stop()
         self.query_text = event.value
-        self.ai_results = None  # typing means the plain filter again
-        self.ai_armed = False
+        self._expire_ranking()  # typing means the plain filter again
         if self._debounce is not None:
             self._debounce.stop()
         self._debounce = self.set_timer(0.25, self._apply_search)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        """Enter in the bar: run the plain filter now, or the ✦ ranking when the
-        ✦ button is armed. Down moves into the results, as in the Library."""
+        """Enter in the bar always means the same thing: filter the list on the
+        query (the ✦ ranking, when it is there, stays as the list's order).
+        Down moves into the results, as in the Library."""
         if event.input.id == "m-msg":
             event.stop()
             self._send_message()
+            return
+        if event.input.id == "proj-search":
+            event.stop()
+            self._focus_projects()
             return
         if event.input.id != "mission-search":
             return
         event.stop()
         self.query_text = event.value
-        if self.ai_armed:
-            self._run_ai_search()
-        else:
-            self._apply_search()
+        if self.query_text.strip() != self.ai_query:
+            # a different query: whatever ✦ produced no longer answers it
+            self._expire_ranking()
+        self._apply_search()
 
     def on_key(self, event: Any) -> None:
-        if event.key == "down" and isinstance(self.screen.focused, Input):
-            rows = self.query_one("#mission-list", RowList)
-            if rows.selectable:
-                event.stop()
-                rows.focus()
-                rows.select(rows.selectable[0])
+        """↓ out of either search bar lands on that bar's list."""
+        if event.key != "down":
+            return
+        focused = self.screen.focused
+        if not isinstance(focused, Input):
+            return
+        rows = self.query_one(
+            "#proj-list" if focused.id == "proj-search" else "#mission-list", RowList
+        )
+        if not rows.selectable:
+            return
+        event.stop()
+        rows.focus()
+        if focused.id == "proj-search":
+            rows.select(self.project if self.project in rows.selectable else None)
+        else:
+            rows.select(rows.selectable[0])
+
+    def _focus_projects(self) -> None:
+        rows = self.query_one("#proj-list", RowList)
+        rows.focus()
+        rows.select(self.project if self.project in rows.selectable else None)
+
+    def _expire_ranking(self) -> None:
+        """The ✦ order belongs to the query it was asked for. Any change to the
+        query drops it (and any in-flight search), so AI-ordered rows can never
+        impersonate the plain filter's result."""
+        if self.ai_results is None and not self.ai_note and not self._ai_busy:
+            return
+        self._ai_gen += 1  # an in-flight worker's answer is stale from here on
+        self.ai_results = None
+        self.ai_query = ""
+        self.ai_note = ""
+        if self._ai_busy:
+            self._ai_busy = False
+            self.workers.cancel_group(self, "dash-ai-search")
 
     def _apply_search(self) -> None:
-        with self.painting():
-            self._paint_overview()
-            self._paint_search_note()
+        self._paint_overview()
 
     def _paint_search_note(self) -> None:
-        """The one line under the bar: the ✦ state (searching…, a result count,
-        a failure) or nothing at all, so the normal list stays uncluttered."""
+        """The ONE status line under the search bar: the ✦ state (searching…, a
+        result count, a failure) or the plain filter's count / no-match state."""
+        plain = self._filtered()
         note = ""
         if self._ai_busy:
             note = f"[{ACCENT}]✦ searching…[/]"
         elif self.ai_note:
             note = f"[{WARN}]{esc(self.ai_note)}[/]"
-        elif self.ai_results is not None:
-            note = (
-                f"[{ACCENT}]✦ {len(self.ai_results)} ranked[/]  "
-                f"[{FAINT}]enter opens · esc dismisses[/]"
-            )
+        elif self._ranking() is not None:
+            # the model returns at most MAX_RESULTS ids, so this list is its
+            # picks out of the matches, not the whole match set: say so
+            count = len(plain)
+            matched = len(search.search_missions(self._scope(), self.query_text))
+            scope = f"{count} of {matched}" if matched > count else f"{count}"
+            note = f"[{ACCENT}]✦ top {scope} from AI[/]  [{FAINT}]esc clears[/]"
         with self.painting():
             widget = self.query_one("#mission-note", Static)
             widget.update(note)
@@ -540,11 +649,18 @@ class DashboardView(View):
         from rework.kernel.llm.adapters import build_provider
 
         gen = self._ai_gen
+        # A query must isolate, including here: with no strict match there is
+        # nothing to rank, so the model is not called and the list keeps saying
+        # why it is empty.
+        if not search.search_missions(self._scope(), query):
+            self.ai_note = f"✦ no missions match “{query}” — nothing to rank"
+            self._apply_search()
+            return
         self._ai_busy = True
         self.ai_results = None
+        self.ai_query = query  # this search answers this query, nothing else
         self.ai_note = ""
-        self.ai_armed = True
-        self._paint_search_note()
+        self._apply_search()
         # One clock over BOTH halves: the per-candidate run fetch is a query per
         # mission, so leaving it unbounded would let "✦ searching…" outlive the
         # budget the model call is already held to.
@@ -570,7 +686,7 @@ class DashboardView(View):
                     self._budget(deadline),
                 )
                 if gen != self._ai_gen:
-                    return  # dismissed while it ran: the note is already clear
+                    return  # dismissed/expired while it ran: the note is clear
                 self.ai_results = ranked
                 if not ranked:
                     self.ai_note = "✦ found no mission for that query"
@@ -626,10 +742,7 @@ class DashboardView(View):
     def _dismiss_ai(self) -> None:
         if self.ai_results is None and not self.ai_note and not self._ai_busy:
             return
-        self._ai_gen += 1  # any in-flight worker's result is now stale
-        self.ai_results = None
-        self.ai_note = ""
-        self.ai_armed = False
+        self._expire_ranking()
         self._apply_search()
 
     # -- head -------------------------------------------------------------------------
@@ -681,16 +794,22 @@ class DashboardView(View):
         if event.action == "search":
             event.stop()
             self.query_text = self.query_one("#mission-search", Input).value
-            self.ai_results = None
-            self.ai_note = ""
+            if self.query_text.strip() != self.ai_query:
+                self._expire_ranking()
             self._apply_search()
             self.query_one("#mission-search", Input).focus()
             return
         if event.action == "ai-search":
+            # the ✦ button runs on the SAME query text, into the SAME list. It
+            # hands focus back to the bar, so Enter means "filter" here exactly
+            # as it does after typing (it is a button, not a mode).
             event.stop()
             self.query_text = self.query_one("#mission-search", Input).value
-            self.ai_armed = True
+            self._expire_ranking()
             self._run_ai_search()
+            bar = self.query_one("#mission-search", Input)
+            bar.focus()
+            bar.cursor_position = len(bar.value)
             return
         if event.action == "add-files":
             # the selected PROJECT decides, not a mission: works with nothing open
@@ -813,27 +932,41 @@ class DashboardView(View):
 
     def back(self) -> bool:
         if self._ai_busy:
-            # an in-flight ranking is dismissable state: drop it and stay put
-            self.workers.cancel_group(self, "dash-ai-search")
-            self._ai_busy = False
-            self.ai_results = None
-            self.ai_note = ""
-            self.ai_armed = False
+            # an in-flight ranking is dismissable state: drop it and stay put.
+            # _expire_ranking also bumps _ai_gen, so a worker finishing inside
+            # the cancellation window cannot land stale rows on the list.
+            self._expire_ranking()
             self._apply_search()
             return True
         if self.ai_results is not None or self.ai_note:
             self._dismiss_ai()
             return True
+        proj_bar = self.query_one("#proj-search", Input)
         bar = self.query_one("#mission-search", Input)
+        # esc acts on the bar the user is actually typing in: checking the
+        # project filter first cleared the sidebar filter out from under a query
+        # typed into the mission bar
         if bar.has_focus:
             bar.value = ""
             self.query_text = ""
-            self.ai_armed = False
+            self._expire_ranking()
             self._apply_search()
             if self.mission_id:
                 self.query_one("#run-list", RowList).focus()
             else:
                 self.query_one("#mission-list", RowList).focus()
+            return True
+        if proj_bar.has_focus:
+            proj_bar.value = ""
+            self.project_query = ""
+            self._focus_projects()
+            return True
+        if proj_bar.value:
+            # esc from the mission list also clears a project-name filter, so a
+            # hidden sidebar never looks like a broken mission list
+            proj_bar.value = ""
+            self.project_query = ""
+            self._paint_overview()
             return True
         if self.run_id:
             self.run_id = None
