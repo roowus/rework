@@ -277,7 +277,11 @@ def test_dashboard_searches_work_in_a_real_terminal(seeded_terminal_env: dict[st
         assert "Search" in plain and "✦" in plain, "both submit buttons on the one bar"
 
         assert term.click_text("✦"), "the ✦ button is clickable"
-        assert term.wait_for("✦ top 2 from AI", 25), "the ranking finished and reports on one line"
+        # the model returns at most MAX_RESULTS ids, so the one status line says
+        # how many of the matches it picked: 'the' matches 6 seeded missions
+        assert term.wait_for("✦ top 2 of 6 from AI", 25), (
+            "the ranking finished and reports on one line: " + term.screen_text()
+        )
         term.pump(1.0)
         ranked = term.screen_text()
         assert ranked.count("from AI") == 1, "one status line, not a second one"
@@ -292,7 +296,7 @@ def test_dashboard_searches_work_in_a_real_terminal(seeded_terminal_env: dict[st
         term.send(b"\r")
         term.pump(2.0)
         after = term.screen_text()
-        assert "✦ top 2 from AI" in after, "enter left the ranking alone"
+        assert "✦ top 2 of 6 from AI" in after, "enter left the ranking alone"
         assert "also about tests" in after, "enter kept the same list"
         assert "PROJECTS" in after, "enter did not open a mission page"
         term.backspace()
