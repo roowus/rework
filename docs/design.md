@@ -181,12 +181,19 @@ Launch and Scrap, plus a "Launch all" action on the group.
   one-chat-to-many-missions link that `WorkView.active_missions()` queries.
 - Proposals have no table of their own: they ride in `chat_messages.body` as the
   assistant message's `tool_calls`, so several proposals replay from one stored
-  message with no migration. A launch note reads `launched <mission id> · <objective>`;
-  on replay a proposal is settled when such a note names its objective, and
-  otherwise the OLDEST still-pending proposal is settled (which is what a legacy
-  bare `launched <id>` note means). Everything left pending is restored into the
-  engine by `Conversation.ensure_engine`, so a reloaded chat shows and can launch
-  all of them.
+  message with no migration. A launch note reads
+  `launched <mission id> · <plan> · <objective>`; on replay a proposal is settled
+  when such a note names its plan AND its objective (an objective alone cannot
+  tell two proposals apart, and a chat may hold two with the same objective and
+  a different plan because the model re-proposes when the owner changes their
+  mind). A note with only two fields is a legacy `launched <id> · <objective>`
+  note: its second field is the objective, so it settles on the objective alone.
+  A legacy bare `launched <id>` note settles the OLDEST still-pending proposal.
+  In every case a note that matches nothing settles the oldest pending proposal,
+  and two proposals that are identical settle the oldest of them (they are
+  interchangeable). Everything left pending is restored into the engine by
+  `Conversation.ensure_engine`, so a reloaded chat shows and can launch all of
+  them.
 
 ### The Library
 

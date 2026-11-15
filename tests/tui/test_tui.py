@@ -230,6 +230,30 @@ async def test_status_bar_counts_open_gates(ids: dict[str, str]) -> None:
 # -- resilience ----------------------------------------------------------------
 
 
+def test_a_launch_note_round_trips_every_field_and_its_separator() -> None:
+    """The note is the only record of WHICH proposal launched, so it parses back
+    to exactly what it carried, including an objective that contains the
+    separator the note itself uses. Legacy shapes keep their old meaning: two
+    fields mean the objective (old notes never carried a plan) and a bare note
+    means neither."""
+    from rework.tui.conversation import NOTE_SEP, launch_note, parse_launch_note
+
+    tricky = f"fix the parser{NOTE_SEP}it drops · and · also / colons"
+    note = launch_note("m-1", "thorough", tricky)
+    assert note == f"launched m-1{NOTE_SEP}thorough{NOTE_SEP}{tricky}"
+    parsed = parse_launch_note(note)
+    assert (parsed.mission_id, parsed.plan, parsed.objective) == ("m-1", "thorough", tricky)
+    # a plan with no objective still anchors the plan (field count, not content)
+    plan_only = parse_launch_note(launch_note("m-2", "echo"))
+    assert (plan_only.mission_id, plan_only.plan, plan_only.objective) == ("m-2", "echo", "")
+    # legacy two fields: the second one is the OBJECTIVE, never a plan
+    legacy = parse_launch_note(f"launched m-3{NOTE_SEP}fix it")
+    assert (legacy.mission_id, legacy.plan, legacy.objective) == ("m-3", "", "fix it")
+    # legacy bare note (what tests/tui/seed.py writes)
+    bare = parse_launch_note("launched m-4")
+    assert (bare.mission_id, bare.plan, bare.objective) == ("m-4", "", "")
+
+
 def test_target_label_names_the_database(monkeypatch: pytest.MonkeyPatch) -> None:
     from rework.tui.app import target_label
 
@@ -576,8 +600,12 @@ async def test_launching_one_card_leaves_its_sibling_pending(
         notes = [m.display for m in await store.chat_messages(chat_id) if m.role == "note"]
         launched = [n for n in notes if n.startswith("launched ")]
         assert len(launched) == 2, notes
-        assert any(n.endswith("say hello") for n in launched)
-        assert any(n.endswith("say goodbye") for n in launched)
+        # the note names the PLAN as well as the objective, so a replayed chat
+        # can tell two proposals that share an objective apart
+        from rework.tui.conversation import NOTE_SEP
+
+        assert any(n.endswith(f"{NOTE_SEP}echo{NOTE_SEP}say hello") for n in launched), launched
+        assert any(n.endswith(f"{NOTE_SEP}echo{NOTE_SEP}say goodbye") for n in launched), launched
     finally:
         await store.aclose()
 
@@ -753,6 +781,209 @@ async def test_a_single_remaining_card_does_not_offer_launch_all(
         ]
     finally:
         await store.aclose()
+
+
+# same objective, two plans: exactly the pair the system prompt steers a
+# re-proposal into when the owner changes their mind
+OBJECTIVE = "check the parser output"
+MISSION = "m-twin0000000a"
+
+KIND_PLAN = {
+    "objective": OBJECTIVE,
+    "plan": "echo",
+    "title": "Quick check",
+}
+DRAFT_PLAN = {"objective": OBJECTIVE, "plan": "draft", "title": "Draft it"}
+
+
+def _propose_call(call_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": "propose_mission", "arguments": json.dumps(args)},
+    }
+
+
+async def test_a_replayed_chat_settles_the_launched_proposal_not_its_twin(
+    ids: dict[str, str], env: Path
+) -> None:
+    """Two proposals in one transcript share an objective and differ only in
+    plan, and the SECOND one was launched. The note must settle that exact twin:
+    matching the objective alone settles the first one instead and leaves the
+    launched proposal live, so a later bare "yes" starts the same work twice."""
+    import time as _time
+
+    from rework.kernel.state.records import Chat, ChatMessage, Mission, MissionStatus
+    from rework.tui.widgets.cards import ProposalCard
+    from rework.tui.widgets.prompt import Prompt
+
+    store = await _store(env)
+    try:
+        chat = await store.create_chat(Chat(title="same objective, two plans", model_id="flash"))
+        await store.create_mission(
+            Mission(
+                id=MISSION,
+                objective=OBJECTIVE,
+                plan={"kind": "draft"},
+                # finished, not running: a live mission would become the
+                # prompt's target, and the bare "yes" would go to ITS
+                # orchestrator instead of this chat
+                status=MissionStatus.DONE,
+                chat_id=chat.id,
+                created_at=_time.time(),
+            )
+        )
+        await store.append_chat_message(
+            ChatMessage(
+                chat_id=chat.id,
+                role="user",
+                body={"role": "user", "content": "check the parser"},
+                display="check the parser",
+            )
+        )
+        await store.append_chat_message(
+            ChatMessage(
+                chat_id=chat.id,
+                role="assistant",
+                body={
+                    "role": "assistant",
+                    "content": "Here's what I'd run.",
+                    "tool_calls": [
+                        _propose_call("c1", KIND_PLAN),
+                        _propose_call("c2", DRAFT_PLAN),
+                    ],
+                },
+                display="Here's what I'd run.",
+            )
+        )
+        await store.append_chat_message(
+            ChatMessage(chat_id=chat.id, role="user", body={}, display="yes")
+        )
+        await store.append_chat_message(
+            ChatMessage(
+                chat_id=chat.id,
+                role="note",
+                body={},
+                display=f"launched {MISSION} · draft · {OBJECTIVE}",
+            )
+        )
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.query_one("#chat-list", RowList).activate(chat.id, via_mouse=True)
+        await _settle(pilot, 1.0)
+        assert app.view("work").convo.id == chat.id
+        cards = list(app.query(ProposalCard))
+        assert [c.proposal.plan for c in cards] == ["echo", "draft"]
+        assert cards[0].live, "the plan=echo twin was never launched"
+        assert not cards[1].live, "the plan=draft twin is the one the note names"
+        # a bare "yes" launches the ONE proposal still pending: the work that is
+        # already a mission (the plan=draft twin) must not be started again
+        prompt = app.query_one("#prompt", Prompt)
+        prompt.focus()
+        await pilot.press("y", "e", "s", "enter")
+        await _settle(pilot, 2.0)
+        assert prompt.text == "", "the yes was typed into the prompt"
+        assert not cards[1].live
+        assert not app.swallowed
+    chat_id = chat.id
+    store = await _store(env)
+    try:
+        ours = [
+            m
+            for m in await store.list_missions(limit=100, chat_id=chat_id)
+            if m.objective == OBJECTIVE
+        ]
+
+        # an orchestrated mission records the chosen plan as its playbook
+        def chosen(m: Any) -> str:
+            return str(m.plan.get("playbook") or m.plan.get("kind"))
+
+        plans = sorted(chosen(m) for m in ours)
+        assert plans == ["draft", "echo"], f"one mission per live proposal, got {plans}"
+        assert [m.id for m in ours if chosen(m) == "draft"] == [MISSION], (
+            "the launched twin ran exactly once"
+        )
+    finally:
+        await store.aclose()
+
+
+async def test_a_legacy_bare_launch_note_still_settles_the_oldest(
+    ids: dict[str, str], env: Path
+) -> None:
+    """Notes written before the plan was recorded carry only a mission id. One
+    of those settles the OLDEST pending proposal, which is all it can mean."""
+    from rework.kernel.state.records import Chat, ChatMessage
+    from rework.tui.widgets.cards import ProposalCard
+
+    store = await _store(env)
+    try:
+        chat = await store.create_chat(Chat(title="legacy note", model_id="flash"))
+        await store.append_chat_message(
+            ChatMessage(
+                chat_id=chat.id,
+                role="user",
+                body={"role": "user", "content": "hello and goodbye, separately"},
+                display="hello and goodbye, separately",
+            )
+        )
+        await store.append_chat_message(
+            ChatMessage(
+                chat_id=chat.id,
+                role="assistant",
+                body={
+                    "role": "assistant",
+                    "content": "Two separate pieces of work.",
+                    "tool_calls": [
+                        {
+                            "id": "c1",
+                            "type": "function",
+                            "function": {
+                                "name": "propose_mission",
+                                "arguments": json.dumps(
+                                    {"objective": "say hello", "plan": "echo", "title": "Greeting"}
+                                ),
+                            },
+                        },
+                        {
+                            "id": "c2",
+                            "type": "function",
+                            "function": {
+                                "name": "propose_mission",
+                                "arguments": json.dumps(
+                                    {
+                                        "objective": "say goodbye",
+                                        "plan": "echo",
+                                        "title": "Farewell",
+                                    }
+                                ),
+                            },
+                        },
+                    ],
+                },
+                display="Two separate pieces of work.",
+            )
+        )
+        await store.append_chat_message(
+            ChatMessage(chat_id=chat.id, role="note", body={}, display="launched " + ids["running"])
+        )
+    finally:
+        await store.aclose()
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.query_one("#chat-list", RowList).activate(chat.id, via_mouse=True)
+        await _settle(pilot, 1.0)
+        cards = list(app.query(ProposalCard))
+        assert [c.proposal.objective for c in cards] == ["say hello", "say goodbye"]
+        assert not cards[0].live, "a bare note settles the oldest pending proposal"
+        assert cards[1].live
+        assert sum(1 for c in cards if c.live) == 1
+        assert not app.swallowed
 
 
 async def test_a_saved_chat_with_two_unlaunched_proposals_shows_and_launches_both(
