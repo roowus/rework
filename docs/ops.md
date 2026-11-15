@@ -615,9 +615,11 @@ mission ON_HOLD and cancelled live roles on any overspend. An auto-raise
 rewrites the cap, appends to `plan["budget"]["raises"]` and counts in
 `budget["auto_raises"]`.
 
-The owner is told every time, three ways:
+An **auto raise** (`try_auto_raise`) tells the owner three ways:
 
-- a TUI toast, from the `budget_raised` event (`old`, `new`, `auto`);
+- a TUI toast, from the `budget_raised` event (`old`, `new`, `auto`). The shell
+  tails `budget_raised` through a seq cursor, so one raise toasts exactly once —
+  not on every two-second poll;
 - a decided row in the gate history (`Auto raise: budget $2.00 -> $4.00? …`,
   written already `APPROVED` with `decision.note = "auto"`, so it appears in
   history without ever looking like an open question);
@@ -625,6 +627,15 @@ The owner is told every time, three ways:
   `REWORK_MISSION_ID`, `REWORK_NOTIFY_MESSAGE` (old cap, new cap and reason)
   and `REWORK_BUDGET_OLD` / `REWORK_BUDGET_NEW`. Same fire-and-forget contract
   as gate notifications: 30s cap, a broken notifier never fails a mission.
+
+An **owner-approved raise** needs no separate announcement, and gets none: the
+owner was asked, so the record is the permission gate they answered. It shows
+up as that decided gate in the history, and the gate notification that fired
+when the question opened (with its `Earlier raises: …` question text) is the
+message that reached them. `budget_policy.record_raise` (the manual path) only
+rewrites the cap and appends to `plan["budget"]["raises"]` — it publishes no
+`budget_raised` event and runs no notifier, so there is no second budget toast
+and no `budget_raise` notification for a raise the owner just approved.
 
 **After that it stops at a gate.** Once the auto raises are spent (or the ask
 is beyond the ceiling), the raise becomes a permission gate instead, and its

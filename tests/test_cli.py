@@ -1301,8 +1301,15 @@ def test_new_refuses_a_cap_that_could_never_bind(
 
     assert result.exit_code != 0, result.output
     assert result.exit_code == 2, "a typer.BadParameter is a usage error"
-    assert "finite number greater than 0" in result.output
-    assert "--budget" in result.output, "the message names the option to fix"
+    # THE ERROR ITSELF must name the flag. Asserting on the whole output was
+    # vacuous: stderr also carries `budget: $nan (from --budget)`, and the
+    # backend sink (`budget_rail`/`create_mission`) refuses the same value with
+    # the same BUDGET_ERROR and exit 2 — so the test stayed green with this
+    # guard deleted. `_opening_budget`'s message is the one that says which
+    # option to fix, and only the CLI's own check produces it.
+    error = next((line for line in result.output.splitlines() if "Invalid value" in line), "")
+    assert f"--budget {value}:" in error, error
+    assert "finite number greater than 0" in error
     assert "Traceback" not in result.output
     assert result.stdout.strip().startswith("m-") is False, "no mission id may be printed"
     assert _missions(rework_db) == [], "no mission may be created"
