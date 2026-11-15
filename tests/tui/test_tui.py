@@ -3263,3 +3263,150 @@ async def test_dashboard_graph_collapsed_rounds_toggle(env: Path) -> None:
         assert keys() == folded, keys()
 
         assert not app.swallowed
+
+
+def _send_back_btn(app: ReworkApp) -> Btn:
+    return next(b for b in app.view("gates").query(Btn) if b.action == "send-back")
+
+
+async def _open_gate_view(app: ReworkApp, pilot: Any, gate_id: str) -> None:
+    await _settle(pilot)
+    await pilot.press("alt+3")
+    await _settle(pilot, 0.8)
+    app.query_one("#gate-list", RowList).activate(gate_id, via_mouse=True)
+    await _settle(pilot, 0.8)
+
+
+async def test_send_back_button_is_offered_only_on_ship_and_open_pr_gates(
+    ids: dict[str, str], env: Path
+) -> None:
+    store = await _store(env)
+    try:
+        await store.create_gate(
+            Gate(
+                id="gate-openpr0001",
+                mission_id=ids["waiting"],
+                kind=GateKind.OPEN_PR,
+                question="Open the PR?",
+            )
+        )
+        await store.create_gate(
+            Gate(
+                id="gate-quest0003",
+                mission_id=ids["running"],
+                kind=GateKind.QUESTION,
+                question="Which file?",
+            )
+        )
+    finally:
+        await store.aclose()
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+3")
+        await _settle(pilot, 0.8)
+        shown = {}
+        for gate_id in (ids["gate"], "gate-openpr0001", "gate-quest0003", ids["question_gate"]):
+            app.query_one("#gate-list", RowList).activate(gate_id, via_mouse=True)
+            await _settle(pilot, 0.6)
+            shown[gate_id] = _send_back_btn(app).display
+        assert shown == {
+            ids["gate"]: True,  # ship
+            "gate-openpr0001": True,  # open_pr
+            "gate-quest0003": False,  # question
+            ids["question_gate"]: False,  # generic
+        }
+
+
+async def test_send_back_routes_a_send_back_decision_with_the_typed_feedback(
+    ids: dict[str, str], env: Path
+) -> None:
+    from textual.widgets import TextArea
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _open_gate_view(app, pilot, ids["gate"])
+        # no feedback typed: refused, the gate stays open
+        await pilot.press("alt+b")
+        await _settle(pilot, 0.6)
+        store = await _store(env)
+        try:
+            assert (await store.get_gate(ids["gate"])).status.value == "open"  # type: ignore[union-attr]
+        finally:
+            await store.aclose()
+        app.query_one("#gate-text", TextArea).text = "also cover the empty-input case"
+        await pilot.click(_send_back_btn(app))
+        await _settle(pilot, 0.8)
+    store = await _store(env)
+    try:
+        gate = await store.get_gate(ids["gate"])
+        assert gate is not None and gate.status.value == "sent_back"
+        assert gate.decision_note == "also cover the empty-input case"
+        assert (gate.decision or {}).get("feedback") == "also cover the empty-input case"
+    finally:
+        await store.aclose()
+
+
+async def test_send_back_is_refused_on_other_gate_kinds(ids: dict[str, str], env: Path) -> None:
+    from textual.widgets import TextArea
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _open_gate_view(app, pilot, ids["question_gate"])
+        app.query_one("#gate-text", TextArea).text = "send this back"
+        await pilot.press("alt+b")
+        await _settle(pilot, 0.8)
+    store = await _store(env)
+    try:
+        gate = await store.get_gate(ids["question_gate"])
+        assert gate is not None and gate.status.value == "open"
+    finally:
+        await store.aclose()
+
+
+async def test_dashboard_open_mission_sends_a_message_through_the_shared_publisher(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The open mission accepts a message whatever chat it belongs to, and the
+    text goes through rework.missions.send_owner_message (not a TUI copy)."""
+    from textual.widgets import Input
+
+    import rework.missions as missions
+
+    calls: list[tuple[str, str]] = []
+    real = missions.send_owner_message
+
+    async def spy(mission_id: str, text: str, **kwargs: Any) -> Any:
+        calls.append((mission_id, text))
+        return await real(mission_id, text, **kwargs)
+
+    monkeypatch.setattr(missions, "send_owner_message", spy)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        await _settle(pilot)
+        dash = app.view("dashboard")
+        dash.open_mission(ids["running"])
+        await _settle(pilot, 0.6)
+        box = dash.query_one("#m-msg", Input)
+        box.focus()
+        box.value = "please also run the linter"
+        await pilot.press("enter")
+        await _settle(pilot, 0.8)
+        assert box.value == "", "cleared once delivered"
+        # the Send button does the same thing
+        box.value = "second note"
+        await pilot.click(_btn(app, dash, "msg-send"))
+        await _settle(pilot, 0.8)
+    assert calls == [
+        (ids["running"], "please also run the linter"),
+        (ids["running"], "second note"),
+    ]
+    store = await _store(env)
+    try:
+        events = await store.events_since(0, mission_id=ids["running"], limit=500)
+        owner = [e.payload["text"] for e in events if e.type.value == "owner_message"]
+        assert owner == ["please also run the linter", "second note"]
+    finally:
+        await store.aclose()

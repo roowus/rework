@@ -38,6 +38,7 @@ from rework.kernel.state.records import (
 from rework.kernel.state.records import run_id as make_run_id
 from rework.logs import bind
 from rework.nodes.report_sections import blocking_findings, open_blockers
+from rework.orchestrator.engine import MAX_SEND_BACKS
 
 log = logging.getLogger("rework.orchestrator")
 
@@ -51,7 +52,6 @@ PREFERRED_FAILURE_LIMIT = 3  # failed turns in a row before leaving the chosen m
 # waits when EVERY model fails transiently (an outage), about 7.5 minutes in all
 OUTAGE_WAITS_S = (15.0, 30.0, 60.0, 120.0, 240.0)
 MAX_IDLE_NUDGES = 3
-MAX_SEND_BACKS = 5  # keep in step with engine.MAX_SEND_BACKS
 PROVIDER_FAILURE_LIMIT = 2  # failed runs on one model before spawn_role refuses it
 
 STRICTNESS_LEVELS = ("light", "standard", "strict")
