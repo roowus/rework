@@ -25,6 +25,7 @@ from rework.tui.conversation import (
     args_text,
     default_model,
     items_from_messages,
+    same_proposal,
 )
 from rework.tui.hub import Snapshot
 from rework.tui.theme import (
@@ -350,24 +351,25 @@ class WorkView(View):
     # -- rendering ------------------------------------------------------------------
 
     def _render_items(self, items: list[Item], *, replay: bool = False) -> None:
+        """One card per proposal, each independently live or settled.
+
+        `items_from_messages` already decided which proposals are still pending
+        (see `_settle_launched`), so the card just carries that flag: several
+        proposals from one request each get their own Launch / Scrap."""
         log = self.query_one("#chat-log", Trajectory)
         widgets: list[Any] = []
-        last_proposal = None
-        launched_after = False
-        for item in items:
-            if item.kind == "proposal":
-                last_proposal = item
-                launched_after = False
-            elif item.kind == "mission":
-                launched_after = True
         for item in items:
             widget = self._item_widget(item)
             if widget is None:
                 continue
             if isinstance(widget, ProposalCard):
-                widget.live = item is last_proposal and not launched_after
+                widget.live = item.live
             widgets.append(widget)
         log.add(*widgets)
+
+    def _pending_cards(self) -> list[ProposalCard]:
+        """The proposal cards still waiting for a decision, in transcript order."""
+        return [card for card in self.query(ProposalCard) if card.live]
 
     def _item_widget(self, item: Item) -> Any:
         if item.kind == "user":
@@ -482,15 +484,15 @@ class WorkView(View):
                 # error line is in the chat; give the owner their text back
                 prompt.text = text  # never lose input
                 return
-            if engine.launched and engine.proposal is not None:
-                await self._launch(engine.proposal)
+            if result.launched_all and result.proposals:
+                # a typed "yes" with proposals pending means launch them ALL
+                await self._launch_all(result.proposals)
                 return
-            if result.proposal is not None:
-                self._retire_proposals()
+            if result.proposals:
                 log.add(assistant_step(result.reply or "Here's what I'd run."))
-                log.add(ProposalCard(result.proposal))
+                log.add(*self._proposal_cards(result.proposals))
             elif result.reply:
-                if result.reply.startswith("Scrapped"):
+                if result.scrapped_all:
                     self._retire_proposals()
                 log.add(assistant_step(result.reply))
             elapsed = time.monotonic() - started
@@ -550,6 +552,22 @@ class WorkView(View):
 
     # -- proposals & launch -------------------------------------------------------------
 
+    def on_proposal_card_launch_all(self, event: ProposalCard.LaunchAll) -> None:
+        """"Launch all": every pending proposal of this chat, in order."""
+        event.stop()
+        if self._sending:
+            return
+        self._launch_all_cards()
+
+    def _proposal_cards(self, proposals: list[Any]) -> list[ProposalCard]:
+        """One card per proposal, plus ONE "Launch all" for the group when there
+        is more than one (with a single proposal it would just duplicate it)."""
+        cards = [ProposalCard(proposal) for proposal in proposals]
+        if len(cards) > 1:
+            for card in cards:
+                card.set_launch_all(True)
+        return cards
+
     def on_proposal_card_decided(self, event: ProposalCard.Decided) -> None:
         event.stop()
         if self._sending:
@@ -557,12 +575,60 @@ class WorkView(View):
         if event.launch:
             self._launch_worker(event.card.proposal)
         else:
-            event.card.set_live(False)
-            if self.convo and self.convo.engine is not None:
-                self.convo.engine.proposal = None
+            self._scrap(event.card)
             self.query_one("#chat-log", Trajectory).add(
                 Step(f"[{FAINT}]proposal scrapped. Tell the orchestrator what to change[/]")
             )
+
+    def _scrap(self, card: Any) -> None:
+        """Scrap ONE proposal: only that card settles, the rest stay pending."""
+        card.set_live(False)
+        engine = self.convo.engine if self.convo is not None else None
+        if engine is not None:
+            engine.proposals = [
+                p for p in engine.proposals if not same_proposal(p, card.proposal)
+            ]
+
+    def _launch_all_cards(self) -> None:
+        """The "Launch all" button: every pending proposal, in transcript order."""
+        cards = self._pending_cards()
+        if not cards:
+            return
+        self._launch_all_worker([card.proposal for card in cards], cards)
+
+    @work(group="send")
+    async def _launch_all_worker(self, proposals: list[Any], cards: list[Any]) -> None:
+        self._sending = True
+        try:
+            await self._launch_all(proposals, cards)
+        finally:
+            self._sending = False
+
+    async def _launch_all(self, proposals: list[Any], cards: list[Any] | None = None) -> None:
+        """One mission per proposal, through the same `Conversation.launch` path
+        a single Launch uses. A proposal that cannot launch (no repo) is left
+        pending, so the owner can fix it without losing the others."""
+        if cards is None:
+            cards = [
+                card
+                for card in self._pending_cards()
+                if any(same_proposal(card.proposal, p) for p in proposals)
+            ]
+        launched: list[Any] = []
+        for proposal in list(proposals):
+            mission = await self._launch(proposal, settle=False)
+            if mission is None:
+                continue
+            launched.append(mission)
+            for card in cards:
+                if same_proposal(card.proposal, proposal):
+                    card.set_live(False)
+        if launched:
+            self.toast(
+                f"Launched {len(launched)} mission{'s' if len(launched) != 1 else ''}",
+                title="Launched",
+            )
+            await self.hub.refresh()
 
     @work(group="send")
     async def _launch_worker(self, proposal: Any) -> None:
@@ -572,10 +638,14 @@ class WorkView(View):
         finally:
             self._sending = False
 
-    async def _launch(self, proposal: Any) -> None:
+    async def _launch(self, proposal: Any, *, settle: bool = True) -> Any:
+        """Create one mission. Returns it, or None when it could not launch.
+
+        `settle=False` leaves the other cards alone (a batch settles them as it
+        goes); a single Launch settles just its own card."""
         log = self.query_one("#chat-log", Trajectory)
         if self.convo is None:
-            return
+            return None
         try:
             mission = await self.convo.launch(self.snap, proposal)
         except ValueError as exc:
@@ -586,15 +656,25 @@ class WorkView(View):
                     kind="gate",
                 )
             )
-            return
+            return None
         except Exception as exc:
             log.add(Step(f"[{DANGER}]✗ launch failed: {esc(clip(str(exc), 300))}[/]"))
-            return
-        self._retire_proposals()
+            return None
+        if settle:
+            self._settle_card(proposal)
         card = MissionCard(mission.id)
         log.add(card)
-        self.toast(f"Mission {mission.id} launched", title="Launched")
-        await self.hub.refresh()
+        if settle:
+            self.toast(f"Mission {mission.id} launched", title="Launched")
+            await self.hub.refresh()
+        return mission
+
+    def _settle_card(self, proposal: Any) -> None:
+        """Settle only the card this proposal belongs to: its siblings stay
+        pending, which is the whole point of several proposals per chat."""
+        for card in self.query(ProposalCard):
+            if same_proposal(card.proposal, proposal):
+                card.set_live(False)
 
     # -- live mission cards -------------------------------------------------------------
 

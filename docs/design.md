@@ -3,6 +3,35 @@
 This is the living architecture doc. Update it in the same commit as the code it
 describes. Decision history lives in `docs/adr/`.
 
+### Several missions from one conversation
+
+One owner request can span separate pieces of work (a bug in one repo, a doc in
+another), so the orchestrator may call `propose_mission` more than once in one
+turn. The Work tab then shows one proposal card per call, each with its own
+Launch and Scrap, plus a "Launch all" action on the group.
+
+- `OrchestratorChat.proposals` is the pending list, in call order. A later turn
+  that proposes REPLACES the pending list (`self.proposal` remains a
+  compatibility view of the first entry).
+- A typed "yes" launches every pending proposal and a typed "no" scraps every
+  pending one; `ChatResult.launched_all` / `ChatResult.scrapped_all` carry that
+  signal so the UI never has to re-derive which proposal was meant.
+- Launching or scrapping ONE card settles only that card; its siblings stay
+  pending. Each launch still goes through `Conversation.launch` ->
+  `missions.create_mission`, so the per-mission kwargs are unchanged.
+- `Chat.mission_id` stays a scalar and keeps the FIRST mission the chat
+  launched (a non-NULL value is never overwritten). It is only the denormalised
+  pointer the chat list uses for a status glyph; `Mission.chat_id` is the real
+  one-chat-to-many-missions link that `WorkView.active_missions()` queries.
+- Proposals have no table of their own: they ride in `chat_messages.body` as the
+  assistant message's `tool_calls`, so several proposals replay from one stored
+  message with no migration. A launch note reads `launched <mission id> · <objective>`;
+  on replay a proposal is settled when such a note names its objective, and
+  otherwise the OLDEST still-pending proposal is settled (which is what a legacy
+  bare `launched <id>` note means). Everything left pending is restored into the
+  engine by `Conversation.ensure_engine`, so a reloaded chat shows and can launch
+  all of them.
+
 ## What rework is
 
 A portable, deployable multi-agent workflow engine. An **orchestrator** (hand-built

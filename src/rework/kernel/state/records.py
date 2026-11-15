@@ -246,7 +246,9 @@ class Chat(BaseModel):
     project_id: str | None = None  # the project the conversation is scoped to
     model_id: str | None = None  # catalog id the conversation was held on
     effort: str | None = None
-    mission_id: str | None = None  # set once a proposal from this chat launched
+    # the FIRST mission this chat launched; never overwritten. One chat can
+    # launch many missions: Mission.chat_id is the real many-to-one link.
+    mission_id: str | None = None
     created_at: float = Field(default_factory=now)
     updated_at: float = Field(default_factory=now)
 

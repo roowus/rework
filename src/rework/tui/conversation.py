@@ -29,6 +29,9 @@ class Item:
     error: str = ""
     proposal: Any = None
     mission_id: str = ""
+    # for proposals: still waiting for a decision (False once it launched or
+    # was scrapped). Computed on replay by `items_from_messages`.
+    live: bool = True
     attachments: list[str] = field(default_factory=list)
 
 
@@ -59,10 +62,32 @@ def proposal_from_args(args: dict[str, Any]) -> Any:
 
 
 LAUNCH_PREFIX = "launched "
+# A launch note reads `launched <mission id> · <objective>`. The objective is
+# prose, not schema: it is what lets a replayed chat tell WHICH of several
+# proposals from one turn was launched (position alone cannot: the note is
+# appended at the end of the transcript).
+NOTE_SEP = " · "
+
+
+def launch_note(mission_id: str, objective: str = "") -> str:
+    objective = (objective or "").strip().replace("\n", " ")
+    return f"{LAUNCH_PREFIX}{mission_id}" + (f"{NOTE_SEP}{objective}" if objective else "")
+
+
+def parse_launch_note(display: str) -> tuple[str, str]:
+    """`launched m-x · fix it` -> ("m-x", "fix it"); a legacy bare note -> ("m-x", "")."""
+    rest = display[len(LAUNCH_PREFIX) :]
+    mission_id, _, objective = rest.partition(NOTE_SEP)
+    return mission_id.strip(), objective.strip()
 
 
 def items_from_messages(messages: list[Any]) -> list[Item]:
-    """Stored ChatMessages -> renderable items (tool calls included)."""
+    """Stored ChatMessages -> renderable items (tool calls included).
+
+    Every `propose_mission` call in an assistant message becomes its own
+    proposal item, in call order: one request can span several separate pieces
+    of work and each is its own mission. A proposal stays `live` (still
+    decidable) unless a launch note settles it; see `_settle_launched`."""
     items: list[Item] = []
     for msg in messages:
         body = msg.body or {}
@@ -70,7 +95,8 @@ def items_from_messages(messages: list[Any]) -> list[Item]:
         if role == "note":
             display = str(msg.display or "")
             if display.startswith(LAUNCH_PREFIX):
-                items.append(Item("mission", mission_id=display[len(LAUNCH_PREFIX) :].strip()))
+                mission_id, objective = parse_launch_note(display)
+                items.append(Item("mission", mission_id=mission_id, text=objective))
             elif display:
                 items.append(Item("note", text=display))
             continue
@@ -93,7 +119,7 @@ def items_from_messages(messages: list[Any]) -> list[Item]:
             continue
         if role == "assistant":
             calls = body.get("tool_calls") or []
-            proposal = None
+            proposals: list[Any] = []
             asked = ""
             for call in calls:
                 fn = call.get("function") or {}
@@ -104,18 +130,42 @@ def items_from_messages(messages: list[Any]) -> list[Item]:
                 except (ValueError, TypeError):
                     args = {}
                 if name == "propose_mission":
-                    proposal = proposal_from_args(args)
+                    proposals.append(proposal_from_args(args))
                 elif name == "ask":
                     asked = str(args.get("question") or "")
             text = str(body.get("content") or "").strip()
-            if proposal is not None:
+            if proposals:
                 items.append(Item("assistant", text=text or "Here's what I'd run."))
-                items.append(Item("proposal", proposal=proposal))
+                items.extend(Item("proposal", proposal=p) for p in proposals)
             elif asked:
                 items.append(Item("assistant", text=asked))
             elif text or msg.display:
                 items.append(Item("assistant", text=text or str(msg.display)))
+    _settle_launched(items)
     return items
+
+
+def _settle_launched(items: list[Item]) -> None:
+    """Mark replayed proposals that already became a mission as not live.
+
+    Rule (documented in docs/design.md): a launch note settles the pending
+    proposal whose objective it names, else the OLDEST still-pending proposal
+    (which is what a legacy `launched <id>` note, or a proposal relaunched by
+    hand, means). Anything left pending can still be launched, here or from the
+    engine's own list."""
+    pending: list[Item] = []
+    for item in items:
+        if item.kind == "proposal":
+            pending.append(item)
+            continue
+        if item.kind != "mission" or not pending:
+            continue
+        wanted = (item.text or "").strip()
+        chosen = next((p for p in pending if str(p.proposal.objective).strip() == wanted), None)
+        if chosen is None:
+            chosen = pending[0]
+        chosen.live = False
+        pending.remove(chosen)
 
 
 def context_note(snap: Snapshot, project_id: str | None) -> str:
@@ -216,14 +266,12 @@ class Conversation:
             kwargs["library"] = await self._library_handle()
         self.engine = OrchestratorChat(build_provider(entry), catalog, model_id, **kwargs)
         await self.engine.load()
-        # a reloaded chat whose last proposal never launched can still be
-        # confirmed with a bare "yes"
-        for item in reversed(await self.items()):
-            if item.kind == "mission":
-                break
-            if item.kind == "proposal":
-                self.engine.proposal = item.proposal
-                break
+        # EVERY proposal that never launched is restored, in order, so a
+        # reloaded chat shows all of them and a bare "yes" launches all of them
+        # (not just the newest one, which is what the old single slot did)
+        self.engine.proposals = [
+            item.proposal for item in await self.items() if item.kind == "proposal" and item.live
+        ]
         self._engine_key = key
         return self.engine
 
@@ -272,12 +320,38 @@ class Conversation:
         if getattr(proposal, "title", "") and _accepts(create_mission, "title"):
             kwargs["title"] = proposal.title
         mission = await self.data.create_mission(**kwargs)
-        await self.data.append_chat_note(self.id, f"{LAUNCH_PREFIX}{mission.id}")
-        await self.data.update_chat(self.id, mission_id=mission.id)
+        # the note carries the proposal's objective as well as the mission id so
+        # a replayed chat can tell WHICH of several proposals from one turn was
+        # launched (the note lands at the end of the transcript, so position
+        # alone cannot). See items_from_messages / _settle_launched.
+        await self.data.append_chat_note(
+            self.id, launch_note(mission.id, proposal.objective)
+        )
+        # Chat.mission_id stays a scalar, and it keeps the FIRST mission this
+        # chat launched: it is only a denormalised pointer for the chat list.
+        # The real one-chat-to-many-missions link is Mission.chat_id (which is
+        # what WorkView.active_missions() queries), and overwriting it would
+        # hide every earlier mission behind the newest one.
+        if not self.chat.mission_id:
+            await self.data.update_chat(self.id, mission_id=mission.id)
+            self.chat.mission_id = mission.id
         if self.engine is not None:
-            self.engine.proposal = None
+            # only the proposal that launched is settled: the others stay
+            # pending and can still be launched on their own
+            self.engine.proposals = [
+                p for p in self.engine.proposals if not same_proposal(p, proposal)
+            ]
             self.engine.launched = False
         return mission
+
+
+def same_proposal(a: Any, b: Any) -> bool:
+    """Identity first (the engine hands out the very objects the cards hold),
+    then the full field tuple so a replayed Proposal still matches."""
+    if a is b:
+        return True
+    fields = ("objective", "title", "plan", "project", "repo", "model", "effort")
+    return all(getattr(a, f, "") == getattr(b, f, "") for f in fields)
 
 
 def default_model(catalog: Any) -> str:
