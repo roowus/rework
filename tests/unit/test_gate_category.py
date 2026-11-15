@@ -12,6 +12,7 @@ from rework.orchestrator.agent import (
     ToolError,
     _gate_ask,
     orchestrator_tools,
+    render,
 )
 
 
@@ -83,10 +84,13 @@ def test_the_refusal_does_not_complete_the_mission() -> None:
 
 
 def test_prompt_text_states_the_strict_rule() -> None:
-    playbook = PLAYBOOKS["fix-pr"]
-    rules = RULES
+    # both copies land in the same system prompt, so both must state the rule;
+    # render() is what fills $GATE_CATEGORIES in RULES.
+    playbook = render(PLAYBOOKS["fix-pr"])
+    rules = render(RULES)
     for text in (playbook, rules):
-        lowered = text.lower()
+        # RULES is hard-wrapped: normalise whitespace before substring checks
+        lowered = " ".join(text.lower().split())
         assert "ask_before_pr" in text
         assert "owner asked for is never gated" in lowered
         assert "summary" in text  # where size/unusualness/accepted findings go

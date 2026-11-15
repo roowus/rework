@@ -501,3 +501,43 @@ async def test_pr_gate_never_overrides_the_ask(
     assert [g for g in gates if g.kind.value == "open_pr"] == []
     mission = await orch_world["store"].get_mission(orch_world["mission"].id)
     assert (mission.result or {}).get("pr_url")
+
+
+async def test_an_ask_without_a_category_is_refused_then_the_pr_opens_ungated(
+    orch_world: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(a) the strict rule end to end: an ask_before_pr with no valid category
+    is refused as a tool error (no gate, mission not finished), and the retry
+    the answer tells it to make -- finish with no ask -- opens the PR ungated."""
+    from rework.kernel.llm.types import ChatResult, ToolCall, Usage
+
+    script = _with_reason(_orch_pr_script(), reason="large diff, many files touched", category="")
+    # what the refusal text tells the orchestrator to do: finish with no ask
+    script = [
+        *script,
+        ChatResult(
+            text="",
+            tool_calls=[
+                ToolCall(
+                    id="r2", name="finish", arguments={"outcome": "done", "summary": ORCH_SUMMARY}
+                )
+            ],
+            usage=Usage(input_tokens=200, output_tokens=20),
+        ),
+    ]
+    runner = _runner(orch_world, monkeypatch, script)
+    await asyncio.wait_for(asyncio.create_task(runner.run()), timeout=60)
+
+    from rework.orchestrator.agent import orchestrator_chat_id
+
+    msgs = await orch_world["store"].chat_messages(orchestrator_chat_id(orch_world["mission"].id))
+    tool_out = [m.body.get("content", "") for m in msgs if m.role == "tool"]
+    refusals = [t for t in tool_out if "gate_category" in t]
+    assert refusals, f"the invalid ask was not refused; tool results: {tool_out}"
+    assert "without a gate" in refusals[0], "the refusal must say how to proceed"
+    gates = await orch_world["store"].list_gates(orch_world["mission"].id)
+    assert [g for g in gates if g.kind.value == "open_pr"] == [], "a refused ask opened a gate"
+    mission = await orch_world["store"].get_mission(orch_world["mission"].id)
+    assert mission is not None and mission.status == MissionStatus.DONE
+    assert (mission.result or {}).get("pr_url") == "https://github.com/roowus/toyrepo/pull/1"
+    assert orch_world["gh_body"].exists(), "the retry never opened the PR"
