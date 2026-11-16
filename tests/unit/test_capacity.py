@@ -113,7 +113,12 @@ MEASUREMENTS: tuple[tuple[int, float, int | None], ...] = (
 def test_the_invariant_holds_on_every_pinned_path_too() -> None:
     """The unpinned sweep above is not the whole story: `target()` re-applies the
     explicit env caps with the pin winning for that cap, so the mission cap could
-    come back above the role cap there. Sweep the pinned combinations as well."""
+    come back above the role cap there. Sweep the pinned combinations as well.
+
+    The invariant is scoped to the caps auto manages: with BOTH caps pinned there
+    is nothing for auto to do, so those two cells are the documented exception
+    (the owner gets exactly what they asked for, see
+    test_both_pinned_caps_are_a_total_no_op)."""
     for fixed_concurrency, pinned_missions in ((True, 1), (True, 3), (True, 8)):
         for fixed_max_roles, pinned_roles in ((False, 0), (True, 2), (True, 5)):
             policy = CapacityPolicy(
@@ -122,15 +127,20 @@ def test_the_invariant_holds_on_every_pinned_path_too() -> None:
                 fixed_concurrency=fixed_concurrency,
                 fixed_max_roles=fixed_max_roles,
             )
+            both_pinned = fixed_concurrency and fixed_max_roles
             for cpus, load, avail in MEASUREMENTS:
                 cap = policy.target(cpus, load, avail)
                 case = (fixed_concurrency, pinned_missions, fixed_max_roles, pinned_roles)
-                assert cap.concurrency >= 1, (case, cpus, load, avail, cap)
-                assert cap.concurrency <= cap.max_roles, (case, cpus, load, avail, cap)
-                assert cap.max_roles >= 1, (case, cpus, load, avail, cap)
                 assert f"{cap.concurrency} missions / {cap.max_roles} roles" in cap.reason
+                assert cap.max_roles >= 1, (case, cpus, load, avail, cap)
                 if fixed_max_roles:
                     assert cap.max_roles == pinned_roles, "the pin is honoured, not re-derived"
+                if both_pinned:
+                    # no managed cap: the pinned pair is returned untouched
+                    assert cap.concurrency == pinned_missions, (case, cpus, cap)
+                    continue
+                assert cap.concurrency >= 1, (case, cpus, load, avail, cap)
+                assert cap.concurrency <= cap.max_roles, (case, cpus, load, avail, cap)
                 # the clamp only reduces the mission side, never raises it
                 assert cap.concurrency == min(pinned_missions, cap.max_roles), (case, cpus, cap)
 
@@ -257,6 +267,42 @@ def test_explicit_max_roles_env_fixes_only_that_cap(monkeypatch: pytest.MonkeyPa
     # resource that protects the box: the mission cap is clamped down to fit it.
     assert new.concurrency == 5, "never more mission slots than role slots, pinned or not"
     assert "5 missions / 5 roles" in new.reason
+
+
+def test_a_clamped_pin_comes_back_on_the_next_measurement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """M1: `REWORK_CONCURRENCY=8` pinned with the role cap managed. A starved first
+    measurement clamps the pair to 1 / 1; if that clamped pair were written back
+    over the pin, the box that pinned a mission cap would stop following the box
+    until a daemon restart, and the 8 would never come back."""
+    monkeypatch.setenv("REWORK_CONCURRENCY", "8")
+    settings = CapacitySettings.from_env()
+    assert settings.fixed_concurrency is True
+    assert settings.fixed_max_roles is False
+
+    policy = CapacityPolicy(
+        concurrency=8,
+        max_roles=8,
+        fixed_concurrency=settings.fixed_concurrency,
+        fixed_max_roles=settings.fixed_max_roles,
+    )
+    starved = policy.apply_initial(16, 0.0, 2 * GB)  # 16 idle CPUs, 2.0 GB free
+    assert starved is not None
+    assert (starved.concurrency, starved.max_roles) == (1, 1), "the clamp cut it to fit 1 role"
+    assert (policy.concurrency, policy.max_roles) == (1, 1), "the LIVE caps are 1 / 1 now"
+
+    # the box is idle and healthy again: the pin is still 8, not the clamped 1
+    assert policy.observe(16, 0.0, None) is None, "first sighting of the new plan"
+    back = policy.observe(16, 0.0, None)
+    assert back is not None, "the second sighting must apply"
+    assert (back.concurrency, back.max_roles) == (8, 16), "the pin comes back, 1 was not a pin"
+    assert "8 missions / 16 roles" in back.reason
+    assert (policy.concurrency, policy.max_roles) == (8, 16)
+
+    # on an idle 8-core box the same pin is exactly 8 missions / 8 roles
+    idle8 = policy.target(8, 0.0, None)
+    assert (idle8.concurrency, idle8.max_roles) == (8, 8), "the pin is clamped to the role cap"
 
 
 # -- PrioritySlots.set_capacity ----------------------------------------------
@@ -468,8 +514,35 @@ def test_both_explicit_caps_leave_nothing_to_manage() -> None:
         settings=_settings(fixed_concurrency=True, fixed_max_roles=True),
         measure_fn=lambda: (8, 0.0, None),
     )
+    assert dyn.policy.has_managed_cap is False
     assert dyn.enabled is False
     assert dyn.start() is None
+
+
+def test_both_pinned_caps_are_a_total_no_op(caplog: pytest.LogCaptureFixture) -> None:
+    """REWORK_CONCURRENCY=8 plus REWORK_MAX_ROLES=2 is honoured exactly as given:
+    every entry point returns None, no clamp runs on that pair and the live caps
+    stay 8 / 2 (the documented behaviour, see docs/ops.md)."""
+    slots, limiter = PrioritySlots(8), RoleLimiter(2)
+    calls = [(16, 0.0, 2 * GB), (16, 0.0, None), (16, 0.0, None)]
+    dyn = DynamicCapacity(
+        slots,
+        limiter,
+        settings=_settings(fixed_concurrency=True, fixed_max_roles=True),
+        measure_fn=lambda: calls.pop(0),
+    )
+    assert dyn.policy.has_managed_cap is False
+    assert dyn.enabled is False
+    with caplog.at_level(logging.INFO, logger="rework.capacity"):
+        assert dyn.policy.target(16, 0.0, 2 * GB) == Capacity(
+            8, 2, "16 CPUs, load 0.0, 2.0 GB free: 8 missions / 2 roles"
+        ), "the pinned pair is reported as given"
+        assert dyn.apply_now() is None
+        assert dyn.observe_now() is None
+        assert dyn.start() is None
+        assert dyn.task is None, "no watchdog on a fully pinned pair"
+    assert (slots.capacity, limiter.cap) == (8, 2), "the owner gets exactly what they asked for"
+    assert [r for r in caplog.records if r.name == "rework.capacity"] == []
 
 
 async def test_the_watchdog_starts_and_stops_without_leaking_a_task() -> None:

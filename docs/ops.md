@@ -519,13 +519,18 @@ order:
    does not bound it, because protecting the box beats using it: 16 idle CPUs
    with 2 GB free plan 1 mission and 1 role.
 
-The mission cap never exceeds the role cap, on the measured path and on the
-pinned one alike: pinning a role cap with `REWORK_MAX_ROLES` also lowers the
-mission cap to fit it (2 pinned roles on 12 idle CPUs run 2 missions / 2
-roles), and a pinned `REWORK_CONCURRENCY` above the planned role cap is cut
-back to that cap. Pinning never raises a cap to satisfy the rule. A change is
-applied only when the same plan shows up in two measurements in a row, so
-one `uv sync` burst does not flap the caps.
+On the caps auto actually manages, the mission cap never exceeds the role
+cap: pinning a role cap with `REWORK_MAX_ROLES` also lowers the managed mission
+cap to fit it (2 pinned roles on 12 idle CPUs run 2 missions / 2 roles), and a
+pinned `REWORK_CONCURRENCY` above the planned role cap is cut back to that cap.
+Pinning never raises a cap to satisfy the rule, and the cut is never written
+back over the pin, so a pinned mission cap returns to its pinned value as soon
+as the box can hold it again. With BOTH caps set explicitly there is nothing
+left for auto to manage, and the documented exception applies: rework honours
+the two numbers exactly as given (8 and 2 stay 8 missions / 2 roles), measures
+nothing and starts no watchdog. A change is applied only when the same plan
+shows up in two measurements in a row, so one `uv sync` burst does not flap the
+caps.
 
 Shrinking never cancels work: running missions keep their slots until they
 finish (the free-slot count goes negative until their releases bring it back),
