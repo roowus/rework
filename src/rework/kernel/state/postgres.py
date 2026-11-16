@@ -1073,6 +1073,17 @@ class PostgresStore:
         return int(row["max_id"] or 0)
 
     @_serialized
+    async def chat_ids_with_messages(self, chat_ids: list[str]) -> set[str]:
+        """One probe for the whole list (idx_chat_messages_chat covers it)."""
+        ids = list(dict.fromkeys(chat_ids))
+        if not ids:
+            return set()
+        rows = await self._fetch_all(
+            "SELECT DISTINCT chat_id FROM chat_messages WHERE chat_id = ANY(%s)", (ids,)
+        )
+        return {str(r["chat_id"]) for r in rows}
+
+    @_serialized
     async def chat_messages_since(self, chat_id: str, after_id: int) -> list[ChatMessage]:
         rows = await self._fetch_all(
             "SELECT * FROM chat_messages WHERE chat_id = %s AND id > %s ORDER BY id",

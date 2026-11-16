@@ -27,6 +27,7 @@ from rework.tui.conversation import (
     items_from_messages,
     same_proposal,
 )
+from rework.kernel.state.records import orchestrator_chat_id
 from rework.tui.hub import Snapshot
 from rework.tui.theme import (
     ACCENT,
@@ -124,6 +125,15 @@ class WorkView(View):
                 with Horizontal(classes="pane-head", id="work-head"):
                     yield Static("", id="work-title", classes="pane-head-title")
                     yield Static("", classes="spacer")
+                    # every mission has an orchestrator transcript that is
+                    # deliberately not a row in the list; this is its way in
+                    yield Btn(
+                        "Transcript",
+                        "transcript",
+                        variant="ghost",
+                        id="work-transcript",
+                        tooltip="open the orchestrator transcript of the mission in view",
+                    )
                     yield Btn("Rename", "rename", variant="ghost", id="work-rename")
                     yield Btn("Delete", "delete", variant="ghost", id="work-delete")
                 yield Static(WELCOME, id="work-welcome", classes="empty")
@@ -293,6 +303,10 @@ class WorkView(View):
         lst = self.query_one("#chat-list", RowList)
         lst.set_rows(rows)
         lst.select(self.convo.id if self.convo else None)
+        try:
+            self.query_one("#work-transcript", Btn).display = self.mission_in_view() is not None
+        except Exception:  # a head-only test may not mount the button
+            pass
 
     def _paint_head(self) -> None:
         title = self.query_one("#work-title", Static)
@@ -372,22 +386,41 @@ class WorkView(View):
     def open_chat(self, chat_id: str) -> None:
         self._load_chat(chat_id)
 
+    def mission_in_view(self) -> str | None:
+        """The mission whose transcript this view is "about": the explicit send
+        target when it is a mission (ADR 0007), else the chat's launched
+        mission. None when the view is just a chat with the chat orchestrator."""
+        if self.target and self.target != "chat":
+            return self.target
+        if self.convo is not None:
+            return getattr(self.convo.chat, "mission_id", None)
+        return None
+
+    def open_transcript(self, mission_id: str) -> None:
+        """Open a mission's own orchestrator transcript.
+
+        That chat is filtered out of the sidebar (one per mission, machinery
+        rather than a conversation), so it is reached by id. A mission whose
+        orchestrator never ran has no row yet: say so instead of the generic
+        "Chat not found"."""
+        self._load_chat(orchestrator_chat_id(mission_id), missing="no transcript yet")
+
     @work(exclusive=True, group="load-chat")
-    async def _load_chat(self, chat_id: str) -> None:
+    async def _load_chat(self, chat_id: str, missing: str = "Chat not found") -> None:
         self._loading_chat = chat_id
         try:
-            await self._read_chat(chat_id)
+            await self._read_chat(chat_id, missing)
         finally:
             # `_loading_chat` means "a load is in flight"; leaving it set made
             # the transcript poller think a load was still running forever
             if self._loading_chat == chat_id:
                 self._loading_chat = None
 
-    async def _read_chat(self, chat_id: str) -> None:
+    async def _read_chat(self, chat_id: str, missing: str = "Chat not found") -> None:
         self._chat_cursor = 0  # never carry a cursor across chats
         chat = await self.hub.guard(lambda: self.hub.data.chat(chat_id), None)
         if chat is None:
-            self.toast("Chat not found", severity="warning")
+            self.toast(missing, severity="warning")
             return
         convo = Conversation(self.hub.data, chat)
         # the cursor comes from the rows actually rendered, so a row committed
@@ -957,7 +990,14 @@ class WorkView(View):
     # -- header buttons & knobs -------------------------------------------------------
 
     def on_btn_pressed(self, event: Btn.Pressed) -> None:
-        if event.action == "new":
+        if event.action == "transcript":
+            event.stop()
+            mid = self.mission_in_view()
+            if mid is None:
+                self.toast("open a mission first", severity="warning")
+            else:
+                self.open_transcript(mid)
+        elif event.action == "new":
             event.stop()
             self.new_chat()
         elif event.action == "rename" and self.convo:

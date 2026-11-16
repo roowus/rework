@@ -309,6 +309,9 @@ class DashboardView(View):
                         id="m-msg",
                     )
                     yield Btn("Send", "msg-send", variant="primary")
+                    # the mission's real transcript is not in the CHATS list
+                    # (one orchestrator chat per mission); this is its door
+                    yield Btn("Transcript", "transcript", variant="ghost", id="m-transcript")
 
     def on_mount(self) -> None:
         self._paint_head()

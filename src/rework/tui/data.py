@@ -604,6 +604,13 @@ class TuiData:
             lambda: self._call(lambda s: s.chat_messages_since(chat_id, after_id)),
         )
 
+    async def chat_ids_with_messages(self, chat_ids: list[str]) -> set[str]:
+        """Which of these chats actually hold a message (one batched probe)."""
+        key = "chat_ids_with_messages:" + ",".join(sorted(chat_ids))
+        return await self._resilient(
+            key, lambda: self._call(lambda s: s.chat_ids_with_messages(chat_ids))
+        )
+
     async def update_chat(self, chat_id: str, **fields: Any) -> Any:
         store = await self.store()
         return await store.update_chat(chat_id, **fields)

@@ -258,6 +258,13 @@ class StateStore(Protocol):
         """Transcript rows newer than `after_id`, oldest first."""
         ...
 
+    async def chat_ids_with_messages(self, chat_ids: list[str]) -> set[str]:
+        """The subset of `chat_ids` that has at least one message row.
+
+        Batched on purpose: the Work list hides auto-created chats that never got
+        a message, and asking per chat would be an N+1 over the whole list."""
+        ...
+
     # -- leader lock (one daemon per database; atomic-upsert hardened in M3) --
     async def acquire_lock(self, owner: str, stale_after_s: float = 60.0) -> bool: ...
 
