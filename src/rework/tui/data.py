@@ -537,11 +537,16 @@ class TuiData:
         """Retry push+PR for a finished mission whose delivery failed. Shares
         `rework.orchestrator.delivery.retry_pr` with `rework mission retry-pr`,
         so the button and the command can never disagree."""
+        from rework.config import Config
         from rework.kernel.events.bus import InProcessEventBus
         from rework.orchestrator.delivery import retry_pr
 
         store = await self.store()
-        return await retry_pr(store, InProcessEventBus(store), mission_id)
+        # the deployment's commit identity, so the retried merge commit has the
+        # same author as the mission's own commits
+        return await retry_pr(
+            store, InProcessEventBus(store), mission_id, author=Config.from_env().git_author
+        )
 
     async def prioritize_mission(self, mission_id: str, priority: str = "high") -> Any:
         """Pickup priority (normal | high): the daemon reads the row, so this
@@ -613,6 +618,20 @@ class TuiData:
         return await self._resilient(
             f"chat_messages_since:{chat_id}",
             lambda: self._call(lambda s: s.chat_messages_since(chat_id, after_id)),
+        )
+
+    async def chat_ids_with_messages(self, chat_ids: list[str]) -> set[str]:
+        """Which of these chats actually hold a message (one batched probe)."""
+        key = "chat_ids_with_messages:" + ",".join(sorted(chat_ids))
+        return await self._resilient(
+            key,
+            lambda: self._call(lambda s: s.chat_ids_with_messages(chat_ids)),
+            # Hiding a chat is only safe while the answer is fresh: a stale set
+            # still hides a chat that just received its first message (exactly
+            # the blank-row bug), and a stale empty one blanks the whole list.
+            # Opting out of the cache raises instead, so Hub._non_empty can fail
+            # open and list every chat as documented.
+            stale_ok=False,
         )
 
     async def update_chat(self, chat_id: str, **fields: Any) -> Any:

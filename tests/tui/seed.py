@@ -485,7 +485,20 @@ async def seed(db_path: str, *, history_days: int = 120) -> dict[str, str]:
         ]
         for msg in msgs:
             await store.append_chat_message(msg)
-        await store.create_chat(Chat(title="what did the auth audit find?", model_id="flash"))
+        # a plain human chat with one message: the Work list HIDES chats that
+        # never got a message (an auto-created shell looks like a broken chat),
+        # so a fixture that must show up in the list needs a row of its own
+        audit = await store.create_chat(
+            Chat(title="what did the auth audit find?", model_id="flash")
+        )
+        await store.append_chat_message(
+            ChatMessage(
+                chat_id=audit.id,
+                role="assistant",
+                body={"role": "assistant", "content": "the audit found nothing alarming"},
+                display="the audit found nothing alarming",
+            )
+        )
     finally:
         await store.aclose()
     return ids

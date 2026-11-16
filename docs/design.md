@@ -90,6 +90,43 @@ before the first astream call).
 Roles are NOT subgraphs of the orchestrator checkpoint; each Run is an independent
 asyncio task with its own checkpointer thread. Parallelism = N run rows for one step.
 
+### Reliability
+
+A mission must survive a database that aborts a transaction on purpose.
+`kernel/state/retry.py` is the one place that recognises those events and
+retries them: SQLSTATE `40P01` (deadlock_detected), `40001`
+(serialization_failure) and sqlite's `database is locked`. A store operation
+gets 3 total attempts (`MAX_ATTEMPTS`) with a short jittered sleep between them
+(`RETRY_SLEEP_RANGE_S`, 10 to 100 ms), exactly one WARNING per retry naming the
+attempt number and the SQLSTATE, and a clean connection per attempt (the aborted
+transaction is rolled back first). Logical errors (unique violation `23505`,
+syntax `42601`, any other non-transient SQLSTATE) are never retried: they
+propagate on the first attempt, and exhausted attempts surface as
+`TransientDatabaseError` with the original as its cause. Both stores share it:
+`_serialized` wraps every public `PostgresStore` method (the op lock is taken
+per attempt, inside the retry, so the backoff sleep holds no lock), and
+`@retry_transient_methods` wraps `SqliteStore` as a class.
+
+The retry is the safety net, not the fix. Every statement that touches both
+`chats` and `chat_messages` takes the `chats` row first (`SELECT 1 FROM chats
+WHERE id = $1 FOR UPDATE`), then `chat_messages`: found live on 2026-11-14, a
+deadlock on `UPDATE chats SET updated_at = $1 WHERE id = $2` when one
+transaction took the two relations the other way round. sqlite does the parity
+equivalent (a no-op `UPDATE chats SET id = id`), and the Postgres checkpointer's
+`setup()` (DDL on the same database) runs at most once per process and database
+URL instead of per run connection, so it cannot race store writes.
+
+`MAX_TRANSIENT_CRASHES` = 3: a runner that dies on a transient database error
+does not fail its mission while `transient_crash_count` (a missions column, in
+both stores' DDL and idempotent migrations) is at most 3. The mission goes back
+to PENDING with `transient_db_error` and a `crash` note in its result
+("transient database error, crash 1 of 3, resuming from its checkpoint"), a
+WARNING is logged, an INFO event says it will resume from its checkpoint, and
+the pickup machinery restarts it from there. Past 3 crashes it fails with
+"transient database error, crash N after 3 requeues, giving up: <error>" as the result
+error, and a non-transient error fails at once. The counter resets to 0 at a
+terminal status, so a later run gets the full budget.
+
 ### Logs
 
 `rework/logs.py`: JSON lines per component in `~/.rework/logs/` with
@@ -136,7 +173,11 @@ specified in `docs/tui/DESIGN.md`; every view is built from that kit.
   (status, last steps, inline gate answers, pause/cancel). Nothing runs until
   you confirm: typing "yes" launches every pending proposal and "no" scraps
   every one of them. Project / model / effort knobs under the prompt. Opens
-  with no chat selected.
+  with no chat selected. A chat that never got a message (the shell mission
+  creation mints for the CLI) is not listed: it would open blank. A mission's
+  own orchestrator transcript is not listed either (there is one per mission,
+  machinery rather than a conversation); it opens from the mission's Work row
+  and from the Dashboard Transcript action.
 - **Dashboard**: overview (stats strip, projects, missions grouped needs-you →
   queued → running → paused → recent) and a mission drill-down: header + flow strip,
   sessions (one per run) on the left, and Trajectory / Graph (LangGraph-style
