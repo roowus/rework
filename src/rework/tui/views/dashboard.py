@@ -582,7 +582,8 @@ class DashboardView(View):
         Strictly that entity's own stamp. It is never a max over several keys
         (every run event also stamps its mission, so a max would let one live
         run make a wedged sibling look busy) and never falls back to another
-        entity's stamp. No key means UNKNOWN, and unknown animates. "*" is the
+        entity's stamp. No key means UNKNOWN: it animates while the link is up (a mission
+        that has not published yet) and never while offline. "*" is the
         newest across all running missions: use it only where an aggregate is
         genuinely meant (the stats tile, the project badge)."""
         return self.snap.last_event.get(key) if key else None
@@ -600,7 +601,7 @@ class DashboardView(View):
         if status_value(status) != "running":
             return glyph(status)
         clock = time.time() if now is None else now
-        return run_mark(spinner.is_stalled(clock, last), frame)
+        return run_mark(spinner.is_stalled(clock, last, self.snap.online), frame)
 
     def _row_mark(
         self, mission: Any, section: str, frame: str | None = None, now: float | None = None
@@ -625,9 +626,8 @@ class DashboardView(View):
             return
         clock = time.time() if now is None else now
         last = self._stamp("*")
-        if spinner.is_stalled(clock, last):
-            human = spinner.human_duration(spinner.silence(clock, last))
-            stat.set(str(running), f"idle {human}")
+        if spinner.is_stalled(clock, last, self.snap.online):
+            stat.set(str(running), spinner.idle_text(clock, last))
         else:
             stat.set(f"{run_mark(False, frame)} {running}", "working", markup=True)
 
@@ -1353,6 +1353,10 @@ class DashboardView(View):
             # the spinner reads "working" vs "idle 7m" off this stamp: a poll alone
             # (no tick while unfocused) must repaint the header when it moves
             self._stamp(self.mission_id),
+            # connectivity belongs to the key: an offline -> online flip must
+            # repaint this page even when no other keyed field moved
+            self.snap.online,
+            self.snap.error,
         )
 
     async def _load_full_mission(self, mission_id: str) -> None:
@@ -1441,11 +1445,11 @@ class DashboardView(View):
         # silent run is named next to "working" instead of being masked.
         last = self._stamp(mission.id)
         clock = time.time() if now is None else now
-        stalled = st == "running" and spinner.is_stalled(clock, last)
+        stalled = st == "running" and spinner.is_stalled(clock, last, self.snap.online)
         if st == "running":
             mark = self._mark(st, last, frame, clock)
             if stalled:
-                head = f"{mark} idle {spinner.human_duration(spinner.silence(clock, last))}"
+                head = f"{mark} {spinner.idle_text(clock, last)}"
             else:
                 head = f"{mark} working"
                 quiet = self._quiet_runs(clock)
@@ -1566,8 +1570,8 @@ class DashboardView(View):
         clock = time.time() if now is None else now
         last = self._stamp(key)
         age = spinner.human_duration(spinner.silence(clock, last))
-        if spinner.is_stalled(clock, last):
-            label = " ".join(x for x in (f"idle {age}", subject, step) if x)
+        if spinner.is_stalled(clock, last, self.snap.online):
+            label = " ".join(x for x in (spinner.idle_text(clock, last), subject, step) if x)
         else:
             label = " ".join(x for x in ("working", subject, step, age) if x)
         traj.spinner(f"{self._mark('running', last, frame, clock)} [{FAINT}]{esc(label)}[/]")

@@ -195,8 +195,9 @@ class Hub:
         EVENT_WINDOW events, no payload-heavy 200-row reads, no per-run queries)
         for at most STAMP_MISSIONS missions, so at most 24 small queries. Runs
         are read out of that one window in Python. A failed query leaves that
-        mission without a stamp ("unknown"), which animates; it never replays an
-        old stamp. The stamp only decides "animating frame" vs "idle 7m"."""
+        mission without a stamp ("unknown"); it never replays an old stamp. The
+        views never show an offline snapshot as working, whatever the stamps.
+        The stamp only decides "animating frame" vs "idle 7m"."""
         stamps: dict[str, float] = {}
         active = [
             m for m in snap.missions if str(getattr(m.status, "value", m.status)) == "running"

@@ -964,3 +964,23 @@ Project keys live in the project's `settings` JSON (`rework project show <id>`
 prints it). There is no `rework project set` command yet, so changing them today
 means updating that JSON in the store (or creating the project with the keys in
 its settings); the global env vars are the supported knob otherwise.
+
+### When the link to the database drops
+
+The TUI keeps running through an outage. The status bar at the top right changes
+from the green dot to a warning-coloured "○ offline" marker (with the database
+name). The marker carries no error text; the last error (for example
+`OperationalError: server closed the connection`) is the tooltip when you hover
+it. Every list, mission page and chat keeps the last good data it fetched
+instead of blanking, so an open gate is still readable and the decision buttons
+stay where they were. A drop is never a reason to restart: the data service
+reconnects by itself on the next poll (the hub waits 2 s, 4 s, 8 s and so on, up
+to 30 s, between polls whenever a poll fails outright), the open mission page
+repaints as soon as the link is back even when nothing else about the mission
+changed, and a long outage still recovers without duplicating a chat row or
+losing one. No activity stamp is invented while the link is down, and nothing is
+shown as working on no evidence: while the app is offline every running mission
+shows the idle marker instead of the spinner, and the spinner returns on the
+first poll after recovery once a fresh stamp is read. A gate answer pressed
+during an outage fails with a red "Could not answer gate" toast and the gate
+stays open; pressing it again after recovery lands the decision exactly once.

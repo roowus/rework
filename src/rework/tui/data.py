@@ -497,8 +497,19 @@ class TuiData:
         """Answer a gate. `note` is human-facing; `decision` is a TYPED answer
         the paused role receives as its interrupt() result (e.g. free-text
         feedback, or a choice among options the gate offered)."""
-        store = await self.store()
-        gate = await store.decide_gate(gate_id, approved, note, decision, send_back)
+        # Routed through `_resilient` like every other query: a decide during a
+        # brief outage gets the same one-reopen ladder, and a decide that cannot
+        # reach the store sets the offline note instead of leaving the status bar
+        # claiming online. `decide_gate` is idempotent-by-refusal (the UPDATE is
+        # guarded on status = open), so a retry cannot double-decide, and
+        # stale_ok=False keeps a cached payload from ever faking a verdict.
+        gate = await self._resilient(
+            f"decide_gate:{gate_id}",
+            lambda: self._call(
+                lambda s: s.decide_gate(gate_id, approved, note, decision, send_back)
+            ),
+            stale_ok=False,
+        )
         if gate is None:
             return False
         if send_back:  # the third verdict: the mission resumes with `note` as feedback

@@ -34,12 +34,19 @@ def frame_for(t: float) -> str:
     return FRAMES[int(t / SECONDS_PER_FRAME) % len(FRAMES)]
 
 
-def is_stalled(now: float, last_event: float | None) -> bool:
-    """True when a running thing has been silent for at least STALL_SECONDS.
+def is_stalled(now: float, last_event: float | None, online: bool = True) -> bool:
+    """True when a running thing must NOT be shown as working.
+
+    That is the case when it has been silent for at least STALL_SECONDS, or
+    when the link to the store is down (`online` False): while offline no stamp
+    can be read, and "working" would be a claim made with no evidence.
 
     `last_event` is a wall-clock epoch (the `ts` of the newest event, or a run's
-    `updated_at`); `now` is `time.time()`. A missing timestamp is NOT stalled:
-    nothing has been observed yet, so there is nothing to declare dead."""
+    `updated_at`); `now` is `time.time()`. A missing timestamp while ONLINE is
+    NOT stalled: nothing has been observed yet (a brand-new mission), so there
+    is nothing to declare dead."""
+    if not online:
+        return True
     if last_event is None:
         return False
     return (now - float(last_event)) >= STALL_SECONDS
@@ -50,6 +57,14 @@ def silence(now: float, last_event: float | None) -> float:
     if last_event is None:
         return 0.0
     return max(0.0, now - float(last_event))
+
+
+def idle_text(now: float, last_event: float | None) -> str:
+    """ "idle 7m", or a bare "idle" when there is no stamp to measure from (an
+    offline poll), so an unknown silence is never printed as "idle 0s"."""
+    if last_event is None:
+        return "idle"
+    return f"idle {human_duration(silence(now, last_event))}"
 
 
 def human_duration(seconds: float) -> str:
