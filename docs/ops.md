@@ -158,12 +158,14 @@ therefore runs, in the coder's own worktree and just before the push:
    abort runs, so a crash that left both a stopped merge and staged edits loses
    nothing. That ref is a single mutable ref: the next delivery that discards
    anything overwrites it, so only the most recently discarded stash is kept.
-   It is always named in the INFO event of any outcome that discarded work; the
-   PR body names it only for a refused merge or a real conflict, because those
-   are the only two outcomes that get a **Merge with main** section at all. An
-   abort that discards nothing (the usual case, since a stopped merge leaves
-   unmerged entries that `git stash create` refuses) pins no ref and says
-   nothing;
+   The INFO event of any outcome that discarded work names it, and a successful
+   merge is the one outcome that cannot: a stash is only pinned when work is
+   staged, and staged work makes `git status --porcelain` non-empty, which
+   trips the dirty-worktree skip before any merge runs. The PR body names it
+   only for a refused merge or a real conflict, because those are the only two
+   outcomes that get a **Merge with main** section at all. An abort that
+   discards nothing (the usual case, since a stopped merge leaves unmerged
+   entries that `git stash create` refuses) pins no ref and says nothing;
 4. check `git status --porcelain` is empty, so a merge cannot clobber
    uncommitted work (and `git add -A` cannot fold it into the merge commit);
 5. `git fetch origin main`, then `git merge-base --is-ancestor origin/main HEAD`:
@@ -176,10 +178,6 @@ therefore runs, in the coder's own worktree and just before the push:
    uses; `rework <rework@rework.local>` when nothing is configured). One branch's
    history never gains a second author. The merge commit is pushed with the
    coder's commits, so the PR is mergeable. An INFO event names the merge commit.
-
-An up-to-date branch is a silent no-op. The same is true of the three skips,
-**no origin** (step 1), **wrong branch** (step 2) and **dirty worktree** (step 4):
-no event and no body note, since there is nothing the owner can act on.
 
 The silent outcomes are the ones with nothing to act on: **no origin** (step 1),
 **wrong branch** (step 2), **dirty worktree** (step 4) and **already up to
@@ -223,11 +221,14 @@ failed delivery, and a **Merge with main** section is recomputed on every
 attempt, so a retry that merges cleanly cannot republish an earlier conflict.
 To make that cleanup exact, the paragraph is appended behind the marker
 `<!-- rework:merge-note -->`, and a retry strips only from that marker. A row
-stored by an older rework carries no marker, so there the trailing section has
-to read like one of the notes this step writes (it names `main` as **not**
-merged, or lists conflicting paths) before anything is cut. A coder summary or
-auditor finding that itself quotes `## Merge with main` is published verbatim
-and never truncated.
+stored by an older rework carries no marker, so the trailing section is cut
+only when it reads like one of the notes this step writes: it names `main` as
+**not** merged into the branch, lists `Conflicting paths:`, or carries the
+`Staged work that the abort` line about the discarded stash. Without a marker
+that test is only a heuristic, so a coder paragraph that quotes `## Merge with
+main` and then happens to use our own phrasing can still be cut, while a coder
+summary or auditor finding that quotes the heading and then uses other words is
+published verbatim and never truncated.
 
 A sleeping Mac pauses every local mission: nothing fails, it just stops
 until the lid opens (seen 2026-11-09: four stalls that looked like hangs
