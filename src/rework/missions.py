@@ -69,7 +69,31 @@ PLAN_FIX: dict = {
 # has no gate by default but still publishes.
 PLAN_FIX_PR: dict = {"steps": PLAN_FIX["steps"], "gates": [], "publish": "pr"}
 
-PLANS = ("echo", "fix", "fix-pr", "draft")
+# `audit` is understanding work: an investigator scopes the question, a
+# read-only surveyor maps the codebase. It has no coder step, no gate and no
+# `publish`, so it can never push a branch or open a PR.
+PLAN_AUDIT: dict = {
+    "steps": [
+        {
+            "step": "investigate",
+            "role": "investigator",
+            "context": {
+                "brief": "$OBJECTIVE",
+                "depth": "quick",
+                "requested_sections": ["summary", "findings", "blockers"],
+            },
+        },
+        {
+            "step": "survey",
+            "role": "surveyor",
+            "context": {"brief": "$OBJECTIVE"},
+            "context_from": {"investigation": {"step": "investigate"}},
+        },
+    ],
+    "gates": [],
+}
+
+PLANS = ("echo", "fix", "fix-pr", "draft", "audit")
 
 # a derived mission title is a few words for lists (PR titles, `rework ls`,
 # commit subjects): the whole objective is not one (found live: PR #24 was
@@ -114,10 +138,22 @@ def derive_title(objective: str) -> str | None:
 
 # a playbook's FINAL gates. `draft` deliberately has none: its results are
 # the project's files, so there is nothing to push and no PR to open.
-PLAYBOOK_GATES: dict[str, list[str]] = {"echo": [], "fix": ["ship"], "fix-pr": [], "draft": []}
+PLAYBOOK_GATES: dict[str, list[str]] = {
+    "echo": [],
+    "fix": ["ship"],
+    "fix-pr": [],
+    "draft": [],
+    "audit": [],
+}
 
 DEFAULT_BUDGET_USD = 2.0  # what a deployment gets when nothing usable is set
-PLAYBOOK_PUBLISH: dict[str, str] = {"echo": "", "fix": "", "fix-pr": "pr", "draft": ""}
+PLAYBOOK_PUBLISH: dict[str, str] = {
+    "echo": "",
+    "fix": "",
+    "fix-pr": "pr",
+    "draft": "",
+    "audit": "",
+}
 
 
 BUDGET_ERROR = "budget must be a finite number greater than 0"
@@ -489,7 +525,7 @@ async def create_mission(
     upload_project = project_id is not None and await _upload_project(project_id)
     # draft needs one too: the deliverables are files written into the project
     if (
-        plan in ("fix", "fix-pr", "draft")
+        plan in ("fix", "fix-pr", "draft", "audit")
         and not resolved["repo_path"]
         and not resolved["repo_origin"]
         and not upload_project
@@ -510,11 +546,11 @@ async def create_mission(
             budget_usd=budget_usd,
             budget_step_usd=budget_step_usd,
         )
-    elif plan in ("fix", "fix-pr", "draft"):
+    elif plan in ("fix", "fix-pr", "draft", "audit"):
         # `draft` needs the template as much as fix/fix-pr do: without it
         # plan_spec stays None, the engine's DEFAULT_PLAN (echo) takes over, and
         # a programmatic caller silently gets a mission that does nothing.
-        template = PLAN_FIX_PR if plan == "fix-pr" else PLAN_FIX
+        template = {"fix-pr": PLAN_FIX_PR, "audit": PLAN_AUDIT}.get(plan, PLAN_FIX)
         plan_spec = json.loads(json.dumps(template).replace("$OBJECTIVE", objective))
         plan_spec["kind"] = plan
         if budget_usd is not None:
@@ -523,9 +559,10 @@ async def create_mission(
             # missions have never had one, so inventing a default here would
             # put a new cap on every existing `--plan fix` mission.
             plan_spec["budget"] = budget_rail(budget_usd, budget_step_usd)
-        if plan == "draft":
-            # writing in the project's own files: nothing to ship, no PR
-            plan_spec["gates"] = list(PLAYBOOK_GATES["draft"])
+        if plan in ("draft", "audit"):
+            # draft writes the project's own files and audit changes nothing:
+            # either way there is nothing to ship and no PR
+            plan_spec["gates"] = list(PLAYBOOK_GATES[plan])
         if model:
             # a mission-wide model choice replaces the template's per-step pins
             for step in plan_spec["steps"]:

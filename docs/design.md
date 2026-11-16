@@ -110,6 +110,20 @@ the orchestrator is a typed envelope `{kind: blocked|needs_model|needs_tool|
 needs_context|question, detail}`: runtime policies act on the kind mechanically; the
 orchestrator LLM reads the detail.
 
+| Role | Does | Changes code? |
+|---|---|---|
+| investigator | Investigates a brief and reports structured findings with evidence | no |
+| surveyor | Reads a codebase cold and reports a cited map: layout, entry points, tests, CI, risks, gaps | no: read-only, cannot publish |
+| coder | Implements the change in its own worktree and hands off a branch | yes |
+| auditor | Verifies another role's diff and informs the ship decision | no |
+
+Surveyor maps, auditor verifies, coder changes. The surveyor's read-only guarantee is
+enforced in code (`nodes/readonly.py`): its executor wrapper is outermost, offers only
+`read_file`, `list_dir` and a validated read-only `run_command`, and refuses every
+other tool name and any write, redirect or chained command. The `audit` plan
+(investigator, then surveyor) has no coder step, no gate and no `publish`, so it can
+never open a PR.
+
 Escalation policies (engine, M3): `needs_model` promotes within the provider (catalog
 tier order) and resumes the role with no human; when the catalog is exhausted the run
 falls through to a gate tracked by id (decisions are read from gate ROWS, and a resume

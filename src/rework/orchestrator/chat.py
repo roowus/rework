@@ -68,6 +68,9 @@ Plans you can choose:
             research with the web tools, write the draft as files in the
             project, and audit every claim against its cited source. No branch
             push and no PR.
+- audit   - read-only understanding work: map, survey or assess a codebase. A
+            surveyor reads it and returns a cited map. It changes nothing: no
+            coder, no branch push and no PR.
 
 A project may also be repo-less: its transport is "upload", which means rework
 keeps that project's files itself. For an upload project, fix and fix-pr do NOT
@@ -117,7 +120,7 @@ PROPOSE_TOOL = ToolSpec(
                 "type": "string",
                 "description": "A short name for lists, 3 to 6 words.",
             },
-            "plan": {"type": "string", "enum": ["echo", "fix", "fix-pr", "draft"]},
+            "plan": {"type": "string", "enum": ["echo", "fix", "fix-pr", "draft", "audit"]},
             "project": {"type": "string", "description": "Project name, or empty for none."},
             "repo": {
                 "type": "string",

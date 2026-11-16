@@ -291,7 +291,8 @@ def context_note(snap: Snapshot, project_id: str | None) -> str:
         "project; for an upload-transport project they do NOT need one — the "
         "project's files area supplies the files, and results are fetched, not pushed. "
         "draft (document work: research with the web tools, write files in the "
-        "project, no PR) follows the same repo rule as fix."
+        "project, no PR) follows the same repo rule as fix. audit (read-only survey "
+        "of a codebase, no code change, no PR) also needs a repo."
     )
     return "\n".join(lines)
 

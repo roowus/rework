@@ -133,6 +133,12 @@ def render_tool(tool: ToolSpec) -> ToolSpec:
 
 
 PLAYBOOKS: dict[str, str] = {
+    "audit": (
+        "Understanding work, no code changes: optionally spawn an investigator to scope "
+        "the question, then spawn a `surveyor` (read-only) with the objective as its "
+        "brief and read its map. Do NOT spawn a coder: there is no branch push and no "
+        "PR. Finish with the survey's bottom line and the gaps and risks it cites."
+    ),
     "echo": (
         "Plumbing check: spawn the `echo` role once with the objective as its brief, "
         "wait for it, then finish."
@@ -217,6 +223,9 @@ How you work:
   speculative side concerns into extra work items unless they block the goal: a
   one-line change deserves a one-line-sized mission.
 - Read handoffs (`read_artifact`) before deciding what comes next.
+- Spawn `surveyor` for understanding work (audit, map, survey or assess a codebase):
+  it is read-only and returns a cited map. Spawn `auditor` only to check work
+  another role just did (a coder's diff).
 - Keep the owner informed with `message_owner` at meaningful moments only.
 - Roles may ask you questions (`ask_orchestrator`); answer with `answer_escalation`
   when you can, or forward to the owner with `ask_owner(run_id=...)` when only they
@@ -287,7 +296,7 @@ _TOOLS: list[ToolSpec] = [
                 "max_turns": {
                     "type": "integer",
                     "description": "Tool-round budget for this role (cost control). "
-                    "Defaults: investigator 20 (deep 45), coder 40, auditor 25.",
+                    "Defaults: investigator 20 (deep 45), surveyor 25, coder 40, auditor 25.",
                 },
                 "fresh": {
                     "type": "boolean",
@@ -1231,6 +1240,9 @@ class MissionOrchestrator:
         last completed audit (unaudited changes). The only way through is to
         spawn a fresh audit and wait for it."""
         audits = await self._completed_runs("auditor")
+        if not audits and not await self._completed_runs("coder"):
+            if await self._completed_runs("surveyor"):
+                return  # a survey changed nothing: there is no diff to audit
         if not audits:
             raise ToolError(
                 "no auditor has completed in this mission: spawn an auditor on the coder's "
@@ -1974,7 +1986,7 @@ class MissionOrchestrator:
         return "\n".join(lines)
 
 
-DEFAULT_TURNS = {"investigator": 20, "coder": 40, "auditor": 25}
+DEFAULT_TURNS = {"investigator": 20, "surveyor": 25, "coder": 40, "auditor": 25}
 
 
 def _accepted_findings(raw: Any) -> list[dict[str, str]]:
