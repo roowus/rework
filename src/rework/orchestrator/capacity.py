@@ -10,14 +10,18 @@ The rules (:func:`plan`), all derived from constants below:
 
 - cpus below 1 never happen, load below 0 never happens;
 - roles = cpus when the box is idle, halved (integer division, min 1) when the
-  1 minute load average is above the CPU count; a multi-core box never drops
-  under MULTICORE_MIN_ROLES roles (one role per CPU is already the point);
+  1 minute load average is above the CPU count; the LOAD rule alone never takes
+  a multi-core box under MULTICORE_MIN_ROLES roles (one role per CPU is already
+  the point);
 - missions = max(CONCURRENCY_FLOOR, roles), then clamped so it is never MORE
   than roles: a mission slot with nothing to run is a wasted queue slot;
 - available RAM, when /proc/meminfo says so, must be at least
-  MIN_RAM_PER_ROLE_BYTES per planned role, and roles are cut until it is
-  (floor 1). This is the rule that keeps the box out of swap, the 2026-11-13
-  failure mode (docs/ops.md#the-2026-11-13-incident).
+  MIN_RAM_PER_ROLE_BYTES per planned role, and roles are cut one at a time
+  until it is, down to 1. The RAM rule runs AFTER the load rule and is not
+  bounded by MULTICORE_MIN_ROLES: plan(16, 0.0, 2 GB) is 1 mission / 1 role,
+  because protecting the box beats using it. This is the rule that keeps the
+  box out of swap, the 2026-11-13 failure mode
+  (docs/ops.md#the-2026-11-13-incident).
 
 1.5 GB is MIN_RAM_PER_ROLE_BYTES = 1_500_000_000 bytes: the DECIMAL gigabyte,
 the same unit the log line prints ("9.1 GB free").
@@ -305,6 +309,7 @@ class DynamicCapacity:
         )
         self._task: asyncio.Task[None] | None = None
         self.last: Capacity | None = None
+        self._warned = False
 
     @property
     def enabled(self) -> bool:
@@ -327,11 +332,33 @@ class DynamicCapacity:
             return None
         return self._apply(self.policy.observe(*self._measure()))
 
+    def _guarded(self, action: Callable[[], Capacity | None]) -> Capacity | None:
+        """One measurement, made fatal proof: a raise inside the measurement OR
+        inside applying it is logged at WARNING with its traceback, the caps
+        stay where they were and the watchdog keeps its interval. A persistent
+        failure warns ONCE, not once per tick, so it cannot bury the log."""
+        try:
+            result = action()
+        except Exception:
+            if not self._warned:
+                self._warned = True
+                log.warning(
+                    "capacity update failed, keeping %d missions / %d roles and "
+                    "retrying every %.0f s",
+                    self._slots.capacity,
+                    self._limiter.cap,
+                    self.settings.interval_s,
+                    exc_info=True,
+                )
+            return None
+        self._warned = False
+        return result
+
     def start(self) -> asyncio.Task[None] | None:
         """Apply the first plan and start the watchdog (needs a running loop)."""
         if not self.enabled:
             return None
-        self.apply_now()
+        self._guarded(self.apply_now)  # a failed first look must not abort startup
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._watch(), name="rework-capacity")
         return self._task
@@ -351,7 +378,7 @@ class DynamicCapacity:
     async def _watch(self) -> None:
         while True:
             await asyncio.sleep(self.settings.interval_s)
-            self.observe_now()
+            self._guarded(self.observe_now)
 
     def _apply(self, new: Capacity | None) -> Capacity | None:
         if new is None:

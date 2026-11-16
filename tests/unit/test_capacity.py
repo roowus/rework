@@ -344,6 +344,38 @@ def test_no_log_line_when_the_plan_did_not_change(caplog: pytest.LogCaptureFixtu
     assert [r for r in caplog.records if r.name == "rework.capacity"] == []
 
 
+def test_a_box_already_at_its_caps_logs_nothing_on_apply(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """apply_now() on a box already at the constructed caps: _apply runs and the
+    caps do not move, so the change-log guard must stay silent (observe_now()
+    never reaches that guard, it returns before it)."""
+    slots, limiter = PrioritySlots(8), RoleLimiter(8)
+    dyn = DynamicCapacity(slots, limiter, settings=_settings(), measure_fn=lambda: (8, 0.0, None))
+    with caplog.at_level(logging.INFO, logger="rework.capacity"):
+        assert dyn.apply_now() is not None, "the first look is applied unconditionally"
+    assert (slots.capacity, limiter.cap) == (8, 8)
+    assert [r for r in caplog.records if r.name == "rework.capacity"] == [], "no change, no line"
+    assert [r for r in caplog.records if r.name == "rework.capacity"] == [], "still nothing"
+
+
+def test_an_intervening_different_plan_resets_the_hysteresis_streak() -> None:
+    """A, B, A, A: B must clear the A streak, so the change lands on the FOURTH
+    measurement. Without that reset B would be confirmed on its second sighting
+    and applied on the second measurement of the run."""
+    policy = CapacityPolicy(concurrency=2, max_roles=2)
+    four = (4, 0.0, None)  # A: 4 idle CPUs plan 4 missions / 4 roles
+    six = (6, 0.0, None)  # B: a third pair, neither the current caps nor A
+    assert (plan(*four).concurrency, plan(*four).max_roles) == (4, 4)
+    assert (plan(*six).concurrency, plan(*six).max_roles) == (6, 6)
+    assert policy.observe(*four) is None, "first sighting of A: not confirmed yet"
+    assert policy.observe(*six) is None, "B is a different target: the A streak dies"
+    assert (policy.concurrency, policy.max_roles) == (2, 2), "B was not applied either"
+    assert policy.observe(*four) is None, "A starts a NEW streak, one long again"
+    assert policy.observe(*four) is not None, "two A in a row now: apply"
+    assert (policy.concurrency, policy.max_roles) == (4, 4)
+
+
 def test_one_bad_measurement_does_not_move_the_caps(caplog: pytest.LogCaptureFixture) -> None:
     slots, limiter = PrioritySlots(2), RoleLimiter(2)
     readings = [(2, 0.0, None), (2, 30.0, None)]
@@ -432,6 +464,110 @@ async def test_the_watchdog_ticks_and_applies_a_confirmed_change() -> None:
         assert (slots.capacity, limiter.cap) == (2, 2), dyn.last
     finally:
         await dyn.stop()
+
+
+async def test_one_raise_does_not_kill_the_watchdog(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unexpected raise inside a tick is logged once, at WARNING, with the
+    traceback, and the loop keeps its interval: the next measurement is applied."""
+
+    def flaky() -> tuple[int, float, int | None]:
+        calls.append(len(calls) + 1)
+        if len(calls) == 2:
+            raise RuntimeError("boom: a probe that cannot answer")
+        return (2, 0.0, None) if len(calls) >= 3 else (4, 0.0, None)
+
+    calls: list[int] = []
+    slots, limiter = PrioritySlots(1), RoleLimiter(1)
+    dyn = DynamicCapacity(slots, limiter, settings=_settings(interval_s=0.01), measure_fn=flaky)
+    with caplog.at_level(logging.WARNING, logger="rework.capacity"):
+        task = dyn.start()  # call 1: applied at once, unconditionally
+        assert task is not None
+        assert (slots.capacity, limiter.cap) == (4, 4)
+        try:
+            for _ in range(200):
+                if len(calls) >= 4:
+                    break
+                await asyncio.sleep(0.01)
+            assert len(calls) >= 3, "the loop kept ticking after the raise"
+            for _ in range(200):
+                if (slots.capacity, limiter.cap) == (2, 2):
+                    break
+                await asyncio.sleep(0.01)
+            assert not task.done(), "one raise must not end the watchdog"
+            assert (slots.capacity, limiter.cap) == (2, 2), "the next measurement applied"
+        finally:
+            await dyn.stop()
+    warnings = [
+        r for r in caplog.records if r.name == "rework.capacity" and r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1, f"one warning, not one per tick: {[r.message for r in warnings]}"
+    assert "capacity update failed" in warnings[0].message
+    assert "2 missions / 2 roles" in warnings[0].message or "4 missions / 4 roles" in (
+        warnings[0].message
+    )
+    assert warnings[0].exc_info is not None, "the traceback goes with it"
+
+
+async def test_a_persistent_failure_warns_once_not_once_per_tick(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Every tick fails: the loop stays alive and the log gets ONE warning, so a
+    broken probe cannot bury the file at one record a minute."""
+
+    calls: list[int] = []
+
+    def always_boom() -> tuple[int, float, int | None]:
+        calls.append(len(calls) + 1)
+        raise RuntimeError("boom")
+
+    slots, limiter = PrioritySlots(2), RoleLimiter(2)
+    dyn = DynamicCapacity(
+        slots, limiter, settings=_settings(interval_s=0.01), measure_fn=always_boom
+    )
+    with caplog.at_level(logging.WARNING, logger="rework.capacity"):
+        task = dyn.start()
+        assert task is not None
+        try:
+            for _ in range(200):
+                if len(calls) >= 5:
+                    break
+                await asyncio.sleep(0.01)
+            assert len(calls) >= 5, "the watchdog kept ticking through the failures"
+            assert not task.done(), "a persistent raise must not end the watchdog"
+        finally:
+            await dyn.stop()
+    assert (slots.capacity, limiter.cap) == (2, 2)
+    warnings = [
+        r for r in caplog.records if r.name == "rework.capacity" and r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1, f"warned {len(warnings)} times for {len(calls)} failures"
+
+
+async def test_a_failed_first_measurement_does_not_abort_startup(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """start() applies the first plan; if that measurement raises, the daemon
+    still starts, the watchdog still runs and the caps stay as constructed."""
+
+    def boom() -> tuple[int, float, int | None]:
+        raise RuntimeError("boom")
+
+    slots, limiter = PrioritySlots(3), RoleLimiter(3)
+    dyn = DynamicCapacity(slots, limiter, settings=_settings(), measure_fn=boom)
+    with caplog.at_level(logging.WARNING, logger="rework.capacity"):
+        task = dyn.start()
+    assert task is not None, "startup must not be aborted by the failed measurement"
+    assert dyn.task is task
+    assert not task.done()
+    assert (slots.capacity, limiter.cap) == (3, 3), "caps stay as constructed"
+    await dyn.stop()
+    assert task.done()
+    warnings = [r for r in caplog.records if r.name == "rework.capacity"]
+    assert len(warnings) == 1, "one warning for the one failure"
+    assert warnings[0].levelno == logging.WARNING
+    assert warnings[0].exc_info is not None
 
 
 # -- daemon wiring ------------------------------------------------------------

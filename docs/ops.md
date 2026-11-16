@@ -489,12 +489,15 @@ back to `running` the moment its last gate is decided, and the daemon corrects
 any `awaiting_gate` row with no open gate on every poll (a log line and an INFO
 event say so).
 
-A sqlite deployment keeps its historical concurrency of 1 unless the env says
-otherwise, and Postgres deployments get the host-aware default. With
-`REWORK_CAPACITY=auto` (the default) both are only the STARTING value: the caps
-then follow the host on either backend, so pin one with an explicit
-`REWORK_CONCURRENCY` / `REWORK_MAX_ROLES` or turn the watchdog off with
-`REWORK_CAPACITY=fixed` when a deployment must not move.
+A sqlite deployment STARTS at its historical concurrency of 1, and Postgres
+deployments start at the host-aware default. Either way that is only the
+starting value: with `REWORK_CAPACITY=auto` (the default) the first measurement
+moves both caps to what the box can take, so an idle 8-core sqlite deployment
+runs 8 missions and 8 roles, and the old `min(cpu_count, 4)` ceiling no longer
+applies at runtime. A sqlite deployment therefore no longer keeps concurrency 1
+forever unless it says so: set `REWORK_CONCURRENCY` (or `REWORK_MAX_ROLES`) to
+pin that one cap, or `REWORK_CAPACITY=fixed` to keep the resolved startup caps
+and nothing else.
 
 #### Capacity: the two caps follow the box (`REWORK_CAPACITY`)
 
@@ -503,12 +506,22 @@ With the default `REWORK_CAPACITY=auto`, `REWORK_CONCURRENCY` and
 `REWORK_CAPACITY_INTERVAL_S` seconds (default 60) the daemon re-measures the
 host and moves both caps, so switching from a busy box to an idle one needs no
 edit and no restart. A quiet box plans one role and one mission per CPU (2 and
-2 on a 2-core box, 8 and 8 on an idle 8-core box); when the 1-minute load
-average is above the CPU count the role count halves (never below 2 on a
-multi-core box); and when `MemAvailable` in /proc/meminfo is under 1.5 GB per
-planned role, roles are cut until it is (floor 1). The mission cap never
-exceeds the role cap. A change is applied only when the same plan shows up in
-two measurements in a row, so one `uv sync` burst does not flap the caps.
+2 on a 2-core box, 8 and 8 on an idle 8-core box). Two cuts can follow, in this
+order:
+
+1. LOAD: when the 1-minute load average is strictly above the CPU count the
+   role count halves, and on a multi-core box this rule never takes it below 2
+   (one role per CPU is already the point). A load average exactly equal to the
+   CPU count does not halve: 8 CPUs at load 8.0 still plans 8 and 8.
+2. RAM: when `MemAvailable` in /proc/meminfo is under 1.5 GB (1.5 decimal GB,
+   `1_500_000_000` bytes) per planned role, roles are cut one at a time until
+   they fit, down to 1. This rule runs AFTER the load rule and the floor of 2
+   does not bound it, because protecting the box beats using it: 16 idle CPUs
+   with 2 GB free plan 1 mission and 1 role.
+
+The mission cap never exceeds the role cap. A change is applied only when the
+same plan shows up in two measurements in a row, so one `uv sync` burst does
+not flap the caps.
 
 Shrinking never cancels work: running missions keep their slots until they
 finish (the free-slot count goes negative until their releases bring it back),
@@ -516,9 +529,13 @@ and new work simply stops being admitted. Every change is ONE log line with
 the reason, and nothing is logged while the caps hold:
 
 ```
-capacity changed: 8 missions / 8 roles -> 4 missions / 4 roles
-(8 CPUs, load 12.4, 5.1 GB free: 4 missions / 4 roles)
+capacity changed: 8 missions / 8 roles -> 4 missions / 4 roles (8 CPUs, load 12.4, 6.5 GB free: 4 missions / 4 roles)
 ```
+
+Those numbers are what the code actually prints for that box: 8 CPUs at load
+12.4 halve to 4 roles, and 6.5 GB free covers 4 roles at 1.5 GB each (6.0 GB).
+The same box with 5.1 GB free plans 3 and 3 instead, because the RAM cut takes
+the fourth role away.
 
 Precedence: an EXPLICIT `REWORK_CONCURRENCY` or `REWORK_MAX_ROLES` (a non-empty
 value in the env) fixes that one cap and `auto` manages only the other one;
