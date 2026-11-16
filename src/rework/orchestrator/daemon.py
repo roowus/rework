@@ -375,8 +375,8 @@ class Daemon:
                         return
                     # bound reached: fail, but keep the reason visible
                     error = (
-                        f"transient database error, crash {count} of"
-                        f" {MAX_TRANSIENT_CRASHES}, giving up: {summary}"
+                        f"transient database error, crash {count} after"
+                        f" {MAX_TRANSIENT_CRASHES} requeues, giving up: {summary}"
                     )
                 await self._store.update_mission(
                     mission_id,

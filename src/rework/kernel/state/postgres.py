@@ -260,22 +260,28 @@ def _serialized(method: Any) -> Any:
 
     @functools.wraps(method)
     async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        # The lock is OUTERMOST and the retry sits INSIDE it: a retried attempt
-        # must not re-enter the (reentrant) op lock from a nested public call,
-        # and no other task may slip a statement onto the shared connection
-        # between our attempts. A deadlock (SQLSTATE 40P01) or a serialization
-        # failure (40001) is retried here, once, for every read and write the
-        # store exposes; `cleanup` rolls the aborted transaction back so each
-        # attempt starts from a clean connection.
-        async with self._op_lock:
-            try:
-                return await retry_transient(
-                    lambda: method(self, *args, **kwargs),
-                    cleanup=self._end_idle_transaction,
-                    label=f"PostgresStore.{method.__name__}",
-                )
-            finally:
-                await self._end_idle_transaction()
+        # The lock is PER ATTEMPT and the retry sits OUTSIDE it. A deadlock
+        # (SQLSTATE 40P01) or a serialization failure (40001) is retried here,
+        # once, for every read and write the store exposes, and retry_transient
+        # sleeps 10 to 100 ms between attempts. This store owns ONE async
+        # connection, so holding the op lock across that sleep would stall the
+        # whole daemon: the event pump, every role task's update_run and the
+        # leader heartbeat would all wait out the backoff. Hence the lock covers
+        # one attempt only. The connection is left clean INSIDE the lock (the
+        # `finally` commits or rolls back) before the lock is released, so no
+        # other task can observe a half-finished transaction and a retried
+        # attempt starts from a clean connection. The lock stays reentrant per
+        # task, so a nested public call (update_mission -> get_mission) still
+        # takes it without self-deadlocking, and retry.py's depth guard keeps
+        # one warning per retry rather than one per nested call.
+        async def attempt() -> Any:
+            async with self._op_lock:
+                try:
+                    return await method(self, *args, **kwargs)
+                finally:
+                    await self._end_idle_transaction()
+
+        return await retry_transient(attempt, label=f"PostgresStore.{method.__name__}")
 
     return wrapper
 

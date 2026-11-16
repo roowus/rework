@@ -122,7 +122,7 @@ to PENDING with `transient_db_error` and a `crash` note in its result
 ("transient database error, crash 1 of 3, resuming from its checkpoint"), a
 WARNING is logged, an INFO event says it will resume from its checkpoint, and
 the pickup machinery restarts it from there. Past 3 crashes it fails with
-"transient database error, crash N of 3, giving up: <error>" as the result
+"transient database error, crash N after 3 requeues, giving up: <error>" as the result
 error, and a non-transient error fails at once. The counter resets to 0 at a
 terminal status, so a later run gets the full budget.
 

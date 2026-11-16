@@ -147,7 +147,9 @@ async def test_the_crash_past_the_bound_fails_the_mission(tmp_path: Path) -> Non
         assert mission is not None and mission.status == MissionStatus.FAILED
         error = (mission.result or {})["error"]
         assert "transient database error" in error
-        assert f"crash {MAX_TRANSIENT_CRASHES + 1} of {MAX_TRANSIENT_CRASHES}" in error
+        assert (
+            f"crash {MAX_TRANSIENT_CRASHES + 1} after {MAX_TRANSIENT_CRASHES} requeues"
+        ) in error
         assert "giving up" in error and "40P01" in error
         assert EventType.MISSION_FAILED in await _events(store, mission_id)
     finally:

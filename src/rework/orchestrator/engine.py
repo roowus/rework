@@ -46,6 +46,7 @@ from rework.kernel.state.records import (
 from rework.kernel.state.records import (
     run_id as make_run_id,
 )
+from rework.kernel.state.retry import is_transient_db_error
 from rework.kernel.state.store import StateStore
 from rework.logs import bind
 from rework.missions import project_is_upload
@@ -172,6 +173,11 @@ class RunSupervisor:
         self._closers: list[Callable[[], Awaitable[None]]] = []
         self._ctxs: dict[str, RoleBuildCtx] = {}
 
+    #: A transient database error that escaped a role run. `_pump_until_terminal`
+    #: re-raises it so it reaches Daemon._log_runner_error, which requeues the
+    #: mission; recording it as a FAILED run instead made it terminal.
+    _fatal: BaseException | None = None
+
     async def _build_graph(self, run: Run) -> Any:
         spec = self._registry.get(run.role)
         from rework.config import default_model_id
@@ -296,6 +302,13 @@ class RunSupervisor:
             log.info("role %s cancelled", run.role)
             raise
         except Exception as exc:
+            if is_transient_db_error(exc):
+                # Not this run's failure: the server rolled the transaction back
+                # and told us to run it again. Hand it to the daemon's crash
+                # handler (which requeues from the checkpoint) instead of turning
+                # it into a FAILED run, which failed the MISSION via _synthesize.
+                self._fatal = exc
+                raise
             log.exception("role %s failed", run.role)
             await self._store.update_run(run.id, status=RunStatus.FAILED)
             await self._bus.publish(
@@ -382,6 +395,9 @@ class RunSupervisor:
             result = await graph.ainvoke(Command(resume=decision), config=config)
             await self._consume_result(run, result)
         except Exception as exc:
+            if is_transient_db_error(exc):
+                self._fatal = exc
+                raise
             log.exception("role %s resume failed", run.role)
             await self._store.update_run(run.id, status=RunStatus.FAILED)
             await self._bus.publish(
@@ -1375,6 +1391,11 @@ class MissionRunner:
         gate is checked BEFORE handling halts: a spend-cap hold must not sit
         behind an unanswered escalation gate."""
         while True:
+            fatal = self._supervisor._fatal if self._supervisor is not None else None
+            if fatal is not None:
+                # A transient database error inside a role run: raise it out of
+                # the runner so the daemon's crash handler requeues the mission.
+                raise fatal
             signal = await self._owner_signal()
             if signal == "cancelled":
                 return "cancelled"

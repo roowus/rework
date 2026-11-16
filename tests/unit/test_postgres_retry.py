@@ -13,8 +13,12 @@ the only two attributes the wrapper touches.
 
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 
+from rework.kernel.state import retry as retry_module
 from rework.kernel.state.postgres import _serialized, _TaskLock
 from rework.kernel.state.retry import MAX_ATTEMPTS, TransientDatabaseError
 
@@ -88,3 +92,59 @@ async def test_serialized_exhaustion_still_classifies_as_transient() -> None:
     assert store.calls == MAX_ATTEMPTS
     assert caught.value.attempts == MAX_ATTEMPTS
     assert caught.value.sqlstate == "40P01"
+
+
+class TwoMethodStore:
+    """Two decorated methods sharing ONE op lock: the lock is what is under test."""
+
+    def __init__(self, failures: list[Exception]) -> None:
+        self._op_lock = _TaskLock()
+        self._failures = list(failures)
+        self.others = 0
+
+    async def _end_idle_transaction(self) -> None:
+        return None
+
+    @_serialized
+    async def deadlocking(self) -> str:
+        if self._failures:
+            raise self._failures.pop(0)
+        return "first"
+
+    @_serialized
+    async def other(self) -> str:
+        self.others += 1
+        return "second"
+
+
+async def test_the_backoff_sleep_does_not_hold_the_op_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The op lock covers ONE ATTEMPT, so the backoff sleep must not hold it.
+
+    While the deadlocked write is in its sleep, a second task must be able to
+    take the lock and finish its own call. Pre-fix the sleep ran INSIDE
+    `async with self._op_lock`, so `other()` blocked on the lock until the retry
+    was over and the wait_for below timed out. The sleep is patched, so no real
+    delay is involved and the interleaving is deterministic."""
+    store = TwoMethodStore([DbError("deadlock detected", "40P01")])
+    sleeping = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_sleep(_delay: float) -> None:
+        sleeping.set()
+        await release.wait()
+
+    monkeypatch.setattr(retry_module, "asyncio", SimpleNamespace(sleep=fake_sleep))
+
+    first = asyncio.create_task(store.deadlocking())
+    await asyncio.wait_for(sleeping.wait(), timeout=5)
+    assert not first.done(), "the first call must be sleeping between its attempts"
+
+    # the decisive assertion: another task gets the connection during the backoff
+    assert await asyncio.wait_for(store.other(), timeout=5) == "second"
+    assert store.others == 1
+    assert not first.done(), "the second call must finish BEFORE the first returns"
+
+    release.set()
+    assert await asyncio.wait_for(first, timeout=5) == "first"
