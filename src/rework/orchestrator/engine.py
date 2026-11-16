@@ -411,6 +411,22 @@ class RunSupervisor:
         finally:
             self.limiter.release(run.id)
 
+    async def check_fatal(self) -> None:
+        """Re-raise a transient database error that escaped a role run.
+
+        Called from every path that could otherwise wait on a run row that will
+        never leave RUNNING (the step pump, and the orchestrator's owner gate,
+        which its wait loop and turn loop both pass through). Retires each
+        finished task's exception on the way (that IS the retrieval: a task
+        nobody awaits ends with "Task exception was never retrieved"), then
+        re-raises the latch so the runner dies with it and Daemon's crash
+        handler requeues the mission instead of failing it."""
+        done = [task for task in self.tasks.values() if task.done()]
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
+        if self._fatal is not None:
+            raise self._fatal
+
     async def wait_all(self) -> None:
         if self.tasks:
             await asyncio.gather(*self.tasks.values())
@@ -1391,11 +1407,10 @@ class MissionRunner:
         gate is checked BEFORE handling halts: a spend-cap hold must not sit
         behind an unanswered escalation gate."""
         while True:
-            fatal = self._supervisor._fatal if self._supervisor is not None else None
-            if fatal is not None:
+            if self._supervisor is not None:
                 # A transient database error inside a role run: raise it out of
                 # the runner so the daemon's crash handler requeues the mission.
-                raise fatal
+                await self._supervisor.check_fatal()
             signal = await self._owner_signal()
             if signal == "cancelled":
                 return "cancelled"
