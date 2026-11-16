@@ -319,7 +319,12 @@ class DashboardView(View):
 
     def hints(self) -> list[tuple[str, str]]:
         if self.mission_id:
-            return [("click", "focus a session"), ("esc", "back"), ("ctrl+c", "copy")]
+            return [
+                ("click", "focus a session"),
+                ("click", "transcript"),
+                ("esc", "back"),
+                ("ctrl+c", "copy"),
+            ]
         return [
             ("/", "search"),
             ("tab ⇥", "cycle focus"),
@@ -1096,6 +1101,11 @@ class DashboardView(View):
         if event.action == "msg-send":
             self._send_message()
             return
+        if event.action == "transcript":
+            # its own door, not a control verb: the orchestrator chat is not in
+            # the CHATS list, so it is opened by mission id (see open_transcript)
+            self.open_transcript()
+            return
         verb = event.action
         if verb == "copy-id":
             self.rw.copy_to_clipboard(self.mission_id)
@@ -1783,6 +1793,18 @@ class DashboardView(View):
         with self.painting():
             self.query_one("#m-msg", Input).value = ""
         self.toast(f"Sent to {mission_id}'s orchestrator")
+
+    def open_transcript(self) -> None:
+        """Open the OPEN mission's orchestrator transcript on the Work tab.
+
+        That chat is filtered out of the CHATS list (one per mission,
+        machinery rather than a conversation), so it is opened by id through
+        the Work view, which toasts "no transcript yet" when the orchestrator
+        never ran instead of painting a blank panel."""
+        if not self.mission_id:
+            return
+        self.rw.action_tab("work")
+        self.rw.view("work").open_transcript(self.mission_id)
 
     def _gate_button(self, btn: Btn) -> bool:
         if not btn.action.startswith("gate-"):

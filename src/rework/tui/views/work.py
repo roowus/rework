@@ -18,6 +18,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Input, Static, TextArea
 
+from rework.kernel.state.records import orchestrator_chat_id
 from rework.tui import actions
 from rework.tui.conversation import (
     Conversation,
@@ -27,7 +28,6 @@ from rework.tui.conversation import (
     items_from_messages,
     same_proposal,
 )
-from rework.kernel.state.records import orchestrator_chat_id
 from rework.tui.hub import Snapshot
 from rework.tui.theme import (
     ACCENT,

@@ -136,7 +136,11 @@ specified in `docs/tui/DESIGN.md`; every view is built from that kit.
   (status, last steps, inline gate answers, pause/cancel). Nothing runs until
   you confirm: typing "yes" launches every pending proposal and "no" scraps
   every one of them. Project / model / effort knobs under the prompt. Opens
-  with no chat selected.
+  with no chat selected. A chat that never got a message (the shell mission
+  creation mints for the CLI) is not listed: it would open blank. A mission's
+  own orchestrator transcript is not listed either (there is one per mission,
+  machinery rather than a conversation); it opens from the mission's Work row
+  and from the Dashboard Transcript action.
 - **Dashboard**: overview (stats strip, projects, missions grouped needs-you →
   queued → running → paused → recent) and a mission drill-down: header + flow strip,
   sessions (one per run) on the left, and Trajectory / Graph (LangGraph-style

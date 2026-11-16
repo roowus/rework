@@ -43,8 +43,8 @@ from rework.kernel.state.records import (
     MissionStatus,
     Run,
     RunStatus,
+    orchestrator_chat_id,
 )
-from rework.kernel.state.records import orchestrator_chat_id
 from rework.kernel.state.records import run_id as make_run_id
 from rework.logs import bind
 from rework.nodes.report_sections import blocking_findings, open_blockers
