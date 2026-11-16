@@ -360,12 +360,19 @@ async def test_send_back_at_gate_returns_mission_to_running(world: dict) -> None
 async def test_gate_row_visible_before_mission_parks_then_converges_to_awaiting_gate(
     world: dict,
 ) -> None:
-    """The gate row and the mission status are two writes, so a SECOND
-    connection can see the open ship gate while the mission still reads
-    `running`. What the engine owes a reader is convergence: within a bounded
-    wait the mission says AWAITING_GATE, and it stays there while the gate
-    remains open (it never flaps back to `running`). Tests therefore wait for
-    both facts (conftest.wait_for_gate_park), never for the gate row alone."""
+    """What this proves: on a SECOND connection, after the ship gate row is
+    visible, the engine CONVERGES to AWAITING_GATE within a bounded wait and
+    never regresses to `running` while the gate stays open (the design decision
+    recorded in docs/design.md). The wait is bounded, not fire-and-forget: if
+    the engine never writes the status the convergence wait raises TimeoutError
+    naming the mission park (not verified by mutation here).
+
+    What it does NOT prove: instantaneous equality at the moment the gate row
+    appears. Its own ship-gate wait above is deliberately gate-only, and by the
+    time it returns the status has landed, so this test also passes against a
+    gate-row-only proxy and is NOT the lock for that contract. The barrier
+    contract itself (the helper must not return on the gate row alone) is
+    locked in tests/integration/test_gate_park_barrier.py."""
     store: SqliteStore = world["store"]
     mission = await store.create_mission(
         Mission(

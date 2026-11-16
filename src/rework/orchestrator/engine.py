@@ -831,15 +831,15 @@ class MissionRunner:
                 )
             else:
                 gate = await self._refresh_gate_question(gate, question)
-            # The gate row is committed BEFORE the mission status by design
-            # (two autocommit statements). A reader may briefly see an open
-            # gate beside a `running` row; tests must wait for BOTH facts, not
-            # for the gate row alone (conftest.wait_for_gate_park). The order is
-            # not flipped: status-first would expose AWAITING_GATE with no gate
-            # row, which daemon._repair_stale_gate_status corrects back to
-            # RUNNING and engine._clear_awaiting_gate treats as stale.
+            # The gate row is committed before the mission status, and the two
+            # writes are never atomic: an open gate beside a `running` row, and
+            # an `awaiting_gate` row whose gate row is not committed yet, are
+            # both legal transients. Readers converge and must wait on BOTH
+            # facts, not on the gate row alone (conftest.wait_for_gate_park).
+            # The order stays gate-row-first: status-first would move the
+            # transient to `awaiting_gate` with no gate row, which the daemon
+            # repair pass and the _handle_halted wait loop both assume away.
             if gate.status == GateStatus.OPEN:
-                await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
             ship_decision = await self._gate_decision(mission.id, gate.id)
             if ship_decision is None:
                 # Send-back: mission back to running, don't synthesize
@@ -911,13 +911,14 @@ class MissionRunner:
                 )
             else:
                 gate = await self._refresh_gate_question(gate, question)
-            # The gate row is committed BEFORE the mission status by design
-            # (two autocommit statements). A reader may briefly see an open
-            # gate beside a `running` row; tests must wait for BOTH facts, not
-            # for the gate row alone (conftest.wait_for_gate_park). The order is
-            # not flipped: status-first would expose AWAITING_GATE with no gate
-            # row, which daemon._repair_stale_gate_status corrects back to
-            # RUNNING and engine._clear_awaiting_gate treats as stale.
+            # The gate row is committed before the mission status, and the two
+            # writes are never atomic: an open gate beside a `running` row, and
+            # an `awaiting_gate` row whose gate row is not committed yet, are
+            # both legal transients. Readers converge and must wait on BOTH
+            # facts, not on the gate row alone (conftest.wait_for_gate_park).
+            # The order stays gate-row-first: status-first would move the
+            # transient to `awaiting_gate` with no gate row, which the daemon
+            # repair pass and the _handle_halted wait loop both assume away.
             if gate.status == GateStatus.OPEN:
                 await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
             pr_approved = await self._gate_decision(mission.id, gate.id)
@@ -1668,7 +1669,10 @@ class MissionRunner:
         if gated:
             # gate rows first, status second, same reason as _final_gates: the
             # pair is never atomic, so a reader may see an open escalation gate
-            # beside a running row and must wait for both (wait_for_gate_park)
+            # beside a running row and must wait on both facts, not the gate
+            # row alone (conftest.wait_for_gate_park). Status-first instead
+            # shows `awaiting_gate` with no gate row, which the daemon repair
+            # pass and the wait loop below both assume away.
             await self._store.update_mission(self.mission_id, status=MissionStatus.AWAITING_GATE)
         while True:
             open_gates = await self._store.list_open_gates(self.mission_id)
