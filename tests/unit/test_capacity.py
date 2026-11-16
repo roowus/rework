@@ -1047,11 +1047,13 @@ async def test_the_collision_states_the_clamp_in_the_one_startup_line(
 ) -> None:
     """REWORK_CONCURRENCY=8 with REWORK_MAX_ROLES=4, on a QUIET and a BUSY box.
 
-    On the quiet box the role floor of 4 is below what 8 idle CPUs plan (8
-    roles), so no measurement clamps anything and nothing is cut; on the busy
-    box the plan is cut to 4 and 4. The startup line advertises floor 8 missions
-    next to a 4 role cap in BOTH cases, so it must say why in the one line it
-    prints, from the numbers themselves and not from the reading."""
+    The clause belongs to the cut and only to the cut, so the two boxes differ:
+    on the quiet box 8 idle CPUs plan 8 roles, which already clears the role
+    floor of 4, so the applied pair is 8 and 8 and NOTHING was clamped - a line
+    that claimed a clamp there would be self-contradictory (floor 8 next to an
+    applied 8, no cut anywhere). On the busy box the plan stops at the role
+    floor of 4, the mission number really is cut to 4, and the one line must say
+    why, in one clause."""
     monkeypatch.setenv("REWORK_CONCURRENCY", str(IDLE_CPUS))
     monkeypatch.setenv("REWORK_MAX_ROLES", str(FLOOR_MAX_ROLES))
     settings = CapacitySettings.from_env()
@@ -1070,9 +1072,15 @@ async def test_the_collision_states_the_clamp_in_the_one_startup_line(
     assert f"{pair[0]} missions / {pair[1]} roles" in line, f"the plan it applied: {line}"
     assert f"missions MANAGED, floor {IDLE_CPUS}" in line, "the floor the line advertises"
     assert f"roles MANAGED, floor {FLOOR_MAX_ROLES}" in line, "next to the smaller role cap"
-    clause = "mission floor 8 cannot exceed the 4 role cap, raise REWORK_MAX_ROLES"
-    assert clause in line, f"the clamp clause must be in the one line: {line}"
-    assert line.count("role cap") == 1, "one clause, not a paragraph"
+    if pair == (IDLE_CPUS, IDLE_CPUS):
+        # quiet box: the planner's own 8 roles clear the floor of 4, so the
+        # applied mission number is the declared one and nothing was cut
+        assert "role cap" not in line, f"nothing was clamped, so no clause: {line}"
+        assert "cut to the planner's" not in line, line
+    else:
+        clause = "mission floor 8 cannot exceed the 4 role cap, raise REWORK_MAX_ROLES"
+        assert clause in line, f"the clamp clause must be in the one line: {line}"
+        assert line.count("role cap") == 1, "one clause, not a paragraph"
 
 
 async def test_a_lone_mission_floor_states_the_cut_in_the_one_startup_line(

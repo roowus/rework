@@ -68,9 +68,12 @@ REWORK_CAPACITY_PINS (default floor) decides what a hand-set number MEANS:
 - an invalid REWORK_CAPACITY_PINS raises ValueError out of
   :meth:`CapacitySettings.from_env`; it never falls back to a silent default.
 - the mission cap never exceeds the role cap, under either mode: a mission floor
-  above the role cap is cut to that role cap (REWORK_CONCURRENCY=8 with
-  REWORK_MAX_ROLES=4 never runs more than 4 missions) and the reason sentence
-  says so in one clause.
+  above the role cap is cut to that role cap, and the reason sentence says so in
+  one clause. REWORK_CONCURRENCY=8 with REWORK_MAX_ROLES=4 never runs more than 4
+  missions on a box whose own role plan is 4 (busy 2 CPUs: 4 and 4, the role
+  floor); on a quiet 8 CPU box the same two floors plan 8 and 8 and nothing is
+  cut. Under pins=fixed the mission number is cut to the PINNED role number
+  instead (8 missions and 4 pinned roles stay 8 and 4).
 
 A pin and a floor are immutable once the policy is built: each lives in its own
 field (`_pinned_concurrency` / `_pinned_max_roles` under pins=fixed,
@@ -406,33 +409,18 @@ class CapacityPolicy:
         """One clause saying THIS measurement's mission number was cut."""
         return f"{missions} missions clamped to the {roles} role cap, {self._remedy()}"
 
-    def notes(self) -> str:
-        """The clamp clause derived from the DECLARED numbers, not from a reading.
-
-        The mission cap never exceeds the role cap, so a hand-set mission number
-        above a hand-set role number is a collision whatever the box is doing
-        right now. The in-target note only exists when a measurement actually
-        clamps (a quiet box plans enough roles to hold the mission floor and
-        nothing is cut), so the startup line takes the clause from here and
-        states it in both cases."""
-        if not self.has_managed_cap:
-            return ""
-        missions = self._declared(self._pinned_concurrency, self._floor_concurrency)
-        roles = self._declared(self._pinned_max_roles, self._floor_max_roles)
-        if missions is None or roles is None or missions <= roles:
-            return ""
-        return f"mission floor {missions} cannot exceed the {roles} role cap, {self._remedy()}"
-
     def applied_note(self, cap: Capacity | None = None) -> str:
-        """The clamp clause for a plan that was ALREADY applied, if it clamped.
+        """The ONE clamp clause for the startup line: declared vs APPLIED.
 
-        :meth:`notes` needs both numbers DECLARED, so a mission floor alone
-        (REWORK_CONCURRENCY=8, REWORK_MAX_ROLES unset) gets no clause from it even
-        when a starved box applies 4 missions next to a 4 role cap. Read the
-        declared mission floor against the cap the daemon now enforces instead:
-        that catches the collision the arithmetic made, without a fresh
-        measurement. Silent when nothing was cut, and silent when the mission cap
-        is not declared (then the planner picked the number nobody was promised).
+        The clause appears exactly when the invariant really cut something, that
+        is when the declared mission number is above the role cap the daemon now
+        enforces, so the evidence is the applied pair and not a fresh
+        measurement. Comparing the two DECLARED numbers instead lied on a quiet
+        box: REWORK_CONCURRENCY=8 with REWORK_MAX_ROLES=4 applies 8 missions / 8
+        roles, because a floor is a minimum and the planner's own 8 roles already
+        clear the role floor of 4, so nothing was cut and the line says nothing.
+        Silent as well when the mission cap is not declared: then the planner
+        picked the number nobody was promised.
 
         `cap` is the applied plan (`None` means nothing was applied yet, so the
         live caps are what the daemon enforces)."""
@@ -446,7 +434,13 @@ class CapacityPolicy:
         # same cut happens to a PINNED cap, and calling that a floor would lie
         # about what describe() says two clauses earlier.
         what = "mission floor" if self._floor_concurrency is not None else "mission cap"
-        return f"{what} {missions} cut to the planner's {roles} role cap, {self._remedy()}"
+        # the role number is named when the owner declared it, and called the
+        # planner's own when the measurement picked it
+        if self._declared(self._pinned_max_roles, self._floor_max_roles) is not None:
+            how = f"cannot exceed the {roles} role cap"
+        else:
+            how = f"cut to the planner's {roles} role cap"
+        return f"{what} {missions} {how}, {self._remedy()}"
 
     @staticmethod
     def _declared(pinned: int | None, floor: int | None) -> int | None:
@@ -628,11 +622,10 @@ class DynamicCapacity:
             f"capacity plan: {head}; {self.policy.describe('missions')};"
             f" {self.policy.describe('roles')}; {mode_phrase(self.settings, self.policy)}"
         )
-        # A collision survives the measurement: floor 8 missions with a 4 role cap
-        # is one clause even when a quiet box plans 8 roles and clamps nothing.
-        # notes() needs both numbers declared; when only the mission floor is, the
-        # applied pair is what holds the evidence that the arithmetic cut it.
-        note = self.policy.notes() or self.policy.applied_note(cap)
+        # ONE source for the clamp clause: the applied plan says whether the
+        # invariant actually cut the declared mission number. Nothing is claimed
+        # on a box whose own role plan already clears the mission floor.
+        note = self.policy.applied_note(cap)
         return f"{line}; {note}" if note else line
 
     def start(self) -> asyncio.Task[None] | None:

@@ -628,20 +628,26 @@ order:
    does not bound it, because protecting the box beats using it: 16 idle CPUs
    with 2 GB free plan 1 mission and 1 role.
 
-On the caps auto actually manages, the mission cap never exceeds the role
-cap: pinning a role cap with `REWORK_MAX_ROLES` also lowers the managed mission
-cap to fit it (2 pinned roles on 12 idle CPUs run 2 missions / 2 roles), and a
-pinned `REWORK_CONCURRENCY` above the planned role cap is cut back to that cap.
-Pinning never raises a cap to satisfy the rule, and the cut is never written
-back over the pin, so a pinned mission cap returns to its pinned value as soon
-as the box can hold it again. Only under `REWORK_CAPACITY_PINS=fixed` is there
-nothing left for auto to manage once BOTH caps are set explicitly, and then the
-documented exception applies: rework honours the two numbers exactly as given
-(8 and 2 stay 8 missions / 2 roles), measures nothing and starts no watchdog.
-Under the default `REWORK_CAPACITY_PINS=floor` the same two numbers are floors,
-both caps stay managed and the plan can move above them. A change is applied
-only when the same plan shows up in two measurements in a row, so one
-`uv sync` burst does not flap the caps.
+On the caps auto actually manages, the mission cap never exceeds the role cap.
+Under `REWORK_CAPACITY_PINS=fixed` that means an exact role cap set with
+`REWORK_MAX_ROLES` also lowers the managed mission cap to fit it (2 pinned roles
+on 12 idle CPUs run 2 missions / 2 roles), and a pinned `REWORK_CONCURRENCY`
+above the planned role cap is cut back to that cap. Under the default
+`REWORK_CAPACITY_PINS=floor` both numbers are minimums instead, so nothing is
+frozen and the same `REWORK_MAX_ROLES=2` on 12 idle CPUs plans 12 missions / 12
+roles, not 2 / 2; the mission number is the one that gives way on a collision
+(floors of 8 missions and 2 roles on a busy 2 CPU box apply 2 missions / 2
+roles). Neither mode raises a cap to satisfy the rule, and a cut is never
+written back over the pin or the floor, so a hand-set mission number is what the
+next measurement starts from again as soon as the box can hold it.
+Only under `REWORK_CAPACITY_PINS=fixed` is there nothing left for auto to manage
+once BOTH caps are set explicitly, and then the documented exception applies:
+rework honours the two numbers exactly as given (8 and 2 stay 8 missions / 2
+roles), measures nothing and starts no watchdog. Under the default
+`REWORK_CAPACITY_PINS=floor` the same two numbers are floors, both caps stay
+managed and the plan can move above them. A change is applied only when the same
+plan shows up in two measurements in a row, so one `uv sync` burst does not flap
+the caps.
 
 Shrinking never cancels work: running missions keep their slots until they
 finish (the free-slot count goes negative until their releases bring it back),
