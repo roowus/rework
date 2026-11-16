@@ -21,8 +21,17 @@ from typing import Any
 
 from rework.kernel.state.records import EventRecord, EventType, Mission
 from rework.kernel.state.store import StateStore
+from rework.nodes.failure_text import scrub
 from rework.nodes.gh import pr_create
-from rework.nodes.git_ops import push_branch
+from rework.nodes.git_ops import (
+    DEFAULT_GIT_AUTHOR,
+    PRE_MERGE_ABORT_REF,
+    MergeResult,
+    abort_merge,
+    merge_base_into_branch,
+    merge_in_progress,
+    push_branch,
+)
 
 log = logging.getLogger("rework.delivery")
 
@@ -86,6 +95,197 @@ async def _safe_write(store: StateStore, mission_id: str, updates: dict[str, Any
         log.exception("could not record PR delivery state for %s: %r", mission_id, updates)
 
 
+# The base every mission PR is opened against (gh's own default).
+PR_BASE = "main"
+
+
+# `git merge` output can be long (hints, a full status block); the PR body gets
+# the reason, not the tutorial.
+MERGE_DETAIL_LIMIT = 1200
+
+# The heading every merge paragraph starts with, exactly as `_merge_note` emits
+# it (`f"{body.rstrip()}\n\n{note}\n"`).
+MERGE_NOTE_HEADING = "\n\n## Merge with main\n"
+
+
+def _without_merge_note(body: str) -> str:
+    """Drop a **Merge with main** paragraph an EARLIER delivery attempt added.
+
+    The merge is re-run on every delivery (retry included), so a note from a
+    failed attempt must never survive into the next one: attempt 1 that
+    conflicted and then failed to push used to persist its body, and the retry
+    that merged cleanly republished "the merge conflicts ... `a.txt`" for a
+    conflict that no longer existed. Bodies persisted by an older rework have
+    the note baked in, so this strips on the way in as well."""
+    index = body.find(MERGE_NOTE_HEADING)
+    if index < 0:
+        return body
+    return body[:index].rstrip() + "\n"
+
+
+def _truncated(text: str) -> str:
+    text = (text or "").strip()
+    if len(text) <= MERGE_DETAIL_LIMIT:
+        return text
+    return text[:MERGE_DETAIL_LIMIT].rstrip() + " [...]"
+
+
+def _merge_failure_detail(result: MergeResult) -> str:
+    """git's own words for a merge that did not run, scrubbed like every other
+    failure text and fenced so the body renders it verbatim."""
+    text = _truncated(scrub(result.detail)) if result.detail else ""
+    if not text:
+        return ""
+    return f"\n\n```\n{text}\n```"
+
+
+def _discarded_line(result: MergeResult) -> list[str]:
+    """The sentence naming the ref that holds staged work an abort discarded."""
+    if not result.discarded_work:
+        return []
+    return [
+        "",
+        "Staged work that the abort of that leftover merge would have thrown away "
+        f"is kept on `{PRE_MERGE_ABORT_REF}` (`{result.discarded_work}`).",
+    ]
+
+
+def _merge_note(result: MergeResult, branch: str) -> str | None:
+    """The PR-body paragraph for a merge that did not happen (real conflicts, or
+    git refusing the merge). None for every other outcome: those are silent."""
+    if result.failed:
+        return "\n".join(
+            [
+                "## Merge with main",
+                "",
+                f"`{PR_BASE}` was **not** merged into `{branch}`: git refused the merge "
+                "(it reported no conflicting paths), so the branch is unchanged and the "
+                "PR opens as it is." + _merge_failure_detail(result),
+                *_discarded_line(result),
+            ]
+        )
+    if not result.conflicted:
+        return None
+    paths = result.conflicting or []
+    listed = "\n".join(f"- `{path}`" for path in paths)
+    lines = [
+        "## Merge with main",
+        "",
+        f"`{PR_BASE}` was **not** merged into `{branch}`: the merge conflicts, so "
+        "this branch needs a human to resolve it before merging.",
+        "",
+        "Conflicting paths:",
+        "",
+        listed,
+    ]
+    if result.abort_failed:
+        lines += [
+            "",
+            "The merge abort also failed, so the branch may need a manual cleanup "
+            f"(`git merge --abort`): {result.abort_failed}",
+        ]
+    lines += _discarded_line(result)
+    return "\n".join(lines)
+
+
+def _merge_event(result: MergeResult, branch: str) -> dict[str, Any] | None:
+    """The INFO payload for the merge step, or None when there is nothing worth
+    an event (no origin, up to date, and the silent skips: wrong branch, dirty
+    worktree). An event never carries a merge note without saying so."""
+    if result.failed:
+        payload: dict[str, Any] = {
+            "note": f"{PR_BASE} was not merged into {branch}: git refused the merge "
+            "and named no conflicting paths, so the branch is unchanged",
+            "error": _truncated(scrub(result.detail)) or "git merge failed",
+            "base": PR_BASE,
+        }
+        if result.discarded_work:
+            payload["pre_merge_abort_ref"] = PRE_MERGE_ABORT_REF
+            payload["pre_merge_abort_sha"] = result.discarded_work
+        return payload
+    if result.conflicted:
+        payload = {
+            "note": f"{PR_BASE} was not merged into {branch}: the merge conflicts, so "
+            "the branch is unchanged and the PR lists the conflicting paths",
+            "conflicting_paths": list(result.conflicting),
+            "base": PR_BASE,
+        }
+        if result.abort_failed:
+            payload["error"] = f"git merge --abort failed: {result.abort_failed}"
+        if result.discarded_work:
+            payload["pre_merge_abort_ref"] = PRE_MERGE_ABORT_REF
+            payload["pre_merge_abort_sha"] = result.discarded_work
+        return payload
+    if result.merged:
+        return {
+            "note": f"merged {PR_BASE} into {branch} before opening the PR "
+            f"(merge commit {result.sha or 'unknown'})",
+            "merge_sha": result.sha,
+            "base": PR_BASE,
+        }
+    if result.skipped_reason == "fetch-failed":
+        # the remote could not be read: the owner may want to know why
+        return {
+            "note": f"{PR_BASE} was not merged into {branch} before the PR "
+            "(the fetch failed); the PR opens as it is",
+            "error": _truncated(scrub(result.detail)) or "git fetch failed",
+            "base": PR_BASE,
+        }
+    # dirty-worktree / wrong-branch: silent, like no-origin. Nothing the owner
+    # can act on, and a repo-less mission must stay byte-identical.
+    return None
+
+
+async def _abort_any_merge(worktree: Path) -> None:
+    try:
+        if await merge_in_progress(worktree):
+            await abort_merge(worktree)
+    except Exception:
+        log.debug("could not abort a merge in %s", worktree, exc_info=True)
+
+
+async def merge_main_before_push(
+    bus: Any,
+    mission_id: str,
+    branch: str,
+    worktree: str | Path,
+    author: tuple[str, str] = DEFAULT_GIT_AUTHOR,
+) -> str | None:
+    """Merge origin/main into `branch` in its worktree, before the push.
+
+    Returns the paragraph to append to the PR body for a merge that did not
+    happen for a reason the owner must see (real conflicts, or git refusing the
+    merge), and None for every silent outcome including the repo-less one.
+    Never raises and never blocks the PR: any failure here is an INFO event and
+    an ordinary push, because most PRs arrive conflicting with main while other
+    missions merged, and a PR that opens stale is still better than a mission
+    that dies."""
+    try:
+        result = await merge_base_into_branch(Path(worktree), branch, PR_BASE, author)
+    except Exception as exc:  # a merge must never fail the delivery
+        # a half-finished merge would make the later `git add -A` commit
+        # conflict markers, so leave no merge behind even on a crash
+        await _abort_any_merge(Path(worktree))
+        log.warning("merging %s into %s for %s failed: %r", PR_BASE, branch, mission_id, exc)
+        await _publish(
+            bus,
+            mission_id,
+            {
+                "note": f"{PR_BASE} was not merged into {branch} before the PR "
+                "(merge step failed); the PR opens as it is",
+                "error": _error_text(exc),
+                "base": PR_BASE,
+            },
+        )
+        return None
+    event = _merge_event(result, branch)
+    if event is not None:
+        await _publish(bus, mission_id, event)
+    if result.conflicted:
+        log.info("%s conflicts with %s: %s", branch, PR_BASE, result.conflicting)
+    return _merge_note(result, branch)
+
+
 async def deliver_pr(
     store: StateStore,
     bus: Any,
@@ -95,17 +295,32 @@ async def deliver_pr(
     worktree: str | Path,
     title: str,
     body: str,
+    author: tuple[str, str] = DEFAULT_GIT_AUTHOR,
 ) -> str | None:
     """Push `branch` and open the PR from it. Returns the PR URL, or None when
     delivery failed — in which case the mission is left retryable and the full
     error is recorded. Never raises for a delivery failure: the work is already
-    done and the mission must not die for a flaky remote."""
+    done and the mission must not die for a flaky remote.
+
+    `author` is the configured commit identity (`Config.git_author`), so the
+    merge commit this makes carries the same author as the mission's commits.
+    """
+    # the coder's own body, without any merge paragraph: the merge note is
+    # recomputed on every attempt and never persisted, so a retry cannot
+    # republish a conflict that has since been resolved
+    body = _without_merge_note(body)
     info: dict[str, Any] = {
         "pr_branch": branch,
         "pr_worktree": str(worktree),
         "pr_title": title,
         "pr_body": body,
     }
+    # merge main INTO the branch first, so the PR arrives mergeable instead of
+    # conflicting with everything other missions merged while this one worked.
+    # A real conflict leaves the branch untouched and is reported in the body.
+    note = await merge_main_before_push(bus, mission_id, branch, worktree, author)
+    if note:
+        body = f"{body.rstrip()}\n\n{note}\n"
     try:
         await push_branch(Path(worktree), branch)
         url = await pr_create(Path(worktree), head=branch, title=title, body=body)
@@ -176,11 +391,18 @@ def _is_checkout(path: str) -> bool:
     return p.is_dir() and (p / ".git").exists()
 
 
-async def retry_pr(store: StateStore, bus: Any, mission_id: str) -> tuple[bool, str]:
+async def retry_pr(
+    store: StateStore,
+    bus: Any,
+    mission_id: str,
+    author: tuple[str, str] = DEFAULT_GIT_AUTHOR,
+) -> tuple[bool, str]:
     """Retry push+PR for a finished mission from its persisted delivery record.
 
     Shared by the CLI (`rework mission retry-pr ID`) and the TUI, so the two can
-    never disagree. Returns (ok, PR URL on success / the full error on failure).
+    never disagree. `author` is that deployment's `Config.git_author`, so the
+    merge commit pushed here carries the same author as the mission's commits.
+    Returns (ok, PR URL on success / the full error on failure).
     """
     mission = await store.get_mission(mission_id)
     if mission is None:
@@ -225,6 +447,7 @@ async def retry_pr(store: StateStore, bus: Any, mission_id: str) -> tuple[bool, 
         worktree=worktree,
         title=str(result.get("pr_title") or _pr_title(mission)),
         body=str(result.get("pr_body") or _fallback_body(mission)),
+        author=author,
     )
     if url is None:
         current = await store.get_mission(mission_id)

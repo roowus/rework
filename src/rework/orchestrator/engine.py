@@ -49,6 +49,7 @@ from rework.kernel.state.records import (
 from rework.kernel.state.store import StateStore
 from rework.logs import bind
 from rework.missions import project_is_upload
+from rework.nodes.git_ops import DEFAULT_GIT_AUTHOR
 from rework.nodes.report_sections import accepted_findings_section, mechanical_verdict
 from rework.orchestrator.delivery import DELIVERY_RESULT_KEYS
 from rework.orchestrator.limits import MissionSlot, RoleLimiter
@@ -150,7 +151,7 @@ class RunSupervisor:
         catalog: ModelCatalog,
         make_checkpointer: CheckpointerFactory,
         workroot: Path,
-        git_author: tuple[str, str] = ("rework", "rework@rework.local"),
+        git_author: tuple[str, str] = DEFAULT_GIT_AUTHOR,
         provider: ModelProvider | None = None,
         library: Any | None = None,
         limiter: RoleLimiter | None = None,
@@ -423,7 +424,7 @@ class MissionRunner:
         make_checkpointer: CheckpointerFactory,
         workroot: Path,
         poll_interval_s: float = 0.25,
-        git_author: tuple[str, str] = ("rework", "rework@rework.local"),
+        git_author: tuple[str, str] = DEFAULT_GIT_AUTHOR,
         provider: ModelProvider | None = None,
         library: Any | None = None,
         slot: MissionSlot | None = None,
@@ -1052,6 +1053,7 @@ class MissionRunner:
             worktree=worktree,
             title=title,
             body=body,
+            author=self._git_author,
         )
         return url
 
