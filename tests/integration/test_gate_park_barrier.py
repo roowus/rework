@@ -135,9 +135,7 @@ async def test_the_barrier_returns_once_the_mission_row_is_parked(parked_world: 
     store: SqliteStore = parked_world["store"]
     mission: Mission = parked_world["mission"]
     lying = LyingStore(store, stale_mission_status=MissionStatus.RUNNING, stale_polls=5)
-    await wait_for_gate_park(
-        lying, mission.id, mission_status=MissionStatus.AWAITING_GATE, timeout_s=10
-    )
+    await wait_for_gate_park(lying, mission.id, mission_status=MissionStatus.AWAITING_GATE)
     assert lying.mission_reads == 6, "the helper returned before the park or polled past it"
     assert lying.gate_reads == 6, lying.gate_reads
 
@@ -175,6 +173,5 @@ async def test_the_barrier_waits_for_the_gated_run_row_too(parked_world: Any) ->
         mission.id,
         mission_status=MissionStatus.AWAITING_GATE,
         run_id=run.id,
-        timeout_s=10,
     )
     assert caught_up.run_reads == 5, caught_up.run_reads

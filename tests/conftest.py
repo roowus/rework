@@ -50,9 +50,19 @@ def make_git_repo(tmp_path: Path) -> Path:
     return repo
 
 
+# The one bound every gate-park wait in the suite uses. It exists to turn a
+# genuine hang (a park that never lands) into a loud TimeoutError; it is not a
+# budget for a slow write. On a starved host (20 pytest processes on 2 cores) a
+# park that takes ~1.6s serially has been observed to take tens of seconds, so a
+# bound sized for the serial case fires on state that is merely late. CI runs
+# pytest serially, where a real park is a couple of seconds and this is never
+# approached.
+GATE_PARK_TIMEOUT_S = 60.0
+
+
 async def _wait_for(
     predicate: Callable[[], Awaitable[bool]],
-    timeout_s: float = 10.0,
+    timeout_s: float = GATE_PARK_TIMEOUT_S,
     what: str = "condition",
 ) -> None:
     """Poll `predicate` on a fresh read until it holds, or raise TimeoutError.
@@ -73,7 +83,7 @@ async def wait_for_gate_park(
     *,
     mission_status: MissionStatus | None = None,
     run_id: str | None = None,
-    timeout_s: float = 15.0,
+    timeout_s: float = GATE_PARK_TIMEOUT_S,
     what: str = "",
 ) -> None:
     """Wait until a mission is PARKED at its gate, not merely "a gate exists".

@@ -391,7 +391,6 @@ async def test_gate_row_visible_before_mission_parks_then_converges_to_awaiting_
             await wait_for_gate_park(
                 second,
                 mission.id,
-                timeout_s=30,
                 what="the plan's next gate to be visible on a fresh connection",
             )
             for gate in await second.list_open_gates(mission.id):
@@ -406,7 +405,6 @@ async def test_gate_row_visible_before_mission_parks_then_converges_to_awaiting_
             second,
             mission.id,
             mission_status=MissionStatus.AWAITING_GATE,
-            timeout_s=10,
             what="the mission to park at the ship gate the fresh connection can see",
         )
 
