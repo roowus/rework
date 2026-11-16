@@ -1013,6 +1013,18 @@ class SqliteStore:
         )
         return [self._chat_message(r) for r in rows]
 
+    async def chat_ids_with_messages(self, chat_ids: list[str]) -> set[str]:
+        """One probe for the whole list (idx_chat_messages_chat covers it)."""
+        ids = list(dict.fromkeys(chat_ids))
+        if not ids:
+            return set()
+        marks = ", ".join("?" * len(ids))
+        rows = await self._fetch_all(
+            f"SELECT DISTINCT chat_id FROM chat_messages WHERE chat_id IN ({marks})",
+            tuple(ids),
+        )
+        return {str(r["chat_id"]) for r in rows}
+
     async def mission_spend(self, mission_id: str) -> BudgetState:
         row = await self._fetch_one(
             "SELECT COALESCE(SUM(input_tokens), 0) AS i, COALESCE(SUM(output_tokens), 0) AS o,"

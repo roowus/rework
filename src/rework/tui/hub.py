@@ -23,7 +23,7 @@ from typing import Any
 
 from textual.css.query import NoMatches
 
-from rework.kernel.state.records import EventType
+from rework.kernel.state.records import ORCHESTRATOR_CHAT_PREFIX, EventType
 from rework.tui.data import TuiData
 
 log = logging.getLogger("rework.tui")
@@ -215,8 +215,34 @@ class Hub:
             chats = await self.data.chats(limit=200)
         except AttributeError:  # store without chat support
             return []
-        # a mission orchestrator's own conversation is machinery, not a chat
-        return [c for c in chats if not str(c.id).startswith("orch-")]
+        # A mission orchestrator's own conversation is machinery, not a chat:
+        # there is one per mission, so listing them would flood the Work list,
+        # and the owner never writes in it directly. It stays reachable per
+        # mission (the Work mission row and the Dashboard Transcript action
+        # open `orchestrator_chat_id(mission.id)`); that chat IS the mission's
+        # real transcript, so it is hidden here, not deleted.
+        chats = [c for c in chats if not str(c.id).startswith(ORCHESTRATOR_CHAT_PREFIX)]
+        return await self._non_empty(chats)
+
+    async def _non_empty(self, chats: list[Any]) -> list[Any]:
+        """Drop chats with no messages at all.
+
+        `create_mission` mints a per-mission chat for the CLI and never writes
+        to it, so the Work list filled up with blank rows that opened an empty
+        panel. A batch probe answers "does it hold anything"; a store (or test
+        fake) that cannot answer degrades to listing everything, because an
+        unknown chat must never vanish."""
+        if not chats:
+            return chats
+        try:
+            filled = await self.data.chat_ids_with_messages([str(c.id) for c in chats])
+        except (AttributeError, TypeError):  # fake/older store: keep them all
+            log.debug("chat emptiness probe unavailable, listing all chats", exc_info=True)
+            return chats
+        except Exception:  # a probe failure must not blank the list either
+            log.debug("chat emptiness probe failed, listing all chats", exc_info=True)
+            return chats
+        return [c for c in chats if str(c.id) in filled]
 
     async def _budget_raises(self) -> list[Any]:
         try:

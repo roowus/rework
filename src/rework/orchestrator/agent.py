@@ -43,6 +43,7 @@ from rework.kernel.state.records import (
     MissionStatus,
     Run,
     RunStatus,
+    orchestrator_chat_id,
 )
 from rework.kernel.state.records import run_id as make_run_id
 from rework.logs import bind
@@ -543,10 +544,6 @@ def _gate_ask(args: dict[str, Any]) -> tuple[bool, str, str]:
     if not reason or category not in GATE_CATEGORIES:
         raise ToolError(GATE_ASK_REFUSED)
     return True, reason, category
-
-
-def orchestrator_chat_id(mission_id: str) -> str:
-    return f"orch-{mission_id}"
 
 
 def orchestrator_run_id(mission_id: str) -> str:

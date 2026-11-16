@@ -604,6 +604,20 @@ class TuiData:
             lambda: self._call(lambda s: s.chat_messages_since(chat_id, after_id)),
         )
 
+    async def chat_ids_with_messages(self, chat_ids: list[str]) -> set[str]:
+        """Which of these chats actually hold a message (one batched probe)."""
+        key = "chat_ids_with_messages:" + ",".join(sorted(chat_ids))
+        return await self._resilient(
+            key,
+            lambda: self._call(lambda s: s.chat_ids_with_messages(chat_ids)),
+            # Hiding a chat is only safe while the answer is fresh: a stale set
+            # still hides a chat that just received its first message (exactly
+            # the blank-row bug), and a stale empty one blanks the whole list.
+            # Opting out of the cache raises instead, so Hub._non_empty can fail
+            # open and list every chat as documented.
+            stale_ok=False,
+        )
+
     async def update_chat(self, chat_id: str, **fields: Any) -> Any:
         store = await self.store()
         return await store.update_chat(chat_id, **fields)
