@@ -1047,13 +1047,14 @@ async def _report_hand_off(
     """`rework report --to-library`: one report item per mission, re-run safe.
 
     Body resolution and the dedupe key live in rework.library.handoff. The
-    dedupe key is `provenance.mission_id` PLUS the `handoff:report` marker tag
-    (a report filed before that marker existed is matched by a fingerprint
-    gated on an empty `provenance.role`), because the mission id alone is
-    stamped on role contributions too and would overwrite a report a role
-    authored. A second run updates instead of minting an `l-<hex>` duplicate
-    the way `library add` does. Errors are usage errors with a non-zero exit
-    and nothing written."""
+    dedupe key is `provenance.mission_id`, an empty `provenance.role` (checked
+    first, because rework stamps the role onto every role contribution, so a
+    role cannot clear it) and then the `handoff:report` marker tag, or, for a
+    report filed before that marker existed, the hand-off fingerprint. The
+    mission id alone would be stamped on role contributions too and would
+    overwrite a report a role authored. A second run updates instead of minting
+    an `l-<hex>` duplicate the way `library add` does. Errors are usage errors
+    with a non-zero exit and nothing written."""
     from rework.config import Config
     from rework.library import handoff
     from rework.library.store import GitLibrary

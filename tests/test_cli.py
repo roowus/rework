@@ -1077,6 +1077,85 @@ def test_report_to_library_refuses_a_role_fingerprint_spoof(
     assert "handoff:report" in own.tags
 
 
+def test_report_to_library_ignores_a_role_marker_spoof(
+    rework_db: Path,
+    library_dir: Path,
+) -> None:
+    """The marker branch must not run before the role gate. Tags are entirely
+    role-supplied: `library_contribute` passes the caller's tags through
+    verbatim, so a role can mint a report carrying `handoff:report`. Shaped
+    exactly like this command's own item, it must still be refused: the dry run
+    says "would create", and after a real run the role item keeps its body and
+    version 1 while the command files its own item beside it."""
+    _seed_summary_mission(rework_db, "m-tool", "the summary")
+    from rework.library.handoff import find_report_item
+    from rework.library.model import ItemType
+    from rework.library.store import GitLibrary, open_library_store
+    from rework.library.tools import LibraryAwareExecutor, LibraryHandle
+
+    class _StubInner:
+        async def execute(self, name: str, args: dict[str, Any]) -> str:  # pragma: no cover
+            return ""
+
+    body = "# the role's own body\n"
+    role_tags = ["handoff:report", "mission:m-tool"]
+
+    async def file_spoof() -> str:
+        """Through the real contribution path: the role executor, whose role is
+        set by the wrapper and whose tags are the role's own choice."""
+        index = await open_library_store(str(rework_db))
+        try:
+            handle = LibraryHandle(index=index, git=GitLibrary(library_dir))
+            ex = LibraryAwareExecutor(
+                _StubInner(), handle, "m-tool", "m-tool:code:coder:1", "coder"
+            )
+            note = await ex.execute(
+                "library_contribute",
+                {
+                    "type": "report",
+                    "name": "Role report",
+                    "description": "a report a role wrote",
+                    "body": body,
+                    "tags": role_tags,
+                },
+            )
+            assert "contributed: l-" in note, note
+            spoof_id = note.split()[1]
+            (item,) = await index.list_items(type_=ItemType.REPORT, limit=10)
+            assert item.id == spoof_id
+            assert item.provenance.role == "coder"
+            assert "handoff:report" in item.tags
+            return spoof_id
+        finally:
+            await index.aclose()
+
+    spoof_id = asyncio.run(file_spoof())
+
+    async def lookup() -> Any:
+        index = await open_library_store(str(rework_db))
+        try:
+            return await find_report_item(index, "m-tool")
+        finally:
+            await index.aclose()
+
+    assert asyncio.run(lookup()) is None
+    dry = runner.invoke(app, ["report", "m-tool", "--to-library", "--dry-run"])
+    assert "would create report" in dry.output, dry.output
+    assert "would update report" not in dry.output, dry.output
+    assert spoof_id not in dry.output
+
+    result = runner.invoke(app, ["report", "m-tool", "--to-library"])
+    assert result.exit_code == 0, result.output
+    assert "created report" in result.output, result.output
+    assert "updated report" not in result.output, result.output
+    items = {i.id: i for i in _library_items(rework_db)}
+    assert len(items) == 2
+    spoof = items[spoof_id]
+    assert (spoof.version, spoof.body, spoof.tags) == (1, body, role_tags)
+    (own,) = [i for i in items.values() if i.id != spoof_id]
+    assert "handoff:report" in own.tags and own.provenance.role is None
+
+
 def test_report_to_library_dedupe_relies_on_the_marker(rework_db: Path, library_dir: Path) -> None:
     """The marker, not the fingerprint, is the dedupe key for an item this
     command filed. If the owner hand-edits such an item (tags and description

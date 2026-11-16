@@ -21,14 +21,18 @@ Dedupe key: `(type=report, provenance.mission_id, hand-off marker)`.
 `find_report_item` is that lookup. Role contributions get `provenance.mission_id`
 stamped automatically too, so the mission id alone would match (and overwrite)
 a report a role authored. What limits a re-run to items this command filed is
-the `handoff:report` marker plus, for items filed before the marker existed, a
-fingerprint that is additionally gated on `provenance.role` being empty: the
-fingerprint is a `mission:<id>` tag, a `source:<kind>` tag and the hand-off
-description, all of which a role could choose for itself, but a role cannot
-leave its own provenance role empty, because rework stamps it. So a role
-contribution is never a match, whatever tags and description it picks, and an
-item with no role recorded and no marker is still recognised. A
-re-run UPDATES the item in place (its id, body path, created_at, uses and
+`provenance.role` being empty, checked before anything else: every key that
+follows is role-supplied. A role chooses its own tags, so it can paste
+`handoff:report` into its own item, and it can choose a `mission:<id>` tag, a
+`source:<kind>` tag and the hand-off description shape, which is the backfill
+fingerprint for items filed before the marker existed. What a role cannot do is
+leave `provenance.role` empty: the library tool wrapper stamps the role it runs
+under onto every contribution. So a role contribution is never a match,
+whatever tags and description it picks, while an item this command filed (no
+role recorded) matches by marker, or by fingerprint when it predates the
+marker.
+
+A re-run UPDATES the item in place (its id, body path, created_at, uses and
 status survive, its version is bumped) instead of minting a duplicate, which
 mirrors the re-run safety `library backfill-bodies` already promises. A mission
 can therefore own exactly one handed-off report.
@@ -55,7 +59,9 @@ KIND_DOC_MODIFIED = "doc-modified"
 KIND_SUMMARY = "summary"
 _KINDS = (KIND_FILE, KIND_WORKTREE, KIND_DOC_MODIFIED, KIND_SUMMARY)
 
-# Marks an item this command filed. Role contributions never carry it.
+# Marks an item this command filed. A role CAN put this tag on its own item
+# (tags are role-supplied), so is_handoff_item() only trusts it on an item whose
+# provenance.role is empty.
 HANDOFF_TAG = "handoff:report"
 # Records which `source:<kind>` tag this command derived for the item, so a
 # re-run replaces exactly that tag and leaves an owner `--tag source:...` (even
@@ -301,17 +307,24 @@ def is_handoff_item(item: LibraryItem, mission_id: str) -> bool:
     """True only for a report item this command filed for `mission_id`.
 
     provenance.mission_id alone is not enough: role contributions are stamped
-    with it too, so the marker tag decides. Items filed before the marker
-    existed carry no role (rework stamps `provenance.role` on everything a role
-    contributes), so the empty-role gate makes the fingerprint below unforgeable
-    from role-supplied tags and description: mission tag + source tag + the
-    hand-off description."""
+    with it too. The role gate is checked FIRST, before the marker and before
+    the fingerprint, because both of those keys are role-supplied: a role picks
+    its own tags through library_contribute, so it can mint an item carrying
+    `handoff:report` and be mistaken for this command's work. What a role
+    cannot do is leave `provenance.role` empty, because
+    LibraryAwareExecutor.execute stamps the role it runs under onto every
+    contribution. The test is "falsy", so both None and "" count as no role
+    recorded (an item the owner adds by hand, or one filed by `library add`
+    without --role); any non-empty role means "not mine", whatever tags and
+    description it picked. With that gate passed, the marker decides, and an
+    item filed before the marker existed is still recognised by the
+    fingerprint: mission tag + source tag + the hand-off description."""
     if item.type is not ItemType.REPORT or item.provenance.mission_id != mission_id:
+        return False
+    if item.provenance.role:
         return False
     if HANDOFF_TAG in item.tags:
         return True
-    if item.provenance.role:
-        return False
     return (
         mission_tag(mission_id) in item.tags
         and any(t in {f"{_SOURCE_PREFIX}{k}" for k in _KINDS} for t in item.tags)

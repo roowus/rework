@@ -120,10 +120,12 @@ exists. If the mission only edited existing docs, the largest edited one is used
 warning and the tag `source:doc-modified`; failing that, `missions.result.summary`,
 tagged `source:summary` because that field describes the report rather than containing
 it. Re-running updates the same item (no duplicate ids): only items this command filed
-are ever updated, never a report a role wrote. The marker tag `handoff:report`
-identifies them; an item filed before that marker existed is matched by its own
-fingerprint instead, and only when its provenance role is empty, which a role
-cannot arrange for itself. A re-run keeps
+are ever updated, never a report a role wrote. The rule is that the item's provenance
+role is empty, checked before any tag: rework stamps every role contribution with the
+role it ran as, so a role cannot arrange an empty one for itself, whatever tags it
+picks. With that passed, the marker tag `handoff:report` identifies this command's
+items, and an item filed before that marker existed is matched by its own fingerprint
+instead. A re-run keeps
 the item's name unless you pass `--title`, and merges `--tag` into the existing tags.
 `--dry-run` prints the item and writes nothing. `--from-file`, `--title`, `--tag` and
 `--dry-run` are errors without `--to-library`, and `--to-library` cannot be combined
