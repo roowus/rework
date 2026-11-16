@@ -84,7 +84,14 @@ receives the owner's messages to a running mission.
 
 The engine (`orchestrator/engine.py`) is the heart: MissionRunner streams the graph,
 materializes interrupts as gate rows, waits on store-derived wake conditions, resumes with
-`Command(resume=...)`. RunSupervisor reconciles INTENT rows into live role asyncio tasks.
+`Command(resume=...)`.
+A gate row is committed before the mission status (and before a gated run's
+`halted_escalated` row is visible), so an open gate beside a `running` mission is a
+legal transient and tests wait for both facts (`conftest.wait_for_gate_park`) instead of
+for the gate row alone; the write order is deliberately not flipped, because
+status-first would expose `awaiting_gate` with no gate row, which
+`daemon._repair_stale_gate_status` and `engine._clear_awaiting_gate` both repair to
+`running`. RunSupervisor reconciles INTENT rows into live role asyncio tasks.
 The daemon runs one runner per mission under a semaphore, holds a leader lock, and runs a
 boot recovery pass (reopen missions, re-enumerate runs, pick up gates decided while down,
 before the first astream call).

@@ -17,7 +17,7 @@ from typing import Any
 
 import pytest
 
-from conftest import role_catalog
+from conftest import role_catalog, wait_for_gate_park
 from rework.config import Config
 from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.gates import GateManager
@@ -222,7 +222,22 @@ async def test_kill_mid_role_resumes_from_checkpoint(world: dict[str, Any]) -> N
 
 async def test_gate_decided_while_down_applied_on_restart(world: dict[str, Any]) -> None:
     """The owner answers while the daemon is DOWN. Restart must apply the
-    decision from the row: approved resumes the role, no second gate opens."""
+    decision from the row: approved resumes the role, no second gate opens.
+
+    Flaked on CI (3.12 and 3.13) before the shared barrier existed. Reproduce
+    under CPU load:
+
+        for i in 1 2 3 4 5 6; do
+            pytest tests/integration/test_chaos.py -q &
+        done; wait
+
+    Note the failure mode is NOT a mission-status assert (this test never makes
+    one): the gate row is committed in `_handle_halted` while the run's
+    HALTED_ESCALATED row was written earlier in `_consume_result`. The old gate
+    -row-only wait could cancel the runner before the run was parked, so the
+    restart saw an unparked run, re-fired the interrupt and opened a SECOND
+    gate, failing `len(opened) == 1`. The barrier now waits for the gate row AND
+    the run's park (conftest.wait_for_gate_park)."""
     store: SqliteStore = world["store"]
     mission = await store.create_mission(
         Mission(
@@ -233,7 +248,18 @@ async def test_gate_decided_while_down_applied_on_restart(world: dict[str, Any])
     )
     runner1 = _runner(world, mission.id)
     task1 = asyncio.create_task(runner1.run())
-    await _wait_for(lambda: _open_gate(store, mission.id), what="gate to open")
+    # BARRIER: the gate row is committed before the run's HALTED_ESCALATED row
+    # (engine._consume_result writes the park, _handle_halted opens the gate).
+    # A kill in that window restarts an UNPARKED run, which re-fires the
+    # interrupt and opens a SECOND gate; the "one gate_opened" assert below
+    # then fails. Wait for the park, not for the gate row.
+    await wait_for_gate_park(
+        store,
+        mission.id,
+        mission_status=MissionStatus.AWAITING_GATE,
+        run_id=f"{mission.id}:do:crashy:1",
+        what="run parked at its gate",
+    )
     task1.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task1, timeout=5)
@@ -330,7 +356,16 @@ async def test_gate_rejected_while_down_aborts_on_restart(world: dict[str, Any])
     )
     runner1 = _runner(world, mission.id)
     task1 = asyncio.create_task(runner1.run())
-    await _wait_for(lambda: _open_gate(store, mission.id), what="gate to open")
+    # BARRIER: same two-write window as test_gate_decided_while_down_applied_
+    # on_restart, but here an early cancel shows up as the run never reaching
+    # `aborted` (the restart re-runs an unparked role). Wait for the park.
+    await wait_for_gate_park(
+        store,
+        mission.id,
+        mission_status=MissionStatus.AWAITING_GATE,
+        run_id=f"{mission.id}:do:crashy:1",
+        what="run parked at its gate",
+    )
     task1.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task1, timeout=5)
@@ -367,7 +402,13 @@ async def test_ship_gate_decided_while_down_not_duplicated(world: dict[str, Any]
     )
     runner1 = _runner(world, mission.id)
     task1 = asyncio.create_task(runner1.run())
-    await _wait_for(lambda: _open_gate(store, mission.id), what="ship gate")
+    # BARRIER: the ship gate row commits before _final_gates writes
+    # AWAITING_GATE. Cancelling between the two lets the restart re-run the
+    # plan's final gates and open a SECOND ship gate, which the
+    # "exactly one gate_opened" assert forbids. Wait for both facts.
+    await wait_for_gate_park(
+        store, mission.id, mission_status=MissionStatus.AWAITING_GATE, what="ship gate park"
+    )
     task1.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task1, timeout=5)

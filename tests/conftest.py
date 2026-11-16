@@ -6,15 +6,17 @@ Add a backend: implement the store, then extend `BACKENDS` + `_make_store`.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 from rework.kernel.llm.types import ChatResult, ToolCall, Usage
+from rework.kernel.state.records import MissionStatus, RunStatus
 from rework.kernel.state.store import StateStore
 
 if TYPE_CHECKING:
@@ -46,6 +48,75 @@ def make_git_repo(tmp_path: Path) -> Path:
         capture_output=True,
     )
     return repo
+
+
+async def _wait_for(
+    predicate: Callable[[], Awaitable[bool]],
+    timeout_s: float = 10.0,
+    what: str = "condition",
+) -> None:
+    """Poll `predicate` on a fresh read until it holds, or raise TimeoutError.
+
+    Every call polls: nothing here sleeps blindly and nothing assumes a write
+    made by another coroutine is already visible."""
+    deadline = asyncio.get_event_loop().time() + timeout_s
+    while asyncio.get_event_loop().time() < deadline:
+        if await predicate():
+            return
+        await asyncio.sleep(0.05)
+    raise TimeoutError(f"timed out waiting for {what}")
+
+
+async def wait_for_gate_park(
+    store: Any,
+    mission_id: str,
+    *,
+    mission_status: MissionStatus | None = None,
+    run_id: str | None = None,
+    timeout_s: float = 15.0,
+    what: str = "",
+) -> None:
+    """Wait until a mission is PARKED at its gate, not merely "a gate exists".
+
+    The engine commits the gate row in one autocommit statement and the fact a
+    test then relies on in a LATER one: the mission status AWAITING_GATE
+    (`_final_gates` for ship/open_pr, `_handle_halted` for an escalation), or
+    the gated run's HALTED_ESCALATED row (written in `_consume_result`, before
+    `_handle_halted` opens the gate for that run). A reader therefore CAN see an
+    open gate beside a `running` mission, or beside a run that is not parked
+    yet. Waiting on the gate row alone is a race: under CPU load the poll wins,
+    the test cancels or restarts early, and the next assertion reads the
+    pre-park state (or the restart opens a duplicate gate).
+
+    So: ONE bounded wait, ONE combined predicate, and every iteration re-reads
+    through `store` (never a value captured before the wait):
+
+    - an open gate exists for the mission, AND
+    - `mission_status`, when given, is the mission's status, AND
+    - `run_id`, when given, is a run whose status is HALTED_ESCALATED.
+
+    `what` names the wait in the TimeoutError and defaults to a description of
+    the facts asked for."""
+    label = what or (
+        f"gate open for {mission_id}"
+        + (f" and mission {mission_status.value}" if mission_status is not None else "")
+        + (f" and run {run_id} halted_escalated" if run_id is not None else "")
+    )
+
+    async def parked() -> bool:
+        if not await store.list_open_gates(mission_id):
+            return False
+        if mission_status is not None:
+            mission = await store.get_mission(mission_id)
+            if mission is None or mission.status != mission_status:
+                return False
+        if run_id is not None:
+            run = await store.get_run(run_id)
+            if run is None or run.status != RunStatus.HALTED_ESCALATED:
+                return False
+        return True
+
+    await _wait_for(parked, timeout_s=timeout_s, what=label)
 
 
 def role_catalog() -> ModelCatalog:

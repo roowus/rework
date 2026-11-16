@@ -831,6 +831,13 @@ class MissionRunner:
                 )
             else:
                 gate = await self._refresh_gate_question(gate, question)
+            # The gate row is committed BEFORE the mission status by design
+            # (two autocommit statements). A reader may briefly see an open
+            # gate beside a `running` row; tests must wait for BOTH facts, not
+            # for the gate row alone (conftest.wait_for_gate_park). The order is
+            # not flipped: status-first would expose AWAITING_GATE with no gate
+            # row, which daemon._repair_stale_gate_status corrects back to
+            # RUNNING and engine._clear_awaiting_gate treats as stale.
             if gate.status == GateStatus.OPEN:
                 await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
             ship_decision = await self._gate_decision(mission.id, gate.id)
@@ -904,6 +911,13 @@ class MissionRunner:
                 )
             else:
                 gate = await self._refresh_gate_question(gate, question)
+            # The gate row is committed BEFORE the mission status by design
+            # (two autocommit statements). A reader may briefly see an open
+            # gate beside a `running` row; tests must wait for BOTH facts, not
+            # for the gate row alone (conftest.wait_for_gate_park). The order is
+            # not flipped: status-first would expose AWAITING_GATE with no gate
+            # row, which daemon._repair_stale_gate_status corrects back to
+            # RUNNING and engine._clear_awaiting_gate treats as stale.
             if gate.status == GateStatus.OPEN:
                 await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
             pr_approved = await self._gate_decision(mission.id, gate.id)
@@ -1652,6 +1666,9 @@ class MissionRunner:
             else:
                 gated.append((run, existing.id))
         if gated:
+            # gate rows first, status second, same reason as _final_gates: the
+            # pair is never atomic, so a reader may see an open escalation gate
+            # beside a running row and must wait for both (wait_for_gate_park)
             await self._store.update_mission(self.mission_id, status=MissionStatus.AWAITING_GATE)
         while True:
             open_gates = await self._store.list_open_gates(self.mission_id)

@@ -24,6 +24,7 @@ from conftest import (
     _coder_script,
     _investigator_script,
     role_catalog,
+    wait_for_gate_park,
 )
 from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.gates import GateManager
@@ -411,14 +412,15 @@ async def test_a_role_question_forwarded_to_the_owner_as_a_choice(world: dict[st
     )
     provider.route("Investigate any brief", asking_investigator("old or new parser?"))
     task = asyncio.create_task(runner(world).run())
-    gate = None
-    for _ in range(300):
-        gates = await store.list_open_gates("mo")
-        if gates:
-            gate = gates[0]
-            break
-        await asyncio.sleep(0.05)
-    assert gate is not None and gate.kind.value == "choice"
+    # BARRIER: the orchestrator's ask_owner commits the gate row and then the
+    # AWAITING_GATE status, two separate writes (agent._ask_owner). Wait for
+    # BOTH facts, or the status assert below races the second write.
+    await wait_for_gate_park(
+        store, "mo", mission_status=MissionStatus.AWAITING_GATE, what="ask_owner gate"
+    )
+    gates = await store.list_open_gates("mo")
+    gate = gates[0]
+    assert gate.kind.value == "choice"
     assert (gate.spec or {}).get("options") == ["old", "new"]
     assert gate.for_run == "mo:look:investigator:1"
     mission = await store.get_mission("mo")
@@ -668,10 +670,10 @@ async def test_restart_after_finish_goes_straight_to_the_gate(world: dict[str, A
     )
     provider.route("Find issues", _auditor_script(AUDIT_CLEAN))
     first = asyncio.create_task(runner(world).run())
-    for _ in range(200):
-        if await store.list_open_gates("mo"):
-            break
-        await asyncio.sleep(0.05)
+    # BARRIER: wait for the park (gate row AND AWAITING_GATE), not the gate row
+    await wait_for_gate_park(
+        store, "mo", mission_status=MissionStatus.AWAITING_GATE, what="ship gate before the restart"
+    )
     first.cancel()
     with pytest.raises(asyncio.CancelledError):
         await first
@@ -1532,7 +1534,20 @@ async def test_accepted_findings_survive_a_restart_at_the_gate(world: dict[str, 
     restarted while it waited at its final gate, must come back with the SAME
     accepted reasons and reach the same decision without spending another model
     call. (The recorded finish is re-honored; the audit-fresh rail is not
-    re-litigated into a different answer.)"""
+    re-litigated into a different answer.)
+
+    Flaked on CI (3.12 and 3.13) before the shared barrier existed. Reproduce
+    the pre-fix failure mode under CPU load:
+
+        for i in 1 2 3 4 5 6; do
+            pytest tests/integration/test_orchestrator_agent.py -q &
+        done; wait
+
+    The old wait returned as soon as a gate row existed. Ship gate row and
+    mission status AWAITING_GATE are two commits (`engine._final_gates`), so
+    under load this test cancelled the runner inside that window and
+    `before.status == AWAITING_GATE` below read `running`. Now the wait is
+    conftest.wait_for_gate_park: gate open AND AWAITING_GATE in one bounded poll."""
     provider: ScriptedProvider = world["provider"]
     store: SqliteStore = world["store"]
     full = [
@@ -1572,11 +1587,12 @@ async def test_accepted_findings_survive_a_restart_at_the_gate(world: dict[str, 
 
     first = asyncio.create_task(runner(world).run())
     # the accepted finish is let through the rail and reaches the ship gate; the
-    # kill lands while the mission waits there
-    for _ in range(300):
-        if await store.list_open_gates("mo"):
-            break
-        await asyncio.sleep(0.05)
+    # kill lands while the mission waits there. BARRIER: the gate row and the
+    # AWAITING_GATE status are two writes, so wait for both (see
+    # conftest.wait_for_gate_park and the comment in engine._final_gates)
+    await wait_for_gate_park(
+        store, "mo", mission_status=MissionStatus.AWAITING_GATE, what="ship gate before the kill"
+    )
     first.cancel()
     with pytest.raises(asyncio.CancelledError):
         await first
