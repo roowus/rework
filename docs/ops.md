@@ -536,7 +536,7 @@ fresh; systemd's restart retry wins after one stale window.
 
 rewvis is 2 CPUs, 12 GB of RAM, 4 GB of swap, and it is shared: sshd,
 tailscaled, Postgres (`rework-dev-pg`), journald and the daemon all live on it.
-rework therefore bounds itself. Five knobs, all optional, all in
+rework therefore bounds itself. Six knobs, all optional, all in
 `~/.rework/rework.env`:
 
 | variable | default | what it caps |
@@ -546,6 +546,7 @@ rework therefore bounds itself. Five knobs, all optional, all in
 | `REWORK_CONCURRENCY` | `min(cpu_count, 4)` — 2 on rewvis | working MISSIONS at the same time |
 | `REWORK_CAPACITY` | `auto` | whether the two caps above follow the host at runtime, or stay fixed |
 | `REWORK_CAPACITY_INTERVAL_S` | `60` | how often (`auto`) the host is re-measured |
+| `REWORK_CAPACITY_PINS` | `floor` | whether a hand-set `REWORK_MAX_ROLES` / `REWORK_CONCURRENCY` is a minimum the planner may go above, or the exact cap |
 
 `REWORK_MAX_ROLES` is daemon-wide: every `spawn_role` counts, whichever mission
 it belongs to. Runs beyond the cap are not refused, they queue — the run row

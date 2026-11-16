@@ -355,7 +355,7 @@ class CapacityPolicy:
         if self.has_managed_cap and concurrency > roles:
             # Collision: REWORK_CONCURRENCY=8 with REWORK_MAX_ROLES=4. The ROLE
             # floor wins the role number and the mission count is clamped to it.
-            note = f"{concurrency} missions clamped to the {roles} role cap, raise REWORK_MAX_ROLES"
+            note = self._clamp_note(concurrency, roles)
             concurrency = max(1, roles)
         if not note and (concurrency, roles) == (measured.concurrency, measured.max_roles):
             return measured
@@ -390,6 +390,43 @@ class CapacityPolicy:
         if floor is not None:
             return f"{which} MANAGED, floor {floor} (from {env}, pins=floor)"
         return f"{which} MANAGED, planner decides ({env} unset)"
+
+    def _remedy(self) -> str:
+        """How to lift this clamp in the owner's words.
+
+        It names REWORK_MAX_ROLES only when THAT is what sets the role cap (a
+        pinned or floored role cap). A managed role cap is the planner's own
+        number, so pointing the owner at an env var they never set (and that a
+        measurement would override) would be wrong: then it says "the role cap"."""
+        if self._pinned_max_roles is not None or self._floor_max_roles is not None:
+            return "raise REWORK_MAX_ROLES"
+        return "raise the role cap"
+
+    def _clamp_note(self, missions: int, roles: int) -> str:
+        """One clause saying THIS measurement's mission number was cut."""
+        return f"{missions} missions clamped to the {roles} role cap, {self._remedy()}"
+
+    def notes(self) -> str:
+        """The clamp clause derived from the DECLARED numbers, not from a reading.
+
+        The mission cap never exceeds the role cap, so a hand-set mission number
+        above a hand-set role number is a collision whatever the box is doing
+        right now. The in-target note only exists when a measurement actually
+        clamps (a quiet box plans enough roles to hold the mission floor and
+        nothing is cut), so the startup line takes the clause from here and
+        states it in both cases."""
+        if not self.has_managed_cap:
+            return ""
+        missions = self._declared(self._pinned_concurrency, self._floor_concurrency)
+        roles = self._declared(self._pinned_max_roles, self._floor_max_roles)
+        if missions is None or roles is None or missions <= roles:
+            return ""
+        return f"mission floor {missions} cannot exceed the {roles} role cap, {self._remedy()}"
+
+    @staticmethod
+    def _declared(pinned: int | None, floor: int | None) -> int | None:
+        # the number the owner declared for this cap, whatever mode it is in
+        return pinned if pinned is not None else floor
 
     def apply_initial(
         self, cpu_count: int, load1: float, avail_bytes: int | None
@@ -562,10 +599,14 @@ class DynamicCapacity:
             head = f"measurement failed, {pair}"
         else:
             head = f"{measured}: {pair}"
-        return (
+        line = (
             f"capacity plan: {head}; {self.policy.describe('missions')};"
             f" {self.policy.describe('roles')}; {mode_phrase(self.settings, self.policy)}"
         )
+        # A collision survives the measurement: floor 8 missions with a 4 role cap
+        # is one clause even when a quiet box plans 8 roles and clamps nothing.
+        note = self.policy.notes()
+        return f"{line}; {note}" if note else line
 
     def start(self) -> asyncio.Task[None] | None:
         """Apply the first plan and start the watchdog (needs a running loop)."""

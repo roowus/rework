@@ -1029,3 +1029,69 @@ def test_one_pinned_cap_under_fixed_keeps_the_other_managed() -> None:
     assert policy.describe("roles") == "roles MANAGED, planner decides (REWORK_MAX_ROLES unset)"
     cap = policy.target(IDLE_CPUS, 0.0, None)
     assert (cap.concurrency, cap.max_roles) == (3, IDLE_CPUS)
+
+
+@pytest.mark.parametrize(
+    ("reading", "pair"),
+    [
+        ((IDLE_CPUS, 0.1, None), (IDLE_CPUS, IDLE_CPUS)),  # quiet: nothing clamps
+        ((IDLE_CPUS, HIGH_LOAD, None), (FLOOR_MAX_ROLES, FLOOR_MAX_ROLES)),  # busy: cut
+    ],
+    ids=["quiet-box", "busy-box"],
+)
+async def test_the_collision_states_the_clamp_in_the_one_startup_line(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    reading: tuple[int, float, None],
+    pair: tuple[int, int],
+) -> None:
+    """REWORK_CONCURRENCY=8 with REWORK_MAX_ROLES=4, on a QUIET and a BUSY box.
+
+    On the quiet box the role floor of 4 is below what 8 idle CPUs plan (8
+    roles), so no measurement clamps anything and nothing is cut; on the busy
+    box the plan is cut to 4 and 4. The startup line advertises floor 8 missions
+    next to a 4 role cap in BOTH cases, so it must say why in the one line it
+    prints, from the numbers themselves and not from the reading."""
+    monkeypatch.setenv("REWORK_CONCURRENCY", str(IDLE_CPUS))
+    monkeypatch.setenv("REWORK_MAX_ROLES", str(FLOOR_MAX_ROLES))
+    settings = CapacitySettings.from_env()
+    slots, limiter = PrioritySlots(IDLE_CPUS), RoleLimiter(FLOOR_MAX_ROLES)
+    dyn = DynamicCapacity(slots, limiter, settings=settings, measure_fn=lambda: reading)
+    with caplog.at_level(logging.INFO, logger="rework.capacity"):
+        task = dyn.start()
+    try:
+        lines = [str(r.message) for r in caplog.records if r.name == "rework.capacity"]
+        assert len(lines) == 1, f"ONE startup line, not two: {lines}"
+        line = lines[0]
+        assert (slots.capacity, limiter.cap) == pair, "the caps the daemon now enforces"
+    finally:
+        await dyn.stop()
+    assert task is not None
+    assert f"{pair[0]} missions / {pair[1]} roles" in line, f"the plan it applied: {line}"
+    assert f"missions MANAGED, floor {IDLE_CPUS}" in line, "the floor the line advertises"
+    assert f"roles MANAGED, floor {FLOOR_MAX_ROLES}" in line, "next to the smaller role cap"
+    clause = "mission floor 8 cannot exceed the 4 role cap, raise REWORK_MAX_ROLES"
+    assert clause in line, f"the clamp clause must be in the one line: {line}"
+    assert line.count("role cap") == 1, "one clause, not a paragraph"
+
+
+def test_the_clamp_clause_names_the_env_var_only_when_it_sets_the_role_cap() -> None:
+    """NIT 2: REWORK_CONCURRENCY=16 with NO REWORK_MAX_ROLES. The role cap is the
+    planner's own number, so "raise REWORK_MAX_ROLES" would point at a var the
+    owner never set (and a measurement would override): say "the role cap"."""
+    policy = CapacityPolicy(concurrency=16, max_roles=16, fixed_concurrency=True, pins=PINS_FLOOR)
+    starved = policy.target(16, 0.0, 2 * GB)  # plenty of CPUs, almost no RAM
+    assert starved.max_roles == 1
+    assert "16 missions clamped to the 1 role cap, raise the role cap" in starved.reason
+    assert "REWORK_MAX_ROLES" not in starved.reason, "no env var the owner never set"
+
+    # with REWORK_MAX_ROLES set, THAT is what holds the role cap: name it
+    floored = CapacityPolicy(
+        concurrency=8,
+        max_roles=FLOOR_MAX_ROLES,
+        fixed_concurrency=True,
+        fixed_max_roles=True,
+        pins=PINS_FLOOR,
+    )
+    busy = floored.target(BUSY_CPUS, HIGH_LOAD, None)
+    assert "8 missions clamped to the 4 role cap, raise REWORK_MAX_ROLES" in busy.reason
