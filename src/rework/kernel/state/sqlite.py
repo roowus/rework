@@ -6,8 +6,12 @@ Postgres is the deployment backend; both must pass tests/conformance/test_store.
 
 from __future__ import annotations
 
+import asyncio
+import functools
+import inspect
 import json
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import aiosqlite
@@ -35,6 +39,7 @@ from rework.kernel.state.records import (
     check_priority,
     coerce_priority,
 )
+from rework.kernel.state.retry import retry_transient_methods
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS missions (
@@ -49,6 +54,7 @@ CREATE TABLE IF NOT EXISTS missions (
     priority TEXT NOT NULL DEFAULT 'normal',
     plan TEXT,
     result TEXT,
+    transient_crash_count INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -159,14 +165,119 @@ def _uj(value: str | None) -> dict[str, Any]:
     return json.loads(value) if value else {}
 
 
+class _OpLock:
+    """asyncio.Lock, reentrant within one task (same shape as the Postgres store's).
+
+    One aiosqlite connection is shared by every task of a process, so a public
+    call must not have another task's statements land in the middle of the
+    transaction it opened: they would be committed or rolled back with it.
+    aiossqlite serialises statements, not methods, so the method is the unit
+    that needs the lock. Nested public calls (update_mission -> get_mission)
+    re-enter, which is safe and keeps the outer transaction.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task[Any] | None = None
+
+    @property
+    def held(self) -> bool:
+        return self._owner is asyncio.current_task()
+
+    async def __aenter__(self) -> None:
+        me = asyncio.current_task()
+        if self._owner is me:
+            return
+        await self._lock.acquire()
+        self._owner = me
+
+    async def __aexit__(self, *exc: object) -> None:
+        if self._owner is asyncio.current_task():
+            self._owner = None
+            self._lock.release()
+
+
+def _atomic[T](method: Callable[..., Awaitable[T]]) -> Callable[..., Awaitable[T]]:
+    """Run one public store call as ONE explicit transaction.
+
+    The connection is opened in autocommit (`isolation_level=None` in
+    `open_sqlite`), so without this every `execute()` commits on its own: a
+    method that runs three statements has already stored two of them when the
+    third or the commit fails. The retry seam replays the whole method body, so
+    that half-applied work would be applied twice (a duplicate chat message,
+    mission, event or charge). BEGIN before the body and commit once after it
+    makes an attempt atomic: the rollback on a failed attempt discards exactly
+    what that attempt wrote, and the next attempt starts from the state before
+    the call. Plain BEGIN (deferred), so a read-only method still holds only a
+    read lock for its short life; the write methods that need write intent take
+    it up front with their existing `UPDATE chats SET id = id` statement.
+    """
+
+    @functools.wraps(method)
+    async def wrapper(self: SqliteStore, *args: Any, **kwargs: Any) -> T:
+        if self._op_lock.held:  # a nested public call joins the outer transaction
+            return await method(self, *args, **kwargs)
+        async with self._op_lock:
+            if self._db.in_transaction:  # left open by an interrupted call
+                await self._db.rollback()
+            await self._db.execute("BEGIN")
+            try:
+                result: T = await method(self, *args, **kwargs)
+                await self._db.commit()
+            except BaseException:
+                try:
+                    await self._db.rollback()
+                except Exception:  # never mask the caller's error: the seam retries
+                    pass
+                raise
+            return result
+
+    return wrapper
+
+
+def _atomic_methods[T](cls: type[T]) -> type[T]:
+    """Class decorator: one explicit transaction per public call (see `_atomic`).
+
+    Applied BEFORE `retry_transient_methods`, so the retry wraps the transaction:
+    each attempt gets its own clean BEGIN, and only the successful attempt is
+    committed. `aclose` is skipped: committing after closing the connection
+    would fail.
+    """
+    for name, value in list(vars(cls).items()):
+        if name == "aclose" or name.startswith("_") or not inspect.iscoroutinefunction(value):
+            continue
+        setattr(cls, name, _atomic(value))
+    return cls
+
+
+@retry_transient_methods(cleanup="_rollback")
+@_atomic_methods
 class SqliteStore:
-    """Async SQLite StateStore. Open with `open_sqlite(path)`."""
+    """Async SQLite StateStore. Open with `open_sqlite(path)`.
+
+    Every public method carries the shared transient-error retry (deadlock /
+    serialization class in Postgres terms, `database is locked` in sqlite's):
+    the class decorator is the seam, since this store has no single wrapper.
+    Nested calls share the outer attempt's budget.
+
+    Each public call is also one explicit transaction (`_atomic`), because this
+    connection runs in autocommit and sqlite reports its transient error at
+    COMMIT time, after the DML of that call has already been applied. The
+    attempt's rollback comes from `_rollback`, the cleanup the retry seam runs
+    between attempts, and from `_atomic` for any failure the retry does not
+    repeat.
+    """
 
     def __init__(self, db: aiosqlite.Connection) -> None:
         self._db = db
+        self._op_lock = _OpLock()
 
     async def aclose(self) -> None:
         await self._db.close()
+
+    async def _rollback(self) -> None:
+        """Discard the aborted attempt's transaction (the retry seam's cleanup)."""
+        await self._db.rollback()
 
     # -- internal helpers ---------------------------------------------------
     async def _fetch_one(self, sql: str, params: tuple[Any, ...]) -> aiosqlite.Row | None:
@@ -278,7 +389,6 @@ class SqliteStore:
                 mission.updated_at,
             ),
         )
-        await self._db.commit()
         return mission
 
     async def get_mission(self, mission_id: str) -> Mission | None:
@@ -323,8 +433,25 @@ class SqliteStore:
         params.append(time.time())
         params.append(mission_id)
         await self._db.execute(f"UPDATE missions SET {', '.join(sets)} WHERE id = ?", tuple(params))
-        await self._db.commit()
         return await self.get_mission(mission_id)
+
+    # -- transient crash counter -------------------------------------------
+    # One statement each, committed: a counter bump must survive the crash it
+    # is counting. Mission does not carry the field (SELECT * is unaffected).
+    async def increment_transient_crash_count(self, mission_id: str) -> int:
+        """Bump and return the mission's transient crash count (0 if no row)."""
+        row = await self._fetch_one(
+            "UPDATE missions SET transient_crash_count = transient_crash_count + 1"
+            " WHERE id = ? RETURNING transient_crash_count",
+            (mission_id,),
+        )
+        return int(row["transient_crash_count"]) if row else 0
+
+    async def reset_transient_crash_count(self, mission_id: str) -> None:
+        """Zero the mission's transient crash count (fresh dispatch, terminal)."""
+        await self._db.execute(
+            "UPDATE missions SET transient_crash_count = 0 WHERE id = ?", (mission_id,)
+        )
 
     async def list_missions(
         self,
@@ -401,7 +528,6 @@ class SqliteStore:
             "INSERT INTO projects (id, name, settings, created_at) VALUES (?, ?, ?, ?)",
             (project.id, project.name, _j(project.settings) or "{}", project.created_at),
         )
-        await self._db.commit()
         return project
 
     async def get_project(self, project_id: str) -> Project | None:
@@ -423,7 +549,6 @@ class SqliteStore:
             return await self.get_project(project_id)
         params.append(project_id)
         await self._db.execute(f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", tuple(params))
-        await self._db.commit()
         return await self.get_project(project_id)
 
     async def list_projects(self, limit: int = 100) -> list[Project]:
@@ -455,7 +580,6 @@ class SqliteStore:
                 run.updated_at,
             ),
         )
-        await self._db.commit()
         existing = await self.get_run(run.id)
         assert existing is not None
         return existing
@@ -501,7 +625,6 @@ class SqliteStore:
         params.append(time.time())
         params.append(run_id)
         await self._db.execute(f"UPDATE runs SET {', '.join(sets)} WHERE id = ?", tuple(params))
-        await self._db.commit()
         return await self.get_run(run_id)
 
     async def list_runs(self, mission_id: str) -> list[Run]:
@@ -536,7 +659,6 @@ class SqliteStore:
                 gate.decided_at,
             ),
         )
-        await self._db.commit()
         return gate
 
     async def get_gate(self, gate_id: str) -> Gate | None:
@@ -565,7 +687,6 @@ class SqliteStore:
                 GateStatus.OPEN.value,
             ),
         )
-        await self._db.commit()
         return await self.get_gate(gate_id)
 
     async def set_gate_question(self, gate_id: str, question: str) -> Gate | None:
@@ -613,7 +734,6 @@ class SqliteStore:
                 event.ts,
             ),
         )
-        await self._db.commit()
         event.seq = cur.lastrowid
         return event
 
@@ -666,7 +786,6 @@ class SqliteStore:
                 charge.ts,
             ),
         )
-        await self._db.commit()
 
     async def run_charges(self, run_id: str) -> list[Charge]:
         rows = await self._fetch_all(
@@ -810,7 +929,6 @@ class SqliteStore:
                 chat.updated_at,
             ),
         )
-        await self._db.commit()
         return chat
 
     async def get_chat(self, chat_id: str) -> Chat | None:
@@ -841,7 +959,6 @@ class SqliteStore:
                 params.append(value)
         params.append(chat_id)
         await self._db.execute(f"UPDATE chats SET {', '.join(sets)} WHERE id = ?", tuple(params))
-        await self._db.commit()
         return await self.get_chat(chat_id)
 
     async def list_chats(self, limit: int = 50, include_missions: bool = True) -> list[Chat]:
@@ -852,12 +969,17 @@ class SqliteStore:
         rows = await self._fetch_all(sql, (limit,))
         return [self._chat(r) for r in rows]
 
+    # Lock order for chat writes: the chats row first, then chat_messages.
+    # sqlite has no `SELECT ... FOR UPDATE`, so the write intent on chats is
+    # taken with a no-op UPDATE on that row; on one shared file this is parity
+    # with Postgres (which locks the row with FOR UPDATE), not a deadlock fix.
     async def delete_chat(self, chat_id: str) -> None:
+        await self._db.execute("UPDATE chats SET id = id WHERE id = ?", (chat_id,))
         await self._db.execute("DELETE FROM chat_messages WHERE chat_id = ?", (chat_id,))
         await self._db.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
-        await self._db.commit()
 
     async def append_chat_message(self, message: ChatMessage) -> ChatMessage:
+        await self._db.execute("UPDATE chats SET id = id WHERE id = ?", (message.chat_id,))
         cur = await self._db.execute(
             "INSERT INTO chat_messages (chat_id, role, body, display, ts) VALUES (?, ?, ?, ?, ?)",
             (message.chat_id, message.role, _j(message.body) or "{}", message.display, message.ts),
@@ -865,7 +987,6 @@ class SqliteStore:
         await self._db.execute(
             "UPDATE chats SET updated_at = ? WHERE id = ?", (message.ts, message.chat_id)
         )
-        await self._db.commit()
         message_id = cur.lastrowid
         await cur.close()
         return message.model_copy(update={"id": message_id})
@@ -919,7 +1040,6 @@ class SqliteStore:
             "    OR daemon_lock.heartbeat_at <= ?",
             (owner, now, now - stale_after_s),
         )
-        await self._db.commit()
         return cur.rowcount > 0
 
     async def heartbeat_lock(self, owner: str) -> bool:
@@ -927,12 +1047,10 @@ class SqliteStore:
             "UPDATE daemon_lock SET heartbeat_at = ? WHERE id = 1 AND owner = ?",
             (time.time(), owner),
         )
-        await self._db.commit()
         return cur.rowcount > 0
 
     async def release_lock(self, owner: str) -> None:
         await self._db.execute("DELETE FROM daemon_lock WHERE id = 1 AND owner = ?", (owner,))
-        await self._db.commit()
 
     # -- complaints inbox (ADR 0004) ------------------------------------------------
     async def file_complaint(self, complaint: Complaint) -> Complaint:
@@ -955,7 +1073,6 @@ class SqliteStore:
                 complaint.created_at,
             ),
         )
-        await self._db.commit()
         return complaint
 
     async def list_complaints(
@@ -987,7 +1104,6 @@ class SqliteStore:
         await self._db.execute(
             "UPDATE complaints SET status = ? WHERE id = ?", (status.value, complaint_id)
         )
-        await self._db.commit()
         return await self.get_complaint(complaint_id)
 
     async def get_complaint(self, complaint_id: str) -> Complaint | None:
@@ -1039,6 +1155,10 @@ async def open_sqlite(path: str) -> SqliteStore:
         await db.execute("ALTER TABLE missions ADD COLUMN title TEXT")
     if "priority" not in names:
         await db.execute("ALTER TABLE missions ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'")
+    if "transient_crash_count" not in names:
+        await db.execute(
+            "ALTER TABLE missions ADD COLUMN transient_crash_count INTEGER NOT NULL DEFAULT 0"
+        )
     cols = await db.execute("PRAGMA table_info(gates)")
     names = {row[1] for row in await cols.fetchall()}
     if "for_run" not in names:

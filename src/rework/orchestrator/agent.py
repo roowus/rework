@@ -950,6 +950,11 @@ class MissionOrchestrator:
             if await self.r._pause_until_resumed() == "cancelled":
                 return "cancelled"
             await self._restart_live_runs()
+        if self.r._supervisor is not None:
+            # A transient database error that escaped a role run has to leave
+            # this loop too: the run row never goes terminal, so waiting on it
+            # strands the mission instead of requeueing it.
+            await self.r._supervisor.check_fatal()
         if await self.r._burn_gate_hit() == "cancelled":
             return "cancelled"
         return "ok"
