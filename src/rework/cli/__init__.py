@@ -929,6 +929,31 @@ def report(
     surviving worktree or branch, else missions.result.summary clearly labelled
     as a summary. --from-file is an error when the file is missing or empty."""
 
+    if not to_library:
+        stray = [
+            flag
+            for flag, given in (
+                ("--from-file", from_file is not None),
+                ("--title", title is not None),
+                ("--tag", bool(tag)),
+                ("--dry-run", dry_run),
+            )
+            if given
+        ]
+        if stray:
+            typer.secho(
+                f"{', '.join(stray)} only apply with --to-library; nothing was done.",
+                fg=typer.colors.RED,
+            )
+            raise typer.Exit(2)
+    elif md or out:
+        typer.secho(
+            "--to-library cannot be combined with --md or --out: pick the Library"
+            " hand-off or the markdown file; nothing was done.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(2)
+
     async def go() -> None:
         from rework.config import Config, open_store_from_config
 
@@ -1047,7 +1072,6 @@ async def _report_hand_off(
         )
         raise typer.Exit(1)
 
-    name = title or f"Report: {mission.id}"
     git = GitLibrary(_library_root(), author=config.git_author)
     index = await open_library_index(config.db)
     try:
@@ -1056,7 +1080,7 @@ async def _report_hand_off(
             git,
             mission,
             body=body,
-            name=name,
+            name=title,
             extra_tags=extra_tags,
             dry_run=dry_run,
         )

@@ -830,6 +830,248 @@ def test_report_to_library_finds_the_mission_doc_in_a_surviving_worktree(
     assert "source:worktree" in item.tags
 
 
+def _git_repo(root: Path, files: dict[str, str]) -> Any:
+    """A throwaway git repo on `main` holding `files`; returns a `run(*args)`."""
+    import subprocess
+
+    root.mkdir(parents=True, exist_ok=True)
+    for rel, text in files.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text, encoding="utf-8")
+
+    def run(*args: str) -> None:
+        subprocess.run(
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t", *args],
+            cwd=root,
+            check=True,
+            capture_output=True,
+        )
+
+    run("init", "-b", "main")
+    run("add", "-A")
+    run("commit", "-m", "base")
+    return run
+
+
+def _seed_worktree_mission(db: Path, mission_id: str, worktree: Path) -> None:
+    async def go() -> None:
+        from rework.kernel.state.records import Run, RunStatus
+
+        store = await open_sqlite(str(db))
+        try:
+            await store.create_mission(
+                Mission(id=mission_id, objective="audit", status=MissionStatus.DONE)
+            )
+            await store.update_mission(mission_id, result={"summary": "a description"})
+            await store.create_run(
+                Run(
+                    id=f"r-{mission_id}",
+                    mission_id=mission_id,
+                    role="coder",
+                    step="code",
+                    status=RunStatus.COMPLETED,
+                    artifact={"worktree": str(worktree)},
+                )
+            )
+        finally:
+            await store.aclose()
+
+    asyncio.run(go())
+
+
+def test_report_to_library_prefers_a_new_doc_over_a_bigger_edited_one(
+    rework_db: Path, library_dir: Path, tmp_path: Path
+) -> None:
+    """The mission EDITED a big pre-existing doc and ADDED a small report: the
+    added one is the report. A bigger edited doc must not win on size."""
+    wt = tmp_path / "wt"
+    run = _git_repo(wt, {"docs/guide.md": "# Guide\n" + "old line\n" * 5})
+    run("checkout", "-b", "rework/m-ae-code-coder-1")
+    (wt / "docs" / "guide.md").write_text("# Guide\n" + "edited line\n" * 200, encoding="utf-8")
+    (wt / "docs" / "audits").mkdir()
+    (wt / "docs" / "audits" / "report.md").write_text("# The report\nshort\n", encoding="utf-8")
+    run("add", "-A")
+    run("commit", "-m", "work")
+    _seed_worktree_mission(rework_db, "m-ae", wt)
+
+    result = runner.invoke(app, ["report", "m-ae", "--to-library"])
+    assert result.exit_code == 0, result.output
+    assert "docs/audits/report.md" in result.output
+    assert "WARNING" not in result.output
+    item = _library_items(rework_db)[0]
+    assert "# The report" in item.body and "edited line" not in item.body
+    assert "source:worktree" in item.tags
+
+
+def test_report_to_library_labels_an_edited_doc_loudly(
+    rework_db: Path, library_dir: Path, tmp_path: Path
+) -> None:
+    """Nothing was added, only an existing doc was edited: fall back to it, but
+    warn and tag it source:doc-modified so it is never taken for a report."""
+    wt = tmp_path / "wt"
+    run = _git_repo(wt, {"docs/guide.md": "# Guide\nold\n"})
+    run("checkout", "-b", "rework/m-ed-code-coder-1")
+    (wt / "docs" / "guide.md").write_text("# Guide\nnew text\n", encoding="utf-8")
+    run("add", "-A")
+    run("commit", "-m", "work")
+    _seed_worktree_mission(rework_db, "m-ed", wt)
+
+    result = runner.invoke(app, ["report", "m-ed", "--to-library"])
+    assert result.exit_code == 0, result.output
+    assert "WARNING: no new report document was found" in result.output
+    item = _library_items(rework_db)[0]
+    assert "source:doc-modified" in item.tags
+    assert "source:worktree" not in item.tags
+
+
+def _contribute_role_report(db: Path, library_dir: Path, mission_id: str) -> str:
+    """A report a ROLE authored: contribute() stamps provenance.mission_id on
+    it, but it carries none of the hand-off's markers."""
+    from rework.library.curation import contribute
+    from rework.library.model import ItemType
+    from rework.library.store import GitLibrary, open_library_store
+
+    async def go() -> str:
+        index = await open_library_store(str(db))
+        try:
+            item, _ = await contribute(
+                index,
+                GitLibrary(library_dir),
+                type_=ItemType.REPORT,
+                name="Role authored report",
+                description="written by a role",
+                body="# role body\n",
+                tags=["audit"],
+                mission_id=mission_id,
+            )
+            return item.id
+        finally:
+            await index.aclose()
+
+    return asyncio.run(go())
+
+
+def test_report_to_library_never_overwrites_a_role_authored_report(
+    rework_db: Path, library_dir: Path
+) -> None:
+    """A role's own report carries provenance.mission_id too. The hand-off must
+    neither select nor rewrite it: it files its own item beside it, and only a
+    re-run updates that one."""
+    _seed_summary_mission(rework_db, "m-role", "the summary")
+    role_id = _contribute_role_report(rework_db, library_dir, "m-role")
+
+    from rework.library.handoff import find_report_item
+    from rework.library.store import open_library_store
+
+    async def lookup() -> Any:
+        index = await open_library_store(str(rework_db))
+        try:
+            return await find_report_item(index, "m-role")
+        finally:
+            await index.aclose()
+
+    assert asyncio.run(lookup()) is None
+    dry = runner.invoke(app, ["report", "m-role", "--to-library", "--dry-run"])
+    assert "would create report" in dry.output and role_id not in dry.output
+
+    for expected_updates in (False, True):
+        result = runner.invoke(app, ["report", "m-role", "--to-library"])
+        assert result.exit_code == 0, result.output
+        assert ("updated report" in result.output) is expected_updates
+        items = {i.id: i for i in _library_items(rework_db)}
+        assert len(items) == 2
+        role = items[role_id]
+        assert (role.name, role.tags, role.body, role.version) == (
+            "Role authored report",
+            ["audit"],
+            "# role body\n",
+            1,
+        )
+        (own,) = [i for i in items.values() if i.id != role_id]
+        assert "handoff:report" in own.tags
+
+
+def test_report_to_library_recognises_an_item_filed_before_the_marker(
+    rework_db: Path, library_dir: Path
+) -> None:
+    """The item filed by the first version of this command has no handoff tag,
+    only mission/source tags and the hand-off description. A re-run must still
+    find and update it instead of minting a duplicate."""
+    _seed_summary_mission(rework_db, "m-old", "first")
+    assert runner.invoke(app, ["report", "m-old", "--to-library"]).exit_code == 0
+
+    from rework.library.store import open_library_store
+
+    async def strip_marker() -> None:
+        index = await open_library_store(str(rework_db))
+        try:
+            (item,) = await index.list_items(limit=10)
+            item.tags = [t for t in item.tags if t != "handoff:report"]
+            await index.upsert_item(item)
+        finally:
+            await index.aclose()
+
+    asyncio.run(strip_marker())
+    result = runner.invoke(app, ["report", "m-old", "--to-library", "--dry-run"])
+    assert "would update report" in result.output
+    assert runner.invoke(app, ["report", "m-old", "--to-library"]).exit_code == 0
+    assert len(_library_items(rework_db)) == 1
+
+
+def test_report_to_library_rerun_keeps_title_tags_and_body_file(
+    rework_db: Path, library_dir: Path
+) -> None:
+    """A bare re-run must not revert --title or drop --tag; a re-run with a new
+    --title renames the item and overwrites the SAME body file (no orphan)."""
+    _seed_summary_mission(rework_db, "m-keep", "body one")
+    first = runner.invoke(
+        app, ["report", "m-keep", "--to-library", "--title", "Mine", "--tag", "owner-tag"]
+    )
+    assert first.exit_code == 0, first.output
+    (item,) = _library_items(rework_db)
+    body_path = item.body_path
+    assert item.name == "Mine" and "owner-tag" in item.tags
+
+    bare = runner.invoke(app, ["report", "m-keep", "--to-library"])
+    assert bare.exit_code == 0, bare.output
+    (again,) = _library_items(rework_db)
+    assert again.name == "Mine"
+    assert "owner-tag" in again.tags and "mission:m-keep" in again.tags
+    assert again.body_path == body_path
+
+    renamed = runner.invoke(app, ["report", "m-keep", "--to-library", "--title", "Renamed"])
+    assert renamed.exit_code == 0, renamed.output
+    (final,) = _library_items(rework_db)
+    assert final.name == "Renamed" and "owner-tag" in final.tags
+    assert final.body_path == body_path
+    assert [p.name for p in (library_dir / "reports").glob("*.md")] == [Path(body_path).name]
+
+
+def test_report_flags_without_to_library_are_usage_errors(
+    rework_db: Path, library_dir: Path, tmp_path: Path
+) -> None:
+    """--from-file/--title/--tag/--dry-run do nothing without --to-library, so
+    they are rejected instead of silently falling through to the plain report;
+    --to-library with --md/--out is a conflict. Nothing is written either way."""
+    _seed_summary_mission(rework_db, "m-flag", "body")
+    doc = tmp_path / "d.md"
+    doc.write_text("# d\n", encoding="utf-8")
+    cases = [
+        (["--from-file", str(doc)], "--from-file"),
+        (["--title", "T"], "--title"),
+        (["--tag", "x"], "--tag"),
+        (["--dry-run"], "--dry-run"),
+        (["--to-library", "--md"], "cannot be combined"),
+        (["--to-library", "--out", str(tmp_path / "o.md")], "cannot be combined"),
+    ]
+    for args, needle in cases:
+        result = runner.invoke(app, ["report", "m-flag", *args])
+        assert result.exit_code != 0, args
+        assert needle in result.output, (args, result.output)
+    assert _library_items(rework_db) == []
+    assert not (tmp_path / "o.md").exists()
+
+
 # --- named connection targets (rework targets / sync-config) -----------------
 
 

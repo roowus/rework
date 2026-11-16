@@ -115,11 +115,16 @@ as markdown (default `~/.rework/reports/<id>.md`) and prints a per-step cost sum
 printing it: the body goes into the Library as one `report` item per mission, so a
 mission whose report is stranded in a worktree `rework gc` is about to delete stays
 readable. The body comes from `--from-file PATH` when you name one, else the
-mission's own largest changed `docs/*.md` in a worktree or branch that still exists,
-else `missions.result.summary`, which is tagged `source:summary` because that field
-describes the report rather than containing it. Re-running updates the same item
-(no duplicate ids), `--dry-run` prints the item and writes nothing, and
-`--title`/`--tag` override the name and add a tag.
+mission's own largest newly added `docs/*.md` in a worktree or branch that still
+exists. If the mission only edited existing docs, the largest edited one is used with a
+warning and the tag `source:doc-modified`; failing that, `missions.result.summary`,
+tagged `source:summary` because that field describes the report rather than containing
+it. Re-running updates the same item (no duplicate ids): only items this command filed
+(tagged `handoff:report`) are ever updated, never a report a role wrote. A re-run keeps
+the item's name unless you pass `--title`, and merges `--tag` into the existing tags.
+`--dry-run` prints the item and writes nothing. `--from-file`, `--title`, `--tag` and
+`--dry-run` are errors without `--to-library`, and `--to-library` cannot be combined
+with `--md` or `--out`.
 
 Judge like an owner: does the diff fix `add`? do
 both tests in `test_calc.py` pass now? does the investigation cite file:line evidence

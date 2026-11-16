@@ -618,7 +618,9 @@ class GitLibrary:
         """Write the body file, stage + commit, return the repo-relative path.
         Sync by design; callers wrap in to_thread."""
         self.ensure_repo()
-        rel = self.body_path_for(item)
+        # an item that already has a body file keeps it: a rename must overwrite
+        # the same file, not strand the old one with the old body
+        rel = item.body_path or self.body_path_for(item)
         dest = self.root / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(body)

@@ -8,18 +8,26 @@ idempotent and says out loud which source of the body it used.
 Body resolution, highest priority first:
 (a) an explicit `--from-file PATH`: the owner knows which file is the report;
 (b) the mission's own docs markdown, when a role worktree or a branch of the
-    mission still exists: the largest changed `.md` under `docs/` (an audit or
-    a design note is normally the biggest document a mission adds, and its size
-    is what separates it from an incidental `docs/` edit);
+    mission still exists: the largest NEWLY ADDED `.md` under `docs/` (an audit
+    or a design note is a document the mission wrote, not one it edited). Only
+    when nothing was added does the largest merely EDITED docs markdown stand
+    in, loudly: it is tagged `source:doc-modified` and a warning is printed,
+    because an edited pre-existing doc is not a purpose-written report;
 (c) `missions.result.summary`, LABELLED, because that field describes the work,
     it does not contain the report. A summary-only item is tagged
     `source:summary` so nobody mistakes it for the full document later.
 
-Dedupe key: `(type=report, provenance.mission_id)`. `find_report_item` is that
-lookup. A re-run for the same mission UPDATES the item in place (its id, body
-path, created_at, uses and status survive, its version is bumped) instead of
-minting a duplicate, which mirrors the re-run safety `library backfill-bodies`
-already promises. A mission can therefore own exactly one handed-off report.
+Dedupe key: `(type=report, provenance.mission_id, hand-off marker)`.
+`find_report_item` is that lookup. Role contributions get `provenance.mission_id`
+stamped automatically too, so the mission id alone would match (and overwrite)
+a report a role authored; the `handoff:report` marker tag, which role
+contributions never carry, is what limits a re-run to items this command filed.
+(An item filed before the marker existed is recognised by its own fingerprint:
+a `mission:<id>` tag, a `source:<kind>` tag and the hand-off description.) A
+re-run UPDATES the item in place (its id, body path, created_at, uses and
+status survive, its version is bumped) instead of minting a duplicate, which
+mirrors the re-run safety `library backfill-bodies` already promises. A mission
+can therefore own exactly one handed-off report.
 
 Nothing here is byte-faithful on the way out by accident: the body is a one-line
 header that links the mission and names the source, a blank line, and then the
@@ -39,7 +47,14 @@ from rework.library.model import ItemType, LibraryItem, Origin, Provenance
 # source kinds; they ride along as `source:<kind>` tags on the item
 KIND_FILE = "from-file"
 KIND_WORKTREE = "worktree"
+KIND_DOC_MODIFIED = "doc-modified"
 KIND_SUMMARY = "summary"
+_KINDS = (KIND_FILE, KIND_WORKTREE, KIND_DOC_MODIFIED, KIND_SUMMARY)
+
+# Marks an item this command filed. Role contributions never carry it.
+HANDOFF_TAG = "handoff:report"
+_DESCRIPTION_PREFIX = "Report for mission "
+_SOURCE_PREFIX = "source:"
 
 DOCS_PREFIX = "docs"
 _MD_SUFFIX = ".md"
@@ -50,13 +65,28 @@ class ReportBody:
     """One resolved report body and where it came from."""
 
     text: str
-    kind: str  # from-file | worktree | summary
+    kind: str  # from-file | worktree | doc-modified | summary
     detail: str  # human readable, e.g. "docs/audits/codebase-audit.md (worktree)"
 
     @property
     def is_full_report(self) -> bool:
-        """False only for the summary fallback, which describes the report."""
-        return self.kind != KIND_SUMMARY
+        """False for the fallbacks that are not a purpose-written report."""
+        return self.kind not in (KIND_SUMMARY, KIND_DOC_MODIFIED)
+
+    @property
+    def warning(self) -> str | None:
+        """What the owner must know when the body is not the report itself."""
+        if self.kind == KIND_SUMMARY:
+            return (
+                "the summary describes the report, it does not contain it;"
+                " pass --from-file to hand off the document itself"
+            )
+        if self.kind == KIND_DOC_MODIFIED:
+            return (
+                "no new report document was found; the body is a docs file the mission"
+                " edited, not one it wrote; pass --from-file to hand off the report itself"
+            )
+        return None
 
 
 def mission_tag(mission_id: str) -> str:
@@ -93,19 +123,25 @@ def _base_ref(checkout: Path, ref: str) -> str | None:
     return None
 
 
-def _changed_docs(checkout: Path, ref: str) -> list[str]:
-    """`docs/**/*.md` the mission added or changed. For a working-tree ref
-    ("HEAD") the uncommitted and untracked files count too: a role does not
-    always commit its report. With no base ref at all (a single-commit clone)
-    every doc of that commit is a candidate."""
+def _changed_docs(checkout: Path, ref: str) -> tuple[list[str], list[str]]:
+    """(added, modified) `docs/**/*.md` of the mission. For a working-tree ref
+    ("HEAD") the uncommitted and untracked files count too (untracked ones are
+    added): a role does not always commit its report. With no base ref at all
+    nothing can be called new, so every doc of that commit is "modified"."""
     base = _base_ref(checkout, ref)
     if base is None:
         names = _git(checkout, "ls-tree", "-r", "--name-only", ref, "--", DOCS_PREFIX)
-    elif ref == "HEAD":
-        names = _git(checkout, "diff", "--name-only", base, "--", DOCS_PREFIX)
-        names += _git(checkout, "ls-files", "--others", "--exclude-standard", "--", DOCS_PREFIX)
-    else:
-        names = _git(checkout, "diff", "--name-only", f"{base}..{ref}", "--", DOCS_PREFIX)
+        return [], _md(names)
+    span = base if ref == "HEAD" else f"{base}..{ref}"
+    added_out = _git(checkout, "diff", "--name-only", "--diff-filter=A", span, "--", DOCS_PREFIX)
+    changed_out = _git(checkout, "diff", "--name-only", span, "--", DOCS_PREFIX)
+    if ref == "HEAD":
+        added_out += _git(checkout, "ls-files", "--others", "--exclude-standard", "--", DOCS_PREFIX)
+    added = _md(added_out)
+    return added, [n for n in _md(changed_out) if n not in added]
+
+
+def _md(names: str) -> list[str]:
     return [n for n in dict.fromkeys(names.splitlines()) if n.endswith(_MD_SUFFIX)]
 
 
@@ -128,11 +164,9 @@ def _doc_size(checkout: Path, ref: str, name: str) -> int:
         return 0
 
 
-def largest_changed_doc(checkout: Path, ref: str) -> tuple[str, str] | None:
-    """(body, repo-relative path) for the biggest changed `.md` under docs/, or
-    None when this checkout has no such document."""
+def _largest(checkout: Path, ref: str, names: list[str]) -> tuple[str, str] | None:
     best: tuple[int, str] | None = None
-    for name in _changed_docs(checkout, ref):
+    for name in names:
         size = _doc_size(checkout, ref, name)
         if size and (best is None or size > best[0]):
             best = (size, name)
@@ -142,6 +176,20 @@ def largest_changed_doc(checkout: Path, ref: str) -> tuple[str, str] | None:
     if not text or not text.strip():
         return None
     return text, best[1]
+
+
+def largest_changed_doc(checkout: Path, ref: str) -> tuple[str, str, bool] | None:
+    """(body, repo-relative path, newly_added) for the biggest `.md` under docs/
+    this checkout added, else the biggest it merely edited; None when it has
+    no such document. A newly added doc always wins over a bigger edited one."""
+    added, modified = _changed_docs(checkout, ref)
+    found = _largest(checkout, ref, added)
+    if found is not None:
+        return found[0], found[1], True
+    found = _largest(checkout, ref, modified)
+    if found is not None:
+        return found[0], found[1], False
+    return None
 
 
 def _worktrees(mission: Any, runs: list[Any]) -> list[Path]:
@@ -170,20 +218,26 @@ def _branches(mission: Any, runs: list[Any]) -> list[tuple[Path, str]]:
 
 async def resolve_from_mission(store: Any, mission: Any) -> ReportBody | None:
     """(b) then nothing: the mission's own docs markdown from a worktree or a
-    branch that still exists. None means "no document found", so the caller can
+    branch that still exists. A newly added doc from ANY surviving source beats
+    an edited one; an edited doc is returned (kind `doc-modified`) only when no
+    source has an added one. None means "no document found", so the caller can
     fall back to the summary."""
     runs = await store.list_runs(mission.id)
-    for worktree in _worktrees(mission, runs):
-        found = largest_changed_doc(worktree, "HEAD")
-        if found is not None:
-            text, name = found
-            return ReportBody(text=text, kind=KIND_WORKTREE, detail=f"{name} (worktree)")
-    for repo, branch in _branches(mission, runs):
-        found = largest_changed_doc(repo, branch)
-        if found is not None:
-            text, name = found
-            return ReportBody(text=text, kind=KIND_WORKTREE, detail=f"{name} (branch {branch})")
-    return None
+    sources = [(wt, "HEAD", "worktree") for wt in _worktrees(mission, runs)]
+    sources += [(repo, branch, f"branch {branch}") for repo, branch in _branches(mission, runs)]
+    fallback: ReportBody | None = None
+    for checkout, ref, label in sources:
+        found = largest_changed_doc(checkout, ref)
+        if found is None:
+            continue
+        text, name, added = found
+        if added:
+            return ReportBody(text=text, kind=KIND_WORKTREE, detail=f"{name} ({label})")
+        if fallback is None:
+            fallback = ReportBody(
+                text=text, kind=KIND_DOC_MODIFIED, detail=f"{name} (edited, {label})"
+            )
+    return fallback
 
 
 def from_file(path: str) -> ReportBody:
@@ -222,19 +276,37 @@ def compose(
 ) -> tuple[str, list[str]]:
     """(full body, tags) for this hand-off. The tags carry the mission id and
     the source kind, so a summary-only item is never mistaken for a report."""
-    tags = [mission_tag(mission_id), ItemType.REPORT.value, f"source:{body.kind}"]
+    tags = [mission_tag(mission_id), ItemType.REPORT.value, HANDOFF_TAG, f"source:{body.kind}"]
     for tag in extra_tags or []:
         if tag and tag not in tags:
             tags.append(tag)
     return f"{header_for(mission_id, body)}\n\n{body.text}", tags
 
 
+def is_handoff_item(item: LibraryItem, mission_id: str) -> bool:
+    """True only for a report item this command filed for `mission_id`.
+
+    provenance.mission_id alone is not enough: role contributions are stamped
+    with it too. The marker tag is what role contributions never carry. Items
+    filed before the marker existed are recognised by the fingerprint only this
+    command writes: mission tag + source tag + the hand-off description."""
+    if item.type is not ItemType.REPORT or item.provenance.mission_id != mission_id:
+        return False
+    if HANDOFF_TAG in item.tags:
+        return True
+    return (
+        mission_tag(mission_id) in item.tags
+        and any(t in {f"{_SOURCE_PREFIX}{k}" for k in _KINDS} for t in item.tags)
+        and item.description.startswith(f"{_DESCRIPTION_PREFIX}{mission_id};")
+    )
+
+
 async def find_report_item(index: Any, mission_id: str) -> LibraryItem | None:
-    """The dedupe lookup: a report item whose provenance carries this mission
-    id. Oldest wins, so a mission that somehow owns two converges on the first
-    one instead of flipping between them."""
+    """The dedupe lookup: a report item THIS command filed for the mission (type
+    report, provenance mission id, hand-off marker). Oldest wins, so a mission
+    that somehow owns two converges on the first one instead of flipping."""
     items = await index.list_items(type_=ItemType.REPORT, limit=100_000)
-    matches = [i for i in items if i.provenance.mission_id == mission_id]
+    matches = [i for i in items if is_handoff_item(i, mission_id)]
     if not matches:
         return None
     matches.sort(key=lambda i: i.created_at)
@@ -247,7 +319,7 @@ async def hand_off(
     mission: Any,
     *,
     body: ReportBody,
-    name: str,
+    name: str | None = None,
     extra_tags: list[str] | None = None,
     dry_run: bool = False,
 ) -> tuple[LibraryItem, bool, str]:
@@ -258,26 +330,34 @@ async def hand_off(
     updated in place through the same git writer plus the same index upsert,
     which is what makes a second run a safe re-run rather than a duplicate. On
     `dry_run` neither path is taken: no body file, no index row.
+
+    `name` is the owner's --title: an update changes the item name only when it
+    is given, and tags are merged (union), so a bare re-run never reverts what
+    an earlier run or the owner set. Only the derived `source:*` tag is swapped
+    for the current one.
     """
     from rework.library.curation import accept_status, contribute
 
     full_body, tags = compose(mission.id, body, extra_tags)
-    description = f"Report for mission {mission.id}; body from {body.detail}"
+    description = f"{_DESCRIPTION_PREFIX}{mission.id}; body from {body.detail}"
     existing = await find_report_item(index, mission.id)
     if existing is not None:
         item = existing.model_copy(deep=True)
-        item.name = name
+        if name:
+            item.name = name
         item.description = description
-        item.tags = tags
+        item.tags = [t for t in item.tags if not t.startswith(_SOURCE_PREFIX)]
+        item.tags += [t for t in tags if t not in item.tags]
         item.body = full_body
         item.touch()
         if not dry_run:
             item.body_path = await asyncio.to_thread(
-                git.write_body, item, full_body, f"library: update report {name!r}"
+                git.write_body, item, full_body, f"library: update report {item.name!r}"
             )
             item.body = full_body
             await index.upsert_item(item)
         return item, False, "update"
+    name = name or f"Report: {mission.id}"
     planned = LibraryItem(
         type=ItemType.REPORT,
         name=name,
@@ -323,9 +403,6 @@ def describe(item: LibraryItem, body: ReportBody, dry_run: bool, verb: str) -> l
         f"  source: {body.kind} ({body.detail})",
         f"  body: {len(item.body)} chars",
     ]
-    if not body.is_full_report:
-        lines.append(
-            "  note: the summary describes the report, it does not contain it;"
-            " pass --from-file to hand off the document itself"
-        )
+    if body.warning:
+        lines.append(f"  WARNING: {body.warning}")
     return lines
