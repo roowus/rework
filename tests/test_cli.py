@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
@@ -596,6 +597,237 @@ def test_library_backfill_bodies_command(
     again = runner.invoke(app, ["library", "backfill-bodies"])
     assert again.exit_code == 0, again.output
     assert "backfilled 0 item body/bodies" in again.output
+
+
+# --- report --to-library (repeatable report hand-off) -----------------------
+
+
+@pytest.fixture()
+def library_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A throwaway library git folder: without this the command would commit a
+    body file into the developer's real ~/.rework/library."""
+    root = tmp_path / "library"
+    monkeypatch.setenv("REWORK_LIBRARY_DIR", str(root))
+    return root
+
+
+def _library_items(db: Path) -> list[Any]:
+    from rework.library.store import open_library_store
+
+    async def go() -> list[Any]:
+        index = await open_library_store(str(db))
+        try:
+            return await index.list_items(limit=1000)
+        finally:
+            await index.aclose()
+
+    return asyncio.run(go())
+
+
+def _seed_summary_mission(db: Path, mission_id: str, summary: str) -> None:
+    """A finished mission whose ONLY report trace is result.summary, which is
+    exactly the state the hand-off has to survive."""
+
+    async def go() -> None:
+        store = await open_sqlite(str(db))
+        try:
+            await store.create_mission(
+                Mission(
+                    id=mission_id,
+                    objective="audit the code base",
+                    status=MissionStatus.DONE,
+                )
+            )
+            await store.update_mission(mission_id, result={"summary": summary})
+        finally:
+            await store.aclose()
+
+    asyncio.run(go())
+
+
+def test_report_to_library_files_the_summary_fallback(rework_db: Path, library_dir: Path) -> None:
+    """`rework report M --to-library` turns a finished mission into one report
+    item: type report, name from the mission, the seeded text in the body, and
+    the mission id in the tags. The summary is a labelled fallback, so the tag
+    says so."""
+    summary = "## What changed\n\nOne new file, nothing else: docs/audits/x.md"
+    _seed_summary_mission(rework_db, "m-hand", summary)
+
+    result = runner.invoke(app, ["report", "m-hand", "--to-library"])
+    assert result.exit_code == 0, result.output
+    assert "source: summary" in result.output
+
+    items = _library_items(rework_db)
+    assert len(items) == 1
+    item = items[0]
+    from rework.library.model import ItemStatus, ItemType
+
+    assert item.type is ItemType.REPORT
+    assert item.status is ItemStatus.ACTIVE
+    assert item.name == "Report: m-hand"
+    assert item.provenance.mission_id == "m-hand"
+    assert "mission:m-hand" in item.tags
+    assert "source:summary" in item.tags
+    # the resolved text rides along unmodified, behind a one-line header
+    assert summary in item.body
+    assert item.body.startswith("Handed off from rework mission m-hand.")
+    # the body also landed in the library git folder, not only the index row
+    assert item.body_path and (library_dir / item.body_path).is_file()
+
+
+def test_report_to_library_unknown_mission_writes_nothing(
+    rework_db: Path, library_dir: Path
+) -> None:
+    """An unknown mission id is a clean non-zero exit with nothing written."""
+    result = runner.invoke(app, ["report", "m-nope", "--to-library"])
+    assert result.exit_code != 0
+    assert "no such mission: m-nope" in result.output
+    assert _library_items(rework_db) == []
+    assert not library_dir.exists() or not any(library_dir.rglob("*.md"))
+
+
+def test_report_to_library_dry_run_writes_nothing_but_prints_the_plan(
+    rework_db: Path, library_dir: Path
+) -> None:
+    """--dry-run prints exactly what would be created (id, name, type, status,
+    tags, body length, source) and writes NOTHING: no index row, no body file."""
+    _seed_summary_mission(rework_db, "m-dry", "the audit body")
+
+    result = runner.invoke(app, ["report", "m-dry", "--to-library", "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "would create report l-" in result.output
+    assert "[report/active]" in result.output
+    assert "name: Report: m-dry" in result.output
+    assert "mission:m-dry" in result.output
+    assert "source: summary" in result.output
+    assert "body:" in result.output
+    assert "dry run; nothing written" in result.output
+
+    assert _library_items(rework_db) == []
+    assert not library_dir.exists() or not any(library_dir.rglob("*.md"))
+
+
+def test_report_to_library_is_idempotent_on_mission_id(rework_db: Path, library_dir: Path) -> None:
+    """The dedupe key is (type=report, provenance.mission_id): a second run
+    updates the same item (version bumped, id kept) instead of minting the
+    duplicate `library add` would."""
+    _seed_summary_mission(rework_db, "m-again", "first body")
+    first = runner.invoke(app, ["report", "m-again", "--to-library"])
+    assert first.exit_code == 0, first.output
+    created = _library_items(rework_db)
+    assert len(created) == 1
+    item_id, version = created[0].id, created[0].version
+
+    async def reseed(summary: str) -> None:
+        store = await open_sqlite(str(rework_db))
+        try:
+            await store.update_mission("m-again", result={"summary": summary})
+        finally:
+            await store.aclose()
+
+    asyncio.run(reseed("second body"))
+
+    again = runner.invoke(app, ["report", "m-again", "--to-library"])
+    assert again.exit_code == 0, again.output
+    assert f"updated report {item_id}" in again.output
+    items = _library_items(rework_db)
+    assert len(items) == 1, "a re-run must not mint a second item"
+    assert items[0].id == item_id
+    assert items[0].version > version
+    assert "second body" in items[0].body
+    assert "first body" not in items[0].body
+
+
+def test_report_to_library_prefers_from_file_and_never_reflows(
+    rework_db: Path, library_dir: Path, tmp_path: Path
+) -> None:
+    """--from-file outranks the mission's own markdown and the summary, and the
+    document is stored byte for byte behind the header line."""
+    _seed_summary_mission(rework_db, "m-file", "the summary, not the document")
+    doc = tmp_path / "audit.md"
+    original = "# Audit\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n    indented code\n"
+    doc.write_text(original, encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        ["report", "m-file", "--to-library", "--from-file", str(doc), "--title", "Audit: x"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "source: from-file" in result.output
+    item = _library_items(rework_db)[0]
+    assert item.name == "Audit: x"
+    assert "source:from-file" in item.tags
+    assert item.body == f"Handed off from rework mission m-file. Source: {doc}.\n\n{original}"
+
+    # an empty or missing file is a usage error, and writes nothing new
+    empty = tmp_path / "empty.md"
+    empty.write_text("   \n", encoding="utf-8")
+    for bad in (empty, tmp_path / "gone.md"):
+        fail = runner.invoke(app, ["report", "m-file", "--to-library", "--from-file", str(bad)])
+        assert fail.exit_code != 0
+    assert len(_library_items(rework_db)) == 1
+
+
+def test_report_to_library_finds_the_mission_doc_in_a_surviving_worktree(
+    rework_db: Path, library_dir: Path, tmp_path: Path
+) -> None:
+    """Source (b): with no --from-file, the mission's own largest changed
+    docs/*.md is used. That is the case the live rescue relies on, so it must
+    not fall through to the summary while the document is still on disk."""
+    import subprocess
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "seed.md").write_text("seed\n", encoding="utf-8")
+    git = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
+
+    def run(*args: str) -> None:
+        subprocess.run([*git, *args], cwd=worktree, check=True, capture_output=True)
+
+    # the shape of a real mission checkout: main carries the base repo, the
+    # role's branch carries the deliverables on top of it
+    run("init", "-b", "main")
+    run("add", "-A")
+    run("commit", "-m", "base")
+    run("checkout", "-b", "rework/m-doc-code-coder-1")
+    (worktree / "docs" / "audits").mkdir(parents=True)
+    (worktree / "docs" / "audits" / "small.md").write_text("# small\n", encoding="utf-8")
+    big = "# Audit\n\n" + "finding line\n" * 40
+    (worktree / "docs" / "audits" / "codebase-audit.md").write_text(big, encoding="utf-8")
+    run("add", "-A")
+    run("commit", "-m", "the audit")
+
+    async def seed() -> None:
+        from rework.kernel.state.records import Run, RunStatus
+
+        store = await open_sqlite(str(rework_db))
+        try:
+            await store.create_mission(
+                Mission(id="m-doc", objective="audit", status=MissionStatus.DONE)
+            )
+            await store.update_mission("m-doc", result={"summary": "one new file"})
+            await store.create_run(
+                Run(
+                    id="r-doc",
+                    mission_id="m-doc",
+                    role="coder",
+                    step="code",
+                    status=RunStatus.COMPLETED,
+                    artifact={"worktree": str(worktree)},
+                )
+            )
+        finally:
+            await store.aclose()
+
+    asyncio.run(seed())
+    result = runner.invoke(app, ["report", "m-doc", "--to-library"])
+    assert result.exit_code == 0, result.output
+    assert "source: worktree" in result.output
+    assert "docs/audits/codebase-audit.md" in result.output
+    assert "source:summary" not in result.output
+    item = _library_items(rework_db)[0]
+    assert big in item.body
+    assert "source:worktree" in item.tags
 
 
 # --- named connection targets (rework targets / sync-config) -----------------

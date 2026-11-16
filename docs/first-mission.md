@@ -104,13 +104,24 @@ finish synthesis and mark the mission `done`.
 ```bash
 uv run rework report $MID          # human-readable: every artifact + run stats
 uv run rework report $MID --md     # markdown file (default ~/.rework/reports/<id>.md)
+uv run rework report $MID --to-library   # file the report into the Library
 ```
 
 Plain `report` shows each step's artifact — the investigator's findings and suggested
 fix, the coder's branch/commit/diff, the auditor's verdicts — plus mechanical run
 stats (model calls, tokens, cache, cost estimate, wall clock). `--md` writes the same
 as markdown (default `~/.rework/reports/<id>.md`) and prints a per-step cost summary;
-`--out path.md` writes elsewhere. Judge like an owner: does the diff fix `add`? do
+`--out path.md` writes elsewhere. `--to-library` keeps the document instead of
+printing it: the body goes into the Library as one `report` item per mission, so a
+mission whose report is stranded in a worktree `rework gc` is about to delete stays
+readable. The body comes from `--from-file PATH` when you name one, else the
+mission's own largest changed `docs/*.md` in a worktree or branch that still exists,
+else `missions.result.summary`, which is tagged `source:summary` because that field
+describes the report rather than containing it. Re-running updates the same item
+(no duplicate ids), `--dry-run` prints the item and writes nothing, and
+`--title`/`--tag` override the name and add a tag.
+
+Judge like an owner: does the diff fix `add`? do
 both tests in `test_calc.py` pass now? does the investigation cite file:line evidence
 you can check? One caveat to read for: if the investigator couldn't answer something,
 it says so plainly in the report's `BLOCKERS` section (an open question, not a pause)
