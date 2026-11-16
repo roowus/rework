@@ -126,12 +126,19 @@ merging.
 The gate question then leads with the category and the orchestrator's reason
 ("Gate category: security — ..."), so you can decide from the inbox.
 
-The question also names the audit verdict and the round that verdict came from
-(`audit verdict: approve (round 3 of 3)`). While the gate is open its text is
-refreshed whenever the verdict or the round changes, and each refresh is
-published as an INFO event, so the inbox shows the audit the mission actually
-finished on instead of the round that first opened the gate. A decided gate is
-never rewritten: its text is the record of what you answered.
+The question also names the verdict of the mission's LAST auditor run and, when
+there is at least one such run, the round it came from (`audit verdict: approve
+(round 3 of 3)`). The parenthetical counts auditor runs, not review rounds: two
+auditors fanned out over one review count as two. When that last run produced no
+artifact because it failed, was still running, or the report writer could not
+validate its output, the gate says the audit is `not audited (round 2 of 2)`
+rather than quoting an earlier round that happened to be clean; that is the same
+fail-closed default as a mission that was never audited. With no auditor run at
+all the verdict comes from the audit artifact the engine finished with, and the
+round is left out. While the gate is OPEN its text is rewritten only when it
+differs from the text the engine would write now, and each such refresh is
+published as an INFO event. A decided gate is never rewritten: its text is the
+record of what you answered.
 
 Only a plan that publishes (`"publish": "pr"` — the `fix-pr` playbook; older
 plans carrying `"gates": ["open_pr"]` count too) pushes a branch or opens a PR

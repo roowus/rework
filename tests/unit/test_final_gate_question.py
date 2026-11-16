@@ -31,6 +31,7 @@ from rework.kernel.state.records import (
     new_id,
 )
 from rework.kernel.state.sqlite import SqliteStore, open_sqlite
+from rework.nodes.report_sections import NOT_AUDITED, mechanical_verdict
 from rework.orchestrator.engine import MissionRunner
 
 STALE_SHIP = "Ship the mission result? audit verdict: request changes (round 1 of 1)"
@@ -60,17 +61,26 @@ def _runner(store: SqliteStore, bus: InProcessEventBus, mission_id: str) -> Any:
 
 
 async def _seed_audit(
-    store: SqliteStore, mission_id: str, attempt: int, artifact: dict[str, Any], *, created: float
+    store: SqliteStore,
+    mission_id: str,
+    attempt: int,
+    artifact: dict[str, Any] | None,
+    *,
+    created: float,
+    status: RunStatus = RunStatus.COMPLETED,
+    step: str = "audit",
+    run_id: str | None = None,
 ) -> None:
-    """One COMPLETED auditor run, i.e. one audit round the mission finished."""
+    """One auditor run. By default a COMPLETED one that carries an artifact,
+    i.e. one audit round the mission finished."""
     await store.create_run(
         Run(
-            id=new_id("run"),
+            id=run_id or new_id("run"),
             mission_id=mission_id,
             role="auditor",
-            step="audit",
+            step=step,
             attempt=attempt,
-            status=RunStatus.COMPLETED,
+            status=status,
             artifact=artifact,
             created_at=created,
             updated_at=created,
@@ -283,3 +293,114 @@ async def test_no_completed_audit_falls_back_without_a_round(tmp_path: Path) -> 
         assert await GateManager(store, bus).open_gates("m1")
     finally:
         await store.aclose()
+
+
+async def test_a_failed_final_round_is_not_audited_and_is_still_a_round(tmp_path: Path) -> None:
+    """The engine marks a failed audit step FAILED and writes no artifact. That
+    round is the one the mission ended on, so the question must say so instead
+    of quoting round 1's clean verdict: fail-closed "not audited", round 2 of 2."""
+    store, _bus, runner = await _world(tmp_path)
+    try:
+        mission = await store.create_mission(
+            Mission(id="m1", objective="x", plan={"steps": [], "gates": ["ship"]})
+        )
+        await _seed_audit(store, "m1", 1, CLEAN, created=1.0)
+        await _seed_audit(store, "m1", 2, None, created=2.0, status=RunStatus.FAILED)
+
+        _no_waiting_decision(runner, False)
+        # the caller hands over round 1's artifact: it must not decide anything
+        await runner._final_gates(mission, {}, CLEAN)
+
+        gates = await store.list_gates("m1")
+        assert [g.question for g in gates] == [
+            "Ship the mission result? audit verdict: not audited (round 2 of 2)"
+        ], gates[0].question
+        assert "approve" not in gates[0].question
+    finally:
+        await store.aclose()
+
+
+async def test_an_artifactless_final_round_is_not_audited_either(tmp_path: Path) -> None:
+    """A COMPLETED auditor run can still carry no artifact (the report writer
+    returns `"artifact": None` when validation fails twice). Same fail-closed
+    answer as a FAILED run: not audited, naming the round."""
+    store, _bus, runner = await _world(tmp_path)
+    try:
+        mission = await store.create_mission(
+            Mission(id="m1", objective="x", plan={"steps": [], "gates": ["ship"]})
+        )
+        await _seed_audit(store, "m1", 1, CLEAN, created=1.0)
+        await _seed_audit(store, "m1", 2, {}, created=2.0)
+
+        _no_waiting_decision(runner, False)
+        await runner._final_gates(mission, {}, CLEAN)
+
+        gates = await store.list_gates("m1")
+        assert [g.question for g in gates] == [
+            "Ship the mission result? audit verdict: not audited (round 2 of 2)"
+        ], gates[0].question
+    finally:
+        await store.aclose()
+
+
+async def test_audits_sharing_a_created_at_order_by_id_not_insertion(tmp_path: Path) -> None:
+    """`list_runs` orders by created_at with no id tiebreak and roles may run in
+    parallel, so two runs in the same instant come back in whatever order the
+    backend chose: the final round (and therefore the verdict) must not depend
+    on it. The id is the tiebreak, so the run with the greater id is the final
+    one however the rows were inserted."""
+    questions: list[str] = []
+    for order in ((0, 1), (1, 0)):
+        store = await open_sqlite(str(tmp_path / f"tie-{order[0]}{order[1]}.sqlite3"))
+        try:
+            runner = _runner(store, InProcessEventBus(store), "m1")
+            mission = await store.create_mission(
+                Mission(id="m1", objective="x", plan={"steps": [], "gates": ["ship"]})
+            )
+            # same created_at, ids "run-a" < "run-b": "run-b" (BROKEN) is final
+            artifacts = {"run-a": CLEAN, "run-b": BROKEN}
+            for i in order:
+                run_id = ("run-a", "run-b")[i]
+                await _seed_audit(store, "m1", i + 1, artifacts[run_id], created=5.0, run_id=run_id)
+            _no_waiting_decision(runner, False)
+            await runner._final_gates(mission, {}, CLEAN)
+            gates = await store.list_gates("m1")
+            assert len(gates) == 1
+            questions.append(gates[0].question)
+        finally:
+            await store.aclose()
+
+    assert (
+        questions == ["Ship the mission result? audit verdict: request changes (round 2 of 2)"] * 2
+    ), questions
+
+
+async def test_the_round_parenthetical_counts_runs_not_parallel_reviews(tmp_path: Path) -> None:
+    """Two auditors fanned out over ONE review are two runs: the parenthetical
+    counts runs (documented), and the verdict is the one the FINAL run of the
+    stable order produced, never a disagreement."""
+    store, _bus, runner = await _world(tmp_path)
+    try:
+        mission = await store.create_mission(
+            Mission(id="m1", objective="x", plan={"steps": [], "gates": ["ship"]})
+        )
+        # one review round, two parallel auditors on the same step name
+        await _seed_audit(store, "m1", 1, CLEAN, created=1.0, run_id="run-a")
+        await _seed_audit(store, "m1", 1, BRUISED, created=1.0, run_id="run-b")
+
+        _no_waiting_decision(runner, False)
+        await runner._final_gates(mission, {}, CLEAN)
+
+        gates = await store.list_gates("m1")
+        assert [g.question for g in gates] == [
+            "Ship the mission result? audit verdict: approve with fixes (round 2 of 2)"
+        ], gates[0].question
+    finally:
+        await store.aclose()
+
+
+async def test_mechanical_verdict_of_no_artifact_is_the_fail_closed_default() -> None:
+    """`mechanical_verdict(None)` is what a final round without an artifact maps
+    to: the fail-closed "not audited", never a verdict."""
+    assert mechanical_verdict(None) == NOT_AUDITED == "not audited"
+    assert mechanical_verdict({}) == "not audited"

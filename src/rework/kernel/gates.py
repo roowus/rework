@@ -200,28 +200,31 @@ class GateManager:
             )
         return gate
 
-    async def reword(self, gate_id: str, question: str) -> Gate | None:
+    async def reword(self, gate: Gate, question: str) -> Gate | None:
         """Refresh an OPEN gate's question and publish an INFO event that says
         so. A decided gate is never re-worded (its text is the record of what
-        the owner answered) and publishes nothing. Callers compare first: an
-        unchanged question must not reach the store at all."""
-        before = await self._store.get_gate(gate_id)
-        if before is None or before.status != GateStatus.OPEN:
-            return before
-        if before.question == question:
-            return before
-        gate = await self._store.set_gate_question(gate_id, question)
-        if gate is not None and gate.question == question:
+        the owner answered) and publishes nothing.
+
+        `gate` is the row the caller already looked up, so the status/text guard
+        runs once here instead of re-reading the same row: a decided or
+        unchanged gate returns untouched. The store refuses the write itself
+        when the row stopped being OPEN in between, and a refused write still
+        publishes nothing because the question then does not match."""
+        if gate.status != GateStatus.OPEN or gate.question == question:
+            return gate
+        refreshed = await self._store.set_gate_question(gate.id, question)
+        if refreshed is not None and refreshed.question == question:
             await self._bus.publish(
                 EventRecord(
-                    mission_id=gate.mission_id,
+                    mission_id=refreshed.mission_id,
                     type=EventType.INFO,
                     payload={
-                        "note": f"{gate.kind.value} gate {gate.id} question refreshed: {question}",
+                        "note": f"{refreshed.kind.value} gate {refreshed.id} question "
+                        f"refreshed: {question}",
                     },
                 )
             )
-        return gate
+        return refreshed
 
     async def open_gates(self, mission_id: str | None = None) -> list[Gate]:
         return await self._store.list_open_gates(mission_id)
