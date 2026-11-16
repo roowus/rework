@@ -104,13 +104,34 @@ finish synthesis and mark the mission `done`.
 ```bash
 uv run rework report $MID          # human-readable: every artifact + run stats
 uv run rework report $MID --md     # markdown file (default ~/.rework/reports/<id>.md)
+uv run rework report $MID --to-library   # file the report into the Library
 ```
 
 Plain `report` shows each step's artifact — the investigator's findings and suggested
 fix, the coder's branch/commit/diff, the auditor's verdicts — plus mechanical run
 stats (model calls, tokens, cache, cost estimate, wall clock). `--md` writes the same
 as markdown (default `~/.rework/reports/<id>.md`) and prints a per-step cost summary;
-`--out path.md` writes elsewhere. Judge like an owner: does the diff fix `add`? do
+`--out path.md` writes elsewhere. `--to-library` keeps the document instead of
+printing it: the body goes into the Library as one `report` item per mission, so a
+mission whose report is stranded in a worktree `rework gc` is about to delete stays
+readable. The body comes from `--from-file PATH` when you name one, else the
+mission's own largest newly added `docs/*.md` in a worktree or branch that still
+exists. If the mission only edited existing docs, the largest edited one is used with a
+warning and the tag `source:doc-modified`; failing that, `missions.result.summary`,
+tagged `source:summary` because that field describes the report rather than containing
+it. Re-running updates the same item (no duplicate ids): only items this command filed
+are ever updated, never a report a role wrote. The rule is that the item's provenance
+role is empty, checked before any tag: rework stamps every role contribution with the
+role it ran as, so a role cannot arrange an empty one for itself, whatever tags it
+picks. With that passed, the marker tag `handoff:report` identifies this command's
+items, and an item filed before that marker existed is matched by its own fingerprint
+instead. A re-run keeps
+the item's name unless you pass `--title`, and merges `--tag` into the existing tags.
+`--dry-run` prints the item and writes nothing. `--from-file`, `--title`, `--tag` and
+`--dry-run` are errors without `--to-library`, and `--to-library` cannot be combined
+with `--md` or `--out`.
+
+Judge like an owner: does the diff fix `add`? do
 both tests in `test_calc.py` pass now? does the investigation cite file:line evidence
 you can check? One caveat to read for: if the investigator couldn't answer something,
 it says so plainly in the report's `BLOCKERS` section (an open question, not a pause)

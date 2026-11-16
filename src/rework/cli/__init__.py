@@ -952,10 +952,56 @@ def report(
     mission_id: str,
     md: bool = typer.Option(False, "--md", help="write a markdown file and open-friendly output"),
     out: str | None = typer.Option(None, "--out", help="markdown output path (implies --md)"),
+    to_library: bool = typer.Option(
+        False,
+        "--to-library",
+        "--library",
+        help="hand the report off into the Library as a report item (idempotent).",
+    ),
+    from_file: str | None = typer.Option(
+        None, "--from-file", help="Body source for --to-library: a markdown file."
+    ),
+    title: str | None = typer.Option(None, "--title", help="Item name (default: Report: <id>)."),
+    tag: list[str] = typer.Option([], "--tag", help="Extra item tag, repeatable."),  # noqa: B008
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print the planned item and write nothing."
+    ),
 ) -> None:
     """Render a mission's reports readably: each role's artifact plus the
     mechanical run-stats section (tokens, cache, cost, time). --md writes
-    a markdown file (default ~/rework/reports/<mission-id>.md)."""
+    a markdown file (default ~/rework/reports/<mission-id>.md).
+
+    --to-library copies the report BODY into the Library instead, as one report
+    item per mission: re-running updates that item, never a duplicate. The body
+    comes from --from-file, else the largest newly ADDED docs/*.md in the
+    mission's surviving worktree or branch (a merely edited doc only stands in
+    as a loud last resort), else missions.result.summary clearly labelled as a
+    summary. --from-file is an error when the file is missing or empty."""
+
+    if not to_library:
+        stray = [
+            flag
+            for flag, given in (
+                ("--from-file", from_file is not None),
+                ("--title", title is not None),
+                ("--tag", bool(tag)),
+                ("--dry-run", dry_run),
+            )
+            if given
+        ]
+        if stray:
+            typer.secho(
+                f"{', '.join(stray)} only apply with --to-library; nothing was done.",
+                fg=typer.colors.RED,
+            )
+            raise typer.Exit(2)
+    elif md or out:
+        typer.secho(
+            "--to-library cannot be combined with --md or --out: pick the Library"
+            " hand-off or the markdown file; nothing was done.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(2)
 
     async def go() -> None:
         from rework.config import Config, open_store_from_config
@@ -966,6 +1012,16 @@ def report(
             if mission is None:
                 typer.secho(f"no such mission: {mission_id}", fg=typer.colors.RED)
                 raise typer.Exit(1)
+            if to_library:
+                await _report_hand_off(
+                    store,
+                    mission,
+                    from_file=from_file,
+                    title=title,
+                    extra_tags=list(tag),
+                    dry_run=dry_run,
+                )
+                return
             runs = await store.list_runs(mission_id)
             prepared: list[tuple[Any, dict[str, Any]]] = []
             for run in runs:
@@ -1025,6 +1081,71 @@ def report(
             await store.aclose()
 
     asyncio.run(go())
+
+
+async def _report_hand_off(
+    store: Any,
+    mission: Any,
+    *,
+    from_file: str | None,
+    title: str | None,
+    extra_tags: list[str],
+    dry_run: bool,
+) -> None:
+    """`rework report --to-library`: one report item per mission, re-run safe.
+
+    Body resolution and the dedupe key live in rework.library.handoff. The
+    dedupe key is `provenance.mission_id`, an empty `provenance.role` (checked
+    first, because rework stamps the role onto every role contribution, so a
+    role cannot clear it) and then the `handoff:report` marker tag, or, for a
+    report filed before that marker existed, the hand-off fingerprint. The
+    mission id alone would be stamped on role contributions too and would
+    overwrite a report a role authored. A second run updates instead of minting
+    an `l-<hex>` duplicate the way `library add` does. Errors are usage errors
+    with a non-zero exit and nothing written."""
+    from rework.config import Config
+    from rework.library import handoff
+    from rework.library.store import GitLibrary
+
+    config = Config.from_env()
+    try:
+        body = handoff.from_file(from_file) if from_file else None
+    except ValueError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED)
+        raise typer.Exit(1) from exc
+    if body is None:
+        body = await handoff.resolve_from_mission(store, mission)
+    if body is None:
+        body = handoff.summary_body(mission)
+    if body is None:
+        typer.secho(
+            f"mission {mission.id} has no report to hand off: no --from-file, no docs"
+            " markdown in a surviving worktree or branch, and no result summary."
+            " Pass --from-file PATH.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(1)
+
+    git = GitLibrary(_library_root(), author=config.git_author)
+    index = await open_library_index(config.db)
+    try:
+        item, created, verb = await handoff.hand_off(
+            index,
+            git,
+            mission,
+            body=body,
+            name=title,
+            extra_tags=extra_tags,
+            dry_run=dry_run,
+        )
+    finally:
+        await index.aclose()
+    for line in handoff.describe(item, body, dry_run, verb):
+        typer.echo(line)
+    if dry_run:
+        typer.echo("(dry run; nothing written)")
+    elif created:
+        typer.echo(f"handed off to the library; read it back with `rework library show {item.id}`")
 
 
 def _one_line(text: str | None, width: int = 72) -> str:
@@ -1168,9 +1289,14 @@ def retry_pr_cmd(mission_id: str) -> None:
         from rework.config import Config, open_store_from_config
         from rework.kernel.events.bus import InProcessEventBus
 
-        store = await open_store_from_config(Config.from_env())
+        config = Config.from_env()
+        store = await open_store_from_config(config)
         try:
-            return await retry_pr(store, InProcessEventBus(store), mission_id)
+            # the deployment's commit identity: the retried merge commit must
+            # carry the same author as the mission's own commits
+            return await retry_pr(
+                store, InProcessEventBus(store), mission_id, author=config.git_author
+            )
         finally:
             await store.aclose()
 

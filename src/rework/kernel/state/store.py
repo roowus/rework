@@ -53,6 +53,14 @@ class StateStore(Protocol):
         priority: str | None = None,
     ) -> Mission | None: ...
 
+    async def increment_transient_crash_count(self, mission_id: str) -> int:
+        """Bump and return the mission's transient crash count (0 if no row)."""
+        ...
+
+    async def reset_transient_crash_count(self, mission_id: str) -> None:
+        """Zero the mission's transient crash count (fresh dispatch, terminal)."""
+        ...
+
     async def list_missions(
         self,
         status: MissionStatus | None = None,
@@ -138,6 +146,17 @@ class StateStore(Protocol):
         the role receives a plain bool, as before). `send_back` marks the gate
         `sent_back` instead of approved/rejected (the third final-gate verdict:
         the mission returns to `running` with the owner's feedback)."""
+        ...
+
+    async def set_gate_question(self, gate_id: str, question: str) -> Gate | None:
+        """Re-word an OPEN gate's question in place and hand the row back.
+
+        Only a gate that is still OPEN may be re-worded: what a DECIDED gate
+        says is the record of what the owner actually answered, so a refused
+        write leaves that row untouched (and still returns it). The final
+        gates use this to keep "audit verdict: ... (round N of M)" in step with
+        the audit the mission really finished on, instead of the round that
+        first opened the row."""
         ...
 
     async def list_open_gates(self, mission_id: str | None = None) -> list[Gate]: ...
@@ -256,6 +275,13 @@ class StateStore(Protocol):
 
     async def chat_messages_since(self, chat_id: str, after_id: int) -> list[ChatMessage]:
         """Transcript rows newer than `after_id`, oldest first."""
+        ...
+
+    async def chat_ids_with_messages(self, chat_ids: list[str]) -> set[str]:
+        """The subset of `chat_ids` that has at least one message row.
+
+        Batched on purpose: the Work list hides auto-created chats that never got
+        a message, and asking per chat would be an N+1 over the whole list."""
         ...
 
     # -- leader lock (one daemon per database; atomic-upsert hardened in M3) --

@@ -43,6 +43,7 @@ from rework.kernel.state.records import (
     MissionStatus,
     Run,
     RunStatus,
+    orchestrator_chat_id,
 )
 from rework.kernel.state.records import run_id as make_run_id
 from rework.logs import bind
@@ -549,10 +550,6 @@ def _gate_ask(args: dict[str, Any]) -> tuple[bool, str, str]:
     return True, reason, category
 
 
-def orchestrator_chat_id(mission_id: str) -> str:
-    return f"orch-{mission_id}"
-
-
 def orchestrator_run_id(mission_id: str) -> str:
     """Pseudo run id for the orchestrator's own events and charges (no Run row:
     the supervisor must never try to build it as a role)."""
@@ -954,6 +951,11 @@ class MissionOrchestrator:
             if await self.r._pause_until_resumed() == "cancelled":
                 return "cancelled"
             await self._restart_live_runs()
+        if self.r._supervisor is not None:
+            # A transient database error that escaped a role run has to leave
+            # this loop too: the run row never goes terminal, so waiting on it
+            # strands the mission instead of requeueing it.
+            await self.r._supervisor.check_fatal()
         if await self.r._burn_gate_hit() == "cancelled":
             return "cancelled"
         return "ok"
