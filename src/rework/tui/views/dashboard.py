@@ -235,7 +235,7 @@ class PromptBox(VerticalScroll):
         # of the whole document: the hint is measured against the fold, so it is
         # only visible while the box is scrolled to its top. (It lives inside the
         # scrolled content, docked to the bottom of the viewport.)
-        hidden = max(0, height - body - int(self.scroll_y))
+        hidden = max(0, height - body - round(self.scroll_y))
         text = f"{hidden} more line{'s' * (hidden != 1)} below · scroll" if hidden else ""
         # The header repaints about 10x/s on a running mission and
         # Static.update() always re-dirties layout, so an unchanged hint must
