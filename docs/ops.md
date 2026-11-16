@@ -800,7 +800,8 @@ decision buttons stay where they were. A drop is never a reason to restart: the
 data service reconnects on its own backoff, the open mission page repaints as
 soon as the link is back even when nothing else about the mission changed, and a
 long outage that outlives the backoff cap still recovers without duplicating a
-chat row or losing one. Activity marks do not animate while the link is down: a
-stamp that stopped arriving reads as idle, which is the honest answer. A gate
+chat row or losing one. No activity stamp is invented while the link is down: a
+mission whose stamp cannot be read is shown as unknown, and the stamps return on
+the first poll after recovery. A gate
 answer pressed during an outage fails loudly with a red "Could not answer gate"
 toast, and pressing it again after recovery lands the decision exactly once.

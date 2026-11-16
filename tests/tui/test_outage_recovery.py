@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from seed import seed
 
 from rework.kernel.state.records import GateStatus
-from rework.tui import spinner, theme
+from rework.tui import spinner
 from rework.tui.app import ReworkApp
 from rework.tui.widgets.cards import MissionCard
 from rework.tui.widgets.trajectory import Trajectory
@@ -48,6 +48,9 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.fixture
 async def ids(env: Path) -> dict[str, str]:
     return await seed(str(env), history_days=20)
+
+
+OUTAGE = 10**9  # an outage is unconditional, not a count of failed opens
 
 
 class FlakyFactory:
@@ -105,18 +108,23 @@ def _zero_backoff(app: ReworkApp) -> None:
                     setattr(card, attr, value)
 
 
-async def _recover(app: ReworkApp, pilot: Any) -> None:
+async def _recover(app: ReworkApp, pilot: Any, factory: FlakyFactory) -> None:
+    """Bring the link back: stop failing, drop the dead store, poll once."""
+    factory.fail_next = 0
+    await app.hub.data.drop_store()
     _zero_backoff(app)
     await _tick(app, pilot)
 
 
-async def _go_offline(app: ReworkApp, pilot: Any, factory: FlakyFactory, n: int = 12) -> None:
+async def _go_offline(app: ReworkApp, pilot: Any, factory: FlakyFactory) -> None:
     """Kill the connection at the factory: the pooled store can no longer be
     re-opened, which is the owner's outage. The cache is dropped so the factory
     really is asked again on the next query."""
-    factory.fail_next = n
+    factory.fail_next = OUTAGE
     await app.hub.data.drop_store()
     await _tick(app, pilot)
+    assert app.hub.data._reconnecting_hint, "the data layer is flagged as reconnecting"
+    assert app.hub.snapshot.online is False
 
 
 def _dash(app: ReworkApp) -> Any:
@@ -163,8 +171,7 @@ async def test_recovers_without_restart(env: Path, ids: dict[str, str]) -> None:
         epoch = data.store_epoch
         await _go_offline(app, pilot, factory)
         assert app.hub.snapshot.online is False
-        factory.fail_next = 0
-        await _recover(app, pilot)
+        await _recover(app, pilot, factory)
         snap = app.hub.snapshot
         assert snap.online is True
         assert snap.error == ""
@@ -179,7 +186,7 @@ async def test_recovers_without_restart(env: Path, ids: dict[str, str]) -> None:
 async def test_open_mission_survives_outage(env: Path, ids: dict[str, str]) -> None:
     async with _running(env) as (app, pilot, factory):
         dash = _dash(app)
-        dash.open_mission(ids["running"])
+        dash.open_mission(ids["waiting"])
         await _tick(app, pilot)
         assert dash.full_mission is not None
         repaints: list[int] = []
@@ -192,18 +199,21 @@ async def test_open_mission_survives_outage(env: Path, ids: dict[str, str]) -> N
         dash._paint_runs = counting
         await _go_offline(app, pilot, factory)
         assert app.hub.snapshot.online is False
-        assert dash.mission_id == ids["running"], "the page stays open through the outage"
-        await _recover(app, pilot)
+        assert dash.mission_id == ids["waiting"], "the page stays open through the outage"
+        await _recover(app, pilot, factory)
         assert app.hub.snapshot.online is True
         assert repaints, "the open mission repainted when the link came back"
         assert dash.full_mission is not None, "header and runs are readable again"
 
         data = app.hub.data
         store = await data.store()
-        gates = await data.gates(ids["running"])
+        gates = await data.gates(ids["waiting"])
         assert gates, "the gates of the open mission are readable"
-        assert await data.decide_gate(ids["gate"], True, "", None, False) is True
-        assert await data.decide_gate(ids["gate"], True, "", None, False) is False
+        assert await data.decide_gate(ids["gate"], True) is True
+        # a retried click lands once: the same verdict re-reports True, the
+        # opposite verdict is refused, and the row keeps the first answer
+        assert await data.decide_gate(ids["gate"], True) is True
+        assert await data.decide_gate(ids["gate"], False) is False
         gate = await store.get_gate(ids["gate"])
         assert gate.status is GateStatus.APPROVED
 
@@ -219,7 +229,7 @@ async def test_open_chat_survives_outage(env: Path, ids: dict[str, str]) -> None
         await _go_offline(app, pilot, factory)
         assert app.hub.snapshot.online is False
         assert len(work.query_one("#chat-log", Trajectory).children) == painted
-        await _recover(app, pilot)
+        await _recover(app, pilot, factory)
         assert app.hub.snapshot.online is True
         assert work.convo is not None and work.convo.id == ids["chat"]
         assert len(log.children) == painted, "the transcript is intact"
@@ -236,14 +246,13 @@ async def test_long_outage_recovers_without_duplicate_rows(env: Path, ids: dict[
         painted = len(log.children)
         await _go_offline(app, pilot, factory)
         # an outage longer than the backoff cap: the deadline is now far out
-        factory.fail_next = 200
+        factory.fail_next = OUTAGE
         app.hub._next_try = time.monotonic() + 3600.0
         calls = factory.calls
         await app.hub.refresh()
         await pilot.pause()
         assert factory.calls == calls, "nothing polls before the deadline expires"
-        factory.fail_next = 0
-        await _recover(app, pilot)
+        await _recover(app, pilot, factory)
         assert app.hub.snapshot.online is True
         rows = [w.id for w in log.children if w.id]
         assert len(rows) == len(set(rows)), "no row is painted twice"
@@ -256,11 +265,14 @@ async def test_spinner_idle_while_offline(env: Path, ids: dict[str, str]) -> Non
     async with _running(env) as (app, pilot, factory):
         mid = ids["running"]
         before = app.hub.snapshot.last_event.get(mid)
+        assert before is not None, "the seeded running mission has an activity stamp"
         await _go_offline(app, pilot, factory)
         after = app.hub.snapshot.last_event.get(mid)
-        assert after == before, "an outage cannot manufacture a fresh activity stamp"
-        if after is not None:
-            # the stamp is stale, so the honest rendering is the idle mark
-            assert spinner.is_stalled(after + 100_000.0, after) is True
-            assert isinstance(theme.run_mark(True, "frame"), str)
+        # an outage cannot manufacture a fresh stamp: it is the old one or unknown
+        assert after is None or after <= before
+        if after is None:  # unknown is "nothing observed", never "stalled"
+            assert spinner.is_stalled(time.time(), after) is False
         assert app.hub.snapshot.online is False
+        await _recover(app, pilot, factory)
+        assert app.hub.snapshot.online is True
+        assert app.hub.snapshot.last_event.get(mid) == before, "the stamp is back after recovery"
