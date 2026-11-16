@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from collections import Counter
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,7 @@ from rework.kernel.state.sqlite import SqliteStore, open_sqlite
 from rework.orchestrator import engine as engine_module
 from rework.orchestrator.daemon import sqlite_checkpointer_factory
 from rework.orchestrator.engine import MissionRunner, RunSupervisor
+from rework.orchestrator.limits import RoleLimiter
 from rework.roles.base import RoleBuildCtx, RoleSpec
 from rework.roles.registry import RoleRegistry
 from support.fault_store import FaultStore
@@ -155,7 +157,9 @@ def _stack(world: dict[str, Any]) -> tuple[FaultStore, ResilientStore]:
     return fault, ResilientStore(fault, policy=FAST)
 
 
-def _runner(world: dict[str, Any], store: Any, mission_id: str) -> MissionRunner:
+def _runner(
+    world: dict[str, Any], store: Any, mission_id: str, limiter: RoleLimiter | None = None
+) -> MissionRunner:
     return MissionRunner(
         mission_id,
         store,
@@ -165,6 +169,7 @@ def _runner(world: dict[str, Any], store: Any, mission_id: str) -> MissionRunner
         sqlite_checkpointer_factory(world["ck_path"]),
         world["workroot"],
         poll_interval_s=0.05,
+        limiter=limiter,
     )
 
 
@@ -503,3 +508,70 @@ async def test_the_role_path_redrives_its_own_run_through_an_outage(
     row = await world["real"].get_run(run.id)
     assert row is not None and row.status == RunStatus.COMPLETED
     assert await _ledger(world["real"], mission_id) == baseline, "one clean run's rows only"
+
+
+# -- (h) a PERMANENT store error fails the run; it is not an outage to re-drive -------
+
+NO_SUCH_TABLE = "no such table: charges"
+READ_ONLY = "attempt to write a readonly database"
+
+
+def _sqlite(message: str) -> Callable[[str], BaseException]:
+    """A fault error factory that raises the sqlite3 error the store itself would."""
+    return lambda _injected: sqlite3.OperationalError(message)
+
+
+async def test_a_missing_table_fails_the_mission_fast_and_frees_the_slot(
+    world: dict[str, Any],
+) -> None:
+    """A permanent sqlite error must not be re-driven for the store's five-minute
+    budget. The run fails with the error on the record, the mission ends FAILED in
+    seconds, and the role slot is free for the next mission on the same limiter."""
+    limiter = RoleLimiter(1)
+    mission_id = await _mission(world, ONE_STEP)
+    fault = FaultStore(world["real"])
+    fault.error = _sqlite(NO_SUCH_TABLE)
+    fault.fail_method("charge", times=1000)
+    store = ResilientStore(fault)  # the production retry budget: a regression spends it
+    loop = asyncio.get_running_loop()
+
+    started = loop.time()
+    await asyncio.wait_for(_runner(world, store, mission_id, limiter).run(), timeout=10)
+    elapsed = loop.time() - started
+
+    assert elapsed < 3.0, f"a permanent error took {elapsed:.1f}s: it was re-driven"
+    assert await _mission_status(world["real"], mission_id) == MissionStatus.FAILED
+    events = await world["real"].events_since(0, mission_id=mission_id)
+    errors = [str(e.payload.get("error", "")) for e in events if e.type == EventType.INFO]
+    assert any(NO_SUCH_TABLE in err for err in errors), errors
+
+    # the slot was released: a second mission on the same single-slot limiter runs
+    second = await _mission(world, ONE_STEP)
+    await asyncio.wait_for(_runner(world, world["real"], second, limiter).run(), timeout=10)
+    assert await _mission_status(world["real"], second) == MissionStatus.DONE
+
+
+async def test_a_database_that_turns_read_only_mid_run_ends_instead_of_livelocking(
+    world: dict[str, Any],
+) -> None:
+    """The file is chmod'ed read-only just after the role's first charge lands. The
+    role's completion write is refused, and so is the FAILED write that would record
+    it. The mission must end with that error (the task terminates), not poll forever
+    on a run no task drives. Once the file is writable again, the slot is free."""
+    limiter = RoleLimiter(1)
+    mission_id = await _mission(world, ONE_STEP)
+    fault = FaultStore(world["real"])
+    fault.error = _sqlite(READ_ONLY)
+    fault.read_only_after("charge")
+    store = ResilientStore(fault)
+
+    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+        await asyncio.wait_for(_runner(world, store, mission_id, limiter).run(), timeout=10)
+
+    # a read-only file cannot record FAILED: the row stays RUNNING, never DONE
+    assert await _mission_status(world["real"], mission_id) != MissionStatus.DONE
+    assert await _ledger(world["real"], mission_id)  # reads still work
+
+    second = await _mission(world, ONE_STEP)  # the file is writable again: the real store
+    await asyncio.wait_for(_runner(world, world["real"], second, limiter).run(), timeout=10)
+    assert await _mission_status(world["real"], second) == MissionStatus.DONE

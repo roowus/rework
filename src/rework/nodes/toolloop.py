@@ -208,6 +208,15 @@ async def next_charge_key(store: StateStore, run_id: str, scope: str) -> str:
     - a genuine call after a charge landed gets the next ordinal, so it is kept;
     - two loops (or two report writers) in one run use different scopes, so their
       first charges do not collide.
+
+    CONCURRENCY ASSUMPTION: this is a read-then-write (count the landed charges, then
+    insert under the returned key), with no lock between the two. It is safe today
+    because a run's graph executes one node at a time, and each charge site uses its
+    own scope, so no two callers ever compute the same key concurrently. If parallel
+    tool nodes are ever added to one run, two callers could read the same count and
+    compute the same key, and ON CONFLICT would silently drop one charge. Make the key
+    allocation atomic (e.g. a unique (run, scope, ordinal) row claimed in the store)
+    before that happens.
     """
     prefix = f"{run_id}:{scope}:"
     landed = sum(

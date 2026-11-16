@@ -35,12 +35,6 @@ from rework.kernel.state.store import StateStore
 
 log = logging.getLogger("rework.store")
 
-TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
-    psycopg.OperationalError,
-    psycopg.InterfaceError,
-    sqlite3.OperationalError,
-)
-
 _READS = frozenset(
     {
         "get_mission",
@@ -102,14 +96,41 @@ def _is_link_loss(exc: psycopg.OperationalError) -> bool:
     return code.startswith(_LINK_SQLSTATE_CLASS) or code in _LINK_SQLSTATES
 
 
+# SQLite conditions that clear on their own: another connection holds a write lock or
+# a table lock, or the disk hiccups. The sqlite3 module raises one class (OperationalError)
+# for every condition, so these are matched on the message, lowercased.
+_SQLITE_TRANSIENT = (
+    "database is locked",
+    "database table is locked",
+    "database is busy",
+    "disk i/o error",
+)
+
+
+def _is_sqlite_transient(exc: sqlite3.OperationalError) -> bool:
+    """Condition, not class: an OperationalError is transient only when its message names
+    a recoverable lock or I/O condition. Everything else fails fast, so a broken file
+    surfaces as a visible error instead of re-driving forever. Permanent and schema
+    answers (read-only, no such table/column/function, malformed, not a database) are
+    not transient. AMBIGUOUS messages (unable to open database file, database or disk is
+    full, out of memory, interrupted, anything unrecognised) are also NOT transient: we
+    fail fast, because a retry that burns five minutes and a re-drive loop that never
+    ends are worse than an error the owner can see and act on at once."""
+    message = str(exc).lower()
+    return any(marker in message for marker in _SQLITE_TRANSIENT)
+
+
 def is_transient(exc: BaseException) -> bool:
-    """True for errors a retry (after a reconnect) can cure: a dropped link, a locked
-    SQLite file. A permanent Postgres operational error is not transient (see above)."""
+    """True for errors a retry (after a reconnect) can cure: a dropped Postgres link, or
+    a SQLite lock or I/O condition that clears on its own (see _is_sqlite_transient).
+    A permanent Postgres operational error is not transient (see _is_link_loss)."""
     if isinstance(exc, psycopg.OperationalError):
         return _is_link_loss(exc)
     if isinstance(exc, psycopg.InterfaceError):
         return True  # "the connection is closed": the link is gone
-    return isinstance(exc, sqlite3.OperationalError)
+    if isinstance(exc, sqlite3.OperationalError):
+        return _is_sqlite_transient(exc)
+    return False
 
 
 def is_repeatable(method: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:

@@ -600,6 +600,17 @@ pass is re-run the same way. Each give-up and each re-drive is logged at error l
 restart is needed: once the store answers, the mission carries on to its normal end and
 does not end FAILED.
 
+A permanent database error is not an outage, and it is never re-driven. A read-only
+database file, a missing table or column, a malformed database and a file that is not a
+database fail the run at once: the mission ends FAILED, the error is in its events, and
+the role slot is free for the next mission. SQLite errors are retried only for lock and
+I/O conditions (database is locked, database table is locked, database is busy, disk I/O
+error). Ambiguous conditions (unable to open database file, database or disk is full,
+out of memory) also fail at once, because a visible error is better than a silent loop.
+If the file refuses writes, FAILED cannot be recorded either: the daemon logs the crash,
+the mission row stays RUNNING, and the mission is recovered from its checkpoint once the
+file is writable and the daemon has restarted.
+
 ### Rotating the Postgres password
 
 A running TUI and the long-lived `rework library-mcp` process keep the database

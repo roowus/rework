@@ -1511,6 +1511,17 @@ class MissionRunner:
                 await self._handle_halted(halted)
             if all(_terminal(r) for r in fresh):
                 return "ok"
+            # a role task that died with an exception its own error path could not record
+            # (the FAILED write itself was refused, e.g. a read-only database) leaves its
+            # run non-terminal for ever: no task drives it and no row changes. Surface the
+            # exception so the mission ends with it, instead of polling for ever.
+            assert self._supervisor is not None
+            for run in runs:
+                dead = self._supervisor.tasks.get(run.id)
+                if dead is not None and dead.done() and not dead.cancelled():
+                    dead_exc = dead.exception()
+                    if dead_exc is not None:
+                        raise dead_exc
             await asyncio.sleep(self._poll)
 
     async def _reload_plan(self) -> None:

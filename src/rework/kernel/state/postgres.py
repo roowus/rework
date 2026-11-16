@@ -1253,11 +1253,13 @@ async def _ensure_dedupe_index(conn: psycopg.AsyncConnection[Any], index: str, c
         row = await cur.fetchone()
     if row is not None and row["indisvalid"]:
         return
-    if row is not None:
-        await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {index}")
-    # wait for a long-idle-in-transaction reader rather than hang the daemon start
+    # the timeout covers the DROP too: dropping an INVALID index waits on any session that
+    # can still see it, so a session idle in transaction must fail the start loudly, not
+    # hang it. Set before the first statement that can wait, reset after the last one.
     await conn.execute("SET lock_timeout = '60s'")
     try:
+        if row is not None:
+            await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {index}")
         await conn.execute(create)
     finally:
         await conn.execute("SET lock_timeout = 0")

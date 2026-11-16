@@ -108,6 +108,7 @@ class InvestigatorSpec(RoleSpec):
             provider=ctx.provider,
             catalog=ctx.catalog,
             catalog_id=catalog_id,
+            charge_scope=self.name,  # one scope per loop node: keys never collide
             executor=web_executor(
                 library_executor(
                     ctx,
