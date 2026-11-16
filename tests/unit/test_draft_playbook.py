@@ -183,6 +183,22 @@ CHANGE_OBJECTIVES = [
     "audit the code base and then speed it up",
     "audit the code base, then speed it up",
     "audit the code base; then speed it up",
+    # FINAL round: every clause separator is an anchor, and a filler word
+    # ("also", "only", ...) does not shield the verb that follows it
+    "audit the code base, kill the flaky test",
+    "audit the code base and also kill the flaky test",
+    "audit the code base and only keep the stable deps",
+    "audit the code base: kill the flaky test",
+    "audit the code base - kill the flaky test",
+    "audit the tests, speed them up",
+    "review the codebase, tighten the push timeouts",
+    "review the codebase, prune the dead flags",
+    "survey the schema, backfill the new column",
+    "map out the modules then restructure them",
+    "audit the deploy scripts, automate the rollback",
+    "audit the code base, then repair the parser",
+    "audit the code base. then repair the parser",
+    "audit the code base; then repair the parser",
     "audit the code base. then speed it up",
 ]
 
@@ -225,7 +241,7 @@ def test_both_change_signals_are_load_bearing() -> None:
     rule catches a novel verb that no list holds."""
     from rework.missions import _has_change_veto, _has_further_work
 
-    inflected = "audit the code base and the delivery module needs refactoring"
+    inflected = "audit the code base since the delivery module needs refactoring"
     assert _has_change_veto(inflected) and not _has_further_work(inflected)
     novel_verb = "audit the code base and speed it up"
     assert _has_further_work(novel_verb) and not _has_change_veto(novel_verb)
@@ -253,6 +269,11 @@ def test_report_only_words_hold_no_change_verb() -> None:
         "identify", "trace", "repair", "fix",
     ):  # fmt: skip
         assert verb not in REPORT_ONLY_WORDS, verb
+    for filler in (
+        "also", "only", "not", "no", "still", "any", "all", "with", "for", "in",
+        "on", "to", "it", "this", "the", "how",
+    ):  # fmt: skip
+        assert filler not in REPORT_ONLY_WORDS, filler
 
 
 def test_the_chat_defaults_a_missing_plan_but_never_overrides_a_named_one() -> None:

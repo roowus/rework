@@ -238,34 +238,33 @@ REPORT_PHRASES = (
     "write up a report",
     "write a report",
     "what you find",
+    "what you think",
     "let me know",
     "report back",
     "tell me",
 )
 
-# A trigger phrase nominates the work, but a coordinating continuation after it
-# introduces MORE work: "and then", ", then", "; then", ". then", and "and
-# <word>". The word after a bare "and" decides: only a verb that can NEVER imply
-# a code change keeps the objective an audit.
-CONTINUATION_WORDS = re.compile(r"(?:\band\s+|[,;.]\s*)then\b|\band\s+([a-z]+)", re.IGNORECASE)
+# A trigger phrase nominates the work, but a clause separator introduces MORE
+# work: every "and", "then", comma, semicolon, colon, full stop or dash is an
+# anchor, filler words ("also", "only", "still", ...) are skipped, and the next
+# word is the head verb of the continuation clause. Only a head verb that is a
+# true report verb keeps the objective an audit.
+CONTINUATION_WORDS = re.compile(
+    r"(?:\b(?:and|then)\b|[,;:.\-])\s+(?:(?:also|only|still|just|please|then|now)\s+)*([a-z]+)",
+    re.IGNORECASE,
+)
 
 # FAIL-SAFE BY CONSTRUCTION. The cost of a wrong verdict is asymmetric: a false
 # "draft" silently denies a real fix mission its branch and PR, while a false
-# "change" only costs the owner a relaunch with `--plan draft`. So this set is
-# the ONLY thing that may follow "and" in an audit, and it holds verbs that can
-# never imply a code change, plus the words of a reported sentence and the
-# articles/prepositions that continue the same clause. Anything not listed is
-# NOT positively read-only and returns None. Imperatives that can head real work
-# (write, include, cover, confirm, verify, check, find, identify, trace, repair,
-# fix, ...) are deliberately absent: the earlier allowlist held them and routed
-# "audit X and write the missing tests" to a branchless draft.
+# "change" only costs the owner a relaunch with `--plan draft`. So this set holds
+# ONLY true report verbs, which can never imply a code change. It holds no
+# filler, determiner, preposition or adverb. A continuation clause whose head
+# verb is not listed is NOT positively read-only and returns None: unknown means
+# change.
 REPORT_ONLY_WORDS = frozenset(
     """
-    tell report reports describe describes summarise summarize list listing
-    outline explain assess evaluate highlight mention say show note
-    how what where when why who whether which that this these those the a an its
-    their it any all each not no also still only without with for in on to of by
-    if and or
+    tell report reports describe describes summarise summarize list outline
+    explain assess evaluate highlight mention say show note
     """.split()
 )
 
@@ -291,14 +290,11 @@ def _has_change_veto(body: str) -> bool:
 
 def _has_further_work(body: str) -> bool:
     """True when a continuation introduces work the trigger does not cover:
-    "and then" / ", then" / "; then" / ". then", or "and <word>" where <word> is
-    not a verb that can never imply a change. Fail-safe: an unknown word counts
-    as further work."""
+    any clause separator ("and", "then", ",", ";", ":", ".", "-") whose head verb
+    (after filler words) is not a true report verb. Fail-safe: an unknown word
+    counts as further work."""
     for match in CONTINUATION_WORDS.finditer(_action_text(body)):
-        following = match.group(1)
-        if following is None:  # a "then" continuation
-            return True
-        if following.lower() not in REPORT_ONLY_WORDS:
+        if match.group(1).lower() not in REPORT_ONLY_WORDS:
             return True
     return False
 
@@ -321,10 +317,10 @@ def reads_only_plan(objective: str, text: str = "") -> str | None:
        CHANGE_VETO_STEMS for the deliberate collisions ("add" wins over
        "address", "creat" over "creative"); CHANGE_VETO_FORMS are explicit forms
        so "cover" vetoes but "coverage" does not.
-    2. A continuation ("and then", ", then", "; then", ". then", or "and
-       <word>") whose word is not in REPORT_ONLY_WORDS. That set holds only
-       verbs that can never imply a code change, so an unknown word is further
-       work: "audit the code base and speed it up" is a change mission, while
+    2. A continuation clause (after "and", "then", or any of , ; : . -) whose
+       head verb is not in REPORT_ONLY_WORDS. That set holds only true report
+       verbs, so an unknown word is further work: "audit the code base and speed
+       it up" is a change mission, while
        "review the codebase and list the risks" stays an audit.
 
     FAIL-SAFE BY CONSTRUCTION: the classifier returns "draft" only for what it

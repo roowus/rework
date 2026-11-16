@@ -1092,6 +1092,56 @@ async def test_retry_pr_refuses_a_draft_mission_that_carries_a_coder_branch(
     assert _remote_refs(bare) == ["main"], "the coder branch was pushed by a retry"
 
 
+@pytest.mark.parametrize(
+    "legacy_plan",
+    [
+        {"playbook": "fix-pr", "gates": []},
+        {"kind": "fix-pr", "gates": []},
+    ],
+)
+async def test_retry_pr_still_delivers_a_legacy_fix_pr_plan_without_a_publish_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_plan: dict[str, Any]
+) -> None:
+    """Missions created before the `publish` key existed can carry a pending PR,
+    and `rework mission retry-pr` is the operator's only recovery for them."""
+    bare, work = _make_repo(tmp_path)
+    fake_gh = tmp_path / "fake-gh"
+    log = tmp_path / "gh-calls.log"
+    fake_gh.write_text('#!/bin/sh\necho "$@" >> ' + str(log) + "\necho https://x/pull/9\n")
+    fake_gh.chmod(0o755)
+    monkeypatch.setenv("REWORK_GH_BIN", str(fake_gh))
+    store = await open_sqlite(str(tmp_path / "legacy.sqlite3"))
+    try:
+        mission = await store.create_mission(
+            Mission(
+                id="mlegacy00001",
+                objective="fix the thing",
+                title="Fix",
+                status=MissionStatus.DONE,
+                plan=dict(legacy_plan),
+                repo_path=str(work),
+                result={
+                    "summary": "kept",
+                    "pr_pending": True,
+                    "pr_branch": "rework/test",
+                    "pr_worktree": str(work),
+                },
+            )
+        )
+        assert "publish" not in mission.plan
+        ok, detail = await retry_pr(store, None, mission.id)
+        assert ok, detail
+        assert detail == "https://x/pull/9"
+        after = await store.get_mission(mission.id)
+        assert after is not None
+        assert after.result["pr_pending"] is False
+        assert after.result["pr_url"] == "https://x/pull/9"
+    finally:
+        await store.aclose()
+    assert "rework/test" in _remote_refs(bare), "the retried push landed the branch"
+    assert "pr create" in log.read_text()
+
+
 def test_cli_retry_pr_refuses_a_draft_mission_with_a_clean_message(tmp_path: Path) -> None:
     """The owner surface: an operator who types retry-pr against an audit gets
     the refusal in plain words, not a traceback and not a push."""

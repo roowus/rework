@@ -191,7 +191,15 @@ async def retry_pr(store: StateStore, bus: Any, mission_id: str) -> tuple[bool, 
     # retry must not create one: the branch fallback below would otherwise push
     # a coder's branch and open a PR for a plan that never publishes.
     plan = dict(mission.plan or {})
-    if not (plan.get("publish") or "open_pr" in (plan.get("gates") or [])):
+    # legacy `fix-pr` missions predate the `publish` key (their plan is
+    # {"playbook": "fix-pr", "gates": []} or {"kind": "fix-pr", ...}) and can
+    # carry a pending PR, so the playbook / kind names a publishing plan too
+    publishes = (
+        plan.get("publish")
+        or "open_pr" in (plan.get("gates") or [])
+        or "fix-pr" in (plan.get("playbook"), plan.get("kind"))
+    )
+    if not publishes:
         return False, (
             f"mission {mission_id} does not publish (plan {plan.get('kind') or 'default'!r}): "
             "there is no branch to push and no pull request to retry; a read-and-report "
