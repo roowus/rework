@@ -163,6 +163,27 @@ async def test_gate_lifecycle(store: StateStore) -> None:
     assert again.decision_note == "lgtm"  # first decision stands
 
 
+async def test_set_gate_question_rewords_an_open_gate_only(store: StateStore) -> None:
+    """A final gate is reused across audit rounds, so its question has to be
+    re-wordable while it is open. A decided gate is the record of what the
+    owner answered: its text never changes."""
+    m = await store.create_mission(Mission(id=new_id("m"), objective="o"))
+    gate = Gate(id=new_id("gate"), mission_id=m.id, kind=GateKind.SHIP, question="ship? r1")
+    await store.create_gate(gate)
+
+    refreshed = await store.set_gate_question(gate.id, "ship? r2")
+    assert refreshed is not None and refreshed.question == "ship? r2"
+    assert refreshed.status == GateStatus.OPEN
+    stored = await store.get_gate(gate.id)
+    assert stored is not None and stored.question == "ship? r2"
+
+    await store.decide_gate(gate.id, approved=True, note="lgtm")
+    refused = await store.set_gate_question(gate.id, "ship? r3")
+    assert refused is not None and refused.question == "ship? r2", "a decided gate is frozen"
+    assert refused.status == GateStatus.APPROVED
+    assert await store.set_gate_question("missing", "whatever") is None
+
+
 async def test_events_seq_cursor(store: StateStore) -> None:
     m = await store.create_mission(Mission(id=new_id("m"), objective="o"))
     other = await store.create_mission(Mission(id=new_id("m"), objective="p"))
@@ -559,6 +580,42 @@ async def test_chat_roundtrip(store: StateStore) -> None:
     assert await store.chat_messages(chat.id) == []
 
 
+async def test_chat_ids_with_messages_reports_only_chats_that_hold_a_message(
+    store: StateStore,
+) -> None:
+    """The emptiness probe answers for exactly the chats asked about.
+
+    The Work list hides chats that never got a message (`create_mission` mints
+    one per mission and never writes to it), so a wrong answer here is invisible:
+    returning every id silently restores the blank rows, returning none hides
+    real transcripts. A missing id is simply absent, never an error."""
+    from rework.kernel.state.records import Chat, ChatMessage
+
+    filled = await store.create_chat(Chat(title="has a transcript"))
+    blank = await store.create_chat(Chat(title="never written to"))
+    await store.append_chat_message(
+        ChatMessage(
+            chat_id=filled.id,
+            role="user",
+            body={"role": "user", "content": "hi"},
+            display="hi",
+            ts=100.0,
+        )
+    )
+
+    got = await store.chat_ids_with_messages([filled.id, blank.id])
+    assert got == {filled.id}, got
+
+    # asked for alone, the empty chat still answers empty
+    assert await store.chat_ids_with_messages([blank.id]) == set()
+    # no ids at all: no query, no rows
+    assert await store.chat_ids_with_messages([]) == set()
+    # an id that is not in the db is absent, not an error
+    assert await store.chat_ids_with_messages([filled.id, "chat-does-not-exist"]) == {filled.id}
+    # duplicates are harmless (the probe de-dupes)
+    assert await store.chat_ids_with_messages([filled.id, filled.id]) == {filled.id}
+
+
 async def test_gate_typed_decision_roundtrip(store: StateStore) -> None:
     """A gate can carry a typed answer, and it survives a reload.
 
@@ -584,6 +641,21 @@ async def test_gate_typed_decision_roundtrip(store: StateStore) -> None:
     )
     done = await store.decide_gate(plain.id, approved=True)
     assert done is not None and done.decision is None
+
+
+async def test_transient_crash_count_increments_then_resets(store: StateStore) -> None:
+    """The daemon's requeue budget: one atomic bump returning the new value,
+    and a reset that really zeroes the stored one (fresh dispatch / terminal).
+    The counter is NOT on Mission: it is read only through these two methods.
+    """
+    m = await store.create_mission(Mission(id=new_id("m"), objective="flaky runner"))
+    assert await store.increment_transient_crash_count(m.id) == 1
+    assert await store.increment_transient_crash_count(m.id) == 2
+    # a row that does not exist reports 0 instead of raising
+    assert await store.increment_transient_crash_count("missing") == 0
+    await store.reset_transient_crash_count(m.id)
+    # 1, not 3: the reset hit the stored value and the bump read it back
+    assert await store.increment_transient_crash_count(m.id) == 1
 
 
 async def test_a_schema_change_does_not_break_a_live_connection(

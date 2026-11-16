@@ -126,9 +126,25 @@ merging.
 The gate question then leads with the category and the orchestrator's reason
 ("Gate category: security — ..."), so you can decide from the inbox.
 
+The question also names the verdict of the mission's LAST auditor run and, when
+there is at least one such run, the round it came from (`audit verdict: approve
+(round 3 of 3)`). The parenthetical counts auditor runs, not review rounds: two
+auditors fanned out over one review count as two. When that last run produced no
+artifact because it failed, was still running, or the report writer could not
+validate its output, the gate says the audit is `not audited (round 2 of 2)`
+rather than quoting an earlier round that happened to be clean; that is the same
+fail-closed default as a mission that was never audited. With no auditor run at
+all the verdict comes from the audit artifact the engine finished with, and the
+round is left out. While the gate is OPEN its text is rewritten only when it
+differs from the text the engine would write now, and each such refresh is
+published as an INFO event. A decided gate is never rewritten: its text is the
+record of what you answered.
+
 Only a plan that publishes (`"publish": "pr"` — the `fix-pr` playbook; older
 plans carrying `"gates": ["open_pr"]` count too) pushes a branch or opens a PR
-at all. `echo` and `fix` missions deliver their result and stop.
+at all. `echo` and `fix` missions deliver their result and stop. Audits and other
+read-and-report missions are `draft` missions: their deliverable is the mission's
+Report tab, not a repository change and not a pull request.
 
 | project `settings.pr_gate` | effect |
 | --- | --- |
@@ -137,6 +153,97 @@ at all. `echo` and `fix` missions deliver their result and stop.
 | `never` | never gate; an `ask_before_pr` is noted and overridden |
 
 Merging is always the owner's decision; no agent merges.
+
+### main is merged into the branch before the PR opens
+
+Other missions merge to main while this one works, so a mission branch that was
+clean when the coder finished arrives conflicting anyway. Every PR delivery
+therefore runs, in the coder's own worktree and just before the push:
+
+1. probe `git remote get-url origin`: a repo-less (upload) project has none and
+   nothing happens at all (no fetch, no event, no change to the PR body);
+2. check `git rev-parse --abbrev-ref HEAD` is the coder branch (the fallback to
+   the daemon's shared clone can be detached or on main, and a merge there would
+   move the wrong ref);
+3. abort a merge a dead daemon left in progress (`MERGE_HEAD` present). A
+   stopped merge in this worktree is never somebody else's to resume (the only
+   merge that ever runs here is this step, synchronously), and leaving it would
+   let a later `git add -A` commit the conflict markers. Staged work that the
+   abort discards is stashed (`git stash create`, which never touches the index
+   or the tree) and pinned on the ref `refs/rework/pre-merge-abort` before the
+   abort runs, so a crash that left both a stopped merge and staged edits loses
+   nothing. That ref is a single mutable ref: the next delivery that discards
+   anything overwrites it, so only the most recently discarded stash is kept.
+   The INFO event of any outcome that discarded work names the ref, including a
+   merge that ends up succeeding after discarding staged work from a leftover
+   merge. The PR body names it only for a refused merge or a real conflict,
+   because those are the only two outcomes that get a **Merge with main**
+   section at all. An abort that discards nothing (the usual case, since a
+   stopped merge leaves unmerged entries that `git stash create` refuses) pins
+   no ref and says nothing;
+4. check `git status --porcelain` is empty, so a merge cannot clobber
+   uncommitted work (and `git add -A` cannot fold it into the merge commit);
+5. `git fetch origin main`, then `git merge-base --is-ancestor origin/main HEAD`:
+   already up to date, nothing to do. A failed fetch is a skip too, but it
+   publishes an INFO event with git's reason (scrubbed and truncated), since the
+   branch may then be stale for a reason worth seeing;
+6. `git merge --no-ff -m "Merge origin/main into <branch>" origin/main`, with the
+   deployment's configured commit identity (`REWORK_GIT_AUTHOR_NAME` /
+   `REWORK_GIT_AUTHOR_EMAIL`, the same `Config.git_author` every mission commit
+   uses; `rework <rework@rework.local>` when nothing is configured). One branch's
+   history never gains a second author. The merge commit is pushed with the
+   coder's commits, so the PR is mergeable. An INFO event names the merge commit.
+
+The silent outcomes are the ones with nothing to act on: **no origin** (step 1),
+**wrong branch** (step 2), **dirty worktree** (step 4) and **already up to
+date** (step 5) publish no event and add no body note. Everything else says
+something. The outcomes that carry a problem publish an INFO event, and the two
+that did not merge also give the body its **Merge with main** section: a failed
+fetch (body untouched), a refused merge and a real conflict. A **successful**
+merge publishes its own INFO event naming the merge commit (body untouched, a
+clean merge needs no note). One exception to the silence: aborting a leftover
+merge (step 3) can discard staged work, and no outcome of this step may drop
+that stash silently. So a skip that discarded work DOES publish an INFO event
+naming `refs/rework/pre-merge-abort`, and so does a merge that still succeeds
+after the abort; a plain skip still adds no body note, and the merge paragraph
+is only ever appended for a refused merge or a real conflict.
+
+A real conflict is never guessed at. The conflicting paths are captured first
+(`git ls-files -u` plus `git diff --name-only --diff-filter=U`, so delete/modify
+conflicts are not invisible), then `git merge --abort` runs and is verified with
+`git rev-parse -q --verify MERGE_HEAD`. The branch is then exactly what the coder
+left, for COMMITTED work: same HEAD, no conflict markers, nothing staged. (The
+dirty check in step 4 keeps uncommitted edits away from this step; the one thing
+an abort can discard is work staged inside a leftover merge, and step 3 pins
+that on `refs/rework/pre-merge-abort` first.) The push and the PR still happen,
+and the PR body gains a **Merge with main** section listing the conflicting
+paths so you see it in the PR; an INFO event carries the same list. If the
+abort itself fails, the event and the body say so and delivery continues: this
+step never blocks a PR and never fails a mission.
+
+A non-zero `git merge` exit is **not** automatically a conflict. When git
+REFUSES the merge instead of conflicting (unrelated histories, an `index.lock`
+it could not write) there are no unmerged paths, so the outcome is
+`failed`, not `conflicted`: the PR body and the INFO event then carry git's own
+reason (scrubbed and truncated) and say the merge was refused, and no path list
+is printed. Nothing ever reports conflicts with zero named paths.
+
+Because the merge lives in the shared delivery step, the **Retry PR** button
+(`rework mission retry-pr`) merges main too instead of re-pushing a stale
+branch, and it uses the same configured author from the environment. The merge
+paragraph is **never persisted**: only the coder's own body is stored with a
+failed delivery, and a **Merge with main** section is recomputed on every
+attempt, so a retry that merges cleanly cannot republish an earlier conflict.
+To make that cleanup exact, the paragraph is appended behind the marker
+`<!-- rework:merge-note -->`, and a retry strips only from that marker. A row
+stored by an older rework carries no marker, so the trailing section is cut
+only when it reads like one of the notes this step writes: it names `main` as
+**not** merged into the branch, lists `Conflicting paths:`, or carries the
+`Staged work that the abort` line about the discarded stash. Without a marker
+that test is only a heuristic, so a coder paragraph that quotes `## Merge with
+main` and then happens to use our own phrasing can still be cut, while a coder
+summary or auditor finding that quotes the heading and then uses other words is
+published verbatim and never truncated.
 
 A sleeping Mac pauses every local mission: nothing fails, it just stops
 until the lid opens (seen 2026-11-09: four stalls that looked like hangs
@@ -429,7 +536,7 @@ fresh; systemd's restart retry wins after one stale window.
 
 rewvis is 2 CPUs, 12 GB of RAM, 4 GB of swap, and it is shared: sshd,
 tailscaled, Postgres (`rework-dev-pg`), journald and the daemon all live on it.
-rework therefore bounds itself. Three knobs, all optional, all in
+rework therefore bounds itself. Five knobs, all optional, all in
 `~/.rework/rework.env`:
 
 | variable | default | what it caps |
@@ -437,6 +544,8 @@ rework therefore bounds itself. Three knobs, all optional, all in
 | `REWORK_MAX_ROLES` | one per CPU (`os.cpu_count()`, min 1) — 2 on rewvis | roles RUNNING at the same time, across all missions |
 | `REWORK_ROLE_MEMORY_MAX` | 60% of RAM | the memory one role's command tree may use before the kernel kills it |
 | `REWORK_CONCURRENCY` | `min(cpu_count, 4)` — 2 on rewvis | working MISSIONS at the same time |
+| `REWORK_CAPACITY` | `auto` | whether the two caps above follow the host at runtime, or stay fixed |
+| `REWORK_CAPACITY_INTERVAL_S` | `60` | how often (`auto`) the host is re-measured |
 
 `REWORK_MAX_ROLES` is daemon-wide: every `spawn_role` counts, whichever mission
 it belongs to. Runs beyond the cap are not refused, they queue — the run row
@@ -487,12 +596,75 @@ back to `running` the moment its last gate is decided, and the daemon corrects
 any `awaiting_gate` row with no open gate on every poll (a log line and an INFO
 event say so).
 
-A sqlite deployment keeps its historical concurrency of 1 unless the env says
-otherwise; Postgres deployments get the host-aware default.
+A sqlite deployment STARTS at its historical concurrency of 1, and Postgres
+deployments start at the host-aware default. Either way that is only the
+starting value: with `REWORK_CAPACITY=auto` (the default) the first measurement
+moves both caps to what the box can take, so an idle 8-core sqlite deployment
+runs 8 missions and 8 roles, and the old `min(cpu_count, 4)` ceiling no longer
+applies at runtime. A sqlite deployment therefore no longer keeps concurrency 1
+forever unless it says so: set `REWORK_CONCURRENCY` (or `REWORK_MAX_ROLES`) to
+pin that one cap, or `REWORK_CAPACITY=fixed` to keep the resolved startup caps
+and nothing else.
+
+#### Capacity: the two caps follow the box (`REWORK_CAPACITY`)
+
+With the default `REWORK_CAPACITY=auto`, `REWORK_CONCURRENCY` and
+`REWORK_MAX_ROLES` are no longer read only at startup: every
+`REWORK_CAPACITY_INTERVAL_S` seconds (default 60) the daemon re-measures the
+host and moves both caps, so switching from a busy box to an idle one needs no
+edit and no restart. A quiet box plans one role and one mission per CPU (2 and
+2 on a 2-core box, 8 and 8 on an idle 8-core box). Two cuts can follow, in this
+order:
+
+1. LOAD: when the 1-minute load average is strictly above the CPU count the
+   role count halves, and on a multi-core box this rule never takes it below 2
+   (one role per CPU is already the point). A load average exactly equal to the
+   CPU count does not halve: 8 CPUs at load 8.0 still plans 8 and 8.
+2. RAM: when `MemAvailable` in /proc/meminfo is under 1.5 GB (1.5 decimal GB,
+   `1_500_000_000` bytes) per planned role, roles are cut one at a time until
+   they fit, down to 1. This rule runs AFTER the load rule and the floor of 2
+   does not bound it, because protecting the box beats using it: 16 idle CPUs
+   with 2 GB free plan 1 mission and 1 role.
+
+On the caps auto actually manages, the mission cap never exceeds the role
+cap: pinning a role cap with `REWORK_MAX_ROLES` also lowers the managed mission
+cap to fit it (2 pinned roles on 12 idle CPUs run 2 missions / 2 roles), and a
+pinned `REWORK_CONCURRENCY` above the planned role cap is cut back to that cap.
+Pinning never raises a cap to satisfy the rule, and the cut is never written
+back over the pin, so a pinned mission cap returns to its pinned value as soon
+as the box can hold it again. With BOTH caps set explicitly there is nothing
+left for auto to manage, and the documented exception applies: rework honours
+the two numbers exactly as given (8 and 2 stay 8 missions / 2 roles), measures
+nothing and starts no watchdog. A change is applied only when the same plan
+shows up in two measurements in a row, so one `uv sync` burst does not flap the
+caps.
+
+Shrinking never cancels work: running missions keep their slots until they
+finish (the free-slot count goes negative until their releases bring it back),
+and new work simply stops being admitted. Every change is ONE log line with
+the reason, and nothing is logged while the caps hold:
+
+```
+capacity changed: 8 missions / 8 roles -> 4 missions / 4 roles (8 CPUs, load 12.4, 6.5 GB free: 4 missions / 4 roles)
+```
+
+Those numbers are what the code actually prints for that box: 8 CPUs at load
+12.4 halve to 4 roles, and 6.5 GB free covers 4 roles at 1.5 GB each (6.0 GB).
+The same box with 5.1 GB free plans 3 and 3 instead, because the RAM cut takes
+the fourth role away.
+
+Precedence: an EXPLICIT `REWORK_CONCURRENCY` or `REWORK_MAX_ROLES` (a non-empty
+value in the env) fixes that one cap and `auto` manages only the other one;
+with both set there is nothing to watch and no watchdog runs.
+`REWORK_CAPACITY=fixed` restores the old behaviour exactly (the caps are
+resolved once at startup, no measurement, no watchdog, no log line), which is
+what you want when a deployment must not move under load. A typo in the value
+means `auto`: the guard never turns itself off by accident. Check what it did
+with `rework logs daemon -g 'capacity changed'`.
 
 #### The 2026-11-13 incident
 
-The reason all three exist. The kernel OOM killer fired three times — Nov 12
+The reason the caps exist. The kernel OOM killer fired three times — Nov 12
 19:23, Nov 13 06:23 and 06:58 UTC — the last killing a role's `mypy` at 790 MB
 *inside* `rework.service`, which took the service itself down. From about
 16:20 UTC the box was swap-thrashing instead: journald wrote its lines out of
@@ -501,7 +673,9 @@ order, no OOM kill came, and nothing answered until a hard reboot at 17:02.
 The load that did it: between 15:57 and 16:24 UTC four missions ran at once,
 one of them a batch mission running four investigators in parallel — 6-7 roles
 at a time, each running `pytest`, `mypy` and `uv sync` on 2 CPUs and 12 GB.
-`REWORK_CONCURRENCY=1` was the stopgap until the caps above existed.
+`REWORK_CONCURRENCY=1` was the stopgap until the caps above existed. That is
+also why they follow the host at runtime rather than being set once: the box
+that fell over was shared, and its headroom depends on the hour.
 
 Look for OOM kills before blaming the network, a bad deploy or a hung daemon;
 they are logged by the kernel, not by rework:

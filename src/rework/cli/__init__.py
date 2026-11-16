@@ -53,6 +53,7 @@ def version() -> None:
 
 @app.command()
 def new(
+    ctx: typer.Context,
     objective: str,
     repo: str | None = typer.Option(
         None,
@@ -69,7 +70,11 @@ def new(
         None,
         help="A few words naming the mission (default: derived from the objective).",
     ),
-    plan: str = typer.Option("echo", help="Playbook: echo | fix | fix-pr | draft"),
+    plan: str = typer.Option(
+        "echo",
+        help="Playbook: echo | fix | fix-pr | draft. Omitted on a read-and-report"
+        " objective (an audit, a survey, a written report) means draft.",
+    ),
     orchestrator: str | None = typer.Option(
         None,
         help="Catalog id for the mission's orchestrator (default: REWORK_DEFAULT_MODEL).",
@@ -97,12 +102,13 @@ def new(
     (ADR 0007), following the plan as a playbook: `fix` = investigate, code,
     audit, then a ship gate; `fix-pr` opens a PR instead (no gate by default,
     unless the project's `pr_gate` setting or the orchestrator asks for one);
-    `draft` is document work (research with the web tools, write files, audit
-    the claims) and has no gate: no branch push and no PR."""
+    `draft` is read-and-report work (research with the web tools, audit the
+    claims): its deliverable is the mission's Report tab, not files written into
+    the repository, and it has no gate: no branch push and no PR."""
 
     async def go() -> str:
         from rework.config import Config, open_store_from_config
-        from rework.missions import create_mission, resolve_project
+        from rework.missions import create_mission, reads_only_plan, resolve_project
 
         # a template plan has NEVER carried a cap of its own: stamping an
         # estimated one on it (see create_mission's comment) would make every
@@ -132,13 +138,36 @@ def new(
             if not mechanical:
                 orch_model = orchestrator or default_orchestrator_model()
             project_id = await resolve_project(project)
+            # the plan is the caller's unless the caller stayed silent: an audit
+            # is a read-and-report job, and the DEFAULT for one is `draft` (its
+            # deliverable is the report, not a branch and a pull request). An
+            # explicit `--plan echo` still means echo: this reads the parameter
+            # SOURCE, not the value, so the classifier never overrides a plan
+            # the owner named. It is a default-selection heuristic only, and it
+            # only applies when a repository or project is being resolved:
+            # `draft` cannot be built without one, so a repo-less audit keeps
+            # the caller's plan (and the command keeps succeeding).
+            chosen_plan = plan
+            # `--mechanical` runs the fixed template steps (investigate, code,
+            # audit), so the draft default applies only to the orchestrator
+            # route: a template mission always keeps the caller's plan.
+            if (repo or repo_dir or project_id) and not mechanical and _plan_not_given(ctx):
+                suggested = reads_only_plan(objective)
+                if suggested is not None:
+                    chosen_plan = suggested
+                    # stderr on purpose, like the budget line: stdout stays the id
+                    typer.echo(
+                        f"read-and-report objective: plan {suggested} (no branch push,"
+                        " no pull request); pass --plan to override",
+                        err=True,
+                    )
             mission = await create_mission(
                 objective,
                 repo=repo,
                 repo_dir=repo_dir,
                 project_id=project_id,
                 title=title,
-                plan=plan,
+                plan=chosen_plan,
                 priority=priority,
                 orchestrator_model=orch_model,
                 orchestrator_effort=effort,
@@ -156,6 +185,25 @@ def new(
         typer.echo(asyncio.run(go()))
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+
+
+def _plan_not_given(ctx: Any) -> bool:
+    """True when --plan was not passed on the command line (click's DEFAULT
+    source), so the plan is still a default and a read-and-report objective may
+    pick `draft`. A `--plan echo` typed by the owner is USER source: it wins."""
+    from click.core import ParameterSource
+
+    if ctx is None:
+        return True
+    try:
+        source = ctx.get_parameter_source("plan")
+    except (AttributeError, KeyError):  # no click context: treat it as omitted
+        return True
+    if source is None:
+        return True
+    # typer vendors its own click, so the enum CLASS from `click` is not the
+    # class of the value the context hands back: compare by name
+    return getattr(source, "name", "") == ParameterSource.DEFAULT.name
 
 
 async def _opening_budget(store: Any, objective: str, budget: float | None) -> tuple[float, str]:
@@ -929,10 +977,56 @@ def report(
     mission_id: str,
     md: bool = typer.Option(False, "--md", help="write a markdown file and open-friendly output"),
     out: str | None = typer.Option(None, "--out", help="markdown output path (implies --md)"),
+    to_library: bool = typer.Option(
+        False,
+        "--to-library",
+        "--library",
+        help="hand the report off into the Library as a report item (idempotent).",
+    ),
+    from_file: str | None = typer.Option(
+        None, "--from-file", help="Body source for --to-library: a markdown file."
+    ),
+    title: str | None = typer.Option(None, "--title", help="Item name (default: Report: <id>)."),
+    tag: list[str] = typer.Option([], "--tag", help="Extra item tag, repeatable."),  # noqa: B008
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print the planned item and write nothing."
+    ),
 ) -> None:
     """Render a mission's reports readably: each role's artifact plus the
     mechanical run-stats section (tokens, cache, cost, time). --md writes
-    a markdown file (default ~/rework/reports/<mission-id>.md)."""
+    a markdown file (default ~/rework/reports/<mission-id>.md).
+
+    --to-library copies the report BODY into the Library instead, as one report
+    item per mission: re-running updates that item, never a duplicate. The body
+    comes from --from-file, else the largest newly ADDED docs/*.md in the
+    mission's surviving worktree or branch (a merely edited doc only stands in
+    as a loud last resort), else missions.result.summary clearly labelled as a
+    summary. --from-file is an error when the file is missing or empty."""
+
+    if not to_library:
+        stray = [
+            flag
+            for flag, given in (
+                ("--from-file", from_file is not None),
+                ("--title", title is not None),
+                ("--tag", bool(tag)),
+                ("--dry-run", dry_run),
+            )
+            if given
+        ]
+        if stray:
+            typer.secho(
+                f"{', '.join(stray)} only apply with --to-library; nothing was done.",
+                fg=typer.colors.RED,
+            )
+            raise typer.Exit(2)
+    elif md or out:
+        typer.secho(
+            "--to-library cannot be combined with --md or --out: pick the Library"
+            " hand-off or the markdown file; nothing was done.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(2)
 
     async def go() -> None:
         from rework.config import Config, open_store_from_config
@@ -943,6 +1037,16 @@ def report(
             if mission is None:
                 typer.secho(f"no such mission: {mission_id}", fg=typer.colors.RED)
                 raise typer.Exit(1)
+            if to_library:
+                await _report_hand_off(
+                    store,
+                    mission,
+                    from_file=from_file,
+                    title=title,
+                    extra_tags=list(tag),
+                    dry_run=dry_run,
+                )
+                return
             runs = await store.list_runs(mission_id)
             prepared: list[tuple[Any, dict[str, Any]]] = []
             for run in runs:
@@ -1002,6 +1106,71 @@ def report(
             await store.aclose()
 
     asyncio.run(go())
+
+
+async def _report_hand_off(
+    store: Any,
+    mission: Any,
+    *,
+    from_file: str | None,
+    title: str | None,
+    extra_tags: list[str],
+    dry_run: bool,
+) -> None:
+    """`rework report --to-library`: one report item per mission, re-run safe.
+
+    Body resolution and the dedupe key live in rework.library.handoff. The
+    dedupe key is `provenance.mission_id`, an empty `provenance.role` (checked
+    first, because rework stamps the role onto every role contribution, so a
+    role cannot clear it) and then the `handoff:report` marker tag, or, for a
+    report filed before that marker existed, the hand-off fingerprint. The
+    mission id alone would be stamped on role contributions too and would
+    overwrite a report a role authored. A second run updates instead of minting
+    an `l-<hex>` duplicate the way `library add` does. Errors are usage errors
+    with a non-zero exit and nothing written."""
+    from rework.config import Config
+    from rework.library import handoff
+    from rework.library.store import GitLibrary
+
+    config = Config.from_env()
+    try:
+        body = handoff.from_file(from_file) if from_file else None
+    except ValueError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED)
+        raise typer.Exit(1) from exc
+    if body is None:
+        body = await handoff.resolve_from_mission(store, mission)
+    if body is None:
+        body = handoff.summary_body(mission)
+    if body is None:
+        typer.secho(
+            f"mission {mission.id} has no report to hand off: no --from-file, no docs"
+            " markdown in a surviving worktree or branch, and no result summary."
+            " Pass --from-file PATH.",
+            fg=typer.colors.RED,
+        )
+        raise typer.Exit(1)
+
+    git = GitLibrary(_library_root(), author=config.git_author)
+    index = await open_library_index(config.db)
+    try:
+        item, created, verb = await handoff.hand_off(
+            index,
+            git,
+            mission,
+            body=body,
+            name=title,
+            extra_tags=extra_tags,
+            dry_run=dry_run,
+        )
+    finally:
+        await index.aclose()
+    for line in handoff.describe(item, body, dry_run, verb):
+        typer.echo(line)
+    if dry_run:
+        typer.echo("(dry run; nothing written)")
+    elif created:
+        typer.echo(f"handed off to the library; read it back with `rework library show {item.id}`")
 
 
 def _one_line(text: str | None, width: int = 72) -> str:
@@ -1145,9 +1314,14 @@ def retry_pr_cmd(mission_id: str) -> None:
         from rework.config import Config, open_store_from_config
         from rework.kernel.events.bus import InProcessEventBus
 
-        store = await open_store_from_config(Config.from_env())
+        config = Config.from_env()
+        store = await open_store_from_config(config)
         try:
-            return await retry_pr(store, InProcessEventBus(store), mission_id)
+            # the deployment's commit identity: the retried merge commit must
+            # carry the same author as the mission's own commits
+            return await retry_pr(
+                store, InProcessEventBus(store), mission_id, author=config.git_author
+            )
         finally:
             await store.aclose()
 

@@ -330,7 +330,8 @@ checkpointed and replayed.
 | `REWORK_RESULTS_DIR` / `REWORK_REPORTS_DIR` | visible artifact dirs (default `~/rework/…`) |
 | `REWORK_DAEMON_URL` / `REWORK_HTTP_PORT` | workspace API for fetching results |
 | `REWORK_TOKEN` | bearer token for that API when the deployment sets one |
-| `REWORK_CONCURRENCY` | daemon-side; the TUI does not manage it |
+| `REWORK_CONCURRENCY` / `REWORK_MAX_ROLES` | daemon-side; the TUI does not manage them |
+| `REWORK_CAPACITY` / `REWORK_CAPACITY_INTERVAL_S` | daemon-side: `auto` (default) makes both caps follow the host |
 | `REWORK_GIT_AUTHOR_NAME` / `_EMAIL` | agent commit identity |
 | `REWORK_NOTIFY` | the previous TUI's notify mode; free to keep or drop |
 

@@ -28,6 +28,19 @@ def run_id(mission_id: str, step: str, role: str, attempt: int) -> str:
     return f"{mission_id}:{step}:{role}:{attempt}"
 
 
+ORCHESTRATOR_CHAT_PREFIX = "orch-"
+
+
+def orchestrator_chat_id(mission_id: str) -> str:
+    """The chat a mission's own orchestrator writes its transcript to.
+
+    Deterministic, so any surface (the Work list, the Dashboard action, session
+    restore) can reach a mission's transcript without a lookup. Defined here
+    rather than in rework.orchestrator.agent because the TUI needs it and the
+    orchestrator package pulls in the whole engine."""
+    return f"{ORCHESTRATOR_CHAT_PREFIX}{mission_id}"
+
+
 class MissionStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"

@@ -65,9 +65,11 @@ Plans you can choose:
 - fix-pr  — same, then the engine opens a pull request (no gate by default)
 - draft   — use draft for document work: research write-ups, reports, letters,
             content — anything whose deliverable is writing, not code. The roles
-            research with the web tools, write the draft as files in the
-            project, and audit every claim against its cited source. No branch
-            push and no PR.
+            research with the web tools, write the report in the mission's Report
+            tab, and audit every claim against its cited source. No branch push
+            and no PR. Choose draft when the objective only reads and reports (an
+            audit, a review, an analysis): put draft in propose_mission's plan
+            yourself. A plan the owner names explicitly stays authoritative.
 
 A project may also be repo-less: its transport is "upload", which means rework
 keeps that project's files itself. For an upload project, fix and fix-pr do NOT
@@ -245,6 +247,18 @@ class Proposal:
                 line = f"{line} ({self.budget_reason})"
             bits.append(line)
         return " · ".join(bits)
+
+
+def proposal_plan(args: dict[str, Any], objective: str) -> str:
+    """The plan a proposal carries: the one the model named, else a default.
+    The classifier (`reads_only_plan`) only picks the DEFAULT, when the plan is
+    absent; a plan the model explicitly named is never overridden."""
+    named = str(args.get("plan", "")).strip()
+    if named:
+        return named
+    from rework.missions import reads_only_plan
+
+    return reads_only_plan(objective) or "fix"
 
 
 def proposal_budget(
@@ -735,7 +749,7 @@ class OrchestratorChat:
                     Proposal(
                         objective=objective,
                         title=str(args.get("title", "")).strip(),
-                        plan=str(args.get("plan", "fix")).strip() or "fix",
+                        plan=proposal_plan(args, objective),
                         project=str(args.get("project", "")).strip(),
                         repo=str(args.get("repo", "")).strip(),
                         model=str(args.get("model", "")).strip(),

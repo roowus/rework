@@ -43,6 +43,7 @@ from rework.kernel.state.records import (
     MissionStatus,
     Run,
     RunStatus,
+    orchestrator_chat_id,
 )
 from rework.kernel.state.records import run_id as make_run_id
 from rework.logs import bind
@@ -181,9 +182,10 @@ PLAYBOOKS: dict[str, str] = {
         "Document work, not code: the deliverable is WRITING. Usual shape: (1) "
         "RESEARCH: spawn an investigator whose brief is to gather the facts with "
         "`web_search` and `fetch_url`, and to RECORD the source url of every claim it "
-        "makes; (2) DRAFT: spawn a coder (it owns the worktree and can write files, so "
-        "use it here too) to write the deliverables into the project as real files "
-        "(Markdown or whatever format the objective asks for), citing those sources; "
+        "makes; (2) DRAFT: spawn a coder to write the report itself, citing those "
+        "sources. For a draft mission the deliverable is a written report in the "
+        "mission's Report tab, not a change to the repository, so the brief has to say "
+        "so: do not write files into the target repo to carry the report; "
         "(3) REVIEW: spawn an auditor to check the draft claim by claim against the "
         "cited sources, to check any constraint the objective states (length, format, "
         "tone, audience), and to check that nothing about the OWNER is invented, "
@@ -192,8 +194,11 @@ PLAYBOOKS: dict[str, str] = {
         "findings in its brief and review again (pick each audit's `strictness` from "
         "risk and re-decide it every round, as with fix). Use `ask_owner` for facts "
         "only the owner knows (their own details, preferences, commitments) BEFORE "
-        "finalising: never guess them. THERE IS NO BRANCH PUSH AND NO PR: the results "
-        "are the project's files, so the mission finishes with no gate."
+        "finalising: never guess them. THERE IS NO BRANCH PUSH AND NO PR: never push a "
+        "branch and never open a pull request for a draft mission; it finishes with no "
+        "gate because its deliverable is the report in its Report tab. If a draft "
+        "mission discovers that code has to change, it says so in the Report tab and "
+        "does not change code: the recovery is the owner relaunching on the fix plan."
     ),
 }
 
@@ -552,10 +557,6 @@ def _gate_ask(args: dict[str, Any]) -> tuple[bool, str, str]:
     if not reason or category not in GATE_CATEGORIES:
         raise ToolError(GATE_ASK_REFUSED)
     return True, reason, category
-
-
-def orchestrator_chat_id(mission_id: str) -> str:
-    return f"orch-{mission_id}"
 
 
 def orchestrator_run_id(mission_id: str) -> str:
@@ -959,6 +960,11 @@ class MissionOrchestrator:
             if await self.r._pause_until_resumed() == "cancelled":
                 return "cancelled"
             await self._restart_live_runs()
+        if self.r._supervisor is not None:
+            # A transient database error that escaped a role run has to leave
+            # this loop too: the run row never goes terminal, so waiting on it
+            # strands the mission instead of requeueing it.
+            await self.r._supervisor.check_fatal()
         if await self.r._burn_gate_hit() == "cancelled":
             return "cancelled"
         return "ok"

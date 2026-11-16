@@ -541,3 +541,78 @@ async def test_an_ask_without_a_category_is_refused_then_the_pr_opens_ungated(
     assert mission is not None and mission.status == MissionStatus.DONE
     assert (mission.result or {}).get("pr_url") == "https://github.com/roowus/toyrepo/pull/1"
     assert orch_world["gh_body"].exists(), "the retry never opened the PR"
+
+
+# ---------------------------------------------------------------------------
+# A read-and-report plan (draft) has no branch to publish: neither an
+# orchestrator's ask_before_pr nor the project's pr_gate=always may open an
+# open_pr gate for it, and nothing may be pushed.
+# ---------------------------------------------------------------------------
+
+
+async def _remote_branches(bare: Any) -> list[str]:
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "for-each-ref",
+        "--format=%(refname:short)",
+        cwd=str(bare),
+        stdout=asyncio.subprocess.PIPE,
+    )
+    out, _ = await proc.communicate()
+    return out.decode().split()
+
+
+async def _as_draft_mission(world: dict[str, Any]) -> None:
+    """Turn the world's wired mission into the `draft` plan a read-and-report
+    objective gets from the CLI (playbook draft, no publish, no gates)."""
+    from rework.missions import orchestrated_plan
+
+    store: SqliteStore = world["store"]
+    mission = await store.get_mission(world["mission"].id)
+    assert mission is not None
+    await store.update_mission(mission.id, plan=orchestrated_plan("draft", "pro"))
+    world["mission"] = await store.get_mission(mission.id)
+
+
+async def test_a_draft_mission_never_opens_an_open_pr_gate_even_when_the_orchestrator_asks(
+    orch_world: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ask_before_pr only ever ASKS; the plan decides whether there is anything
+    to gate. A draft mission finishes cleanly with no gate and no PR."""
+    await _as_draft_mission(orch_world)
+    script = _with_reason(_orch_pr_script(), reason="touches the admission path")
+    runner = _runner(orch_world, monkeypatch, script)
+    await asyncio.wait_for(asyncio.create_task(runner.run()), timeout=60)
+
+    store: SqliteStore = orch_world["store"]
+    gates = await store.list_gates(orch_world["mission"].id)
+    assert [g for g in gates if g.kind.value == "open_pr"] == [], (
+        "a draft plan does not publish, so its ask must not open an open_pr gate"
+    )
+    assert not orch_world["gh_body"].exists(), "a draft mission opened a pull request"
+    assert await _remote_branches(orch_world["tmp"] / "origin.git") == ["main"]
+    mission = await store.get_mission(orch_world["mission"].id)
+    assert mission is not None
+    assert mission.status == MissionStatus.DONE, "a draft finishes with no gate, not stuck"
+    assert not (mission.plan or {}).get("publish"), "the draft plan publishes nothing"
+
+
+async def test_a_draft_mission_never_opens_an_open_pr_gate_even_with_pr_gate_always(
+    orch_world: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The project setting `pr_gate=always` forces a gate for a publishing plan
+    only: for a draft there is nothing to push, so it must be a no-op."""
+    await _as_draft_mission(orch_world)
+    await _set_pr_gate(orch_world, "always")
+    runner = _runner(orch_world, monkeypatch, _orch_pr_script())
+    await asyncio.wait_for(asyncio.create_task(runner.run()), timeout=60)
+
+    store: SqliteStore = orch_world["store"]
+    gates = await store.list_gates(orch_world["mission"].id)
+    assert [g for g in gates if g.kind.value == "open_pr"] == [], (
+        "pr_gate=always must not force a PR gate on a plan that publishes nothing"
+    )
+    assert not orch_world["gh_body"].exists(), "a forced pr_gate pushed a draft mission"
+    assert await _remote_branches(orch_world["tmp"] / "origin.git") == ["main"]
+    mission = await store.get_mission(orch_world["mission"].id)
+    assert mission is not None and mission.status == MissionStatus.DONE

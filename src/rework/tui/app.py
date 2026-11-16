@@ -22,6 +22,7 @@ from textual.widgets import ContentSwitcher
 from textual.worker import WorkerFailed
 
 from rework import update as update_mod
+from rework.kernel.state.records import ORCHESTRATOR_CHAT_PREFIX
 from rework.runtime import CODE_CHANGED_IDLE, CodeChangeWatcher
 from rework.tui import reload as reload_mod
 from rework.tui import spinner
@@ -703,8 +704,19 @@ class ReworkApp(App[None]):
             if state.tab in TABS:
                 self.action_tab(state.tab)
             work = self.view("work")
-            if state.chat_id and any(c.id == state.chat_id for c in snap.chats):
-                work.open_chat(state.chat_id)
+            # an orch- chat is hidden from the snapshot by design (one per
+            # mission); a saved session that was looking at a mission's
+            # transcript must still come back to it
+            saved_is_transcript = bool(
+                state.chat_id and str(state.chat_id).startswith(ORCHESTRATOR_CHAT_PREFIX)
+            )
+            if state.chat_id and (
+                saved_is_transcript or any(c.id == state.chat_id for c in snap.chats)
+            ):
+                if saved_is_transcript:
+                    work.open_transcript(str(state.chat_id)[len(ORCHESTRATOR_CHAT_PREFIX) :])
+                else:
+                    work.open_chat(state.chat_id)
             elif state.mission_id and snap.mission(state.mission_id) is not None:
                 self.open_mission(state.mission_id)
             # a gate's selection only exists on the Gates tab, and selecting one
