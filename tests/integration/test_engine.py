@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from conftest import wait_for_gate_park
 from rework.config import Config
 from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.gates import GateManager
@@ -365,8 +366,6 @@ async def test_gate_row_visible_before_mission_parks_then_converges_to_awaiting_
     wait the mission says AWAITING_GATE, and it stays there while the gate
     remains open (it never flaps back to `running`). Tests therefore wait for
     both facts (conftest.wait_for_gate_park), never for the gate row alone."""
-    from conftest import wait_for_gate_park
-
     store: SqliteStore = world["store"]
     mission = await store.create_mission(
         Mission(
@@ -384,15 +383,22 @@ async def test_gate_row_visible_before_mission_parks_then_converges_to_awaiting_
     try:
         gates = GateManager(second, InProcessEventBus(second))
         ship_gate = None
-        for _ in range(600):  # bounded: 30s at 50ms
+        while ship_gate is None:
+            # a gate-only wait is legitimate for THIS step: it is about seeing
+            # the committed row on a fresh connection, before the status lands.
+            # The echo role's own escalation gate blocks the plan, so it is
+            # approved as it appears and the wait re-arms for the ship gate.
+            await wait_for_gate_park(
+                second,
+                mission.id,
+                timeout_s=30,
+                what="the plan's next gate to be visible on a fresh connection",
+            )
             for gate in await second.list_open_gates(mission.id):
                 if gate.kind == GateKind.SHIP:
                     ship_gate = gate
-                else:  # the echo role's own escalation gate blocks the plan
+                else:  # the echo role's own escalation gate
                     await gates.decide(gate.id, approved=True)
-            if ship_gate is not None:
-                break
-            await asyncio.sleep(0.05)
         assert ship_gate is not None, "the plan never reached its ship gate"
 
         # the gate row is committed; the status write is what this test is about

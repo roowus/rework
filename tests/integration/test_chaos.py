@@ -311,7 +311,16 @@ async def test_escalation_gate_links_to_its_run_on_the_row(world: dict[str, Any]
     )
     runner1 = _runner(world, mission.id)
     task1 = asyncio.create_task(runner1.run())
-    await _wait_for(lambda: _open_gate(store, mission.id), what="gate to open")
+    # BARRIER (same shape as the trio above): the gate row is committed before
+    # the run's HALTED_ESCALATED row, so a kill on the gate row alone restarts
+    # an UNPARKED role. What this test relies on next is the open gate AND the
+    # gated run parked, so wait for both facts in one bounded poll.
+    await wait_for_gate_park(
+        store,
+        mission.id,
+        run_id=f"{mission.id}:do:crashy:1",
+        what="the gate open and its run parked",
+    )
     task1.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task1, timeout=5)
