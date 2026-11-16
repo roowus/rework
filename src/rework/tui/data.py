@@ -620,6 +620,16 @@ class TuiData:
             lambda: self._call(lambda s: s.chat_messages_since(chat_id, after_id)),
         )
 
+    async def chat_ids_with_conversation(self, chat_ids: list[str]) -> set[str]:
+        """Which of these chats hold a user or assistant message (one probe).
+        Never served stale: see chat_ids_with_messages."""
+        key = "chat_ids_with_conversation:" + ",".join(sorted(chat_ids))
+        return await self._resilient(
+            key,
+            lambda: self._call(lambda s: s.chat_ids_with_conversation(chat_ids)),
+            stale_ok=False,
+        )
+
     async def chat_ids_with_messages(self, chat_ids: list[str]) -> set[str]:
         """Which of these chats actually hold a message (one batched probe)."""
         key = "chat_ids_with_messages:" + ",".join(sorted(chat_ids))

@@ -154,6 +154,8 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     ts REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_chat_messages_chat ON chat_messages(chat_id, id);
+-- newest-message-per-chat (list_chats ordering): an index-only MAX(ts) probe
+CREATE INDEX IF NOT EXISTS idx_chat_messages_chat_ts ON chat_messages(chat_id, ts);
 """
 
 
@@ -901,6 +903,7 @@ class SqliteStore:
             mission_id=row["mission_id"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            last_message_at=row["last_message_at"] if "last_message_at" in row.keys() else None,
         )
 
     @staticmethod
@@ -962,10 +965,15 @@ class SqliteStore:
         return await self.get_chat(chat_id)
 
     async def list_chats(self, limit: int = 50, include_missions: bool = True) -> list[Chat]:
-        sql = "SELECT * FROM chats"
+        # newest MESSAGE first (what the owner sees as "last active"), with
+        # updated_at only as the tiebreaker and chats with no message last
+        sql = (
+            "SELECT c.*, (SELECT MAX(m.ts) FROM chat_messages m WHERE m.chat_id = c.id)"
+            " AS last_message_at FROM chats c"
+        )
         if not include_missions:
-            sql += " WHERE mission_id IS NULL"
-        sql += " ORDER BY updated_at DESC LIMIT ?"
+            sql += " WHERE c.mission_id IS NULL"
+        sql += " ORDER BY last_message_at IS NULL, last_message_at DESC, c.updated_at DESC LIMIT ?"
         rows = await self._fetch_all(sql, (limit,))
         return [self._chat(r) for r in rows]
 
@@ -1021,6 +1029,19 @@ class SqliteStore:
         marks = ", ".join("?" * len(ids))
         rows = await self._fetch_all(
             f"SELECT DISTINCT chat_id FROM chat_messages WHERE chat_id IN ({marks})",
+            tuple(ids),
+        )
+        return {str(r["chat_id"]) for r in rows}
+
+    async def chat_ids_with_conversation(self, chat_ids: list[str]) -> set[str]:
+        """The subset holding at least one user or assistant message."""
+        ids = list(dict.fromkeys(chat_ids))
+        if not ids:
+            return set()
+        marks = ", ".join("?" * len(ids))
+        rows = await self._fetch_all(
+            "SELECT DISTINCT chat_id FROM chat_messages"
+            f" WHERE role IN ('user', 'assistant') AND chat_id IN ({marks})",
             tuple(ids),
         )
         return {str(r["chat_id"]) for r in rows}

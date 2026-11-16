@@ -615,10 +615,14 @@ class OrchestratorChat:
         user_msg: dict[str, Any] = {"role": "user", "content": text}
         if images:
             user_msg["images"] = images
-        self._history.append(user_msg)
         chips = " ".join(f"📎 {p.split('/')[-1]}" for p in images)
-        self._display.append(("you", f"{text}  {chips}".strip() if chips else text))
-        await self._record("user", user_msg, self._display[-1][1])
+        shown_user = f"{text}  {chips}".strip() if chips else text
+        self._history.append(user_msg)
+        self._display.append(("you", shown_user))
+        # the owner's row is written BEFORE the model is called, so even a turn
+        # that fails leaves the question in the chat. A failed write is logged
+        # and remembered: the reply below says so, it is never silent.
+        user_saved = await self._record("user", user_msg, shown_user)
         specs = [PROPOSE_TOOL, ASK_TOOL]
         if self._toolbox is not None:
             specs = [*specs, *LOOK_TOOLS]
@@ -711,7 +715,12 @@ class OrchestratorChat:
             logger.exception("orchestrator chat turn failed")
             note = f"⚠ {type(exc).__name__}: {exc}"
             self._display.append(("orchestrator", note))
-            await self._record("assistant", {}, note)
+            # the failed turn leaves a visible row, never an empty chat; if even
+            # this write fails the reply below still carries the error
+            error_saved = await self._record("assistant", {}, note)
+            if not (user_saved and error_saved):
+                note = f"{note}\n(not saved — could not persist the chat turn)"
+                self._display[-1] = ("orchestrator", note)
             return ChatResult(
                 reply=note, transcript=[Turn("you", text), Turn("orchestrator", note)]
             )
@@ -793,7 +802,7 @@ class OrchestratorChat:
         # without re-feeding an empty assistant message on reload
         body = assistant_msg if ((result.text or "").strip() or result.tool_calls) else {}
         saved = await self._record("assistant", body, shown)
-        if not saved:
+        if not (saved and user_saved):
             # the reply still reaches the owner; only the note marks it unsaved
             reply = f"{reply}\n(not saved — could not persist the chat turn)"
             transcript[-1] = Turn("orchestrator", reply)

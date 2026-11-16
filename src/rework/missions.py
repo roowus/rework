@@ -16,12 +16,12 @@ from typing import Any
 
 from rework.kernel.state.records import (
     PRIORITIES,
-    Chat,
     EventRecord,
     EventType,
     Mission,
     check_priority,
     new_id,
+    orchestrator_chat_id,
 )
 from rework.kernel.state.store import StateStore
 
@@ -693,13 +693,12 @@ async def create_mission(
         if effort:
             plan_spec["effort"] = effort
 
-    effective_chat = chat_id
-    if effective_chat is None:
-        # a mission created without a chat (the CLI's `rework new`) still gets
-        # one so it is reachable everywhere a chat-backed mission is: the Work
-        # tab's "to" picker and the Dashboard. The TUI conversation, which
-        # supplies its OWN chat_id, is untouched (GAP 1).
-        effective_chat = new_id("chat")
+    # Agents never create chats. A mission launched without a user chat (the
+    # CLI's `rework new`) points at its own orchestrator transcript, which the
+    # orchestrator creates lazily on its first turn; this is a metadata pointer
+    # only and mints no row, so no mission shell ever shows up as a conversation.
+    # A chat_id supplied by the TUI conversation is a genuine user chat: kept.
+    effective_chat = chat_id if chat_id is not None else orchestrator_chat_id(mission_id)
 
     async def _go(own_store: StateStore) -> Mission:
         from rework.kernel.events.bus import InProcessEventBus
@@ -720,17 +719,6 @@ async def create_mission(
                 plan=plan_spec,
             )
         )
-        if chat_id is None:
-            # titled from the mission title so it reads like any TUI-created
-            # chat; linked back so the chat row knows which mission it owns
-            await own_store.create_chat(
-                Chat(
-                    id=effective_chat,
-                    title=(title or "").strip()[:80] or derive_title(objective) or "",
-                    project_id=project_id,
-                    mission_id=mission.id,
-                )
-            )
         bus = InProcessEventBus(own_store)
         await bus.publish(
             EventRecord(
