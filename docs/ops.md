@@ -695,10 +695,10 @@ the guard never turns itself off by accident.
 
 #### Seeing what it decided
 
-Every daemon start logs exactly ONE `capacity plan:` line at INFO on
-`rework.capacity`, whether or not the caps moved, so a settled box (whose
-startup caps already equal the first plan, e.g. 2 missions / 2 roles on an idle
-2-core box) is still visibly measured:
+Every daemon start WITH AUTO ACTIVE logs exactly ONE `capacity plan:` line at
+INFO on `rework.capacity`, whether or not the caps moved, so a settled box
+(whose startup caps already equal the first plan, e.g. 2 missions / 2 roles on
+an idle 2-core box) is still visibly measured:
 
 ```
 capacity plan: 2 CPUs, load 0.1, 9.4 GB (9403 MB) free: 2 missions / 2 roles; missions MANAGED, the planner decides (REWORK_CONCURRENCY unset); roles MANAGED, floor 2 (REWORK_MAX_ROLES=2 is a minimum, pins=floor); AUTO IS ACTIVE: pins=floor, re-measured every 60 s, watchdog runs
@@ -708,6 +708,12 @@ It carries the measurement (CPUs, load, available MB), the planned pair, and for
 each cap `MANAGED` or `PINNED` with the reason (the env var and its number). The
 `capacity changed:` lines below follow as before, one per actual change, so on a
 box whose plan differs from the constructed caps both lines appear.
+
+By design no `capacity plan:` line appears when auto is off, which is
+`REWORK_CAPACITY=fixed`, or `REWORK_CAPACITY_PINS=fixed` with BOTH numbers set
+(nothing is measured and no watchdog runs). On such a box `rework capacity`
+tells you which mode is in force, and for a running auto daemon
+`rework logs daemon -g 'capacity'` shows its plan and every change.
 
 `rework capacity` prints the same view without asking the daemon anything:
 
@@ -721,12 +727,17 @@ AUTO IS ACTIVE: pins=floor, re-measured every 60 s, watchdog runs
 the live daemon's own view: rework logs daemon -g 'capacity' (its 'capacity plan:' startup line and every 'capacity changed:' line)
 ```
 
-It is a RECOMPUTE (env + one measurement + the planner), because the daemon
-exposes no capacity state over its API, and it says so. With
-`REWORK_CAPACITY=fixed` it prints `AUTO IS OFF` and the pair resolved at startup
-instead of a plan that never runs; with `REWORK_CAPACITY_PINS=fixed` and both
-numbers set it prints `AUTO IS OFF: both caps PINNED`. `--json` carries the same
-facts. For what the RUNNING daemon actually did, read its log with
+With auto active it is a RECOMPUTE (env + one measurement + the planner),
+because the daemon exposes no capacity state over its API, and it says so. With
+`REWORK_CAPACITY=fixed` it prints `AUTO IS OFF` and the pair resolved at
+startup instead of a plan that never runs; with `REWORK_CAPACITY_PINS=fixed` and
+both numbers set it prints `AUTO IS OFF: both caps PINNED`. In both of those
+(auto off) it takes no measurement at all, says `measured nothing` rather than
+printing a live reading above "no measurement", and reports the pair as
+resolved at startup. `--json` carries the same facts: `auto_active` and
+`recomputed` are both `false`, `measurement` is `null` and `planned.basis` says
+startup, so a script cannot read a frozen pair as a measured one. For what the
+RUNNING daemon actually did, read its log with
 `rework logs daemon -g 'capacity'`.
 
 #### The 2026-11-13 incident

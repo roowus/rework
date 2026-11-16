@@ -448,6 +448,9 @@ def test_capacity_prints_the_truth_when_auto_is_off(
     assert f"plan: {config.concurrency} missions / {roles} roles" in result.output, result.output
     assert "as resolved at startup" in result.output
     assert "no planner, no watchdog" in result.output
+    # nothing measured, so no live measurement line above "no measurement"
+    assert "measured on this host now" not in result.output, result.output
+    assert "measured nothing" in result.output, result.output
 
 
 def test_capacity_reports_both_pinned_caps_as_pinned_fixed(
@@ -462,6 +465,35 @@ def test_capacity_reports_both_pinned_caps_as_pinned_fixed(
     assert "roles PINNED at 2 by REWORK_MAX_ROLES=2 (pins=fixed)" in result.output
     assert "AUTO IS OFF" in result.output
     assert "both caps PINNED under pins=fixed" in result.output
+    # a frozen pair must not be introduced by a live measurement line, nor carry
+    # the recompute wording: nothing was measured and nothing was recomputed
+    assert "measured on this host now" not in result.output, result.output
+    assert "measured nothing" in result.output, result.output
+    assert "recomputed here from the env" not in result.output, result.output
+
+
+def test_capacity_json_does_not_claim_a_recompute_when_auto_is_off(
+    no_capacity_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fully pinned config: `recomputed`/`basis` must point at the startup pair,
+    never at a measurement, or a script reading them concludes 8 missions came
+    from the box. Same facts in the text branch and the JSON one."""
+    monkeypatch.setenv("REWORK_CAPACITY_PINS", "fixed")
+    monkeypatch.setenv("REWORK_CONCURRENCY", "8")
+    monkeypatch.setenv("REWORK_MAX_ROLES", "2")
+    result = runner.invoke(app, ["capacity", "--json"])
+    assert result.exit_code == 0, result.output
+    facts = json.loads(result.output)
+    assert facts["auto_active"] is False
+    assert facts["recomputed"] is False, "nothing was recomputed"
+    assert "startup" in facts["planned"]["basis"], facts["planned"]["basis"]
+    assert "measurement" not in facts["planned"]["basis"], facts["planned"]["basis"]
+    assert facts["measurement"] is None
+    assert facts["planned"]["measured_missions"] is None
+    assert facts["planned"]["measured_roles"] is None
+    assert (facts["planned"]["missions"], facts["planned"]["roles"]) == (8, 2)
+    text = runner.invoke(app, ["capacity"]).output
+    assert f"plan: 8 missions / 2 roles  ({facts['planned']['basis']}" in text, text
 
 
 def test_capacity_reads_max_roles_as_a_floor_by_default(

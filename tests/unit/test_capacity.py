@@ -892,15 +892,22 @@ async def test_the_plan_line_reports_a_pinned_cap_with_its_env_var(
 async def test_the_daemon_wiring_logs_the_plan_on_a_settled_box(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The wiring, not just the class: an idle box whose config caps already equal
-    the first plan (the settled rewvis case) still gets the line, through
-    Daemon.run_forever's self._capacity.start()."""
+    """The wiring, not just the class: a box whose config caps already equal the
+    first plan (the settled rewvis case) still gets the line, through
+    Daemon.run_forever's self._capacity.start().
+
+    The measurement is STUBBED on the daemon's own DynamicCapacity, so this
+    proves the wiring and not the reviewer's box. On a loaded 4-core runner
+    (load 9.0) or a box with 2 GB free the real measurement moves the caps and
+    logs `capacity changed:` instead, which says nothing about the wiring."""
     from rework.kernel.events.bus import InProcessEventBus
     from rework.kernel.state.sqlite import open_sqlite
 
     db, ck = tmp_path / "state.sqlite3", tmp_path / "checkpoints.sqlite3"
     store = await open_sqlite(str(db))
-    cpus = measure()[0]
+    # 4 CPUs, idle, RAM unknown (no RAM cut): plan(4, 0.0, None) is 4 missions /
+    # 4 roles, exactly the caps below, so the plan cannot move whatever the host
+    cpus = 4
     daemon = Daemon(
         store=store,
         bus=InProcessEventBus(store),
@@ -916,6 +923,7 @@ async def test_the_daemon_wiring_logs_the_plan_on_a_settled_box(
             max_roles=cpus,
         ),
     )
+    daemon._capacity._measure = lambda: (cpus, 0.0, None)
     with caplog.at_level(logging.INFO, logger="rework.capacity"):
         task = asyncio.create_task(daemon.run_forever())
         try:
@@ -935,6 +943,7 @@ async def test_the_daemon_wiring_logs_the_plan_on_a_settled_box(
     assert not [m for m in messages if m.startswith("capacity changed:")], messages
     assert "AUTO IS ACTIVE" in plans[0]
     assert f"{cpus} missions / {cpus} roles" in plans[0], "the settled pair is printed"
+    assert f"{cpus} CPUs, load 0.0" in plans[0], "the stubbed measurement is what it printed"
 
 
 # -- FIX 2: a pinned number is a floor ---------------------------------------

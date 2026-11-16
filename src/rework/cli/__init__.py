@@ -1572,13 +1572,14 @@ def capacity(
     """What the daemon's two caps are on THIS host, and whether auto is active.
 
     RECOMPUTED, not read from the daemon: `rework serve` exposes no capacity
-    state over its API, so this runs the daemon's own code path here (the env,
-    one measurement, the planner) and says so. For the live daemon's own view of
-    where the caps actually are, read its log: `rework logs daemon -g
-    'capacity'`."""
+    state over its API, so with auto active this runs the daemon's own code path
+    here (the env, one measurement, the planner) and says so. With auto off it
+    measures nothing and prints the pair resolved at startup, because that is the
+    pair in force. For the live daemon's own view of where the caps actually
+    are, read its log: `rework logs daemon -g 'capacity'`."""
     import json as _json
 
-    from rework.config import Config
+    from rework.config import Config, max_roles
     from rework.orchestrator.capacity import (
         GB,
         CapacityPolicy,
@@ -1595,12 +1596,12 @@ def capacity(
         raise typer.Exit(2) from exc
 
     config = Config.from_env()
-    cpus, load1, avail = measure()
-    measured = plan(cpus, load1, avail)
     # The daemon seeds its policy from the caps it was constructed with, which are
     # the config defaults for this box: the same values here, so a floor under
-    # them cannot print a pair the daemon would never pick.
-    constructed = (config.concurrency, config.max_roles or cpus)
+    # them cannot print a pair the daemon would never pick. max_roles as resolved
+    # at startup is the same function the daemon uses, so the pair below is the
+    # daemon's own startup pair and not a guess from the CPU count.
+    constructed = (config.concurrency, max_roles(config))
     policy = CapacityPolicy(
         concurrency=constructed[0],
         max_roles=constructed[1],
@@ -1609,37 +1610,57 @@ def capacity(
         pins=settings.pins,
     )
     active, state = auto_state(settings, policy)
-    if settings.auto:
+    # no measurement at all when auto is off: one taken here would be printed next
+    # to "no measurement", and could only invite reading the frozen pair as its
+    # result. The raw values stay None so the JSON says so too.
+    cpus: int | None = None
+    load1 = 0.0
+    avail: int | None = None
+    measurement: dict[str, Any] | None = None
+    if active:
+        cpus, load1, avail = measure()
+        measured = plan(cpus, load1, avail)
+        measurement = {
+            "cpus": cpus,
+            "load1": round(load1, 2),
+            "available_mb": None if avail is None else avail // 1_000_000,
+        }
         planned = policy.target(cpus, load1, avail)
         missions, roles = planned.concurrency, planned.max_roles
+        measured_pair: dict[str, int | None] = {
+            "measured_missions": measured.concurrency,
+            "measured_roles": measured.max_roles,
+        }
         basis = "recomputed here from the env and one measurement"
         why_missions = policy.describe("missions")
         why_roles = policy.describe("roles")
     else:
-        # REWORK_CAPACITY=fixed: nothing measures, nothing moves, so the honest
-        # answer is the pair resolved at startup, not a plan that never runs.
+        # AUTO IS OFF: nothing measures and nothing moves, so the honest answer is
+        # the pair resolved at startup. No measurement is taken at all, and the
+        # frozen pair is never presented as if a measurement produced it.
         missions, roles = constructed
-        basis = "as resolved at startup, because REWORK_CAPACITY=fixed"
-        why_missions = "missions as resolved at startup (no planner, no watchdog)"
-        why_roles = "roles as resolved at startup (no planner, no watchdog)"
+        measured_pair = {"measured_missions": None, "measured_roles": None}
+        if settings.auto:
+            basis = "as resolved at startup, because REWORK_CAPACITY_PINS=fixed pins both caps"
+            why_missions = policy.describe("missions")
+            why_roles = policy.describe("roles")
+        else:
+            basis = "as resolved at startup, because REWORK_CAPACITY=fixed"
+            why_missions = "missions as resolved at startup (no planner, no watchdog)"
+            why_roles = "roles as resolved at startup (no planner, no watchdog)"
 
     facts = {
-        "recomputed": True,
+        "recomputed": active,
         "auto_active": active,
         "auto": state,
         "mode": settings.mode,
         "pins": settings.pins,
-        "measurement": {
-            "cpus": cpus,
-            "load1": round(load1, 2),
-            "available_mb": None if avail is None else avail // 1_000_000,
-        },
+        "measurement": measurement,
         "planned": {
             "missions": missions,
             "roles": roles,
             "basis": basis,
-            "measured_missions": measured.concurrency,
-            "measured_roles": measured.max_roles,
+            **measured_pair,
         },
         "why": {"missions": why_missions, "roles": why_roles},
     }
@@ -1647,8 +1668,11 @@ def capacity(
         typer.echo(_json.dumps(facts, indent=2))
         return
 
-    free = "RAM unknown" if avail is None else f"{avail / GB:.1f} GB free"
-    typer.echo(f"measured on this host now: {cpus} CPUs, load {load1:.2f}, {free}")
+    if cpus is not None:
+        free = "RAM unknown" if avail is None else f"{avail / GB:.1f} GB free"
+        typer.echo(f"measured on this host now: {cpus} CPUs, load {load1:.2f}, {free}")
+    else:
+        typer.echo("measured nothing: auto is off, so no measurement feeds these caps")
     typer.echo(f"plan: {missions} missions / {roles} roles  ({basis}: NOT read from the daemon)")
     typer.echo(f"  {why_missions}")
     typer.echo(f"  {why_roles}")
