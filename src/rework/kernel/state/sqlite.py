@@ -685,6 +685,7 @@ class SqliteStore:
                 cached_tokens=r["cached_tokens"],
                 cost_usd=r["cost_usd"],
                 ts=r["ts"],
+                dedupe_key=r["dedupe_key"],
             )
             for r in rows
         ]

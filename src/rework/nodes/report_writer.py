@@ -18,6 +18,7 @@ from rework.kernel.llm.types import ChatRequest
 from rework.kernel.state.records import Charge
 from rework.kernel.state.store import StateStore
 from rework.nodes.report_sections import ReportSection, build_report_prompt, build_report_schema
+from rework.nodes.toolloop import next_charge_key
 
 log = logging.getLogger("rework.nodes")
 
@@ -80,11 +81,7 @@ def make_report_writer_node(
     entry = catalog.resolve(catalog_id)
     schema = build_report_schema(sections)
 
-    report_calls = 0
-
     async def one_shot(messages: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, str]:
-        nonlocal report_calls
-        report_calls += 1
         result = await provider.complete(
             ChatRequest(
                 model=entry.model,
@@ -107,7 +104,7 @@ def make_report_writer_node(
                 mission_id=mission_id,
                 run_id=run_id,
                 model=entry.model,
-                dedupe_key=f"{run_id}:report:{report_calls}",
+                dedupe_key=await next_charge_key(store, run_id, "report"),
                 input_tokens=result.usage.input_tokens,
                 output_tokens=result.usage.output_tokens,
                 cached_tokens=result.usage.cached_tokens,

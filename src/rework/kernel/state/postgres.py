@@ -837,6 +837,7 @@ class PostgresStore:
                 cached_tokens=r["cached_tokens"],
                 cost_usd=r["cost_usd"],
                 ts=r["ts"],
+                dedupe_key=r["dedupe_key"],
             )
             for r in rows
         ]
@@ -1217,20 +1218,50 @@ class PostgresStore:
         )
 
 
-# unique indexes on the dedupe keys; created after the column migrations, and only
-# when missing (a plain CREATE INDEX takes a lock even when the index exists)
+# unique indexes on the dedupe keys, built CONCURRENTLY: a plain CREATE UNIQUE INDEX
+# holds ACCESS EXCLUSIVE on the whole table for the build (every write blocks, and the
+# daemon cannot start on a populated table). CONCURRENTLY needs autocommit, so these run
+# after the migrations have committed; see _ensure_dedupe_index.
 _DEDUPE_INDEXES: list[tuple[str, str, str]] = [
     (
         "idx_events_dedupe",
         "events",
-        "CREATE UNIQUE INDEX idx_events_dedupe ON events (dedupe_key)",
+        "CREATE UNIQUE INDEX CONCURRENTLY idx_events_dedupe ON events (dedupe_key)",
     ),
     (
         "idx_charges_dedupe",
         "charges",
-        "CREATE UNIQUE INDEX idx_charges_dedupe ON charges (dedupe_key)",
+        "CREATE UNIQUE INDEX CONCURRENTLY idx_charges_dedupe ON charges (dedupe_key)",
     ),
 ]
+
+
+async def _ensure_dedupe_index(conn: psycopg.AsyncConnection[Any], index: str, create: str) -> None:
+    """Make `index` exist and be VALID, idempotently (autocommit connection).
+
+    - valid: skip (every restart after the first one);
+    - INVALID: a CONCURRENTLY build that failed (a killed daemon, a duplicate key)
+      leaves it behind, unusable but still present; drop it and build again;
+    - missing: build it.
+    """
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "SELECT i.indisvalid FROM pg_index i"
+            " JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = %s",
+            (index,),
+        )
+        row = await cur.fetchone()
+    if row is not None and row["indisvalid"]:
+        return
+    if row is not None:
+        await conn.execute(f"DROP INDEX CONCURRENTLY IF EXISTS {index}")
+    # wait for a long-idle-in-transaction reader rather than hang the daemon start
+    await conn.execute("SET lock_timeout = '60s'")
+    try:
+        await conn.execute(create)
+    finally:
+        await conn.execute("SET lock_timeout = 0")
+
 
 _MIGRATIONS: list[tuple[str, str, str]] = [
     # (table, column, DDL): check-then-alter. ALTER TABLE takes ACCESS
@@ -1314,13 +1345,11 @@ async def open_postgres(url: str) -> PostgresStore:
             except Exception:
                 await conn.rollback()
                 raise
-        for index, _table, create in _DEDUPE_INDEXES:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT 1 FROM pg_indexes WHERE indexname = %s", (index,))
-                present = await cur.fetchone() is not None
-            if not present:
-                await conn.execute(create)
         await conn.commit()
+        await conn.set_autocommit(True)  # CONCURRENTLY cannot run inside a transaction block
+        for index, _table, create in _DEDUPE_INDEXES:
+            await _ensure_dedupe_index(conn, index, create)
+        await conn.set_autocommit(False)
     except BaseException:
         await conn.close()  # never leak a half-migrated connection
         raise

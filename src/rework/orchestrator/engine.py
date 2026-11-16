@@ -18,6 +18,8 @@ plan/dispatch/check-in nodes land with the M2 vertical slice.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import subprocess
 from collections.abc import Awaitable, Callable
@@ -60,6 +62,10 @@ log = logging.getLogger("rework.engine")
 
 # how many times the owner may send a mission back from a final gate in one run
 MAX_SEND_BACKS = 5
+# a store outage that outlasts the store's own retries: the run (and the mission) is
+# re-driven from its checkpoint with this backoff, never given up on
+REDRIVE_START_S = 1.0
+REDRIVE_MAX_S = 60.0
 
 DEFAULT_PLAN: dict[str, Any] = {"steps": [{"step": "echo", "role": "echo"}]}
 
@@ -137,6 +143,13 @@ class _NodeEvents:
 
         role_run = run_id
         return Handler()
+
+
+def _digest(payload: Any) -> str:
+    """A stable key part for an event payload (the same interrupt re-emits the same key)."""
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[
+        :16
+    ]
 
 
 class RunSupervisor:
@@ -258,8 +271,27 @@ class RunSupervisor:
         self._ctxs[run.id] = ctx
         return graph
 
-    async def _execute(self, run: Run, resume_from_checkpoint: bool) -> None:
-        """Run one role graph to its next stop: completion or interrupt."""
+    async def _execute(self, run: Run, resume_from_checkpoint: bool, *, after: float = 0.0) -> None:
+        """Drive one role graph to its next stop, re-driving it through a store outage.
+
+        A store error that outlasts the store's own retries is not the role's failure:
+        `_drive` releases the run's slot and reports the loss; the run stays RUNNING
+        with its checkpoint, and is re-driven from that checkpoint after a backoff until
+        the store answers. Re-driving is safe: create_run is replay-safe and the writes
+        a re-run repeats are keyed or absolute. This task is the run's only driver, so
+        an owner cancel still stops it, and CancelledError propagates."""
+        delay = REDRIVE_START_S
+        resume = resume_from_checkpoint
+        wait = after
+        while True:
+            if wait:
+                await asyncio.sleep(wait)
+            if not await self._drive(run, resume):
+                return
+            wait, delay, resume = delay, min(delay * 2, REDRIVE_MAX_S), True
+
+    async def _drive(self, run: Run, resume_from_checkpoint: bool) -> bool:
+        """One attempt at a role graph. Returns True when the store was lost."""
         bind(mission=self._mission.id, run=run.id, role=run.role)
         # the row stays INTENT (queued) until a role slot is free: that is what
         # the orchestrator's wait/check_in renders as "queued"
@@ -274,6 +306,7 @@ class RunSupervisor:
                     run_id=run.id,
                     type=EventType.ROLE_SPAWNED,
                     payload={"role": run.role, **_topology(graph)},
+                    dedupe_key=f"{run.id}:spawned",
                 )
             )
             config = self._run_config(run)
@@ -293,15 +326,17 @@ class RunSupervisor:
                 spec = self._registry.get(run.role)
                 result = await graph.ainvoke(spec.initial_state(self._ctxs[run.id]), config=config)
             await self._consume_result(run, result)
+            return False
         except asyncio.CancelledError:
             log.info("role %s cancelled", run.role)
             raise
         except Exception as exc:
             if is_transient(exc):
                 # a store outage is not the role's failure: the run stays RUNNING with its
-                # checkpoint intact, and the mission is not marked FAILED
-                log.error("role %s lost the store (%s); run left RUNNING", run.role, exc)
-                return
+                # checkpoint intact and the mission is not marked FAILED; the slot is
+                # released (finally) and the caller re-drives the run
+                log.error("role %s lost the store (%s); re-driving from checkpoint", run.role, exc)
+                return True
             log.exception("role %s failed", run.role)
             await self._store.update_run(run.id, status=RunStatus.FAILED)
             await self._bus.publish(
@@ -312,6 +347,7 @@ class RunSupervisor:
                     payload={"error": f"{type(exc).__name__}: {exc}"},
                 )
             )
+            return False
         finally:
             self.limiter.release(run.id)
 
@@ -336,6 +372,7 @@ class RunSupervisor:
                     run_id=run.id,
                     type=EventType.ROLE_HALTED,
                     payload=payload,
+                    dedupe_key=f"{run.id}:halted:{_digest(payload)}",
                 )
             )
         else:
@@ -350,6 +387,7 @@ class RunSupervisor:
                     run_id=run.id,
                     type=EventType.ROLE_COMPLETED,
                     payload={"role": run.role},
+                    dedupe_key=f"{run.id}:completed",
                 )
             )
 
@@ -379,18 +417,27 @@ class RunSupervisor:
 
     async def _execute_resume(self, run: Run, decision: Any) -> None:
         bind(mission=self._mission.id, run=run.id, role=run.role)
-        await self.limiter.acquire(run.id)
         log.info("role %s resuming with a decision", run.role)
+        if await self._drive_resume(run, decision):
+            # the decision is on the gate row; the re-drive continues from the checkpoint
+            await self._execute(run, True, after=REDRIVE_START_S)
+
+    async def _drive_resume(self, run: Run, decision: Any) -> bool:
+        """One resume attempt. Returns True when the store was lost."""
+        await self.limiter.acquire(run.id)
         try:
             graph = await self._build_graph(run)
             await self._store.update_run(run.id, status=RunStatus.RUNNING)
             config = self._run_config(run)
             result = await graph.ainvoke(Command(resume=decision), config=config)
             await self._consume_result(run, result)
+            return False
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             if is_transient(exc):
-                log.error("role %s lost the store on resume (%s); run left RUNNING", run.role, exc)
-                return
+                log.error("role %s lost the store on resume (%s); re-driving", run.role, exc)
+                return True
             log.exception("role %s resume failed", run.role)
             await self._store.update_run(run.id, status=RunStatus.FAILED)
             await self._bus.publish(
@@ -401,6 +448,7 @@ class RunSupervisor:
                     payload={"error": f"resume failed: {type(exc).__name__}: {exc}"},
                 )
             )
+            return False
         finally:
             self.limiter.release(run.id)
 
@@ -460,14 +508,8 @@ class MissionRunner:
 
     async def run(self) -> None:
         bind(mission=self.mission_id)
-        mission = await self._store.get_mission(self.mission_id)
-        if mission is None:
-            raise ValueError(f"mission {self.mission_id} not found")
-        self._plan = mission.plan
         self._workroot.mkdir(parents=True, exist_ok=True)
-        mission = await self._ensure_repo(mission)
-        if mission.status == MissionStatus.PENDING:
-            await self._store.update_mission(mission.id, status=MissionStatus.RUNNING)
+        mission = await self._until_store_answers(self._start)
         self._supervisor = RunSupervisor(
             mission,
             self._store,
@@ -482,14 +524,65 @@ class MissionRunner:
             self._limiter,
         )
         try:
-            if (mission.plan or {}).get("orchestrator"):
-                from rework.orchestrator.agent import MissionOrchestrator
+            # a store outage that outlasts the store's retries ends the pass, not the
+            # mission: the pass is run again from the store (a daemon restart does the
+            # same), with backoff, until the store answers. Dispatch and the runs'
+            # own re-drives are replay-safe, so a second pass reattaches, not duplicates
+            wait, delay = 0.0, REDRIVE_START_S
+            while True:
+                try:
+                    if wait:
+                        await asyncio.sleep(wait)
+                        mission = (await self._store.get_mission(self.mission_id)) or mission
+                        self._plan = mission.plan
+                    if (mission.plan or {}).get("orchestrator"):
+                        from rework.orchestrator.agent import MissionOrchestrator
 
-                await MissionOrchestrator(self, mission).run()
-            else:
-                await self._run_steps(mission)
+                        await MissionOrchestrator(self, mission).run()
+                    else:
+                        await self._run_steps(mission)
+                    return
+                except Exception as exc:
+                    if not is_transient(exc):
+                        raise
+                    log.error(
+                        "mission %s lost the store (%s); re-driving in %.1fs",
+                        self.mission_id,
+                        exc,
+                        delay,
+                    )
+                wait, delay = delay, min(delay * 2, REDRIVE_MAX_S)
         finally:
             await self._supervisor.aclose()
+
+    async def _start(self) -> Mission:
+        mission = await self._store.get_mission(self.mission_id)
+        if mission is None:
+            raise ValueError(f"mission {self.mission_id} not found")
+        self._plan = mission.plan
+        mission = await self._ensure_repo(mission)
+        if mission.status == MissionStatus.PENDING:
+            await self._store.update_mission(mission.id, status=MissionStatus.RUNNING)
+        return mission
+
+    async def _until_store_answers(self, op: Callable[[], Awaitable[Any]]) -> Any:
+        """Run one store-backed step, waiting out a store outage that outlasts the
+        store's own retries (the mission is re-driven, not failed)."""
+        delay = REDRIVE_START_S
+        while True:
+            try:
+                return await op()
+            except Exception as exc:
+                if not is_transient(exc):
+                    raise
+                log.error(
+                    "mission %s: store unavailable (%s); retrying in %.1fs",
+                    self.mission_id,
+                    exc,
+                    delay,
+                )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, REDRIVE_MAX_S)
 
     async def _ensure_repo(self, mission: Mission) -> Mission:
         """Materialise the mission's workspace before it goes RUNNING.

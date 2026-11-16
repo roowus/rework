@@ -198,6 +198,24 @@ async def _wait_for_budget(store: StateStore, mission_id: str, budget: Budget) -
         await asyncio.sleep(1.0)
 
 
+async def next_charge_key(store: StateStore, run_id: str, scope: str) -> str:
+    """The dedupe key for the NEXT model-call charge in `scope` (a graph node name,
+    unique within its graph). The ordinal is the number of charges already LANDED
+    under that scope in this run, plus one:
+
+    - a retry, a resume or a rebuilt node that re-makes a call whose charge never
+      landed computes the same key, so the charge lands once;
+    - a genuine call after a charge landed gets the next ordinal, so it is kept;
+    - two loops (or two report writers) in one run use different scopes, so their
+      first charges do not collide.
+    """
+    prefix = f"{run_id}:{scope}:"
+    landed = sum(
+        1 for c in await store.run_charges(run_id) if (c.dedupe_key or "").startswith(prefix)
+    )
+    return f"{prefix}{landed + 1}"
+
+
 def make_toolloop_node(
     provider: ModelProvider,
     catalog: ModelCatalog,
@@ -277,7 +295,9 @@ def make_toolloop_node(
                     session_id=run_id,
                 )
             )
-            await charge(result.usage, entry.model, f"{run_id}:{charge_scope}:handoff")
+            await charge(
+                result.usage, entry.model, await next_charge_key(store, run_id, charge_scope)
+            )
             return (result.text or "").strip()
         except Exception as exc:  # the note is a courtesy; never fail the run
             log.warning("handoff note failed: %s", exc)
@@ -365,9 +385,12 @@ def make_toolloop_node(
                     session_id=run_id,
                 )
             )
-            # `turns` is the iteration index and is persisted with the loop, so a resumed
-            # loop reproduces the same keys for the same model calls
-            await charge(result.usage, entry.model, f"{run_id}:{charge_scope}:turn{turns}")
+            # keyed by the landed-charge ordinal of this scope (next_charge_key), not by
+            # the iteration index: a resumed loop re-makes the same call under the same
+            # key, and a second loop in the run (another scope) cannot collide with it
+            await charge(
+                result.usage, entry.model, await next_charge_key(store, run_id, charge_scope)
+            )
             turns += 1
             await emit(
                 "turn",

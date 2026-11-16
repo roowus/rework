@@ -33,6 +33,7 @@ from rework.kernel.state.records import (
 )
 from rework.kernel.state.resilient import ResilientStore, RetryPolicy
 from rework.kernel.state.sqlite import SqliteStore, open_sqlite
+from rework.orchestrator import engine as engine_module
 from rework.orchestrator.daemon import sqlite_checkpointer_factory
 from rework.orchestrator.engine import MissionRunner
 from rework.roles.base import RoleBuildCtx, RoleSpec
@@ -373,3 +374,59 @@ async def test_non_repeatable_write_surfaces_and_the_link_is_still_usable(
     assert fault.calls == 1
     # the next call is served normally: the failure did not poison the proxy
     assert await store.list_missions() == []
+
+
+# -- (f) an outage that outlasts the retry budget: the run is re-driven, not lost --------
+
+SHORT_BUDGET = RetryPolicy(max_elapsed_s=0.05, base_delay_s=0.01, max_delay_s=0.02, jitter=0.0)
+
+
+@pytest.fixture
+def fast_redrive(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(engine_module, "REDRIVE_START_S", 0.01)
+    monkeypatch.setattr(engine_module, "REDRIVE_MAX_S", 0.05)
+
+
+async def test_outage_outlasting_the_budget_is_redriven_to_one_clean_run(
+    world: dict[str, Any], fast_redrive: None
+) -> None:
+    """The store is down for much longer than the store's own retries. The role and
+    the mission give up their pass, re-drive from the store with backoff, and once the
+    link is back the mission is DONE with exactly the rows of one clean run."""
+    baseline = await _clean_baseline(world, ONE_STEP)
+    mission_id = await _mission(world, ONE_STEP)
+    fault = FaultStore(world["real"])
+    store = ResilientStore(fault, policy=SHORT_BUDGET)
+    fault.set_down(True)
+    task = asyncio.create_task(_runner(world, store, mission_id).run())
+
+    async def outage_has_lasted() -> bool:
+        return fault.calls > 200  # many retry budgets, many re-drive passes
+
+    await _wait_for(outage_has_lasted, timeout_s=20, what="the outage to outlast the budget")
+    assert not task.done()  # nothing gave up while the link was down
+    fault.set_down(False)
+    await asyncio.wait_for(task, timeout=30)
+
+    assert await _mission_status(world["real"], mission_id) == MissionStatus.DONE
+    assert await _ledger(world["real"], mission_id) == baseline
+
+
+async def test_owner_cancel_stops_a_run_that_is_being_redriven(
+    world: dict[str, Any], fast_redrive: None
+) -> None:
+    """A cancelled task must end, even while it waits to re-drive through an outage."""
+    mission_id = await _mission(world, ONE_STEP)
+    fault = FaultStore(world["real"])
+    store = ResilientStore(fault, policy=SHORT_BUDGET)
+    fault.set_down(True)
+    task = asyncio.create_task(_runner(world, store, mission_id).run())
+
+    async def redriving() -> bool:
+        return fault.calls > 50
+
+    await _wait_for(redriving, timeout_s=20, what="the re-drive loop to start")
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=10)
+    fault.set_down(False)

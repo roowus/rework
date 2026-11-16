@@ -84,9 +84,32 @@ _REPEATABLE_WRITES = frozenset(
 _KEYED_WRITES = frozenset({"append_event", "charge"})
 
 
+# SQLSTATE classes of a Postgres connection loss: class 08 (connection exception) and
+# the server going away (admin/crash shutdown, cannot connect now)
+_LINK_SQLSTATE_CLASS = "08"
+_LINK_SQLSTATES = frozenset({"57P01", "57P02", "57P03"})
+
+
+def _is_link_loss(exc: psycopg.OperationalError) -> bool:
+    """A link-level loss, not a permanent server answer. psycopg raises a link drop with
+    no SQLSTATE (the socket died client-side). A query that is cancelled by the statement
+    timeout (57014), a lock that is not available (55P03), too many connections (53300)
+    or resources (53xxx) are answers from a live server: retrying them burns the whole
+    budget on each call, so they surface at once."""
+    code = exc.sqlstate
+    if code is None:
+        return True
+    return code.startswith(_LINK_SQLSTATE_CLASS) or code in _LINK_SQLSTATES
+
+
 def is_transient(exc: BaseException) -> bool:
-    """True for errors a retry (after a reconnect) can cure: a link drop, a lock."""
-    return isinstance(exc, TRANSIENT_ERRORS)
+    """True for errors a retry (after a reconnect) can cure: a dropped link, a locked
+    SQLite file. A permanent Postgres operational error is not transient (see above)."""
+    if isinstance(exc, psycopg.OperationalError):
+        return _is_link_loss(exc)
+    if isinstance(exc, psycopg.InterfaceError):
+        return True  # "the connection is closed": the link is gone
+    return isinstance(exc, sqlite3.OperationalError)
 
 
 def is_repeatable(method: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
