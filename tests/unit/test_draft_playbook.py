@@ -100,19 +100,9 @@ def test_every_playbook_has_a_gate_entry(playbook: str) -> None:
 
 
 # Every objective below is a read-and-report job: the deliverable is writing,
-# so the DEFAULT plan is `draft`. These are the plain audits the classifier must
-# keep recognising after the change-word matching was tightened to stems.
+# so the DEFAULT plan is `draft`. The shape is closed: a read-only opener, no
+# change verb anywhere, no second clause (bar a closed trailing report phrase).
 AUDIT_OBJECTIVES = [
-    "audit the code base for dead code",
-    "Audit the release process",  # capitalised trigger
-    "review the codebase and list the risks",
-    "analyse the failure rates in the ledger",
-    "please map out the auth flow for me",  # trigger mid-sentence
-    "survey the test suite for gaps",
-    "write a report on the deploy process",
-    "document how the gate rail works",
-    # the ten "must stay draft" controls named in the audit of the fix: the
-    # stem matching and the continuation rule must not eat real audits
     "audit the release process",
     "review the codebase for security issues",
     "analyse the auth flow",
@@ -123,68 +113,23 @@ AUDIT_OBJECTIVES = [
     "investigate what causes the flaky test",
     "explain how retries interact",
     "audit the doubletake code base and tell me what you find",  # the incident
+    "review the code base",
     "audit the code base and report back",
-    "review the codebase and let me know what you think",
+    "document how the retry logic works, and let me know",
+    # shape variants: capitals, a leading "please", a trailing full stop
+    "Audit the release process",
+    "please map out the auth flow",
+    "Please review the code base.",
+    "audit the code base for dead code",
+    "write up a report on the deploy process",
 ]
 
-# Objectives that name a change, in whatever inflection. The direction matters:
-# a real fix mission misrouted to `draft` produces no branch and no PR, so the
-# fix silently never lands and the stderr note makes it look intentional. A
-# false "draft" is therefore the COSTLIER error, and these all must veto.
+# Objectives that need a code change, or that the closed shape cannot prove are
+# read-only. The direction matters: a real fix mission misrouted to `draft`
+# produces no branch and no PR, so the fix silently never lands and the stderr
+# note makes it look intentional. All of these must return None.
 CHANGE_OBJECTIVES = [
-    "fix the login crash",
-    "add a --json flag to rework ls",
-    "rename the ledger table",
-    "bump the anthropic sdk",
-    "migrate the store to postgres",
-    "implement retries for push_branch",
-    "refactor the delivery module",
     "audit the code base and fix the two crashes",
-    # inflections of a change word: matched by stem, not as literal base forms
-    # (matching the literals only is what let these through as audits)
-    "audit the code base and fixing the two crashes",
-    "audit the code base and refactoring the delivery module",
-    "audit the code base and adding a --json flag",
-    "audit the code base and migrating the store",
-    "audit the code base and implementing retries",
-    "audit the code base and applying the fixes it recommends",
-    "audit the code base and improve error handling",
-    "review the code base and rewrite the parser",
-    "audit the codebase and delete the unused tables",
-    # a coordinating continuation that introduces further work, with verbs no
-    # stem list holds: these are caught by the structural rule
-    # inflections with no "and" continuation in front of them: only the stem
-    # matching can catch these, so they pin FIX 1 on their own
-    "fixing the two crashes found in the audit",
-    "audit findings: refactoring the delivery module",
-    "adding a --json flag, as the audit recommends",
-    "the audit recommends migrating the store to postgres",
-    "audit the code base and make the tests pass",
-    "audit the code base and speed it up",
-    # round 3: change verbs that used to sit in the report allowlist
-    "audit the code base and write the missing tests",
-    "audit the code base and write the missing unit tests",
-    "audit the code base and cover the untested branches",
-    "audit the code base and include the missing tests",
-    "audit the code base and confirm the tests pass",
-    "audit the code base and verify the build is green",
-    "audit the code base and check that ci passes",
-    "audit the code base and trace the crash",
-    "audit the code base and find the bug in the parser",
-    "audit the code base and identify the crash",
-    "audit the code base; write the missing tests",
-    "audit the code base and explain the bug, then repair it",
-    # the continuation anchor is not only the literal "and"
-    "audit the code base and then repair the parser",
-    "audit the code base, then repair the parser",
-    "audit the code base; then repair the parser",
-    "audit the code base. then repair the parser",
-    # the same anchors with a verb no stem holds, so ONLY the anchor can catch it
-    "audit the code base and then speed it up",
-    "audit the code base, then speed it up",
-    "audit the code base; then speed it up",
-    # FINAL round: every clause separator is an anchor, and a filler word
-    # ("also", "only", ...) does not shield the verb that follows it
     "audit the code base, kill the flaky test",
     "audit the code base and also kill the flaky test",
     "audit the code base and only keep the stable deps",
@@ -197,9 +142,37 @@ CHANGE_OBJECTIVES = [
     "map out the modules then restructure them",
     "audit the deploy scripts, automate the rollback",
     "audit the code base, then repair the parser",
-    "audit the code base. then repair the parser",
-    "audit the code base; then repair the parser",
+    "audit the auth flow to close the gaps",
+    "audit the code base to stop the flaky test",
+    "audit the code base so the flaky test stops failing",
+    "audit the code base and outline the redesign",
+    "audit the code base and mention what should be tightened",
+    "audit the code base and fixing the two crashes",
+    "audit the code base and refactoring the delivery module",
+    "add a survey endpoint",
+    "explain how the auth works and fix the leak",
+    "document how to bump the version",
+    "review the code base and fix it",
+    "fix the flaky test",
+    "write the missing tests",
+    "investigate what causes the crash and fix it",
+    "audit the logs rotation",
+    "summarise the risks",
+    # no opener at all
+    "add a --json flag to rework ls",
+    "rename the ledger table",
+    "migrate the store to postgres",
+    # a second clause that is not a closed trailing phrase
+    "review the codebase and list the risks",
+    "review the codebase and let me know what you think",
     "audit the code base. then speed it up",
+    "audit the code base; then repair the parser",
+    "audit the code base (and fix it)",
+    "audit the code base and tell me what you find, then fix it",
+    # a purpose or a condition with no separator character in front of it
+    "audit the code base until the tests pass",
+    "review the code base such that it compiles",
+    "audit the flaky test away",
 ]
 
 
@@ -213,67 +186,45 @@ def test_read_and_report_objectives_default_to_the_draft_plan(objective: str) ->
 @pytest.mark.parametrize("objective", CHANGE_OBJECTIVES)
 def test_change_objectives_get_no_plan_suggestion(objective: str) -> None:
     """The classifier is a DEFAULT only: anything that asks for a change stays
-    on the caller's plan (the last case is an audit that also asks for a fix)."""
+    on the caller's plan."""
     assert reads_only_plan(objective) is None
 
 
 def test_the_classifier_errs_toward_a_change_mission() -> None:
     """Which way the mistake leans, asserted rather than assumed: a real fix
     mission misrouted to `draft` produces no branch and no PR, so the fix
-    silently never lands and the CLI note makes it look intentional. A missed
-    draft suggestion only leaves the caller on its own plan. So an objective
-    that can be read either way must read as a CHANGE, and the deliberate
-    word collisions resolve that way too."""
+    silently never lands. A missed draft suggestion only leaves the caller on
+    its own plan. So an input that can be read either way must read as None,
+    and the over-generous denylist collisions resolve that way too."""
     assert len(AUDIT_OBJECTIVES) >= 8 and len(CHANGE_OBJECTIVES) >= 8
-    assert "audit the code base and fix the two crashes" in CHANGE_OBJECTIVES
     for ambiguous in (
-        "audit the docs and address the gaps",  # "add" also vetoes "address"
-        "audit the copy and make it more creative",  # "creat" also vetoes "creative"
+        "audit the docs and address the gaps",  # "add" also hits "address"
+        "audit the copy and make it more creative",  # "creat" also hits "creative"
         "review the module and remove the dead branch",
-        "audit the code base and then fix what you find",  # "and then"
+        "audit the code base and then fix what you find",
+        "audit the portfolio page",  # "port" also hits "portfolio"
     ):
         assert reads_only_plan(ambiguous) is None, ambiguous
 
 
-def test_both_change_signals_are_load_bearing() -> None:
-    """Two independent mechanisms, one case each, so neither can rot silently:
-    the stem/form alternation catches a known change word, and the continuation
-    rule catches a novel verb that no list holds."""
-    from rework.missions import _has_change_veto, _has_further_work
-
-    inflected = "audit the code base since the delivery module needs refactoring"
-    assert _has_change_veto(inflected) and not _has_further_work(inflected)
-    novel_verb = "audit the code base and speed it up"
-    assert _has_further_work(novel_verb) and not _has_change_veto(novel_verb)
+def test_the_denylist_is_consulted_over_the_whole_objective() -> None:
+    """A change verb in the middle of an otherwise clean audit, with no clause
+    separator to point at it, still returns None; remove the verb and it is a
+    draft."""
+    assert reads_only_plan("audit how the team will tighten the code base") is None
+    assert reads_only_plan("audit how the team reads the code base") == "draft"
+    # the verb can also come from `text`, which is scanned for verbs only
+    assert reads_only_plan("audit the release process", "also fix the typo") is None
 
 
-def test_report_phrases_and_forms_do_not_false_veto() -> None:
-    """ "write a report" is a trigger phrase, stripped before the scan, and
-    "coverage" is not the change verb "cover"; yet a bare "write" or "cover"
-    still vetoes."""
-    from rework.missions import _has_change_veto
-
-    assert not _has_change_veto("write a report on test coverage")
-    assert not _has_change_veto("audit it and tell me what you find")
-    assert _has_change_veto("audit it and write the tests")
-    assert _has_change_veto("audit it, covering the branches")
-
-
-def test_report_only_words_hold_no_change_verb() -> None:
-    """The allowlist is fail-safe only while it holds verbs that can never head
-    real work."""
-    from rework.missions import REPORT_ONLY_WORDS
-
-    for verb in (
-        "write", "include", "cover", "confirm", "verify", "check", "find",
-        "identify", "trace", "repair", "fix",
-    ):  # fmt: skip
-        assert verb not in REPORT_ONLY_WORDS, verb
-    for filler in (
-        "also", "only", "not", "no", "still", "any", "all", "with", "for", "in",
-        "on", "to", "it", "this", "the", "how",
-    ):  # fmt: skip
-        assert filler not in REPORT_ONLY_WORDS, filler
+def test_only_one_closed_trailing_phrase_is_stripped_from_the_end() -> None:
+    """The phrases are closed and END-anchored: one is dropped, and a phrase in
+    the middle or a second one still leaves a clause boundary behind."""
+    assert reads_only_plan("audit the code base and tell me") == "draft"
+    assert reads_only_plan("audit the code base and summarize the findings") == "draft"
+    assert reads_only_plan("audit the code base and let me know about it") is None
+    assert reads_only_plan("audit the code base and report back and let me know") is None
+    assert reads_only_plan("audit the code base and tell me what you find first") is None
 
 
 def test_the_chat_defaults_a_missing_plan_but_never_overrides_a_named_one() -> None:

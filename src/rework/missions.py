@@ -119,184 +119,128 @@ PLAYBOOK_GATES: dict[str, list[str]] = {"echo": [], "fix": ["ship"], "fix-pr": [
 DEFAULT_BUDGET_USD = 2.0  # what a deployment gets when nothing usable is set
 PLAYBOOK_PUBLISH: dict[str, str] = {"echo": "", "fix": "", "fix-pr": "pr", "draft": ""}
 
-# Words that make an objective read-and-report: the deliverable is writing,
-# not a change to the repository. Matched on word boundaries, case-insensitively.
-READS_ONLY_TRIGGERS = (
+# --- reads_only_plan: a closed-set DEFAULT-plan heuristic ---------------------
+#
+# The cost of a wrong verdict is asymmetric. A wrong None only costs the owner a
+# relaunch with `--plan draft`; a wrong "draft" silently denies a real fix
+# mission its branch and PR. So every uncertain case falls to None, and the
+# only way to get "draft" is to pass four small checks in a row.
+
+# 1. TRIGGER: the objective must BEGIN with one of these read-only openers.
+_OPENERS = (
     "audit",
-    "review the code base",
-    "review the codebase",
+    "review",
     "analyse",
     "analyze",
-    "map out",
     "survey",
+    "assess",
+    "evaluate",
+    "summarise",
+    "summarize",
+    "map out",
+    "document",
+    "investigate",
+    "explain",
+    "report on",
     "write a report",
     "write up a report",
-    "document how",
-    "investigate what",
-    "explain how",
 )
-# Words that name a change to make: when one is present the work ends in a
-# repository change, whatever else the objective says.
-#
-# These are STEMS, not whole words, and they are matched as ONE alternation
-# followed by `\w*`: "fix" must also veto "fixing", "fixes" and "fixed",
-# "add" must also veto "adding", "migrat" -> "migrating", and so on. Matching
-# the literal base form only was a real misrouting bug: "audit the code base
-# and fixing the two crashes" slipped through as an audit, so the fix mission
-# became a draft mission with no branch and no PR, and the fix silently never
-# landed.
-#
-# Deliberate collisions, decided rather than overlooked:
-# - "add" also vetoes "address" ("addressing the flaky test" is a fix, so the
-#   veto is the right answer there; the cost is that "review the codebase and
-#   address the risks" stays a fix mission, which is the safer direction).
-# - "creat" also vetoes "creative"/"creatively" (ordinary prose that happens to
-#   follow the trigger), same trade: a change word next to an audit means work.
-# - "mov" matches "move"/"moves"/"moving", never "remove" (that is "remov").
-# - "clean" vetoes "clean", "cleanup", "cleaning", which is what we want; the
-#   near-cousin "cleanse" comes along with it and is not worth an exception.
-# - "correct" is a change word; a request to "review and correct" edits files.
-# The direction of every one of these is the same on purpose: a word that can
-# be read two ways is read as a change, because a fix mission run as an audit
-# is the error that loses work.
-CHANGE_VETO_STEMS = (
-    "fix",
-    "add",
-    "renam",
-    "bump",
-    "migrat",
-    "implement",
-    "refactor",
-    "updat",
-    "remov",
-    "upgrad",
-    "patch",
-    "chang",
-    "rewrit",
-    "replac",
-    "delet",
-    "creat",
-    "introduc",
-    "correct",
-    "clean",
-    "harden",
-    "optimi",
-    "optimiz",
-    "simplif",
-    "improv",
-    "extract",
-    "inlin",
-    "mov",
-    "split",
-    "merg",
-    "convert",
-    "swap",
-    "restor",
-    "revert",
-    "roll",
-    # added after the second audit round; each was run against the ten
-    # report-only controls (AUDIT_OBJECTIVES) and none occurs in one. "mak" and
-    # "generat" are over-broad on purpose ("maker", "generates"): a false veto
-    # costs a relaunch, a missed one costs a fix mission its branch and PR.
-    "confirm",
-    "verif",
-    "identif",
-    "trace",
-    "repair",
-    "ensur",
-    "mak",
-    "generat",
+_OPENER = re.compile(
+    r"^(?:" + "|".join(r"\s+".join(o.split()) for o in _OPENERS) + r")\b", re.IGNORECASE
 )
-# Change verbs whose stem would also eat ordinary report prose, so they are
-# matched as EXPLICIT forms (no `\w*` tail): "cover" must veto "covering the
-# untested branches" but never "coverage" ("write a report on test coverage"),
-# "pass" must not eat "password", "run" must not eat "runtime", "check" stays
-# a stem-free form so "checkpoint" is not a veto, and so on. Anything a form
-# misses is still caught by the continuation rule or simply defaults to None.
-CHANGE_VETO_FORMS = (
-    "writ(?:e|es|ing|ten)",
-    "cover(?:s|ed|ing)?",
-    "check(?:s|ed|ing)?",
-    "pass(?:es|ed|ing)?",
-    "run(?:s|ning)?",
-    "build(?:s|ing)?",
-    "built",
-    "green(?:s|ed|ing)?",
-)
-CHANGE_VETO = re.compile(
-    r"\b(?:(?:" + "|".join(CHANGE_VETO_STEMS) + r")\w*|" + "|".join(CHANGE_VETO_FORMS) + r")\b",
+
+# 2. CHANGE DENYLIST: change verb STEMS, each followed by `\w*` so every
+# inflection hits ("fix" also hits "fixing", "add" also hits "address"). It is
+# scanned over the whole objective and is DELIBERATELY over-generous: it can
+# only ever turn a "draft" into None, which is the cheap direction, so a stem
+# that also catches innocent words ("add" in "address", "port" in "portfolio",
+# "risk" because a risk summary usually ends in "and mitigate them") costs
+# nothing worth an exception. Do not narrow it; widen it. The only stems left
+# out are the ones that would hit a required read-only phrase ("retri" would
+# hit "how retries interact", "cover" would hit "test coverage").
+_CHANGE_STEMS = (
+    "fix", "add", "kill", "stop", "reduc", "tight", "prun", "restructur",
+    "automat", "clos", "speed", "harden", "enabl", "disabl", "adjust", "tun",
+    "configur", "instal", "upgrad", "downgrad", "patch", "convert",
+    "consolidat", "dedup", "extract", "split", "merg", "mov", "remov", "delet",
+    "creat", "introduc", "correct", "clean", "optimi", "optimiz", "simplif",
+    "improv", "replac", "rewrit", "refactor", "renam", "migrat", "bump",
+    "implement", "generat", "build", "ensur", "verif", "check", "identif",
+    "trace", "repair", "mak", "writ", "updat", "chang", "port", "adopt",
+    "eliminat", "mitigat", "resum", "normalis", "normaliz",
+    # beyond the required set: more of the same kind
+    "rotat", "risk", "address", "apply", "appli", "resolv", "redesign",
+    "overhaul", "revert", "rollback", "deprecat", "remediat", "tweak",
+    "polish", "increas", "decreas", "rais", "lower", "drop", "backfill",
+    "rework", "revis", "swap", "wire", "ship",
+)  # fmt: skip
+_CHANGE_DENYLIST = re.compile(r"\b(?:" + "|".join(_CHANGE_STEMS) + r")\w*", re.IGNORECASE)
+
+# 3. CLAUSE-SEPARATOR GUARD: a second clause means a second deliverable, and we
+# cannot tell a report verb from a work verb, so a second clause is never a
+# draft. The one exception is the closed trailing phrases below.
+_CLAUSE_BOUNDARY = re.compile(
+    r"[,;:.\-\u2013\u2014()]|\b(?:and|then|but|so|to|because|since|plus|with"
+    r"|for\s+the\s+purpose\s+of|in\s+order\s+to"
+    # more of the same: subordinators and particles that start a purpose or a
+    # condition ("audit it until the tests pass"); extra words can only give None
+    r"|until|unless|such|if|while|when|whenever|once|after|before|which|that"
+    r"|where|by|via|using|into|away|up|down)\b",
     re.IGNORECASE,
 )
 
-# The report-context phrases are a tiny EXPLICIT list on purpose, not a growing
-# word allowlist: they are change-y or work-y on their own ("write", "tell me
-# what you find") but are report prose as a fixed phrase. Matched whole and
-# STRIPPED from the text before the change scan, so the scan never sees them.
-# Longest first, so "tell me what you find" goes before "tell me".
-REPORT_PHRASES = (
+# 4. CLOSED TRAILING REPORT PHRASES, stripped from the END only, at most one.
+# This is the only path by which a phrase containing "and" or "to" survives.
+# Keep it small: a realistic audit that needs a phrase not listed here is
+# answered None (cheap), not with a new pattern.
+_TRAILING_PHRASES = (
+    "and tell me what you find",
+    "and tell me what you found",
+    "and tell me what you think",
+    "and tell me",
+    "and let me know",
+    "and report back",
+    "and explain what you find",
+    "and summarise what you find",
+    "and summarize what you find",
+    "to tell me what you find",
+    "to tell me what you think",
+    "to let me know",
+    "and summarise the findings",
+    "and summarize the findings",
+    "please tell me what you find",
     "tell me what you find",
-    "write up a report",
-    "write a report",
-    "what you find",
-    "what you think",
+    "tell me what you think",
     "let me know",
     "report back",
-    "tell me",
 )
-
-# A trigger phrase nominates the work, but a clause separator introduces MORE
-# work: every "and", "then", comma, semicolon, colon, full stop or dash is an
-# anchor, filler words ("also", "only", "still", ...) are skipped, and the next
-# word is the head verb of the continuation clause. Only a head verb that is a
-# true report verb keeps the objective an audit.
-CONTINUATION_WORDS = re.compile(
-    r"(?:\b(?:and|then)\b|[,;:.\-])\s+(?:(?:also|only|still|just|please|then|now)\s+)*([a-z]+)",
+_TRAILING = re.compile(
+    r"[\s,]*\b(?:"
+    + "|".join(r"\s+".join(p.split()) for p in sorted(_TRAILING_PHRASES, key=len, reverse=True))
+    + r")[\s.!?]*$",
     re.IGNORECASE,
 )
 
-# FAIL-SAFE BY CONSTRUCTION. The cost of a wrong verdict is asymmetric: a false
-# "draft" silently denies a real fix mission its branch and PR, while a false
-# "change" only costs the owner a relaunch with `--plan draft`. So this set holds
-# ONLY true report verbs, which can never imply a code change. It holds no
-# filler, determiner, preposition or adverb. A continuation clause whose head
-# verb is not listed is NOT positively read-only and returns None: unknown means
-# change.
-REPORT_ONLY_WORDS = frozenset(
-    """
-    tell report reports describe describes summarise summarize list outline
-    explain assess evaluate highlight mention say show note
-    """.split()
-)
+
+def _read_only_opener(text: str) -> re.Match[str] | None:
+    """Piece 1: the opener the objective begins with (after a leading
+    "please "), or None."""
+    return _OPENER.match(text)
 
 
-def _mentions(needle: str, haystack: str) -> bool:
-    pattern = r"\b" + r"\s+".join(re.escape(part) for part in needle.split()) + r"\b"
-    return re.search(pattern, haystack) is not None
+def _has_change_verb(text: str) -> bool:
+    """Piece 2: any change verb stem anywhere in `text`."""
+    return _CHANGE_DENYLIST.search(text) is not None
 
 
-def _action_text(body: str) -> str:
-    """The text the change scan sees: matched report phrases are removed first,
-    so "tell me what you find" and "write a report" cannot trip a veto."""
-    for phrase in REPORT_PHRASES:
-        pattern = r"\b" + r"\s+".join(re.escape(part) for part in phrase.split()) + r"\b"
-        body = re.sub(pattern, " ", body)
-    return body
+def _strip_trailing_report_phrase(text: str) -> str:
+    """Piece 4: drop ONE closed report phrase from the end of `text`."""
+    return _TRAILING.sub("", text, count=1)
 
 
-def _has_change_veto(body: str) -> bool:
-    """True when the text names a change to make, in any inflection."""
-    return CHANGE_VETO.search(_action_text(body)) is not None
-
-
-def _has_further_work(body: str) -> bool:
-    """True when a continuation introduces work the trigger does not cover:
-    any clause separator ("and", "then", ",", ";", ":", ".", "-") whose head verb
-    (after filler words) is not a true report verb. Fail-safe: an unknown word
-    counts as further work."""
-    for match in CONTINUATION_WORDS.finditer(_action_text(body)):
-        if match.group(1).lower() not in REPORT_ONLY_WORDS:
-            return True
-    return False
+def _has_second_clause(text: str) -> bool:
+    """Piece 3: any clause boundary left in `text`."""
+    return _CLAUSE_BOUNDARY.search(text) is not None
 
 
 def reads_only_plan(objective: str, text: str = "") -> str | None:
@@ -306,38 +250,27 @@ def reads_only_plan(objective: str, text: str = "") -> str | None:
     This is a DEFAULT-selection heuristic only. It is consulted when the caller
     did not name a plan, and it never overrides an explicit plan.
 
-    Matching is case-insensitive on word boundaries in the objective (plus
-    `text`, when given). A trigger phrase only NOMINATES the work; the verdict
-    is "draft" only when nothing in the text suggests a change. Two signals
-    defeat the nomination, after REPORT_PHRASES ("tell me what you find", "write
-    a report", ...) are stripped from the text:
+    A wrong None costs the owner one relaunch with `--plan draft`, while a wrong
+    "draft" silently denies a fix mission its branch and PR. So the verdict is
+    "draft" only for a closed shape (a read-only opener, no change verb
+    anywhere, no second clause) and every uncertain input returns None.
 
-    1. A change word, matched by STEM and therefore in every inflection:
-       "audit the code base and fixing the two crashes" is a fix mission. See
-       CHANGE_VETO_STEMS for the deliberate collisions ("add" wins over
-       "address", "creat" over "creative"); CHANGE_VETO_FORMS are explicit forms
-       so "cover" vetoes but "coverage" does not.
-    2. A continuation clause (after "and", "then", or any of , ; : . -) whose
-       head verb is not in REPORT_ONLY_WORDS. That set holds only true report
-       verbs, so an unknown word is further work: "audit the code base and speed
-       it up" is a change mission, while
-       "review the codebase and list the risks" stays an audit.
-
-    FAIL-SAFE BY CONSTRUCTION: the classifier returns "draft" only for what it
-    positively recognises as read-only and None for everything else. The cost of
-    a wrong verdict is asymmetric: a false "draft" silently denies a real fix
-    mission its branch and PR, while a false "change" merely costs the owner a
-    relaunch with `--plan draft`. So every list here is built so that a missing
-    entry errs toward None.
+    `text`, when given, is only scanned for change verbs; the opener and the
+    clause guard look at the objective alone.
     """
-    body = f"{objective or ''}\n{text or ''}".lower()
-    if not body.strip():
+    line = " ".join((objective or "").lower().split()).rstrip(" .!?")
+    if line.startswith("please "):
+        line = line[len("please ") :]
+    opener = _read_only_opener(line)
+    if opener is None:
         return None
-    if _has_change_veto(body) or _has_further_work(body):
+    # the opener is exempt from the denylist: "write a report" holds "writ"
+    rest = line[opener.end() :]
+    if _has_change_verb(rest) or _has_change_verb(text or ""):
         return None
-    if any(_mentions(word, body) for word in READS_ONLY_TRIGGERS):
-        return "draft"
-    return None
+    if _has_second_clause(_strip_trailing_report_phrase(rest)):
+        return None
+    return "draft"
 
 
 BUDGET_ERROR = "budget must be a finite number greater than 0"
