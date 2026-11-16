@@ -48,7 +48,13 @@ from rework.tui.widgets.base import Btn, Label, RowData, RowList
 from rework.tui.widgets.cards import MissionCard, ProposalCard
 from rework.tui.widgets.modals import Option, Picker
 from rework.tui.widgets.prompt import Prompt
-from rework.tui.widgets.trajectory import Step, Trajectory, assistant_step, user_step
+from rework.tui.widgets.trajectory import (
+    Step,
+    Trajectory,
+    assistant_step,
+    item_step,
+    user_step,
+)
 
 WELCOME = f"""[b]Talk to the orchestrator.[/b]
 
@@ -626,31 +632,13 @@ class WorkView(View):
             card.set_launch_all(offer)
 
     def _item_widget(self, item: Item) -> Any:
-        if item.kind == "user":
-            return user_step(item.text, item.attachments)
-        if item.kind == "assistant":
-            return assistant_step(item.text)
-        if item.kind == "tool_call":
-            return Step(
-                f"[{ACCENT}]⏺[/] [b]{esc(item.name)}[/b]  [{MUTED}]{esc(clip(item.args, 140))}[/]",
-                kind="call",
-            )
-        if item.kind == "tool_result":
-            colour = DANGER if item.error else MUTED
-            lines = item.text.strip().splitlines() or ["(empty)"]
-            more = f" [{FAINT}]+{len(lines) - 1} lines[/]" if len(lines) > 1 else ""
-            detail = "\n".join(f"    [{colour}]{esc(line)}[/]" for line in lines[:40])
-            return Step(
-                f"  [{FAINT}]⎿[/] [{colour}]{esc(clip(lines[0], 140))}[/]{more}",
-                detail=detail if len(lines) > 1 else "",
-                kind="result",
-            )
+        step = item_step(item)  # the text kinds: shared with the Dashboard Chat tab
+        if step is not None:
+            return step
         if item.kind == "proposal":
             return ProposalCard(item.proposal)
         if item.kind == "mission":
             return MissionCard(item.mission_id)
-        if item.kind == "note":
-            return Step(f"[{FAINT}]{esc(item.text)}[/]", kind="note")
         return None
 
     def _retire_proposals(self) -> None:

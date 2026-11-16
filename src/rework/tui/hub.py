@@ -222,9 +222,9 @@ class Hub:
     def _is_orchestrator_transcript(chat: Any) -> bool:
         # A mission orchestrator's own conversation is machinery, not a chat:
         # there is one per mission and the owner never writes in it. It stays
-        # reachable per mission (the Work mission row and the Dashboard
-        # Transcript action open `orchestrator_chat_id(mission.id)`); it is
-        # hidden from the list, not deleted.
+        # reachable per mission (the Dashboard Chat tab shows it read-only, and
+        # the Transcript buttons open `orchestrator_chat_id(mission.id)`); it
+        # is hidden from the list, not deleted.
         return str(chat.id).startswith(ORCHESTRATOR_CHAT_PREFIX)
 
     async def _chats(self) -> list[Any]:
