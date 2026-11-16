@@ -126,6 +126,13 @@ merging.
 The gate question then leads with the category and the orchestrator's reason
 ("Gate category: security — ..."), so you can decide from the inbox.
 
+The question also names the audit verdict and the round that verdict came from
+(`audit verdict: approve (round 3 of 3)`). While the gate is open its text is
+refreshed whenever the verdict or the round changes, and each refresh is
+published as an INFO event, so the inbox shows the audit the mission actually
+finished on instead of the round that first opened the gate. A decided gate is
+never rewritten: its text is the record of what you answered.
+
 Only a plan that publishes (`"publish": "pr"` — the `fix-pr` playbook; older
 plans carrying `"gates": ["open_pr"]` count too) pushes a branch or opens a PR
 at all. `echo` and `fix` missions deliver their result and stop.

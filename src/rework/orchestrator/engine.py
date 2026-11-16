@@ -777,9 +777,7 @@ class MissionRunner:
             verdict, round_text = await self._audit_stamp(mission.id, last_audit_artifact)
             question = f"Ship the mission result? audit verdict: {verdict}{round_text}"
             if gate is None:
-                gate = await self._gates.request(
-                    mission.id, kind=GateKind.SHIP, question=question
-                )
+                gate = await self._gates.request(mission.id, kind=GateKind.SHIP, question=question)
                 await self._bus.publish(
                     EventRecord(
                         mission_id=mission.id,
@@ -834,9 +832,7 @@ class MissionRunner:
         if want_gate:
             gate = await self._latest_gate_of_kind(GateKind.OPEN_PR)
             verdict, round_text = await self._audit_stamp(mission.id, last_audit_artifact)
-            question = (
-                f"Open a pull request for this change? audit verdict: {verdict}{round_text}"
-            )
+            question = f"Open a pull request for this change? audit verdict: {verdict}{round_text}"
             if reason:
                 # the strict gate (issue #36): the category leads, then why
                 label = gate_category or "unspecified"
@@ -845,8 +841,7 @@ class MissionRunner:
                 # forced by the project setting, no category to show: say so
                 # instead of printing an empty one
                 question += (
-                    ". Forced by project setting pr_gate=always; "
-                    "the orchestrator named no category"
+                    ". Forced by project setting pr_gate=always; the orchestrator named no category"
                 )
             if gate is None:
                 gate = await self._gates.request(

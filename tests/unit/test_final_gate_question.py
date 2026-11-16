@@ -107,9 +107,7 @@ async def test_an_open_gate_is_reworded_to_the_final_audit_round(tmp_path: Path)
             Mission(id="m1", objective="x", plan={"steps": [], "gates": ["ship"]})
         )
         await _seed_audit(store, "m1", 1, BROKEN, created=1.0)
-        gate = Gate(
-            id=new_id("gate"), mission_id="m1", kind=GateKind.SHIP, question=STALE_SHIP
-        )
+        gate = Gate(id=new_id("gate"), mission_id="m1", kind=GateKind.SHIP, question=STALE_SHIP)
         await store.create_gate(gate)
         await _seed_audit(store, "m1", 2, BRUISED, created=2.0)
         await _seed_audit(store, "m1", 3, CLEAN, created=3.0)
@@ -162,9 +160,7 @@ async def test_a_decided_gate_is_never_rewritten(tmp_path: Path) -> None:
             assert stored is not None
             assert stored.question == question, f"a {status.value} gate was rewritten"
             assert stored.status == status
-            assert _refresh_events(
-                await store.events_since(0, mission_id=mission_id)
-            ) == []
+            assert _refresh_events(await store.events_since(0, mission_id=mission_id)) == []
             # the reuse record stands: no duplicate gate for a decision already made
             gates = await store.list_gates(mission_id)
             assert [g.id for g in gates] == [gate.id]
@@ -254,9 +250,7 @@ async def test_the_forced_pr_gate_keeps_its_no_category_clause(tmp_path: Path) -
             )
         )
         await _seed_audit(store, "m1", 1, CLEAN, created=1.0)
-        gate = Gate(
-            id=new_id("gate"), mission_id="m1", kind=GateKind.OPEN_PR, question=STALE_PR
-        )
+        gate = Gate(id=new_id("gate"), mission_id="m1", kind=GateKind.OPEN_PR, question=STALE_PR)
         await store.create_gate(gate)
         _no_waiting_decision(runner, False)
 

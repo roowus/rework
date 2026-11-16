@@ -217,8 +217,7 @@ class GateManager:
                     mission_id=gate.mission_id,
                     type=EventType.INFO,
                     payload={
-                        "note": f"{gate.kind.value} gate {gate.id} question refreshed: "
-                        f"{question}",
+                        "note": f"{gate.kind.value} gate {gate.id} question refreshed: {question}",
                     },
                 )
             )
