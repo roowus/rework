@@ -37,30 +37,54 @@ PRECEDENCE (REWORK_CAPACITY, default auto):
 - REWORK_CAPACITY=fixed: today's behaviour, exactly. No measurement, no
   watchdog, no log line, caps as constructed.
 - REWORK_CAPACITY=auto (or unset, empty, or anything unrecognised): measure and
-  manage, except for a cap the owner set EXPLICITLY: a non-empty
-  REWORK_CONCURRENCY fixes the mission cap, a non-empty REWORK_MAX_ROLES fixes
-  the role cap, and auto manages only the other one. Nothing else records
-  whether an env var was set by the owner or derived from the host, so the
-  check is a plain `os.environ.get(...)` on a non-empty value (see
-  :meth:`CapacitySettings.from_env`).
-- With BOTH caps explicit there is nothing for auto to manage
+  manage. A hand-set REWORK_CONCURRENCY / REWORK_MAX_ROLES is then read through
+  REWORK_CAPACITY_PINS (see :meth:`CapacitySettings.from_env`); nothing else
+  records whether an env var was set by the owner, so the check is a plain
+  `os.environ.get(...)` on a non-empty value.
+
+REWORK_CAPACITY_PINS (default floor) decides what a hand-set number MEANS:
+
+| env var set        | pins=floor (default)         | pins=fixed          |
+| ------------------ | ---------------------------- | ------------------- |
+| neither            | MANAGED: the planner decides | MANAGED: the same   |
+| REWORK_CONCURRENCY | MANAGED, with a floor of n   | PINNED: exactly n   |
+| REWORK_MAX_ROLES   | MANAGED, with a floor of n   | PINNED: exactly n   |
+| both               | MANAGED for both, each with  | PINNED for both, so |
+|                    | its floor, watchdog runs     | no managed cap and  |
+|                    |                              | no watchdog         |
+
+- floor (the default): a hand-set number is the MINIMUM the planner may pick.
+  The plan may go ABOVE it (REWORK_MAX_ROLES=4 on a quiet 8 CPU box plans 8
+  roles) and load or RAM may cut the plan back down, but never below the floor
+  (the same 4 on a busy 2 CPU box gives 4 roles, not 2). A floor never freezes a
+  cap, so with BOTH numbers set there is still something to manage:
+  :attr:`CapacityPolicy.has_managed_cap` stays True and the watchdog runs.
+- fixed: today's meaning, exactly. A hand-set number IS the cap, and with both
+  numbers set there is nothing for auto to manage
   (:attr:`CapacityPolicy.has_managed_cap` is False): rework honours the two
   pinned numbers exactly as given, measures nothing, runs no watchdog and
-  therefore runs no clamp on that pair either. Mission slots are inert once the
-  role cap binds, so the arithmetic difference costs the box nothing.
+  therefore runs no clamp on that pair either.
+- an unset (or empty) env var is never a floor: it means "the planner decides".
+- an invalid REWORK_CAPACITY_PINS raises ValueError out of
+  :meth:`CapacitySettings.from_env`; it never falls back to a silent default.
+- the mission cap never exceeds the role cap, under either mode: a mission floor
+  above the role cap is cut to that role cap (REWORK_CONCURRENCY=8 with
+  REWORK_MAX_ROLES=4 never runs more than 4 missions) and the reason sentence
+  says so in one clause.
 
-A pin is immutable once the policy is built: it lives in its own field
-(`_pinned_concurrency` / `_pinned_max_roles`) and
-:meth:`CapacityPolicy._remember` never writes it, so a clamp that cut the
-mission cap for one measurement cannot come back as the pin on the next one.
+A pin and a floor are immutable once the policy is built: each lives in its own
+field (`_pinned_concurrency` / `_pinned_max_roles` under pins=fixed,
+`_floor_concurrency` / `_floor_max_roles` under pins=floor) and
+:meth:`CapacityPolicy._remember` never writes them, so a clamp that cut a cap
+for one measurement cannot come back as the pin or the floor on the next one.
 
 On the caps that auto actually manages, the manager keeps the value the daemon
-was CONSTRUCTED with only when that cap is pinned: `REWORK_CONCURRENCY=3` means
-3, never a re-derivation. The one exception is the invariant above: a managed
-mission cap is reduced to fit a pinned ROLE cap when the role cap is the
-smaller of the two (roles are the resource that protects the box), and a pinned
-mission cap is likewise cut back to a managed role cap. A pinned cap is never
-raised to satisfy it.
+was CONSTRUCTED with only when that cap is pinned: `REWORK_CONCURRENCY=3` with
+pins=fixed means 3, never a re-derivation. The one exception is the invariant
+above: a managed mission cap is reduced to fit a pinned ROLE cap when the role
+cap is the smaller of the two (roles are the resource that protects the box),
+and a pinned mission cap is likewise cut back to a managed role cap. A pinned
+cap is never raised to satisfy it.
 """
 
 from __future__ import annotations
@@ -96,6 +120,10 @@ MEMINFO = "/proc/meminfo"
 
 CAPACITY_AUTO = "auto"
 CAPACITY_FIXED = "fixed"
+# what a hand-set REWORK_CONCURRENCY / REWORK_MAX_ROLES means (REWORK_CAPACITY_PINS)
+PINS_FLOOR = "floor"  # a MINIMUM the planner may pick a higher number than (default)
+PINS_FIXED = "fixed"  # the EXACT cap, the meaning main had before pins existed
+PINS_ENV = "REWORK_CAPACITY_PINS"
 
 
 @dataclass(frozen=True)
@@ -142,12 +170,18 @@ def measure(meminfo: Path | str = MEMINFO) -> tuple[int, float, int | None]:
 
 
 def _reason(
-    cpu_count: int, load1: float, avail_bytes: int | None, concurrency: int, max_roles: int
+    cpu_count: int,
+    load1: float,
+    avail_bytes: int | None,
+    concurrency: int,
+    max_roles: int,
+    note: str = "",
 ) -> str:
     parts = [f"{cpu_count} CPU" if cpu_count == 1 else f"{cpu_count} CPUs", f"load {load1:.1f}"]
     if avail_bytes is not None:
         parts.append(f"{avail_bytes / GB:.1f} GB free")
-    return f"{', '.join(parts)}: {concurrency} missions / {max_roles} roles"
+    text = f"{', '.join(parts)}: {concurrency} missions / {max_roles} roles"
+    return f"{text} ({note})" if note else text
 
 
 def plan(cpu_count: int, load1: float, avail_bytes: int | None) -> Capacity:
@@ -174,16 +208,24 @@ def plan(cpu_count: int, load1: float, avail_bytes: int | None) -> Capacity:
 
 @dataclass(frozen=True)
 class CapacitySettings:
-    """The two capacity settings, read from the env exactly once at startup."""
+    """The capacity settings, read from the env exactly once at startup."""
 
     mode: str = CAPACITY_AUTO
     interval_s: float = CAPACITY_INTERVAL_DEFAULT
+    # REWORK_CAPACITY_PINS: what a hand-set REWORK_CONCURRENCY / REWORK_MAX_ROLES
+    # means, a floor (default) or the exact cap
+    pins: str = PINS_FLOOR
     fixed_concurrency: bool = False
     fixed_max_roles: bool = False
 
     @property
     def auto(self) -> bool:
         return self.mode == CAPACITY_AUTO
+
+    @property
+    def pins_fixed(self) -> bool:
+        """True under pins=fixed, where a hand-set number IS the cap."""
+        return self.pins == PINS_FIXED
 
     @classmethod
     def from_env(cls) -> CapacitySettings:
@@ -194,6 +236,7 @@ class CapacitySettings:
         return cls(
             mode=mode,
             interval_s=interval,
+            pins=_pins_from_env(),
             # a non-empty env var is the only signal that the owner chose a cap
             fixed_concurrency=bool(os.environ.get("REWORK_CONCURRENCY")),
             fixed_max_roles=bool(os.environ.get("REWORK_MAX_ROLES")),
@@ -212,6 +255,21 @@ def _interval_from_env() -> float:
     return value if value > 0 else CAPACITY_INTERVAL_DEFAULT
 
 
+def _pins_from_env() -> str:
+    """REWORK_CAPACITY_PINS, else floor. Unset and empty mean floor.
+
+    An unrecognised value raises: reading a typo as `fixed` would freeze a cap
+    the owner meant as a floor, and reading it as `floor` would silently ignore
+    what the owner asked for, so neither fallback is acceptable here."""
+    raw = os.environ.get(PINS_ENV)
+    if raw is None or not raw.strip():
+        return PINS_FLOOR
+    value = raw.strip().lower()
+    if value not in (PINS_FLOOR, PINS_FIXED):
+        raise ValueError(f"{PINS_ENV}={raw!r} is invalid: use {PINS_FLOOR} or {PINS_FIXED}")
+    return value
+
+
 class CapacityPolicy:
     """When is a measured plan stable enough to apply? Pure and synchronous.
 
@@ -227,14 +285,28 @@ class CapacityPolicy:
         max_roles: int,
         fixed_concurrency: bool = False,
         fixed_max_roles: bool = False,
+        pins: str = PINS_FLOOR,
         hysteresis: int = HYSTERESIS_MEASUREMENTS,
     ) -> None:
-        # The pins are IMMUTABLE and live in their own fields: _remember only ever
-        # tracks the live caps, so a clamped value can never be mistaken for the
-        # pin on the next measurement. `concurrency` / `max_roles` are the caps in
-        # force right now (they start at the constructed value).
-        self._pinned_concurrency = max(1, int(concurrency)) if fixed_concurrency else None
-        self._pinned_max_roles = max(1, int(max_roles)) if fixed_max_roles else None
+        # The pins and the floors are IMMUTABLE and live in their own fields:
+        # _remember only ever tracks the live caps, so a clamped value can never
+        # be mistaken for the pin (or the floor) on the next measurement.
+        # `concurrency` / `max_roles` are the caps in force right now (they start
+        # at the constructed value). `pins` decides what an explicit env value
+        # MEANS: PINS_FIXED -> that exact cap, PINS_FLOOR -> a minimum for it.
+        if pins not in (PINS_FLOOR, PINS_FIXED):
+            raise ValueError(f"pins={pins!r} is invalid: use {PINS_FLOOR} or {PINS_FIXED}")
+        as_pins = pins == PINS_FIXED
+        self.pins = pins
+        self._pinned_concurrency = (
+            max(1, int(concurrency)) if fixed_concurrency and as_pins else None
+        )
+        self._pinned_max_roles = max(1, int(max_roles)) if fixed_max_roles and as_pins else None
+        # a floor is a MINIMUM the planner may pick a higher number than, never a freeze
+        self._floor_concurrency = (
+            max(1, int(concurrency)) if fixed_concurrency and not as_pins else None
+        )
+        self._floor_max_roles = max(1, int(max_roles)) if fixed_max_roles and not as_pins else None
         self.concurrency = max(1, int(concurrency))
         self.max_roles = max(1, int(max_roles))
         self.fixed_concurrency = fixed_concurrency
@@ -247,36 +319,77 @@ class CapacityPolicy:
     def has_managed_cap(self) -> bool:
         """True when at least one cap is left for auto (and its clamp) to move.
 
-        False means both caps are pinned: every entry point is a no-op and the
-        pinned pair is honoured exactly as given, watchdog included."""
+        False means both caps are PINNED under pins=fixed: every entry point is a
+        no-op and the pinned pair is honoured exactly as given, watchdog
+        included. A FLOOR never freezes a cap, so pins=floor leaves this True for
+        every combination of hand-set numbers and the watchdog still runs."""
+        if self.pins != PINS_FIXED:
+            return True
         return self._pinned_concurrency is None or self._pinned_max_roles is None
 
     def target(self, cpu_count: int, load1: float, avail_bytes: int | None) -> Capacity:
-        """What the caps should be now, with the pinned cap(s) applied.
+        """What the caps should be now, with the pinned cap(s) and floor(s) applied.
 
-        The pin is read from the immutable pin fields, never from the live caps,
-        so the result depends only on the constructor and the measurement."""
+        A pin or a floor is read from its immutable field, never from the live
+        caps, so the result depends only on the constructor and the measurement."""
         measured = plan(cpu_count, load1, avail_bytes)
-        concurrency = (
-            self._pinned_concurrency
-            if self._pinned_concurrency is not None
-            else measured.concurrency
-        )
-        roles = self._pinned_max_roles if self._pinned_max_roles is not None else measured.max_roles
+        concurrency = measured.concurrency
+        roles = measured.max_roles
+        if self._pinned_concurrency is not None:  # pins=fixed: exactly this number
+            concurrency = self._pinned_concurrency
+        elif self._floor_concurrency is not None:  # pins=floor: never below it
+            concurrency = max(concurrency, self._floor_concurrency)
+        if self._pinned_max_roles is not None:
+            roles = self._pinned_max_roles
+        elif self._floor_max_roles is not None:
+            roles = max(roles, self._floor_max_roles)
         # The clamp applies to the OUTPUT of the caps auto manages, and only there:
         # it reduces the mission cap to fit the role cap (roles are what protects
-        # the box) and never raises a pinned number. It does not touch
-        # _pinned_concurrency, so the pin survives: REWORK_MAX_ROLES=2 on 12 CPUs
+        # the box) and never raises a pinned number. It does not touch the pin or
+        # the floor, so both survive: REWORK_MAX_ROLES=2 with pins=fixed on 12 CPUs
         # is 2 missions / 2 roles, and a later idle measurement with the role cap
         # managed plans 8 again, not 1. With BOTH caps pinned there is nothing for
         # auto to manage, so the pair is returned exactly as given (the entry
         # points never even reach this method then).
-        if self.has_managed_cap:
-            concurrency = max(1, min(concurrency, roles))
-        if (concurrency, roles) == (measured.concurrency, measured.max_roles):
+        note = ""
+        if self.has_managed_cap and concurrency > roles:
+            # Collision: REWORK_CONCURRENCY=8 with REWORK_MAX_ROLES=4. The ROLE
+            # floor wins the role number and the mission count is clamped to it.
+            note = f"{concurrency} missions clamped to the {roles} role cap, raise REWORK_MAX_ROLES"
+            concurrency = max(1, roles)
+        if not note and (concurrency, roles) == (measured.concurrency, measured.max_roles):
             return measured
         cpus = max(1, int(cpu_count))
-        return Capacity(concurrency, roles, _reason(cpus, load1, avail_bytes, concurrency, roles))
+        return Capacity(
+            concurrency,
+            roles,
+            _reason(cpus, load1, avail_bytes, concurrency, roles, note),
+        )
+
+    def describe(self, which: str) -> str:
+        """One phrase for one cap: MANAGED (with its floor) or PINNED, and why.
+
+        `which` is "missions" or "roles". The startup line prints both, so the
+        owner can read what a hand-set number did without reading this module."""
+        if which == "missions":
+            pinned, floor, env = (
+                self._pinned_concurrency,
+                self._floor_concurrency,
+                "REWORK_CONCURRENCY",
+            )
+        elif which == "roles":
+            pinned, floor, env = (
+                self._pinned_max_roles,
+                self._floor_max_roles,
+                "REWORK_MAX_ROLES",
+            )
+        else:  # pragma: no cover - programmer error, not a user path
+            raise ValueError(f"unknown cap {which!r}")
+        if pinned is not None:
+            return f"{which} PINNED at {pinned} by {env} (pins=fixed)"
+        if floor is not None:
+            return f"{which} MANAGED, floor {floor} (from {env}, pins=floor)"
+        return f"{which} MANAGED, planner decides ({env} unset)"
 
     def apply_initial(
         self, cpu_count: int, load1: float, avail_bytes: int | None
@@ -321,6 +434,33 @@ class CapacityPolicy:
         self._streak = 0
 
 
+def _measurement_phrase(reading: tuple[int, float, int | None] | None) -> str | None:
+    """The raw measurement as one phrase: CPUs, load, available RAM."""
+    if reading is None:
+        return None
+    cpus, load1, avail = reading
+    parts = [f"{cpus} CPU" if cpus == 1 else f"{cpus} CPUs", f"load {load1:.1f}"]
+    if avail is not None:
+        parts.append(f"{avail / GB:.1f} GB free")
+    return ", ".join(parts)
+
+
+def mode_phrase(settings: CapacitySettings, policy: CapacityPolicy) -> str:
+    """One sentence saying whether the caps follow the host, and why not.
+
+    The startup line and the change lines share it, so the log can never claim
+    the watchdog runs when REWORK_CAPACITY=fixed (or both caps are PINNED under
+    pins=fixed) turned it off."""
+    if not settings.auto:
+        return "AUTO IS OFF: REWORK_CAPACITY=fixed, caps stay as resolved at startup"
+    if not policy.has_managed_cap:
+        return "AUTO IS OFF: both caps PINNED under pins=fixed (REWORK_CAPACITY_PINS)"
+    return (
+        f"AUTO IS ON: REWORK_CAPACITY_PINS={settings.pins},"
+        f" re-measured every {settings.interval_s:.0f} s"
+    )
+
+
 class DynamicCapacity:
     """Keeps the daemon's two caps following the box, with no restart.
 
@@ -349,9 +489,13 @@ class DynamicCapacity:
             max_roles=limiter.cap,
             fixed_concurrency=self.settings.fixed_concurrency,
             fixed_max_roles=self.settings.fixed_max_roles,
+            pins=self.settings.pins,
         )
         self._task: asyncio.Task[None] | None = None
         self.last: Capacity | None = None
+        # the raw reading of the last SUCCESSFUL measurement: the startup line
+        # prints the measurement, not only the plan it produced
+        self.last_measurement: tuple[int, float, int | None] | None = None
         self._warned = False
 
     @property
@@ -367,13 +511,18 @@ class DynamicCapacity:
         """Measure once and apply the first plan (unconditional)."""
         if not self.enabled:
             return None
-        return self._apply(self.policy.apply_initial(*self._measure()))
+        return self._apply(self.policy.apply_initial(*self._reading()))
 
     def observe_now(self) -> Capacity | None:
         """Measure once and apply the plan only if it is now confirmed."""
         if not self.enabled:
             return None
-        return self._apply(self.policy.observe(*self._measure()))
+        return self._apply(self.policy.observe(*self._reading()))
+
+    def _reading(self) -> tuple[int, float, int | None]:
+        reading = self._measure()
+        self.last_measurement = reading
+        return reading
 
     def _guarded(self, action: Callable[[], Capacity | None]) -> Capacity | None:
         """One measurement, made fatal proof: a raise inside the measurement OR
@@ -397,11 +546,41 @@ class DynamicCapacity:
         self._warned = False
         return result
 
+    def summary(self, cap: Capacity | None = None) -> str:
+        """The ONE line a human reads at daemon start: the measurement, the
+        planned pair, and per cap whether it is MANAGED (and its floor) or
+        PINNED, plus whether auto is active at all."""
+        if cap is None:
+            cap = self.last
+        measured = _measurement_phrase(self.last_measurement)
+        pair = (
+            f"{cap.concurrency} missions / {cap.max_roles} roles"
+            if cap is not None
+            else f"keeping {self._slots.capacity} missions / {self._limiter.cap} roles"
+        )
+        if measured is None:
+            head = f"measurement failed, {pair}"
+        else:
+            head = f"{measured}: {pair}"
+        return (
+            f"capacity plan: {head}; {self.policy.describe('missions')};"
+            f" {self.policy.describe('roles')}; {mode_phrase(self.settings, self.policy)}"
+        )
+
     def start(self) -> asyncio.Task[None] | None:
         """Apply the first plan and start the watchdog (needs a running loop)."""
         if not self.enabled:
             return None
-        self._guarded(self.apply_now)  # a failed first look must not abort startup
+        # the first look applies silently: its `capacity changed:` line would only
+        # repeat what the ONE startup line below says, measured and planned.
+        applied = self._guarded(
+            lambda: self._apply(self.policy.apply_initial(*self._reading()), quiet=True)
+        )  # a failed first look must not abort startup
+        # ONE line per start(), always, at INFO: on a settled box (the caps the
+        # daemon was constructed with already equal the plan, the 2 CPU rewvis
+        # case) _apply logs no `capacity changed:` line at all, and then nothing
+        # anywhere would say the watchdog ran or what it decided.
+        log.info("%s", self.summary(applied))
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._watch(), name="rework-capacity")
         return self._task
@@ -423,14 +602,14 @@ class DynamicCapacity:
             await asyncio.sleep(self.settings.interval_s)
             self._guarded(self.observe_now)
 
-    def _apply(self, new: Capacity | None) -> Capacity | None:
+    def _apply(self, new: Capacity | None, *, quiet: bool = False) -> Capacity | None:
         if new is None:
             return None
         before = (self._slots.capacity, self._limiter.cap)
         self._slots.set_capacity(new.concurrency)
         self._limiter.set_cap(new.max_roles)
         self.last = new
-        if (new.concurrency, new.max_roles) != before:
+        if (new.concurrency, new.max_roles) != before and not quiet:
             # ONE line per change, never per tick: the reason says why
             log.info(
                 "capacity changed: %d missions / %d roles -> %d missions / %d roles (%s)",

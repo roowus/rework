@@ -20,6 +20,8 @@ from rework.orchestrator.capacity import (
     HYSTERESIS_MEASUREMENTS,
     MIN_RAM_PER_ROLE_BYTES,
     MULTICORE_MIN_ROLES,
+    PINS_FIXED,
+    PINS_FLOOR,
     Capacity,
     CapacityPolicy,
     CapacitySettings,
@@ -38,6 +40,7 @@ def _no_ambient_capacity_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
         "REWORK_CAPACITY",
         "REWORK_CAPACITY_INTERVAL_S",
+        "REWORK_CAPACITY_PINS",
         "REWORK_CONCURRENCY",
         "REWORK_MAX_ROLES",
     ):
@@ -126,6 +129,7 @@ def test_the_invariant_holds_on_every_pinned_path_too() -> None:
                 max_roles=pinned_roles or 1,
                 fixed_concurrency=fixed_concurrency,
                 fixed_max_roles=fixed_max_roles,
+                pins=PINS_FIXED,
             )
             both_pinned = fixed_concurrency and fixed_max_roles
             for cpus, load, avail in MEASUREMENTS:
@@ -231,8 +235,11 @@ def test_a_good_interval_is_used(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_explicit_concurrency_env_fixes_only_that_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """pins=fixed keeps main's meaning: the explicit cap is the cap."""
     monkeypatch.setenv("REWORK_CONCURRENCY", "3")
+    monkeypatch.setenv("REWORK_CAPACITY_PINS", "fixed")
     settings = CapacitySettings.from_env()
+    assert settings.pins_fixed is True
     assert settings.fixed_concurrency is True
     assert settings.fixed_max_roles is False
 
@@ -241,6 +248,7 @@ def test_explicit_concurrency_env_fixes_only_that_cap(monkeypatch: pytest.Monkey
         max_roles=2,
         fixed_concurrency=settings.fixed_concurrency,
         fixed_max_roles=settings.fixed_max_roles,
+        pins=settings.pins,
     )
     new = policy.apply_initial(8, 0.0, None)
     assert new is not None
@@ -249,8 +257,11 @@ def test_explicit_concurrency_env_fixes_only_that_cap(monkeypatch: pytest.Monkey
 
 
 def test_explicit_max_roles_env_fixes_only_that_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    """pins=fixed keeps main's meaning: the explicit cap is the cap."""
     monkeypatch.setenv("REWORK_MAX_ROLES", "5")
+    monkeypatch.setenv("REWORK_CAPACITY_PINS", "fixed")
     settings = CapacitySettings.from_env()
+    assert settings.pins_fixed is True
     assert settings.fixed_max_roles is True
     assert settings.fixed_concurrency is False
 
@@ -259,6 +270,7 @@ def test_explicit_max_roles_env_fixes_only_that_cap(monkeypatch: pytest.MonkeyPa
         max_roles=5,
         fixed_concurrency=settings.fixed_concurrency,
         fixed_max_roles=settings.fixed_max_roles,
+        pins=settings.pins,
     )
     new = policy.apply_initial(8, 0.0, None)
     assert new is not None
@@ -277,6 +289,7 @@ def test_a_clamped_pin_comes_back_on_the_next_measurement(
     over the pin, the box that pinned a mission cap would stop following the box
     until a daemon restart, and the 8 would never come back."""
     monkeypatch.setenv("REWORK_CONCURRENCY", "8")
+    monkeypatch.setenv("REWORK_CAPACITY_PINS", "fixed")
     settings = CapacitySettings.from_env()
     assert settings.fixed_concurrency is True
     assert settings.fixed_max_roles is False
@@ -286,6 +299,7 @@ def test_a_clamped_pin_comes_back_on_the_next_measurement(
         max_roles=8,
         fixed_concurrency=settings.fixed_concurrency,
         fixed_max_roles=settings.fixed_max_roles,
+        pins=settings.pins,
     )
     starved = policy.apply_initial(16, 0.0, 2 * GB)  # 16 idle CPUs, 2.0 GB free
     assert starved is not None
@@ -511,7 +525,7 @@ def test_both_explicit_caps_leave_nothing_to_manage() -> None:
     dyn = DynamicCapacity(
         slots,
         limiter,
-        settings=_settings(fixed_concurrency=True, fixed_max_roles=True),
+        settings=_settings(fixed_concurrency=True, fixed_max_roles=True, pins=PINS_FIXED),
         measure_fn=lambda: (8, 0.0, None),
     )
     assert dyn.policy.has_managed_cap is False
@@ -528,7 +542,7 @@ def test_both_pinned_caps_are_a_total_no_op(caplog: pytest.LogCaptureFixture) ->
     dyn = DynamicCapacity(
         slots,
         limiter,
-        settings=_settings(fixed_concurrency=True, fixed_max_roles=True),
+        settings=_settings(fixed_concurrency=True, fixed_max_roles=True, pins=PINS_FIXED),
         measure_fn=lambda: calls.pop(0),
     )
     assert dyn.policy.has_managed_cap is False
@@ -777,3 +791,241 @@ async def test_run_forever_cancelled_leaves_no_capacity_task_behind(tmp_path: Pa
         await store.aclose()
     assert daemon._capacity.task is None
     assert watchdog.done(), "no leaked task after the daemon is cancelled"
+
+
+# -- REWORK_CAPACITY_PINS=floor: a hand-set number is a MINIMUM ---------------
+#
+# The numbers are named so the arithmetic is readable: a floor is a minimum the
+# planner may go above, and a load based cut may come down to it but not below.
+
+IDLE_CPUS = 8  # a quiet 8 CPU box: plan(8, 0.0, None) -> 8 missions / 8 roles
+FLOOR_MAX_ROLES = 4  # the owner's REWORK_MAX_ROLES=4
+BUSY_CPUS = 2  # a busy 2 CPU box: plan(2, 50.0, None) -> 2 missions / 2 roles
+LOADED_PLAN = MULTICORE_MIN_ROLES  # what the load based cut wants on 2 busy CPUs
+HIGH_LOAD = 50.0  # 25x the CPU count: the cut bites
+
+
+def test_pins_defaults_to_floor(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset means floor: a hand-set number is a minimum, not a freeze."""
+    settings = CapacitySettings.from_env()
+    assert settings.pins == PINS_FLOOR
+    assert settings.pins_fixed is False
+
+
+@pytest.mark.parametrize("raw", ["", "  ", "floor", " FLOOR "])
+def test_empty_or_floor_pins_is_floor(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+    monkeypatch.setenv("REWORK_CAPACITY_PINS", raw)
+    assert CapacitySettings.from_env().pins == PINS_FLOOR
+
+
+@pytest.mark.parametrize("raw", ["FIXED", " fixed "])
+def test_fixed_pins_is_recognised(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+    monkeypatch.setenv("REWORK_CAPACITY_PINS", raw)
+    settings = CapacitySettings.from_env()
+    assert settings.pins == PINS_FIXED
+    assert settings.pins_fixed is True
+
+
+@pytest.mark.parametrize("raw", ["soft", "pinned", "0", "floors"])
+def test_a_typo_in_pins_is_loud(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+    """Unlike REWORK_CAPACITY (typo -> auto), a typo here must never guess: floor
+    and fixed mean opposite things, so the owner has to say which one."""
+    monkeypatch.setenv("REWORK_CAPACITY_PINS", raw)
+    with pytest.raises(ValueError) as excinfo:
+        CapacitySettings.from_env()
+    assert "REWORK_CAPACITY_PINS" in str(excinfo.value)
+    assert "floor" in str(excinfo.value)
+    assert "fixed" in str(excinfo.value)
+
+
+def test_a_floor_above_the_plan_lets_the_plan_win_upward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FLOOR_MAX_ROLES=4 on an idle IDLE_CPUS box gives the planned 8, not 4."""
+    monkeypatch.setenv("REWORK_MAX_ROLES", str(FLOOR_MAX_ROLES))
+    settings = CapacitySettings.from_env()
+    assert settings.pins == PINS_FLOOR
+    policy = CapacityPolicy(
+        concurrency=FLOOR_MAX_ROLES,
+        max_roles=FLOOR_MAX_ROLES,
+        fixed_concurrency=settings.fixed_concurrency,
+        fixed_max_roles=settings.fixed_max_roles,
+        pins=settings.pins,
+    )
+    assert policy.has_managed_cap is True, "a floor never freezes a cap"
+    cap = policy.target(IDLE_CPUS, 0.0, None)
+    assert cap.max_roles == IDLE_CPUS == 8, "the plan goes above the floor of 4"
+    assert cap.concurrency == IDLE_CPUS
+    assert f"{IDLE_CPUS} missions / {IDLE_CPUS} roles" in cap.reason
+
+
+def test_a_floor_above_the_load_based_cut_wins(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FLOOR_MAX_ROLES=4 on a busy 2 CPU box gives 4 (the floor), not 2."""
+    monkeypatch.setenv("REWORK_MAX_ROLES", str(FLOOR_MAX_ROLES))
+    settings = CapacitySettings.from_env()
+    policy = CapacityPolicy(
+        concurrency=FLOOR_MAX_ROLES,
+        max_roles=FLOOR_MAX_ROLES,
+        fixed_concurrency=settings.fixed_concurrency,
+        fixed_max_roles=settings.fixed_max_roles,
+        pins=settings.pins,
+    )
+    cut = plan(BUSY_CPUS, HIGH_LOAD, None)
+    assert cut.max_roles == LOADED_PLAN == 2, "the load based cut alone would plan 2"
+    cap = policy.target(BUSY_CPUS, HIGH_LOAD, None)
+    assert cap.max_roles == FLOOR_MAX_ROLES == 4, "the floor wins over the cut, not 2"
+    assert cap.concurrency == cut.concurrency == 2, "the mission cap still follows the plan"
+    assert f"2 missions / {FLOOR_MAX_ROLES} roles" in cap.reason
+
+
+def test_a_floor_below_the_plan_lets_the_plan_win(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A floor of 2 changes nothing at all on an idle IDLE_CPUS box."""
+    monkeypatch.setenv("REWORK_MAX_ROLES", "2")
+    settings = CapacitySettings.from_env()
+    policy = CapacityPolicy(
+        concurrency=2,
+        max_roles=2,
+        fixed_concurrency=settings.fixed_concurrency,
+        fixed_max_roles=settings.fixed_max_roles,
+        pins=settings.pins,
+    )
+    cap = policy.target(IDLE_CPUS, 0.0, None)
+    assert (cap.concurrency, cap.max_roles) == (IDLE_CPUS, IDLE_CPUS)
+    assert cap.reason == plan(IDLE_CPUS, 0.0, None).reason, "nothing to add: same sentence"
+
+
+def test_a_floor_below_the_cut_still_loses_to_the_cut() -> None:
+    """The floor is a MINIMUM, not a target: on a busy box the cut may go down to
+    it, and only to it. Floor 2 vs a cut that wants 2: 2 either way."""
+    policy = CapacityPolicy(concurrency=2, max_roles=2, fixed_max_roles=True, pins=PINS_FLOOR)
+    cap = policy.target(BUSY_CPUS, HIGH_LOAD, None)
+    assert cap.max_roles == 2
+
+
+def test_a_lone_mission_floor_is_clamped_to_the_managed_role_cap() -> None:
+    """REWORK_CONCURRENCY=8 with no role floor, on a box the planner cuts to 1
+    role: the mission cap never exceeds the role cap, so the mission floor is cut
+    back to it and the log says why (the documented invariant, see the module
+    docstring). Only an explicit REWORK_MAX_ROLES can hold a high mission floor."""
+    policy = CapacityPolicy(concurrency=8, max_roles=8, fixed_concurrency=True, pins=PINS_FLOOR)
+    starved = policy.target(16, 0.0, 2 * GB)  # plenty of CPUs, almost no RAM
+    assert plan(16, 0.0, 2 * GB).concurrency == CONCURRENCY_FLOOR == 1
+    assert starved.max_roles == 1, "the role cap is what protects the box"
+    assert starved.concurrency == 1, "so the 8 mission floor is clamped to it"
+    assert "8 missions clamped to the 1 role cap" in starved.reason
+
+    # with the role floor declared as well, both floors hold: 8 / 8
+    both = CapacityPolicy(
+        concurrency=8,
+        max_roles=8,
+        fixed_concurrency=True,
+        fixed_max_roles=True,
+        pins=PINS_FLOOR,
+    )
+    held = both.target(16, 0.0, 2 * GB)
+    assert (held.concurrency, held.max_roles) == (8, 8), "both floors hold"
+
+
+def test_both_floors_keep_the_caps_managed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The bug this feature fixes: two hand-set numbers used to stop the watchdog."""
+    monkeypatch.setenv("REWORK_CONCURRENCY", "3")
+    monkeypatch.setenv("REWORK_MAX_ROLES", str(FLOOR_MAX_ROLES))
+    settings = CapacitySettings.from_env()
+    assert (settings.fixed_concurrency, settings.fixed_max_roles) == (True, True)
+    slots, limiter = PrioritySlots(3), RoleLimiter(FLOOR_MAX_ROLES)
+    dyn = DynamicCapacity(
+        slots, limiter, settings=settings, measure_fn=lambda: (IDLE_CPUS, 0.0, None)
+    )
+    assert dyn.policy.has_managed_cap is True, "floors never leave nothing to manage"
+    assert dyn.enabled is True, "the watchdog must run"
+
+
+async def test_both_floors_create_the_watchdog_task(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    slots, limiter = PrioritySlots(3), RoleLimiter(FLOOR_MAX_ROLES)
+    dyn = DynamicCapacity(
+        slots,
+        limiter,
+        settings=_settings(fixed_concurrency=True, fixed_max_roles=True),
+        measure_fn=lambda: (IDLE_CPUS, 0.0, None),
+    )
+    with caplog.at_level(logging.INFO, logger="rework.capacity"):
+        task = dyn.start()
+    try:
+        assert task is not None, "two floors still get a watchdog"
+        assert dyn.task is task
+        assert (slots.capacity, limiter.cap) == (IDLE_CPUS, IDLE_CPUS), "the plan won upward"
+    finally:
+        await dyn.stop()
+
+
+async def test_the_startup_line_states_mode_floors_and_plan(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    slots, limiter = PrioritySlots(3), RoleLimiter(FLOOR_MAX_ROLES)
+    dyn = DynamicCapacity(
+        slots,
+        limiter,
+        settings=_settings(fixed_concurrency=True, fixed_max_roles=True),
+        measure_fn=lambda: (IDLE_CPUS, 0.0, None),
+    )
+    with caplog.at_level(logging.INFO, logger="rework.capacity"):
+        task = dyn.start()
+    try:
+        lines = [str(r.message) for r in caplog.records if r.name == "rework.capacity"]
+        assert len(lines) == 1, f"ONE startup line, not a second competing one: {lines}"
+        line = lines[0]
+    finally:
+        await dyn.stop()
+    assert task is not None
+    assert line.startswith("capacity plan:"), line
+    assert f"{IDLE_CPUS} CPUs, load 0.0" in line, "the measurement it planned from"
+    assert f"{IDLE_CPUS} missions / {IDLE_CPUS} roles" in line, "the planned numbers"
+    assert "missions MANAGED, floor 3 (from REWORK_CONCURRENCY, pins=floor)" in line
+    assert f"roles MANAGED, floor {FLOOR_MAX_ROLES} (from REWORK_MAX_ROLES, pins=floor)" in line
+    assert "AUTO IS ON: REWORK_CAPACITY_PINS=floor" in line
+
+
+def test_the_collision_clamps_missions_to_the_role_floor_in_one_clause() -> None:
+    """REWORK_CONCURRENCY=8 with REWORK_MAX_ROLES=4: the ROLE floor wins the role
+    number, the mission count is clamped to it, and the reason says so."""
+    policy = CapacityPolicy(
+        concurrency=8,
+        max_roles=FLOOR_MAX_ROLES,
+        fixed_concurrency=True,
+        fixed_max_roles=True,
+        pins=PINS_FLOOR,
+    )
+    # a busy box, so the plan's role number (2) is below both floors
+    cap = policy.target(BUSY_CPUS, HIGH_LOAD, None)
+    assert cap.max_roles == FLOOR_MAX_ROLES == 4, "the role floor wins the role number"
+    assert cap.concurrency == FLOOR_MAX_ROLES, "the mission floor is clamped to it"
+    assert "8 missions clamped to the 4 role cap, raise REWORK_MAX_ROLES" in cap.reason
+    assert cap.reason.count("clamped") == 1, "one clause, not a paragraph"
+
+
+def test_the_fixed_mode_startup_line_says_auto_is_off(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """pins=fixed with both caps set keeps main's behaviour: no watchdog, no line."""
+    slots, limiter = PrioritySlots(8), RoleLimiter(2)
+    dyn = DynamicCapacity(
+        slots,
+        limiter,
+        settings=_settings(fixed_concurrency=True, fixed_max_roles=True, pins=PINS_FIXED),
+        measure_fn=lambda: (16, 0.0, None),
+    )
+    with caplog.at_level(logging.INFO, logger="rework.capacity"):
+        assert dyn.start() is None
+    assert [r for r in caplog.records if r.name == "rework.capacity"] == []
+
+
+def test_one_pinned_cap_under_fixed_keeps_the_other_managed() -> None:
+    """pins=fixed with only one env var set is exactly main's behaviour."""
+    policy = CapacityPolicy(concurrency=3, max_roles=2, fixed_concurrency=True, pins=PINS_FIXED)
+    assert policy.has_managed_cap is True
+    assert policy.describe("missions") == "missions PINNED at 3 by REWORK_CONCURRENCY (pins=fixed)"
+    assert policy.describe("roles") == "roles MANAGED, planner decides (REWORK_MAX_ROLES unset)"
+    cap = policy.target(IDLE_CPUS, 0.0, None)
+    assert (cap.concurrency, cap.max_roles) == (3, IDLE_CPUS)

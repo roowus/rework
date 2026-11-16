@@ -653,14 +653,20 @@ Those numbers are what the code actually prints for that box: 8 CPUs at load
 The same box with 5.1 GB free plans 3 and 3 instead, because the RAM cut takes
 the fourth role away.
 
-Precedence: an EXPLICIT `REWORK_CONCURRENCY` or `REWORK_MAX_ROLES` (a non-empty
-value in the env) fixes that one cap and `auto` manages only the other one;
-with both set there is nothing to watch and no watchdog runs.
-`REWORK_CAPACITY=fixed` restores the old behaviour exactly (the caps are
-resolved once at startup, no measurement, no watchdog, no log line), which is
-what you want when a deployment must not move under load. A typo in the value
-means `auto`: the guard never turns itself off by accident. Check what it did
-with `rework logs daemon -g 'capacity changed'`.
+A hand-set number is a FLOOR by default (`REWORK_CAPACITY_PINS=floor`), not a
+freeze: `REWORK_MAX_ROLES=4` is a minimum the planner may go above, so on a
+quiet 8 CPU box you get 8 roles and on a busy 2 CPU box you still get 4 (the
+floor), not 2. Both caps stay managed that way even with both env vars set, so
+the watchdog keeps running. The startup line says which it is, for example
+`capacity plan: 8 CPUs, load 0.1: 8 missions / 8 roles; missions MANAGED, floor
+2 (from REWORK_CONCURRENCY, pins=floor); roles MANAGED, floor 4 (from
+REWORK_MAX_ROLES, pins=floor); AUTO IS ON`. `REWORK_CAPACITY_PINS=fixed` is the
+old meaning: an explicit number IS the cap, and with both set there is nothing
+left to watch, so no watchdog runs and nothing is measured (main's behaviour,
+exactly). `REWORK_CAPACITY=fixed` is still the blunt global off switch either
+way. An unrecognised `REWORK_CAPACITY_PINS` is a startup error naming the two
+allowed values; a typo in `REWORK_CAPACITY` means `auto`, as before. Check what
+it did with `rework logs daemon -g 'capacity'`.
 
 #### The 2026-11-13 incident
 
