@@ -158,14 +158,13 @@ therefore runs, in the coder's own worktree and just before the push:
    abort runs, so a crash that left both a stopped merge and staged edits loses
    nothing. That ref is a single mutable ref: the next delivery that discards
    anything overwrites it, so only the most recently discarded stash is kept.
-   The INFO event of any outcome that discarded work names it, and a successful
-   merge is the one outcome that cannot: a stash is only pinned when work is
-   staged, and staged work makes `git status --porcelain` non-empty, which
-   trips the dirty-worktree skip before any merge runs. The PR body names it
-   only for a refused merge or a real conflict, because those are the only two
-   outcomes that get a **Merge with main** section at all. An abort that
-   discards nothing (the usual case, since a stopped merge leaves unmerged
-   entries that `git stash create` refuses) pins no ref and says nothing;
+   The INFO event of any outcome that discarded work names the ref, including a
+   merge that ends up succeeding after discarding staged work from a leftover
+   merge. The PR body names it only for a refused merge or a real conflict,
+   because those are the only two outcomes that get a **Merge with main**
+   section at all. An abort that discards nothing (the usual case, since a
+   stopped merge leaves unmerged entries that `git stash create` refuses) pins
+   no ref and says nothing;
 4. check `git status --porcelain` is empty, so a merge cannot clobber
    uncommitted work (and `git add -A` cannot fold it into the merge commit);
 5. `git fetch origin main`, then `git merge-base --is-ancestor origin/main HEAD`:
@@ -186,12 +185,12 @@ something. The outcomes that carry a problem publish an INFO event, and the two
 that did not merge also give the body its **Merge with main** section: a failed
 fetch (body untouched), a refused merge and a real conflict. A **successful**
 merge publishes its own INFO event naming the merge commit (body untouched, a
-clean merge needs no note). One exception to the silence: a leftover merge
-(step 3) can coexist with a wrong branch or a dirty worktree, and the abort then
-discards staged work, which that skip cannot drop silently. Such a skip DOES
-publish an INFO event naming `refs/rework/pre-merge-abort`, so the discarded
-stash stays findable; a plain skip still adds no body note, and the merge
-paragraph is only ever appended for a refused merge or a real conflict.
+clean merge needs no note). One exception to the silence: aborting a leftover
+merge (step 3) can discard staged work, and no outcome of this step may drop
+that stash silently. So a skip that discarded work DOES publish an INFO event
+naming `refs/rework/pre-merge-abort`, and so does a merge that still succeeds
+after the abort; a plain skip still adds no body note, and the merge paragraph
+is only ever appended for a refused merge or a real conflict.
 
 A real conflict is never guessed at. The conflicting paths are captured first
 (`git ls-files -u` plus `git diff --name-only --diff-filter=U`, so delete/modify

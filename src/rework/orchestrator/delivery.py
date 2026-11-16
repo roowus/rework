@@ -266,12 +266,16 @@ def _merge_event(result: MergeResult, branch: str) -> dict[str, Any] | None:
             payload["pre_merge_abort_sha"] = result.discarded_work
         return payload
     if result.merged:
-        return {
+        payload = {
             "note": f"merged {PR_BASE} into {branch} before opening the PR "
             f"(merge commit {result.sha or 'unknown'})",
             "merge_sha": result.sha,
             "base": PR_BASE,
         }
+        if result.discarded_work:
+            payload["pre_merge_abort_ref"] = PRE_MERGE_ABORT_REF
+            payload["pre_merge_abort_sha"] = result.discarded_work
+        return payload
     if result.skipped_reason == "fetch-failed":
         # the remote could not be read: the owner may want to know why
         return {

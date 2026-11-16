@@ -1179,6 +1179,62 @@ async def test_discarded_staged_work_is_pinned_on_the_pre_merge_abort_ref(
         await store.aclose()
 
 
+async def test_a_merge_that_discards_staged_work_still_names_the_pinned_stash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ref is a single mutable ref, so a discard that is not named is lost.
+
+    A leftover merge whose conflicts a human already resolved and STAGED leaves a
+    clean tree once aborted, so the dirty check passes and the merge runs. Made
+    clean against main by main moving back off the conflicting file, the outcome
+    is `merged=True` *with* `discarded_work`, and that event must name the ref.
+    """
+    bare, work, other = _movable_repo(tmp_path)
+    (work / "a.txt").write_text("line one\ncoder's edit\n")
+    _commit(work, "coder edit")
+    _advance_main(other, {"a.txt": "line one\nanother mission's edit\n"})
+    _git("fetch", "origin", "main", cwd=work)
+    _stopped_merge(work)
+    resolved = "line one\nboth edits, resolved by hand\n"
+    (work / "a.txt").write_text(resolved)
+    _git("add", "a.txt", cwd=work)
+    assert _git("status", "--porcelain", cwd=work).stdout.strip() == "M  a.txt"
+    # main moves back off a.txt, so the same merge is now clean
+    _advance_main(other, {"a.txt": "line one\n", "other.txt": "another mission's work\n"})
+    fake_gh, body_file = _fake_gh(tmp_path)
+    monkeypatch.setenv("REWORK_GH_BIN", str(fake_gh))
+    body = "## What changed\n\nsomething\n"
+
+    store = await open_sqlite(str(tmp_path / "mergeddiscard.sqlite3"))
+    try:
+        mission = await _done_mission(store, work, "mmergeddisc01")
+        url = await deliver_pr(
+            store,
+            InProcessEventBus(store),
+            mission.id,
+            branch=BRANCH,
+            worktree=str(work),
+            title="rework: Deliver",
+            body=body,
+        )
+        assert url == "https://github.com/roowus/repo/pull/1"
+        merge_sha = _rev(work, "HEAD")
+        assert _git("log", "-1", "--format=%s", cwd=work).stdout.strip().startswith("Merge")
+        events = _merge_events(await _notes(store, mission.id))
+        assert len(events) == 1, events
+        assert events[0]["merge_sha"] == merge_sha, events
+        assert merge_sha in events[0]["note"], events
+        assert events[0]["pre_merge_abort_ref"] == "refs/rework/pre-merge-abort", events
+        stash = events[0]["pre_merge_abort_sha"]
+        assert stash == _rev(work, "refs/rework/pre-merge-abort")
+        assert _git("show", f"{stash}:a.txt", cwd=work).stdout.rstrip("\n") == resolved.rstrip("\n")
+        # the push carried the merge, and a clean merge adds no body note
+        assert _is_ancestor(bare, merge_sha, _rev(bare, f"refs/heads/{BRANCH}"))
+        assert body_file.read_text() == body, "a clean merge adds no body note"
+    finally:
+        await store.aclose()
+
+
 async def test_a_dirty_skip_that_discarded_staged_work_is_reported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
