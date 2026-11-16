@@ -32,7 +32,7 @@ from rework.tui.app import ReworkApp
 from rework.tui.spinner import FRAMES, IDLE_GLYPH
 from rework.tui.theme import run_mark
 from rework.tui.views import dashboard as dashboard_view
-from rework.tui.widgets.base import Stat
+from rework.tui.widgets.base import RowList, Stat
 from rework.tui.widgets.cards import MissionCard
 from rework.tui.widgets.trajectory import Trajectory
 
@@ -156,11 +156,28 @@ async def _running(env: Path) -> AsyncIterator[tuple[ReworkApp, Any, FlakyFactor
         yield app, pilot, factory
 
 
+def _status_bar(app: ReworkApp) -> str:
+    """The text the menu bar paints at the right edge, as the owner reads it."""
+    return str(app.query_one("#menubar-status").render())
+
+
+def _painted_missions(app: ReworkApp) -> list[str]:
+    """The mission keys the dashboard list actually paints (headers excluded)."""
+    return _dash(app).query_one("#mission-list", RowList).selectable
+
+
 async def test_offline_marker_shown_and_last_good_data_kept(env: Path, ids: dict[str, str]) -> None:
     async with _running(env) as (app, pilot, factory):
         before = [m.id for m in app.hub.snapshot.missions]
         assert before, "the seed painted rows before the link dropped"
+        painted = _painted_missions(app)
+        assert painted, "the dashboard painted mission rows while online"
+        assert "offline" not in _status_bar(app)
         await _go_offline(app, pilot, factory)
+        assert "offline" in _status_bar(app), "the menu bar says offline"
+        assert "OperationalError" not in _status_bar(app), "the error is not in the text"
+        assert "OperationalError" in str(app.query_one("#menubar-status").tooltip)
+        assert _painted_missions(app) == painted, "the dashboard keeps its rows"
         snap = app.hub.snapshot
         assert snap.online is False
         assert snap.error, "the marker is a hint string, not a bare word"
@@ -168,6 +185,9 @@ async def test_offline_marker_shown_and_last_good_data_kept(env: Path, ids: dict
         assert snap.loaded, "the last good snapshot is still served"
         assert [m.id for m in snap.missions] == before, "rows are kept, not blanked"
         assert snap.mission(ids["running"]) is not None
+        await _recover(app, pilot, factory)
+        assert "offline" not in _status_bar(app), "the marker is gone after recovery"
+        assert _painted_missions(app) == painted
 
 
 async def test_recovers_without_restart(env: Path, ids: dict[str, str]) -> None:
@@ -313,15 +333,95 @@ async def test_long_outage_recovers_without_duplicate_rows(env: Path, ids: dict[
     async with _running(env) as (app, pilot, factory):
         text = "written during a long outage"
         work, log, painted = await _chat_through_outage(env, app, pilot, factory, ids, text)
-        # an outage longer than the backoff cap: the deadline is now far out
-        app.hub._next_try = time.monotonic() + 3600.0
+        # An outage that outlasts the ladder. The data layer normally hides a
+        # dead link behind its last good rows, so the hub's own backoff only
+        # engages when a query raises through (no last good answer); make
+        # `missions` do exactly that, then walk the REAL ladder to its cap.
+        hub = app.hub
+        data = hub.data
+        polls: list[int] = []
+
+        async def dead(*args: Any, **kwargs: Any) -> Any:
+            polls.append(1)
+            raise psycopg.OperationalError("server closed the connection")
+
+        data.missions = dead  # type: ignore[method-assign]
+        waits: list[float] = []
+        for _ in range(6):
+            hub._next_try = 0.0  # let this poll through; the ladder re-arms it
+            started = time.monotonic()
+            await hub.refresh()
+            waits.append(hub._next_try - started)
+        assert hub._failures >= 5 and hub.snapshot.online is False
+        assert waits[0] < waits[2] < waits[4], f"the wait grows per failure: {waits}"
+        assert 29.0 <= waits[-1] <= 30.5, f"capped at 30 s, got {waits[-1]:.1f}"
+        assert max(waits) <= 30.5, "never above the cap"
+        # the deadline is in the future: a refresh before it makes no query
+        before = len(polls)
         calls = factory.calls
-        await app.hub.refresh()
+        await hub.refresh()
+        assert len(polls) == before and factory.calls == calls, "no poll before the deadline"
         await pilot.pause()
-        assert factory.calls == calls, "nothing polls before the deadline expires"
         assert len(log.children) == painted
+        del data.missions  # the link is back: the real method answers again
         await _recover(app, pilot, factory)
         await _assert_chat_intact(app, pilot, work, log, painted, text, ids)
+
+
+async def test_chat_incremental_poll_paints_each_row_once(env: Path, ids: dict[str, str]) -> None:
+    """No outage, no reopen: the store epoch never changes, so every poll takes
+    the incremental path (cursor and rendered mark), not the full reload."""
+    async with _running(env) as (app, pilot, _factory):
+        work = _work(app)
+        work.open_chat(ids["chat"])
+        await _tick(app, pilot)
+        log = work.query_one("#chat-log", Trajectory)
+        painted = len(log.children)
+        assert painted > 0, "the transcript loaded"
+        data = app.hub.data
+        epoch = data.store_epoch
+        assert work._store_epoch == epoch
+
+        async def poll() -> None:
+            work.on_tick(app.hub.snapshot)  # starts the chat poll worker
+            await app.workers.wait_for_complete()
+            await pilot.pause()
+
+        async def head() -> int:
+            return await data.chat_messages_max_id(ids["chat"])
+
+        # another instance writes a row: the view must paint it, once
+        text = "written by another instance"
+        other = await _fresh_store(env)
+        try:
+            await other.append_chat_message(
+                ChatMessage(chat_id=ids["chat"], role="user", body={"content": text}, display=text)
+            )
+        finally:
+            await other.aclose()
+        await poll()
+        assert data.store_epoch == epoch, "the store was not re-opened"
+        assert len(log.children) == painted + 1, "exactly one new row"
+        assert sum(text in t for t in _texts(log)) == 1, "its text appears once"
+        assert work._chat_cursor == work._rendered_max_id == await head()
+
+        await poll()  # nothing new: the same row must not be painted again
+        await poll()
+        assert len(log.children) == painted + 1
+        assert sum(text in t for t in _texts(log)) == 1
+
+        # a row this instance wrote through its own store is already on screen
+        # (rendered live), so the poll advances past it without painting it
+        own = "written through the open store"
+        store = await data.store()
+        await store.append_chat_message(
+            ChatMessage(chat_id=ids["chat"], role="user", body={"content": own}, display=own)
+        )
+        await poll()
+        assert data.store_epoch == epoch
+        assert len(log.children) == painted + 1, "an own row is not painted a second time"
+        assert sum(own in t for t in _texts(log)) == 0
+        assert work._chat_cursor == work._rendered_max_id == await head()
 
 
 async def _touch_mission(env: Path, mission_id: str) -> None:
@@ -414,3 +514,40 @@ async def test_work_card_idle_while_offline(env: Path, ids: dict[str, str]) -> N
         await _recover(app, pilot, factory)
         paint()
         assert "working" in head() and FRAMES[3] in head()
+
+
+async def test_work_card_repaints_on_link_flip_without_tick(env: Path, ids: dict[str, str]) -> None:
+    """An unfocused work view gets `on_tick` but never `tick` (no frame clock),
+    so the card must repaint on the link flip from `on_tick` alone."""
+    async with _running(env) as (app, pilot, factory):
+        mid = ids["running"]
+        await _touch_mission(env, mid)
+        await _tick(app, pilot)
+        work = _work(app)
+        # the app's frame clock only ticks the CURRENT view; this one is made
+        # unfocused by silencing its tick, so only `on_tick` can repaint the card
+        work.tick = lambda frame, now: None  # type: ignore[method-assign]
+        card = MissionCard(mid)
+        await work.mount(card)
+        card.update_from(app.hub.snapshot.mission(mid), [])
+        await pilot.pause()
+
+        def head() -> str:
+            return str(card.query_one(".mc-head", Static).render())
+
+        card.tick(FRAMES[3], app.hub.snapshot.last_event.get(mid))  # animating
+        work.on_tick(app.hub.snapshot)
+        assert "working" in head() and FRAMES[3] in head()
+
+        await _go_offline(app, pilot, factory)
+        work.on_tick(app.hub.snapshot)  # only on_tick: no work.tick anywhere
+        assert card.online is False
+        assert "working" not in head() and FRAMES[3] not in head()
+        assert IDLE_GLYPH in head()
+
+        await _recover(app, pilot, factory)
+        work.on_tick(app.hub.snapshot)
+        assert card.online is True
+        assert "working" in head()
+        card.tick(FRAMES[3], app.hub.snapshot.last_event.get(mid))
+        assert FRAMES[3] in head(), "animated again after recovery"
