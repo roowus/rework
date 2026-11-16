@@ -568,6 +568,15 @@ class SqliteStore:
         await self._db.commit()
         return await self.get_gate(gate_id)
 
+    async def set_gate_question(self, gate_id: str, question: str) -> Gate | None:
+        """Re-word an OPEN gate in place; a decided row is left alone."""
+        await self._db.execute(
+            "UPDATE gates SET question = ? WHERE id = ? AND status = ?",
+            (question, gate_id, GateStatus.OPEN.value),
+        )
+        await self._db.commit()
+        return await self.get_gate(gate_id)
+
     async def list_open_gates(self, mission_id: str | None = None) -> list[Gate]:
         if mission_id is not None:
             rows = await self._fetch_all(

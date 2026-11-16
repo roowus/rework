@@ -714,6 +714,16 @@ class PostgresStore:
         return await self.get_gate(gate_id)
 
     @_serialized
+    async def set_gate_question(self, gate_id: str, question: str) -> Gate | None:
+        """Re-word an OPEN gate in place; a decided row is left alone."""
+        await self._conn.execute(
+            "UPDATE gates SET question = %s WHERE id = %s AND status = %s",
+            (question, gate_id, GateStatus.OPEN.value),
+        )
+        await self._conn.commit()
+        return await self.get_gate(gate_id)
+
+    @_serialized
     async def list_open_gates(self, mission_id: str | None = None) -> list[Gate]:
         if mission_id is not None:
             rows = await self._fetch_all(

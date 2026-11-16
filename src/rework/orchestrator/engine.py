@@ -774,12 +774,11 @@ class MissionRunner:
         ship_decision: bool | None = None
         if "ship" in gates_spec:
             gate = await self._latest_gate_of_kind(GateKind.SHIP)
+            verdict, round_text = await self._audit_stamp(mission.id, last_audit_artifact)
+            question = f"Ship the mission result? audit verdict: {verdict}{round_text}"
             if gate is None:
-                verdict = mechanical_verdict(last_audit_artifact)
                 gate = await self._gates.request(
-                    mission.id,
-                    kind=GateKind.SHIP,
-                    question=f"Ship the mission result? audit verdict: {verdict}",
+                    mission.id, kind=GateKind.SHIP, question=question
                 )
                 await self._bus.publish(
                     EventRecord(
@@ -788,6 +787,8 @@ class MissionRunner:
                         payload={"note": f"ship gate {gate.id} open (verdict: {verdict})"},
                     )
                 )
+            else:
+                gate = await self._refresh_gate_question(gate, question)
             if gate.status == GateStatus.OPEN:
                 await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
             ship_decision = await self._gate_decision(mission.id, gate.id)
@@ -832,20 +833,22 @@ class MissionRunner:
 
         if want_gate:
             gate = await self._latest_gate_of_kind(GateKind.OPEN_PR)
+            verdict, round_text = await self._audit_stamp(mission.id, last_audit_artifact)
+            question = (
+                f"Open a pull request for this change? audit verdict: {verdict}{round_text}"
+            )
+            if reason:
+                # the strict gate (issue #36): the category leads, then why
+                label = gate_category or "unspecified"
+                question += f". Gate category: {label} — {reason}"
+            elif setting == "always":
+                # forced by the project setting, no category to show: say so
+                # instead of printing an empty one
+                question += (
+                    ". Forced by project setting pr_gate=always; "
+                    "the orchestrator named no category"
+                )
             if gate is None:
-                verdict = mechanical_verdict(last_audit_artifact)
-                question = f"Open a pull request for this change? audit verdict: {verdict}"
-                if reason:
-                    # the strict gate (issue #36): the category leads, then why
-                    label = gate_category or "unspecified"
-                    question += f". Gate category: {label} — {reason}"
-                elif setting == "always":
-                    # forced by the project setting, no category to show: say so
-                    # instead of printing an empty one
-                    question += (
-                        ". Forced by project setting pr_gate=always; "
-                        "the orchestrator named no category"
-                    )
                 gate = await self._gates.request(
                     mission.id, kind=GateKind.OPEN_PR, question=question
                 )
@@ -856,6 +859,8 @@ class MissionRunner:
                         payload={"note": f"open_pr gate {gate.id} open (verdict: {verdict})"},
                     )
                 )
+            else:
+                gate = await self._refresh_gate_question(gate, question)
             if gate.status == GateStatus.OPEN:
                 await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
             pr_approved = await self._gate_decision(mission.id, gate.id)
@@ -868,6 +873,48 @@ class MissionRunner:
             pr_url = await self._create_pr(mission, results)
 
         return ship_decision, pr_url, None
+
+    async def _audit_stamp(
+        self, mission_id: str, last_audit_artifact: dict[str, Any] | None
+    ) -> tuple[str, str]:
+        """The audit the mission actually FINISHED on, as (verdict, round text).
+
+        One store read: the COMPLETED auditor runs that carry an artifact, in
+        list order (created_at ascending, so the last one is the newest round).
+        The round is that run's ordinal and the total is how many there are.
+
+        This is deliberately authoritative rather than the caller's
+        `last_audit_artifact`: that value can be one round behind. The
+        mechanical runner sets it from the last audit step even when the audit
+        FAILED, and the orchestrator path hands over the newest COMPLETED
+        auditor run it saw when it finished, which on a revise loop can be an
+        earlier round than the one the mission really ended on. With no
+        completed auditor run at all there is nothing to count, so the argument
+        is used and the round is left out instead of the gate failing."""
+        audits = [
+            r
+            for r in await self._store.list_runs(mission_id)
+            if r.role == "auditor" and r.status == RunStatus.COMPLETED and r.artifact
+        ]
+        if not audits:
+            return mechanical_verdict(last_audit_artifact), ""
+        return mechanical_verdict(audits[-1].artifact), f" (round {len(audits)} of {len(audits)})"
+
+    async def _refresh_gate_question(self, gate: Any, question: str) -> Any:
+        """Keep a REUSED gate's question in step with the audit it asks about.
+
+        A gate row is reused across audit rounds (a restart must not open a
+        duplicate gate for a decision already given), so its stored text would
+        otherwise stay frozen at the round that first opened it: found live, an
+        open_pr gate read "audit verdict: request changes" while the final
+        round had no findings at all. Identical text means nothing at all
+        happens (no write, no event); an OPEN gate is re-worded and the refresh
+        is published as INFO; a DECIDED gate is never re-worded, because its
+        text is the record of what the owner saw when answering."""
+        if gate.status != GateStatus.OPEN or gate.question == question:
+            return gate
+        refreshed = await self._gates.reword(gate.id, question)
+        return refreshed if refreshed is not None else gate
 
     async def _deliver_branch(self, mission: Mission, results: dict[str, Run]) -> None:
         """Honor the project's `results` setting on ship (ADR 0005): for a
