@@ -1709,7 +1709,6 @@ class DashboardView(View):
         colour = WARN if error else FAINT
         markup = f"[{colour}]{esc(text)}[/]"
         if self._chat_state is not None and self._chat_state.parent is not None:
-            self._chat_state._head = markup
             self._chat_state.update(markup)
             return
         self._chat_state = Step(markup, kind="note")

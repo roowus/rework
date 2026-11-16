@@ -710,8 +710,12 @@ class ReworkApp(App[None]):
             saved_is_transcript = bool(
                 state.chat_id and str(state.chat_id).startswith(ORCHESTRATOR_CHAT_PREFIX)
             )
+            # an empty list only means "gone" when it was read successfully: a
+            # transient read failure (snap.chats_failed) must not drop the chat
             if state.chat_id and (
-                saved_is_transcript or any(c.id == state.chat_id for c in snap.chats)
+                saved_is_transcript
+                or snap.chats_failed
+                or any(c.id == state.chat_id for c in snap.chats)
             ):
                 if saved_is_transcript:
                     work.open_transcript(str(state.chat_id)[len(ORCHESTRATOR_CHAT_PREFIX) :])

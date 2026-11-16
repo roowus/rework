@@ -64,6 +64,9 @@ nothing runs until you press Launch.[/]
 
 [{FAINT}]enter send · shift+enter newline · ctrl+n new chat · f1 keys[/]"""
 
+CHATS_EMPTY = f"[{FAINT}]No chats yet.[/]"
+# the chat list could not be read and nothing is cached: say so, never a bare blank
+CHATS_RETRYING = f"[{FAINT}]could not read chats (retrying)[/]"
 EFFORTS = [("", "default"), ("low", "low"), ("medium", "medium"), ("high", "high")]
 
 
@@ -147,7 +150,7 @@ class WorkView(View):
                 with Horizontal(classes="side-actions"):
                     yield Btn("+ New chat", "new", variant="primary", tooltip="ctrl+n")
                 yield Label("Chats")
-                yield RowList(id="chat-list", empty=f"[{FAINT}]No chats yet.[/]")
+                yield RowList(id="chat-list", empty=CHATS_EMPTY)
             with Vertical(classes="main"):
                 with Horizontal(classes="pane-head", id="work-head"):
                     yield Static("", id="work-title", classes="pane-head-title")
@@ -336,6 +339,9 @@ class WorkView(View):
                 )
             )
         lst = self.query_one("#chat-list", RowList)
+        # the placeholder is a Static inside the list, never a Row: it cannot be
+        # clicked or selected, so the note can not pass for a chat
+        lst.set_empty(CHATS_RETRYING if self.snap.chats_failed else CHATS_EMPTY)
         lst.set_rows(rows)
         lst.select(self._loading_chat or (self.convo.id if self.convo else None))
         try:

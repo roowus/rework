@@ -190,11 +190,16 @@ async def test_a_newer_message_sorts_above_an_older_one_whatever_updated_at_says
 ) -> None:
     """Order and age come from the newest MESSAGE. Here `updated_at` says the
     opposite (pinned directly, as a rename or attach would move it), and the
-    row with the newest message must still be first and aged by that message."""
-    stale = await _chat(env, "stale by message", [("user", "old", NOW - 86400 * 20)])
-    fresh = await _chat(env, "fresh by message", [("user", "new", NOW - 60)])
-    _set_updated_at(env, stale, NOW)  # looks newest by updated_at
-    _set_updated_at(env, fresh, NOW - 86400 * 30)  # looks oldest by updated_at
+    row with the newest message must still be first and aged by that message.
+
+    The clock is read here, not from the module-level `now`: the age text is
+    asserted, and in a long full-suite run the import-time value is minutes old
+    by the time this test runs ("18m ago" instead of "1m ago")."""
+    now = time.time()
+    stale = await _chat(env, "stale by message", [("user", "old", now - 86400 * 20)])
+    fresh = await _chat(env, "fresh by message", [("user", "new", now - 60)])
+    _set_updated_at(env, stale, now)  # looks newest by updated_at
+    _set_updated_at(env, fresh, now - 86400 * 30)  # looks oldest by updated_at
     app = _app()
     async with app.run_test(size=SIZE) as pilot:
         await _boot(pilot)
@@ -267,6 +272,99 @@ async def test_a_late_load_for_chat_a_never_paints_over_the_open_chat_b(env: Pat
         assert "BETA-question" in _log(app) and "ALPHA-question" not in _log(app), _log(app)
         await work._read_chat(a, "missing", work._load_seq)  # control: current paints
         assert work.convo.id == a and "ALPHA-question" in _log(app)
+
+
+# -- a failing conversation probe ------------------------------------------------
+
+
+def _break_probe(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Make the store-side conversation probe raise (not a connection error, so
+    it reaches the Hub). Returns a call counter."""
+    from rework.tui.data import TuiData
+
+    calls: list[int] = []
+
+    async def boom(self: Any, chat_ids: list[str]) -> set[str]:
+        calls.append(1)
+        raise RuntimeError("probe down")
+
+    monkeypatch.setattr(TuiData, "chat_ids_with_conversation", boom)
+    return calls
+
+
+async def test_a_failing_probe_keeps_the_real_chats_listed(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rule is preserved (shells, note-only and empty chats stay out); only
+    the failure mode changed. A probe that starts failing AFTER the list was
+    read must not blank the panel: the owner would think the conversations were
+    deleted. The last vouched list stays, with the shell and empty chat still
+    absent. Asserted through the real app: poll, break the probe, poll again."""
+    await _chat(env, "real one", [("user", "hello", NOW - 20)])
+    await _chat(env, "real two", [("assistant", "hi", NOW - 10)])
+    await _chat(env, "EMPTY chat", [])
+    await _chat(env, "NOTES only", [("note", "launched m-x", NOW - 5)])
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _boot(pilot)
+        assert len(_rows(app)) == 2, _rows(app)
+        calls = _break_probe(monkeypatch)
+        await _until(pilot, lambda: bool(calls))
+        await pilot.pause(0.8)  # let the failing poll land and repaint
+        assert calls, "the broken probe must have been hit"
+        rows = _rows(app)
+        assert len(rows) == 2, rows
+        assert any("real one" in r for r in rows) and any("real two" in r for r in rows), rows
+        assert not any("EMPTY" in r or "NOTES" in r for r in rows), rows
+        assert app.hub.snapshot.chats_failed is False
+
+
+async def test_a_failing_probe_with_nothing_cached_says_so_instead_of_a_blank(
+    env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same rule, nothing to keep (process just started, store down): the list
+    stays EMPTY (never fails open to list every chat, so the shell and the empty
+    chat are not shown) but the panel says "could not read chats (retrying)".
+    The note is the list's placeholder Static, not a Row, so there is nothing to
+    click: no row exists, and the real chats are not listed either."""
+    await _chat(env, "real one", [("user", "hello", NOW - 20)])
+    await _chat(env, "EMPTY chat", [])
+    _break_probe(monkeypatch)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _boot(pilot)
+        assert _rows(app) == [], _rows(app)
+        lst = app.query_one("#chat-list", RowList)
+        notes = [w for w in lst.query(".rowlist-empty") if w.display]
+        assert len(notes) == 1, notes
+        assert "could not read chats (retrying)" in str(notes[0].render())
+        assert app.hub.snapshot.chats_failed is True
+        assert not list(lst.query(Row))
+
+
+async def test_a_saved_open_chat_survives_a_transient_empty_list(env: Path) -> None:
+    """`_apply_restore` drops a saved chat only when the list was READ and the
+    chat is not in it. An empty list that came from a failed read
+    (`chats_failed`) says nothing about the chat, so it is still opened.
+    Asserted at the `_apply_restore` level with a hand-built snapshot (the
+    restore runs once, on the first snapshot, so a click cannot reach it); the
+    control, a successfully read empty list, does NOT open it."""
+    from rework.tui.hub import Snapshot
+    from rework.tui.reload import ReloadState
+
+    chat_id = await _chat(env, "the saved one", [("user", "remember me", NOW - 20)])
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _boot(pilot)
+        work = app.view("work")
+        opened: list[str] = []
+        work.open_chat = lambda cid: opened.append(cid)  # type: ignore[method-assign]
+        app._restore = ReloadState(chat_id=chat_id)
+        app._apply_restore(Snapshot(chats=[], loaded=True, chats_failed=False))
+        assert opened == [], "a successfully read list without the chat drops it"
+        app._restore = ReloadState(chat_id=chat_id)
+        app._apply_restore(Snapshot(chats=[], loaded=True, chats_failed=True))
+        assert opened == [chat_id], opened
 
 
 # -- the Dashboard's Chat tab ---------------------------------------------------

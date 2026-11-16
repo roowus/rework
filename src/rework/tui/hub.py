@@ -54,6 +54,10 @@ class Snapshot:
     online: bool = True
     error: str = ""
     loaded: bool = False  # False until the first successful refresh
+    # True when the chat list could not be read this poll and there is no last
+    # good one to show: the Work panel says so instead of rendering a bare
+    # empty list, and a saved open chat is not dropped for an empty list
+    chats_failed: bool = False
     at: float = 0.0
     # newest event epoch per run. Events are the only live signal a role gives,
     # so this is what tells a working run from a wedged one (spinner.STALL_SECONDS).
@@ -101,6 +105,8 @@ class Hub:
         # 'offline:' and broadcast a stale snapshot into a half-torn-down DOM
         # (a spurious error pair in tui.log on every graceful quit).
         self._closing = False
+        # set by `_chats` when the list could not be read (see Snapshot.chats_failed)
+        self._chats_failed = False
 
     def subscribe(self, fn: Callable[[Snapshot], None]) -> None:
         self._listeners.append(fn)
@@ -129,6 +135,7 @@ class Hub:
             # a new message must reorder the list at once: id + newest message
             # time per chat, so it is in the key even if Chat equality changes
             tuple((str(c.id), getattr(c, "last_message_at", None)) for c in snap.chats),
+            snap.chats_failed,
             snap.spend_today,
             snap.online,
             snap.error,
@@ -161,6 +168,7 @@ class Hub:
                 snap.gates = await self.data.open_gates()
                 snap.projects = await self.data.projects()
                 snap.chats = await self._chats()
+                snap.chats_failed = self._chats_failed
                 snap.spend_today = await self._spend_today()
                 snap.budget_raises = await self._budget_raises()
                 await self._event_stamps(snap)
@@ -238,7 +246,14 @@ class Hub:
         mission carries `mission_id` too and must stay listed.
 
         Fails CLOSED: a chat the store cannot vouch for is not listed (a probe
-        that fell back to "list everything" is how shells leaked in)."""
+        that fell back to "list everything" is how shells leaked in). That rule
+        is unchanged; only what a FAILED probe shows has changed. The probe is
+        read like `data.chats()` is (last good on a connection error), and when
+        it still fails the last published list is kept instead of blanking the
+        panel, so a reconnect never looks like deleted conversations. With
+        nothing to keep, the list is empty and `_chats_failed` says why, so the
+        sidebar can show a retrying note."""
+        self._chats_failed = False
         try:
             chats = await self.data.chats(limit=CHAT_FETCH)
         except AttributeError:  # store without chat support
@@ -250,9 +265,12 @@ class Hub:
             return []
         try:
             filled = await self.data.chat_ids_with_conversation([str(c.id) for c in candidates])
-        except Exception:  # probe unavailable or failed: list nothing, never everything
-            log.debug("chat conversation probe failed, listing no chats", exc_info=True)
-            return []
+        except Exception:  # probe failed: keep the last vouched list, never list everything
+            log.debug("chat conversation probe failed, keeping the last list", exc_info=True)
+            asked = {str(c.id) for c in candidates}
+            kept = [c for c in self.snapshot.chats if str(c.id) in asked]
+            self._chats_failed = not kept
+            return kept
         listed = [c for c in candidates if str(c.id) in filled]
         # newest MESSAGE first; updated_at is only the tiebreaker and a chat
         # with no message time sorts last (the store orders the same way, this
