@@ -128,7 +128,9 @@ The gate question then leads with the category and the orchestrator's reason
 
 Only a plan that publishes (`"publish": "pr"` — the `fix-pr` playbook; older
 plans carrying `"gates": ["open_pr"]` count too) pushes a branch or opens a PR
-at all. `echo` and `fix` missions deliver their result and stop.
+at all. `echo` and `fix` missions deliver their result and stop. Audits and other
+read-and-report missions are `draft` missions: their deliverable is the mission's
+Report tab, not a repository change and not a pull request.
 
 | project `settings.pr_gate` | effect |
 | --- | --- |

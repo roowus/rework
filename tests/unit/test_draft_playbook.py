@@ -2,8 +2,8 @@
 
 Two things must hold for it to be usable at all: the orchestrator is actually
 told about it (the system prompt AND the tool enum the model must satisfy), and
-it produces NO open_pr gate -- a writing mission's deliverable is the project's
-files, so pushing a branch and opening a PR would be wrong behaviour, not just
+it produces NO open_pr gate -- a writing mission's deliverable is its Report tab,
+so pushing a branch and opening a PR would be wrong behaviour, not just
 unnecessary.
 """
 
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from rework.missions import PLANS, PLAYBOOK_GATES, orchestrated_plan
+from rework.missions import PLANS, PLAYBOOK_GATES, orchestrated_plan, reads_only_plan
 from rework.orchestrator.agent import PLAYBOOKS
 from rework.orchestrator.chat import PROPOSE_TOOL, SYSTEM_PROMPT
 
@@ -36,7 +36,9 @@ def test_draft_text_instructs_research_draft_review_revise() -> None:
 def test_draft_text_says_no_push_no_pr() -> None:
     text = PLAYBOOKS["draft"]
     assert "NO BRANCH PUSH AND NO PR" in text
-    assert "files" in text
+    assert "Report tab" in text, "the deliverable is the mission's report, not repo files"
+    assert "do not write files into the target repo" in text
+    assert "write the deliverables into the project" not in text
 
 
 def test_draft_yields_no_open_pr_gate() -> None:
@@ -95,3 +97,40 @@ def test_every_playbook_has_a_gate_entry(playbook: str) -> None:
     make `draft` produce PR behaviour if the tables ever diverge."""
     assert playbook in PLAYBOOK_GATES
     assert set(PLAYBOOK_GATES) == set(PLAYBOOKS)
+
+
+AUDIT_OBJECTIVES = [
+    "audit the code base for dead code",
+    "Audit the release process",  # capitalised trigger
+    "review the codebase and list the risks",
+    "analyse the failure rates in the ledger",
+    "please map out the auth flow for me",  # trigger mid-sentence
+    "survey the test suite for gaps",
+    "write a report on the deploy process",
+    "document how the gate rail works",
+]
+
+CHANGE_OBJECTIVES = [
+    "fix the login crash",
+    "add a --json flag to rework ls",
+    "rename the ledger table",
+    "bump the anthropic sdk",
+    "migrate the store to postgres",
+    "implement retries for push_branch",
+    "refactor the delivery module",
+    "audit the code base and fix the two crashes",
+]
+
+
+@pytest.mark.parametrize("objective", AUDIT_OBJECTIVES)
+def test_read_and_report_objectives_default_to_the_draft_plan(objective: str) -> None:
+    """`rework new` with no --plan must land on draft for an audit-like
+    objective: otherwise the default is `echo`, which does nothing."""
+    assert reads_only_plan(objective) == "draft"
+
+
+@pytest.mark.parametrize("objective", CHANGE_OBJECTIVES)
+def test_change_objectives_get_no_plan_suggestion(objective: str) -> None:
+    """The classifier is a DEFAULT only: anything that asks for a change stays
+    on the caller's plan (the last case is an audit that also asks for a fix)."""
+    assert reads_only_plan(objective) is None

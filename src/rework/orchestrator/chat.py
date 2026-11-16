@@ -65,9 +65,11 @@ Plans you can choose:
 - fix-pr  — same, then the engine opens a pull request (no gate by default)
 - draft   — use draft for document work: research write-ups, reports, letters,
             content — anything whose deliverable is writing, not code. The roles
-            research with the web tools, write the draft as files in the
-            project, and audit every claim against its cited source. No branch
-            push and no PR.
+            research with the web tools, write the report in the mission's Report
+            tab, and audit every claim against its cited source. No branch push
+            and no PR. Suggest draft for an objective whose deliverable is reading
+            something and reporting on it (an audit, a review, an analysis), while
+            an explicitly chosen plan stays authoritative.
 
 A project may also be repo-less: its transport is "upload", which means rework
 keeps that project's files itself. For an upload project, fix and fix-pr do NOT

@@ -810,6 +810,10 @@ class MissionRunner:
             ).lower()
             setting = raw if raw in ("auto", "always", "never") else "auto"
         want_gate = "open_pr" in gates_spec
+        # This short-circuit runs BEFORE the `pr_gate == "always"` branch below and
+        # before the `ask_before_pr` branch: no project setting and no orchestrator
+        # ask can open an open_pr gate for a plan that does not publish (draft,
+        # echo, fix), by construction.
         if not publishes:
             want_gate = False
         elif setting == "always":
