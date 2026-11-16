@@ -201,7 +201,8 @@ async def retry_pr(store: StateStore, bus: Any, mission_id: str) -> tuple[bool, 
     )
     if not publishes:
         return False, (
-            f"mission {mission_id} does not publish (plan {plan.get('kind') or 'default'!r}): "
+            f"mission {mission_id} does not publish "
+            f"(plan {plan.get('playbook') or plan.get('kind') or 'default'!r}): "
             "there is no branch to push and no pull request to retry; a read-and-report "
             "mission's deliverable is its Report tab"
         )

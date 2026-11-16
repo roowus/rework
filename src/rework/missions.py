@@ -645,7 +645,8 @@ async def create_mission(
     if plan not in PLANS:
         raise ValueError(f"unknown plan {plan!r}; plans: {', '.join(PLANS)}")
     upload_project = project_id is not None and await _upload_project(project_id)
-    # draft needs one too: the deliverables are files written into the project
+    # draft needs one too: it runs against a repo even though its deliverable
+    # is the mission's Report tab
     if (
         plan in ("fix", "fix-pr", "draft")
         and not resolved["repo_path"]
