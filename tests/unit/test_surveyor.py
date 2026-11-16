@@ -627,6 +627,11 @@ async def test_a_rev_naming_git_internals_is_refused(tmp_path: Path) -> None:
         assert out.startswith("error: refused") and ".git internals" in out, (rev, out)
     ok = await ex.execute("git_read", {"subcommand": "show", "rev": "HEAD:app.py"})
     assert not ok.startswith("error: refused") and "upper" in ok
+    # real files that merely start with ".git" are not git internals: the guard
+    # lets them through (git itself may say the path is absent, which is not a refusal)
+    for rev in ("HEAD:.gitmodules", "HEAD:.gitattributes", ".gitmodules", "HEAD", "main"):
+        out = await ex.execute("git_read", {"subcommand": "show", "rev": rev})
+        assert ".git internals" not in out, (rev, out)
 
 
 def _poison_repo(repo: Path, hook: str) -> None:

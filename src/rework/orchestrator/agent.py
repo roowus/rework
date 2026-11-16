@@ -657,9 +657,14 @@ def artifact_summary(artifact: dict[str, Any] | None) -> str:
 
 
 def _plan_allows_unaudited_done(plan: dict[str, Any]) -> bool:
-    """True only for a plan that can never change or ship anything: no coder
-    step, no gates and no publish. The audit-rail exemption for a survey-only
-    mission is keyed on this, not on which runs happened to be spawned."""
+    """True only for the `audit` playbook (`orchestrated_plan` stamps
+    plan["playbook"]) and only while it can never change or ship anything: no
+    coder step, no gates and no publish. `draft` also has none of those but
+    writes files into the project, so the shape alone is not enough. The
+    audit-rail exemption for a survey-only mission is keyed on this, not on
+    which runs happened to be spawned."""
+    if plan.get("playbook") != "audit":
+        return False
     steps = plan.get("steps") or []
     has_coder = any(isinstance(s, dict) and s.get("role") == "coder" for s in steps)
     return not has_coder and not plan.get("gates") and not plan.get("publish")
@@ -1250,9 +1255,9 @@ class MissionOrchestrator:
         completed, failed, aborted, still running), finish(done) needs a
         completed auditor, and no coder run may have finished after that
         audit STARTED. The only exemption needs ALL of: the mission's PLAN
-        allows an unaudited done (no coder step, no gates, no publish: see
-        `_plan_allows_unaudited_done`), no coder run exists, and a surveyor
-        completed. A survey changes nothing, so there is no diff to audit; a
+        allows an unaudited done (the audit playbook, with no coder step, no gates
+        and no publish: see `_plan_allows_unaudited_done`), no coder run exists,
+        and a surveyor completed. A survey changes nothing, so there is no diff to audit; a
         surveyor never excuses a coder, and never a gated or publishing plan."""
         runs = await self.store.list_runs(self.mid)
         audits = [r for r in runs if r.role == "auditor" and r.status == RunStatus.COMPLETED]

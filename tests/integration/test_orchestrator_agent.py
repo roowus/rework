@@ -1572,9 +1572,12 @@ async def test_accepted_findings_survive_a_restart_at_the_gate(world: dict[str, 
 
     first = asyncio.create_task(runner(world).run())
     # the accepted finish is let through the rail and reaches the ship gate; the
-    # kill lands while the mission waits there
+    # kill lands while the mission waits there. The engine opens the gate, then
+    # publishes an event, THEN flips the status: wait for the status too, or a
+    # poll can land in between and see an open gate on a still-running mission.
     for _ in range(300):
-        if await store.list_open_gates("mo"):
+        got = await store.get_mission("mo")
+        if await store.list_open_gates("mo") and got and got.status == MissionStatus.AWAITING_GATE:
             break
         await asyncio.sleep(0.05)
     first.cancel()
@@ -1734,12 +1737,18 @@ async def _use_plan(world: dict[str, Any], playbook: str) -> Any:
 
 
 def test_plan_allows_unaudited_done_predicate() -> None:
-    from rework.missions import PLAN_AUDIT, PLAN_FIX, PLAN_FIX_PR, orchestrated_plan
+    from rework.missions import PLAN_FIX, PLAN_FIX_PR, orchestrated_plan
     from rework.orchestrator.agent import _plan_allows_unaudited_done as ok
 
     assert ok(orchestrated_plan("audit", "pro"))
-    assert ok(dict(PLAN_AUDIT))
-    assert ok(orchestrated_plan("draft", "pro"))  # no gates, no publish, no coder step
+    # draft has no gates, no publish and no coder step but writes files: never exempt
+    assert not ok(orchestrated_plan("draft", "pro"))
+    assert not ok(orchestrated_plan("echo", "pro"))
+    assert not ok({"steps": [], "gates": [], "publish": ""})  # no playbook stamp
+    # the audit playbook is exempt only while it stays pure
+    assert not ok({**orchestrated_plan("audit", "pro"), "gates": ["ship"]})
+    assert not ok({**orchestrated_plan("audit", "pro"), "publish": "pr"})
+    assert not ok({**orchestrated_plan("audit", "pro"), "steps": [{"role": "coder"}]})
     assert not ok(orchestrated_plan("fix", "pro"))  # gated
     assert not ok(orchestrated_plan("fix-pr", "pro"))  # publishes
     assert not ok(dict(PLAN_FIX)) and not ok(dict(PLAN_FIX_PR))  # coder step
@@ -1753,6 +1762,7 @@ async def test_audit_rail_allows_a_pure_audit_mission(world: dict[str, Any]) -> 
     from rework.orchestrator.agent import MissionOrchestrator
 
     mission = await _use_plan(world, "audit")
+    assert mission.plan["playbook"] == "audit"  # what the exemption keys on
     assert mission.plan["gates"] == [] and not mission.plan["publish"], (
         "the plan shape it relies on"
     )
@@ -1766,16 +1776,17 @@ async def test_audit_rail_allows_a_pure_audit_mission(world: dict[str, Any]) -> 
     await orch._enforce_audit_fresh()  # allowed
 
 
-@pytest.mark.parametrize("playbook", ["fix", "fix-pr"])
+@pytest.mark.parametrize("playbook", ["fix", "fix-pr", "draft"])
 async def test_audit_rail_refuses_a_surveyor_only_run_on_a_gated_or_publishing_plan(
     world: dict[str, Any], playbook: str
 ) -> None:
     """A surveyor spawned instead of a coder must not let a `fix` (gated) or
-    `fix-pr` (publishing) mission finish(done) with nothing audited."""
+    `fix-pr` (publishing) mission finish(done) with nothing audited, nor a
+    `draft` one (no gates, no publish, but it writes files into the project)."""
     from rework.orchestrator.agent import MissionOrchestrator, ToolError
 
     mission = await _use_plan(world, playbook)
-    assert mission.plan["gates"] or mission.plan["publish"], "a shipping plan"
+    assert mission.plan["playbook"] == playbook
     t0 = 1_000_000.0
     await _seed_runs(
         world["store"],

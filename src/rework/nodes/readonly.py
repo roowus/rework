@@ -202,6 +202,15 @@ def _text(raw: Any, name: str, *, limit: int = 500) -> str:
     return raw
 
 
+def _rev_names_git(rev: str) -> bool:
+    """True when a rev, or the path half of `rev:path`, starts at `.git`.
+
+    Component rule only: `.gitmodules` and `.gitattributes` are real files."""
+    path = rev.rsplit(":", 1)[-1]
+    parts = [p for p in re.split(r"[\\/]+", path) if p not in ("", ".")]
+    return bool(parts) and parts[0] == ".git"
+
+
 def _rev(raw: Any, default: str | None = None) -> str | None:
     if raw is None or raw == "":
         return default
@@ -209,7 +218,7 @@ def _rev(raw: Any, default: str | None = None) -> str | None:
     if rev.startswith("-"):
         raise ToolRefused("rev must not start with '-'")
     # a rev can name a path too (rev:path); .git internals are not surveyed there either
-    if rev.startswith(".git") or ".git" in re.split(r"[\\/:]+", rev):
+    if _rev_names_git(rev):
         raise ToolRefused(f"read-only mode: .git internals are not surveyed: {rev!r}")
     if not _REV_OK.match(rev):
         raise ToolRefused(f"rev has characters a revision never needs: {rev!r}")
