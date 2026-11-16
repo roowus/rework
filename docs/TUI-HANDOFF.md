@@ -169,7 +169,7 @@ path — pass the highest `seq` you have seen to get only new rows.
 A completed `Run.artifact` is a plain dict whose keys depend on the role:
 
 - **investigator**: `summary`, `findings` [ {title, detail, evidence[], severity,
-  verdict, confidence} ], `blockers`, `suggested_fix`, `proposed_tests`
+  verdict, confidence} ], `blockers`, `suggested_fix`, `tests`
 - **coder**: `kind="coder_handoff"`, `branch`, `commit`, `base_sha`, `summary`,
   `worktree`, `diff` (string, up to 100 KB)
 - **auditor**: `findings`, `verdict`, plus a run-stats block

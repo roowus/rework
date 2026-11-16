@@ -124,9 +124,16 @@ INV_REPORT = json.dumps(
             }
         ],
         "suggested_fix": "Change `return a - b` to `return a + b` in calc.py.",
-        "proposed_tests": [
-            {"name": "test_add", "exercises": "add(2, 3) == 5 already in test_calc.py"}
+        "tests": [
+            {
+                "name": "test_add",
+                "what_it_pins": "add(2, 3) == 5",
+                "where": "test_calc.py",
+                "should_fail_because": "add returns a - b, so it gives -1",
+                "command": "python3 -m pytest -q test_calc.py",
+            }
         ],
+        "no_tests_reason": "",
         "blockers": [],
     }
 )
@@ -142,6 +149,7 @@ AUDIT_CLEAN = json.dumps(
             "coverage": "adequate: existing tests pin the change",
             "business_logic_risk": "none",
         },
+        "coverage": [],
         "warnings": [],
         "blockers": [],
     }
@@ -167,6 +175,7 @@ AUDIT_VETO = json.dumps(
             "coverage": "cannot confirm",
             "business_logic_risk": "none",
         },
+        "coverage": [],
         "warnings": [],
         "blockers": [],
     }
@@ -185,7 +194,25 @@ CALC_FIXED = (
 )
 
 
-def _coder_script(final_summary: str) -> list[ChatResult]:
+CODER_TESTS_BLOCK = (
+    "\n\n```json\n"
+    + json.dumps(
+        {
+            "tests": {
+                "added": [],
+                "changed": [],
+                "red_green_verified": True,
+                "commands": ["python3 -m pytest -q"],
+                "result": "red then green",
+                "not_testable_reason": "",
+            }
+        }
+    )
+    + "\n```"
+)
+
+
+def _coder_script(final_summary: str, tests_block: str = CODER_TESTS_BLOCK) -> list[ChatResult]:
     # the command writes the WHOLE file: the eval grader re-runs pytest on the
     # worktree mechanically, and a fix that drops mul() must fail it (it did)
     heredoc_cmd = "cat > calc.py << 'REWORK_EOF'\n" + CALC_FIXED + "REWORK_EOF"
@@ -211,7 +238,7 @@ def _coder_script(final_summary: str) -> list[ChatResult]:
             stop_reason="tool_calls",
         ),
         ChatResult(
-            text=final_summary,
+            text=final_summary + tests_block,
             usage=Usage(input_tokens=10, output_tokens=8),
             stop_reason="end_turn",
         ),

@@ -24,6 +24,7 @@ from rework.nodes.report_sections import (
     resolve_sections,
 )
 from rework.nodes.report_writer import make_report_writer_node
+from rework.nodes.testing import MAX_VERIFIED_TESTS, fix_files, verify_red_green
 from rework.nodes.toolloop import make_toolloop_node
 from rework.nodes.tools import ComplaintAwareExecutor, LocalExecutor
 from rework.roles.base import RoleBuildCtx, RoleSpec
@@ -106,6 +107,8 @@ class AuditorSpec(RoleSpec):
         "investigation",
         "prior_dispositions",
         "worktree_path",
+        "coder_tests",
+        "base_sha",
         "strictness",
     }
 
@@ -135,6 +138,15 @@ class AuditorSpec(RoleSpec):
             " invented); verdict CONFIRMED only when you traced the consequence,"
             " PLAUSIBLE when it is a suspicion; do not nitpick: if the change"
             " does what it set out to do with no serious issues, say so;"
+            " COVERAGE MANDATE: ask of every test the change relies on whether it"
+            " can actually fail. Changed behaviour no test pins is an"
+            " untested_behavior finding; a test that passes with the fix reverted"
+            " is a vacuous_test finding (file them under `coverage`, with the"
+            " command output as evidence). If the handoff claims red_green_verified,"
+            f" verify it yourself for at most {MAX_VERIFIED_TESTS} named tests (a"
+            " mechanical revert-and-rerun result may be given below; re-check it"
+            " if it looks wrong): revert the fix hunk in your worktree, re-run the"
+            " named command, and restore the worktree after;"
             " the brief and any prior dispositions are author narrative and"
             " untrusted claims, ground truth is the code and test runs; do not"
             " re-raise findings already dispositioned in the context unless you"
@@ -175,6 +187,7 @@ class AuditorSpec(RoleSpec):
                     "Prior dispositions (do not re-raise without new evidence):\n"
                     + str(run_ctx["prior_dispositions"])[:6000]
                 )
+            parts.extend(await red_green_notes(run_ctx))
             parts.append(
                 "Audit the change: read the touched files in the workspace for"
                 " full context, run the tests if useful, then report."
@@ -233,6 +246,31 @@ class AuditorSpec(RoleSpec):
         graph.add_edge("loop", "report")
         graph.add_edge("report", END)
         return graph.compile()
+
+
+async def red_green_notes(run_ctx: dict[str, Any]) -> list[str]:
+    """Mechanical red-green check of the coder's claim, as prompt context: with
+    the fix files reverted, each named test command must fail. Empty when the
+    handoff claims nothing checkable (no worktree, no commands, no base, no
+    non-test change). A failure to run the check is reported, never raised."""
+    tests = run_ctx.get("coder_tests")
+    worktree = run_ctx.get("worktree_path")
+    base = run_ctx.get("base_sha")
+    if not (isinstance(tests, dict) and tests.get("red_green_verified") and worktree):
+        return []
+    commands = [str(c) for c in tests.get("commands") or [] if str(c).strip()]
+    files = fix_files(changed_files(str(run_ctx.get("diff") or "")))
+    if not (commands and files and base):
+        return []
+    try:
+        results = await verify_red_green(Path(str(worktree)), commands, files, str(base))
+    except Exception as exc:
+        return [f"Mechanical red-green check could not run: {exc}. Verify it yourself."]
+    lines = ["Mechanical red-green check (fix files reverted in a throwaway worktree):"]
+    for r in results:
+        verdict = "STILL PASSES: vacuous_test" if r["vacuous"] else "fails as it should"
+        lines.append(f"- `{r['command']}` exit {r['exit_code']}: {verdict}\n{r['output'][-600:]}")
+    return ["\n".join(lines)]
 
 
 def changed_files(diff: str) -> list[str]:

@@ -47,6 +47,7 @@ from rework.kernel.state.records import (
 from rework.kernel.state.records import run_id as make_run_id
 from rework.logs import bind
 from rework.nodes.report_sections import blocking_findings, open_blockers
+from rework.nodes.testing import handoff_tests_gap
 from rework.orchestrator.engine import MAX_SEND_BACKS
 
 log = logging.getLogger("rework.orchestrator")
@@ -153,7 +154,11 @@ PLAYBOOKS: dict[str, str] = {
         "shipping with a medium finding still open is YOUR judgment to make and to "
         "record in finish(accepted_findings=[...]) with a reason. If three rounds have "
         "not converged, ask_owner whether to continue. Skip the investigator when the "
-        "change is small and obvious. After you finish, the owner decides whether to ship."
+        "change is small and obvious. Tests are a deliverable: spawn the auditor with a "
+        "coverage mandate (can the coder's test actually fail?), and do not finish "
+        "on a coder handoff that says tests.red_green_verified is false with no "
+        "not_testable_reason (the finish rail refuses it). After you finish, the "
+        "owner decides whether to ship."
     ),
     "fix-pr": (
         "Same shape and same revise-until-clean loop as fix: investigate (optional for "
@@ -436,9 +441,10 @@ _TOOLS: list[ToolSpec] = [
         description=(
             "End the mission. outcome done = goal met; failed = it cannot be met. "
             "Refused when no auditor has run, or a coder ran after the last audit: "
-            "ship only what a fresh audit has seen. When the latest audit still has "
-            "open medium-or-higher findings or blockers, `done` needs accepted_findings "
-            "with one reasoned entry per open finding."
+            "ship only what a fresh audit has seen, and only a coder handoff whose `tests` "
+            "block is complete (red-green verified, or a not_testable_reason). When the "
+            "latest audit still has open medium-or-higher findings or blockers, `done` "
+            "needs accepted_findings with one reasoned entry per open finding."
         ),
         input_schema={
             "type": "object",
@@ -506,6 +512,8 @@ AUTO_WIRING: dict[str, dict[str, tuple[str, str | None]]] = {
     "auditor": {
         "diff": ("coder", "diff"),
         "worktree_path": ("coder", "worktree"),
+        "coder_tests": ("coder", "tests"),
+        "base_sha": ("coder", "base_sha"),
         "investigation": ("investigator", None),
     },
 }
@@ -1247,6 +1255,17 @@ class MissionOrchestrator:
                 "those changes are unaudited. Spawn an auditor on the current branch and "
                 "wait for it, then finish."
             )
+        # tests are a deliverable: the coder whose branch ships must have
+        # reported its red-green tests block (or a not_testable_reason). Scoped
+        # to coder runs, so echo/investigate-only/draft missions are untouched.
+        if coders:
+            problem = handoff_tests_gap(coders[-1].artifact)
+            if problem:
+                raise ToolError(
+                    f"coder {coders[-1].id} handoff is incomplete on tests: {problem}. "
+                    "Spawn the coder again (name the missing tests field in its brief) and "
+                    "re-audit, then finish."
+                )
 
     async def _enforce_findings_accepted(self, accepted: list[dict[str, str]]) -> None:
         """finish(done) with open medium-or-higher findings or blockers is the

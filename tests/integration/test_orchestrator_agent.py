@@ -1155,6 +1155,7 @@ AUDIT_MEDIUM = json.dumps(
             "coverage": "gap: zero-results path untested",
             "business_logic_risk": "caller may crash on empty input",
         },
+        "coverage": [],
         "warnings": [],
         "blockers": [],
     }
@@ -1645,6 +1646,86 @@ async def test_a_coder_that_finished_after_the_audit_started_is_unaudited(
     orch = MissionOrchestrator(runner(world), world["mission"])
     with pytest.raises(ToolError, match="after the last completed audit"):
         await orch._enforce_audit_fresh()
+
+
+async def _seed_audited_coder(world: dict[str, Any], artifact: dict[str, Any] | None) -> None:
+    """A completed coder with `artifact`, then a completed audit after it."""
+    from rework.kernel.state.records import Run
+
+    store: SqliteStore = world["store"]
+    t0 = 1_000_000.0
+    await store.create_run(
+        Run(
+            id="mo:code:coder:1",
+            mission_id="mo",
+            role="coder",
+            step="code",
+            status=RunStatus.COMPLETED,
+            created_at=t0,
+            updated_at=t0 + 100,
+            artifact=artifact,
+        )
+    )
+    await store.create_run(
+        Run(
+            id="mo:audit:auditor:1",
+            mission_id="mo",
+            role="auditor",
+            step="audit",
+            status=RunStatus.COMPLETED,
+            created_at=t0 + 200,
+            updated_at=t0 + 300,
+        )
+    )
+
+
+async def test_a_coder_handoff_with_no_tests_block_is_refused(world: dict[str, Any]) -> None:
+    """Tests are a deliverable: an audited coder whose handoff has no `tests`
+    field does not satisfy the finish rail, and the refusal names the field."""
+    from rework.orchestrator.agent import MissionOrchestrator, ToolError
+
+    await _seed_audited_coder(world, {"kind": "coder_handoff", "diff": "x"})
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    await orch._load()
+    with pytest.raises(ToolError, match="no `tests` field"):
+        await orch._enforce_audit_fresh()
+
+
+async def test_red_green_false_without_a_reason_is_refused(world: dict[str, Any]) -> None:
+    from rework.orchestrator.agent import MissionOrchestrator, ToolError
+
+    tests = {"red_green_verified": False, "commands": ["pytest"], "not_testable_reason": ""}
+    await _seed_audited_coder(world, {"kind": "coder_handoff", "tests": tests})
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    await orch._load()
+    with pytest.raises(ToolError, match="not_testable_reason"):
+        await orch._enforce_audit_fresh()
+
+
+async def test_a_legitimate_not_testable_reason_is_accepted(world: dict[str, Any]) -> None:
+    """The gate must not block everything: a stated reason passes, and so does a
+    complete red-green claim."""
+    from rework.orchestrator.agent import MissionOrchestrator
+
+    tests = {
+        "red_green_verified": False,
+        "commands": [],
+        "not_testable_reason": "docs-only change: nothing executable to pin",
+    }
+    await _seed_audited_coder(world, {"kind": "coder_handoff", "tests": tests})
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    await orch._load()
+    await orch._enforce_audit_fresh()  # does not raise
+
+
+async def test_a_complete_red_green_claim_is_accepted(world: dict[str, Any]) -> None:
+    from rework.orchestrator.agent import MissionOrchestrator
+
+    tests = {"red_green_verified": True, "commands": ["pytest -q"], "result": "red then green"}
+    await _seed_audited_coder(world, {"kind": "coder_handoff", "tests": tests})
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    await orch._load()
+    await orch._enforce_audit_fresh()
 
 
 # -- a reply cut off at the output limit is not idleness ----------------------

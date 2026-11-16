@@ -119,6 +119,25 @@ with a continue/abort gate; approving doubles the cap and resumes, rejecting can
 Steps that FAIL get exactly one in-mission retry (the 429-storm lesson) before the
 plan moves on; synthesis counts only the latest attempt per step.
 
+### Tests are a deliverable
+
+A test that cannot fail is worse than no test, because it looks like safety. The
+defense, from the owner's workflow discipline (github.com/roowus/workflow, "Why the
+test thing is clever"), is red-green: write the test first, run it, watch it fail for
+the right reason (the behaviour is missing, not a typo, an import error or a collection
+error), then fix and watch it pass; the system demands it and records whether it
+happened. What each role owes:
+
+| role | owes on tests |
+|---|---|
+| investigator | `tests`: the smallest test that would catch the bug (name, what it pins, where, why it fails on current code, command), or a `no_tests_reason` |
+| coder | handoff `tests` {added, changed, red_green_verified, commands, result, not_testable_reason}, taken from a fenced json block in its final message; never edits an assertion to get green |
+| auditor | a `coverage` section (`untested_behavior`, `vacuous_test`); a claimed red-green is re-checked mechanically (`nodes/testing.py: verify_red_green` reverts the fix files in a throwaway worktree and re-runs at most 3 named commands; one that still passes is vacuous) |
+| orchestrator | `finish(done)` is refused when the latest coder handoff has no `tests` field, or says `red_green_verified: false` with no `not_testable_reason` (`_enforce_audit_fresh`, coder runs only) |
+
+The mission acceptance re-run of pytest lives in the eval grader, not the engine; the
+engine has no verification step and none was added.
+
 ### The TUI (rebuilt 2026-11-06, ADR 0006)
 
 Bare `rework` opens a Textual app: a menu bar (wordmark, File / Edit / View /
