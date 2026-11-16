@@ -1235,29 +1235,36 @@ class MissionOrchestrator:
 
     async def _enforce_audit_fresh(self) -> None:
         """The ONE mechanical rail on finish(done), not bypassable by anything
-        the orchestrator can call: what ships must have been audited. Refuses
-        when no auditor ever completed, or when a coder completed after the
-        last completed audit (unaudited changes). The only way through is to
-        spawn a fresh audit and wait for it."""
-        audits = await self._completed_runs("auditor")
-        if not audits and not await self._completed_runs("coder"):
-            if await self._completed_runs("surveyor"):
-                return  # a survey changed nothing: there is no diff to audit
+        the orchestrator can call: what ships must have been audited.
+
+        Rule: when ANY coder run exists in the mission (whatever its status:
+        completed, failed, aborted, still running), finish(done) needs a
+        completed auditor, and no coder run may have finished after that
+        audit STARTED. The only exemption is a mission with NO coder run at
+        all in which a surveyor completed: a survey changes nothing, so there
+        is no diff to audit. A surveyor never excuses a coder."""
+        runs = await self.store.list_runs(self.mid)
+        audits = [r for r in runs if r.role == "auditor" and r.status == RunStatus.COMPLETED]
+        coders = [r for r in runs if r.role == "coder"]
+        if not coders and not audits:
+            if any(r.role == "surveyor" and r.status == RunStatus.COMPLETED for r in runs):
+                return
         if not audits:
             raise ToolError(
                 "no auditor has completed in this mission: spawn an auditor on the coder's "
                 "branch and wait for it before finishing with outcome='done'"
             )
         last_audit = audits[-1]
-        coders = await self._completed_runs("coder")
-        # a coder that FINISHED after the audit STARTED changed the branch after
-        # the auditor looked (they can run in parallel): compare finish to start
+        # a coder run that ended (or is still running) after the audit STARTED
+        # changed or may change the branch after the auditor looked (they can
+        # run in parallel): compare its last update to the audit's start. A
+        # coder that failed or timed out may still have left edits behind.
         after = [r for r in coders if (r.updated_at or r.created_at) > last_audit.created_at]
         if after:
             raise ToolError(
-                f"coder {after[-1].id} ran after the last completed audit {last_audit.id}: "
-                "those changes are unaudited. Spawn an auditor on the current branch and "
-                "wait for it, then finish."
+                f"coder {after[-1].id} ({after[-1].status}) ran after the last completed "
+                f"audit {last_audit.id}: those changes are unaudited. Spawn an auditor on "
+                "the current branch and wait for it, then finish."
             )
 
     async def _enforce_findings_accepted(self, accepted: list[dict[str, str]]) -> None:

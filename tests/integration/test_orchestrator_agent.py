@@ -1647,6 +1647,117 @@ async def test_a_coder_that_finished_after_the_audit_started_is_unaudited(
         await orch._enforce_audit_fresh()
 
 
+async def _seed_runs(store: SqliteStore, *rows: tuple[str, str, RunStatus, float, float]) -> None:
+    from rework.kernel.state.records import Run
+
+    for role, n, status, created, updated in rows:
+        await store.create_run(
+            Run(
+                id=f"mo:{role}:{role}:{n}",
+                mission_id="mo",
+                role=role,
+                step=role,
+                status=status,
+                created_at=created,
+                updated_at=updated,
+            )
+        )
+
+
+async def test_audit_rail_still_refuses_a_completed_coder_with_no_audit(
+    world: dict[str, Any],
+) -> None:
+    """(a) a completed coder and no completed audit is refused, and a surveyor
+    in the same mission does not excuse it."""
+    from rework.orchestrator.agent import MissionOrchestrator, ToolError
+
+    store: SqliteStore = world["store"]
+    t0 = 1_000_000.0
+    await _seed_runs(
+        store,
+        ("coder", "1", RunStatus.COMPLETED, t0, t0 + 10),
+        ("surveyor", "1", RunStatus.COMPLETED, t0 + 20, t0 + 30),
+    )
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    with pytest.raises(ToolError, match="no auditor has completed"):
+        await orch._enforce_audit_fresh()
+
+
+@pytest.mark.parametrize("status", [RunStatus.FAILED, RunStatus.ABORTED, RunStatus.RUNNING])
+async def test_audit_rail_refuses_a_coder_that_did_not_complete_plus_a_surveyor(
+    world: dict[str, Any], status: RunStatus
+) -> None:
+    """(b) a coder that ran but failed, timed out or is still running, plus a
+    surveyor, in a PUBLISHING mission (the world plan is `fix`): still refused.
+    The surveyor exemption exists only when no coder run exists at all."""
+    from rework.orchestrator.agent import MissionOrchestrator, ToolError
+
+    store: SqliteStore = world["store"]
+    assert world["mission"].plan["gates"] == ["ship"], "this mission is a gated, shipping plan"
+    t0 = 1_000_000.0
+    await _seed_runs(
+        store,
+        ("coder", "1", status, t0, t0 + 10),
+        ("surveyor", "1", RunStatus.COMPLETED, t0 + 20, t0 + 30),
+    )
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    with pytest.raises(ToolError, match="no auditor has completed"):
+        await orch._enforce_audit_fresh()
+
+
+async def test_audit_rail_refuses_a_failed_coder_that_ran_after_the_last_audit(
+    world: dict[str, Any],
+) -> None:
+    """A coder that failed AFTER the last completed audit began may still have
+    left edits behind: completion status does not matter."""
+    from rework.orchestrator.agent import MissionOrchestrator, ToolError
+
+    store: SqliteStore = world["store"]
+    t0 = 1_000_000.0
+    await _seed_runs(
+        store,
+        ("auditor", "1", RunStatus.COMPLETED, t0, t0 + 10),
+        ("coder", "1", RunStatus.FAILED, t0 + 5, t0 + 50),
+    )
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    with pytest.raises(ToolError, match="after the last completed audit"):
+        await orch._enforce_audit_fresh()
+
+
+async def test_audit_rail_allows_a_pure_audit_mission(world: dict[str, Any]) -> None:
+    """(c) investigator + surveyor, no coder run at all: nothing to audit."""
+    from rework.orchestrator.agent import MissionOrchestrator
+
+    store: SqliteStore = world["store"]
+    t0 = 1_000_000.0
+    await _seed_runs(
+        store,
+        ("investigator", "1", RunStatus.COMPLETED, t0, t0 + 10),
+        ("surveyor", "1", RunStatus.COMPLETED, t0 + 20, t0 + 30),
+    )
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    await orch._enforce_audit_fresh()  # allowed
+
+
+async def test_audit_rail_refuses_a_mission_with_neither_coder_nor_completed_survey(
+    world: dict[str, Any],
+) -> None:
+    """The exemption needs a COMPLETED surveyor: an investigator alone, or a
+    failed survey, does not let finish(done) through."""
+    from rework.orchestrator.agent import MissionOrchestrator, ToolError
+
+    store: SqliteStore = world["store"]
+    t0 = 1_000_000.0
+    await _seed_runs(
+        store,
+        ("investigator", "1", RunStatus.COMPLETED, t0, t0 + 10),
+        ("surveyor", "1", RunStatus.FAILED, t0 + 20, t0 + 30),
+    )
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    with pytest.raises(ToolError, match="no auditor has completed"):
+        await orch._enforce_audit_fresh()
+
+
 # -- a reply cut off at the output limit is not idleness ----------------------
 
 

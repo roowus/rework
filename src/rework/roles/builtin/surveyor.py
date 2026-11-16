@@ -1,7 +1,8 @@
 """Surveyor: reads a codebase cold and returns a cited, structured map.
 Genuinely read-only: the tool surface is the read-only wrapper (nodes/readonly),
-mounted outermost, so it cannot write, edit, push or publish whatever the model
-tries. Surveyor maps, auditor verifies another agent's diff, coder changes.
+mounted outermost: structured tools only (no shell), each building its own argv,
+so it cannot write, edit, push or publish whatever the model tries.
+Surveyor maps, auditor verifies another agent's diff, coder changes.
 
 Graph: mechanical repo-map provision (zero LLM), free agentic tool loop over
 read-only tools, rigid report-writer over the survey sections, then a
@@ -140,11 +141,13 @@ class SurveyorSpec(RoleSpec):
             " there.\n\n"
             "You are READ-ONLY and must never change anything: do not create,"
             " edit, move or delete files, do not commit, push or open a pull"
-            " request, and do not implement or prototype a fix. Your tools are"
-            " read_file, list_dir and a read-only run_command (grep, rg, find, ls,"
-            " tree, cat, head, tail, wc, sed -n, git log/blame/show/diff); anything"
-            " that writes is refused. You are not the auditor: you do not verify"
-            " another agent's diff or decide about shipping.\n\n"
+            " request, and do not implement or prototype a fix. You have NO shell."
+            " Your only tools are read_file, list_dir, search_code (text search),"
+            " repo_tree (file tree) and git_read (git log, blame, show, diff,"
+            " ls-files, ls-tree, status, rev-parse, shortlog, describe). They are"
+            " structured and read-only, paths must be relative to the workspace,"
+            " and any other tool name is refused. You are not the auditor: you do"
+            " not verify another agent's diff or decide about shipping.\n\n"
             "Cover: layout, entry points, dependencies, configuration, tests, CI,"
             " then risks and gaps. Evidence over claims: cite file path AND line"
             " numbers you actually read; never invent paths, symbols or findings;"
@@ -185,7 +188,9 @@ class SurveyorSpec(RoleSpec):
             catalog=ctx.catalog,
             catalog_id=catalog_id,
             # outermost: the read-only filter must wrap every other wrapper
-            executor=ReadOnlyExecutor(LocalExecutor(ctx.read_root, mission_id=ctx.mission.id)),
+            executor=ReadOnlyExecutor(
+                LocalExecutor(ctx.read_root, mission_id=ctx.mission.id), ctx.read_root
+            ),
             system_prompt=system_prompt,
             store=ctx.store,
             mission_id=ctx.mission.id,
