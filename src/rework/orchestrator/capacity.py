@@ -423,6 +423,31 @@ class CapacityPolicy:
             return ""
         return f"mission floor {missions} cannot exceed the {roles} role cap, {self._remedy()}"
 
+    def applied_note(self, cap: Capacity | None = None) -> str:
+        """The clamp clause for a plan that was ALREADY applied, if it clamped.
+
+        :meth:`notes` needs both numbers DECLARED, so a mission floor alone
+        (REWORK_CONCURRENCY=8, REWORK_MAX_ROLES unset) gets no clause from it even
+        when a starved box applies 4 missions next to a 4 role cap. Read the
+        declared mission floor against the cap the daemon now enforces instead:
+        that catches the collision the arithmetic made, without a fresh
+        measurement. Silent when nothing was cut, and silent when the mission cap
+        is not declared (then the planner picked the number nobody was promised).
+
+        `cap` is the applied plan (`None` means nothing was applied yet, so the
+        live caps are what the daemon enforces)."""
+        if not self.has_managed_cap:
+            return ""
+        missions = self._declared(self._pinned_concurrency, self._floor_concurrency)
+        roles = cap.max_roles if cap is not None else self.max_roles
+        if missions is None or missions <= roles:
+            return ""
+        # "floor" only when the owner's number is a floor: under pins=fixed the
+        # same cut happens to a PINNED cap, and calling that a floor would lie
+        # about what describe() says two clauses earlier.
+        what = "mission floor" if self._floor_concurrency is not None else "mission cap"
+        return f"{what} {missions} cut to the planner's {roles} role cap, {self._remedy()}"
+
     @staticmethod
     def _declared(pinned: int | None, floor: int | None) -> int | None:
         # the number the owner declared for this cap, whatever mode it is in
@@ -605,7 +630,9 @@ class DynamicCapacity:
         )
         # A collision survives the measurement: floor 8 missions with a 4 role cap
         # is one clause even when a quiet box plans 8 roles and clamps nothing.
-        note = self.policy.notes()
+        # notes() needs both numbers declared; when only the mission floor is, the
+        # applied pair is what holds the evidence that the arithmetic cut it.
+        note = self.policy.notes() or self.policy.applied_note(cap)
         return f"{line}; {note}" if note else line
 
     def start(self) -> asyncio.Task[None] | None:

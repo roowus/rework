@@ -1075,6 +1075,80 @@ async def test_the_collision_states_the_clamp_in_the_one_startup_line(
     assert line.count("role cap") == 1, "one clause, not a paragraph"
 
 
+async def test_a_lone_mission_floor_states_the_cut_in_the_one_startup_line(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """REWORK_CONCURRENCY=8 with NO REWORK_MAX_ROLES, fake reading (8, 50.0, None).
+
+    The role cap is the planner's own number, so it is not a declared floor: the
+    long-lived clause has nothing to compare. A busy 8 CPU box plans 4 roles, the
+    mission floor is cut to 4, and the ONE startup line must still say why it
+    advertises floor 8 missions next to an applied 4. The evidence is the
+    declared floor against the APPLIED cap, not a fresh measurement."""
+    monkeypatch.delenv("REWORK_MAX_ROLES", raising=False)
+    monkeypatch.setenv("REWORK_CONCURRENCY", str(IDLE_CPUS))
+    settings = CapacitySettings.from_env()
+    assert (settings.fixed_concurrency, settings.fixed_max_roles) == (True, False)
+    slots, limiter = PrioritySlots(IDLE_CPUS), RoleLimiter(IDLE_CPUS)
+    dyn = DynamicCapacity(
+        slots, limiter, settings=settings, measure_fn=lambda: (IDLE_CPUS, HIGH_LOAD, None)
+    )
+    with caplog.at_level(logging.INFO, logger="rework.capacity"):
+        task = dyn.start()
+    try:
+        lines = [str(r.message) for r in caplog.records if r.name == "rework.capacity"]
+        assert len(lines) == 1, f"ONE startup line, not two: {lines}"
+        line = lines[0]
+        assert (slots.capacity, limiter.cap) == (FLOOR_MAX_ROLES, FLOOR_MAX_ROLES)
+    finally:
+        await dyn.stop()
+    assert task is not None
+    assert f"missions MANAGED, floor {IDLE_CPUS}" in line, "the floor the line advertises"
+    assert "roles MANAGED, planner decides (REWORK_MAX_ROLES unset)" in line
+    clause = "mission floor 8 cut to the planner's 4 role cap, raise the role cap"
+    assert clause in line, f"the cut must be in the one line: {line}"
+    assert "raise REWORK_MAX_ROLES" not in line, "no env var the owner never set"
+    assert line.count("cut to the planner's") == 1, "one clause, not a paragraph"
+
+
+@pytest.mark.parametrize(
+    "reading",
+    [
+        (IDLE_CPUS, 0.1, None),  # quiet: the plan holds the 2 mission floor
+        (BUSY_CPUS, HIGH_LOAD, None),  # busy: the plan stops at 2 roles, floor met
+        (IDLE_CPUS, 9.0, None),  # load cut to 4 roles, still above the floor
+    ],
+    ids=["quiet-box", "busy-box", "load-cut"],
+)
+async def test_no_cut_means_no_clause_in_the_one_startup_line(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    reading: tuple[int, float, int | None],
+) -> None:
+    """The other half of the fallback: a mission floor that is NOT cut says
+    nothing extra. An 8 CPU quiet box plans 8 and 8, a busy 2 CPU box plans 2 and
+    2 (still at the floor), and 8 CPUs at load 9.0 halve to 4 roles, above it."""
+    monkeypatch.delenv("REWORK_MAX_ROLES", raising=False)
+    monkeypatch.setenv("REWORK_CONCURRENCY", "2")
+    settings = CapacitySettings.from_env()
+    slots, limiter = PrioritySlots(2), RoleLimiter(2)
+    dyn = DynamicCapacity(slots, limiter, settings=settings, measure_fn=lambda: reading)
+    with caplog.at_level(logging.INFO, logger="rework.capacity"):
+        task = dyn.start()
+    try:
+        lines = [str(r.message) for r in caplog.records if r.name == "rework.capacity"]
+        assert len(lines) == 1, f"ONE startup line, not two: {lines}"
+        line = lines[0]
+        applied_roles = limiter.cap
+        assert slots.capacity >= 2, "the 2 mission floor holds"
+    finally:
+        await dyn.stop()
+    assert task is not None
+    assert applied_roles >= 2, "the plan never goes below the mission floor here"
+    assert "cut to the planner's" not in line, f"nothing was cut, so no clause: {line}"
+
+
 def test_the_clamp_clause_names_the_env_var_only_when_it_sets_the_role_cap() -> None:
     """NIT 2: REWORK_CONCURRENCY=16 with NO REWORK_MAX_ROLES. The role cap is the
     planner's own number, so "raise REWORK_MAX_ROLES" would point at a var the
