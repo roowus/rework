@@ -20,10 +20,14 @@ Body resolution, highest priority first:
 Dedupe key: `(type=report, provenance.mission_id, hand-off marker)`.
 `find_report_item` is that lookup. Role contributions get `provenance.mission_id`
 stamped automatically too, so the mission id alone would match (and overwrite)
-a report a role authored; the `handoff:report` marker tag, which role
-contributions never carry, is what limits a re-run to items this command filed.
-(An item filed before the marker existed is recognised by its own fingerprint:
-a `mission:<id>` tag, a `source:<kind>` tag and the hand-off description.) A
+a report a role authored. What limits a re-run to items this command filed is
+the `handoff:report` marker plus, for items filed before the marker existed, a
+fingerprint that is additionally gated on `provenance.role` being empty: the
+fingerprint is a `mission:<id>` tag, a `source:<kind>` tag and the hand-off
+description, all of which a role could choose for itself, but a role cannot
+leave its own provenance role empty, because rework stamps it. So a role
+contribution is never a match, whatever tags and description it picks, and an
+item with no role recorded and no marker is still recognised. A
 re-run UPDATES the item in place (its id, body path, created_at, uses and
 status survive, its version is bumped) instead of minting a duplicate, which
 mirrors the re-run safety `library backfill-bodies` already promises. A mission
@@ -53,6 +57,10 @@ _KINDS = (KIND_FILE, KIND_WORKTREE, KIND_DOC_MODIFIED, KIND_SUMMARY)
 
 # Marks an item this command filed. Role contributions never carry it.
 HANDOFF_TAG = "handoff:report"
+# Records which `source:<kind>` tag this command derived for the item, so a
+# re-run replaces exactly that tag and leaves an owner `--tag source:...` (even
+# one that names another source kind) alone.
+_DERIVED_PREFIX = "handoff:derived:"
 _DESCRIPTION_PREFIX = "Report for mission "
 _SOURCE_PREFIX = "source:"
 
@@ -276,7 +284,13 @@ def compose(
 ) -> tuple[str, list[str]]:
     """(full body, tags) for this hand-off. The tags carry the mission id and
     the source kind, so a summary-only item is never mistaken for a report."""
-    tags = [mission_tag(mission_id), ItemType.REPORT.value, HANDOFF_TAG, f"source:{body.kind}"]
+    tags = [
+        mission_tag(mission_id),
+        ItemType.REPORT.value,
+        HANDOFF_TAG,
+        f"source:{body.kind}",
+        f"{_DERIVED_PREFIX}{body.kind}",
+    ]
     for tag in extra_tags or []:
         if tag and tag not in tags:
             tags.append(tag)
@@ -287,13 +301,17 @@ def is_handoff_item(item: LibraryItem, mission_id: str) -> bool:
     """True only for a report item this command filed for `mission_id`.
 
     provenance.mission_id alone is not enough: role contributions are stamped
-    with it too. The marker tag is what role contributions never carry. Items
-    filed before the marker existed are recognised by the fingerprint only this
-    command writes: mission tag + source tag + the hand-off description."""
+    with it too, so the marker tag decides. Items filed before the marker
+    existed carry no role (rework stamps `provenance.role` on everything a role
+    contributes), so the empty-role gate makes the fingerprint below unforgeable
+    from role-supplied tags and description: mission tag + source tag + the
+    hand-off description."""
     if item.type is not ItemType.REPORT or item.provenance.mission_id != mission_id:
         return False
     if HANDOFF_TAG in item.tags:
         return True
+    if item.provenance.role:
+        return False
     return (
         mission_tag(mission_id) in item.tags
         and any(t in {f"{_SOURCE_PREFIX}{k}" for k in _KINDS} for t in item.tags)
@@ -333,8 +351,10 @@ async def hand_off(
 
     `name` is the owner's --title: an update changes the item name only when it
     is given, and tags are merged (union), so a bare re-run never reverts what
-    an earlier run or the owner set. Only the derived `source:*` tag is swapped
-    for the current one.
+    an earlier run or the owner set. Only the `source:<kind>` tag this command
+    derived last time is dropped, and the `handoff:derived:` tag records which
+    one that was; an owner-supplied `--tag source:...` is left alone even when
+    it names another source kind.
     """
     from rework.library.curation import accept_status, contribute
 
@@ -346,7 +366,15 @@ async def hand_off(
         if name:
             item.name = name
         item.description = description
-        item.tags = [t for t in item.tags if not t.startswith(_SOURCE_PREFIX)]
+        # only the source tag this command derived LAST TIME is replaced (the
+        # derived marker tag says which one); an owner-supplied
+        # `--tag source:...` shares the namespace and is kept, so a bare
+        # re-run never eats it
+        previous = {t[len(_DERIVED_PREFIX) :] for t in item.tags if t.startswith(_DERIVED_PREFIX)}
+        replaced = {f"{_SOURCE_PREFIX}{kind}" for kind in previous}
+        item.tags = [
+            t for t in item.tags if t not in replaced and not t.startswith(_DERIVED_PREFIX)
+        ]
         item.tags += [t for t in tags if t not in item.tags]
         item.body = full_body
         item.touch()

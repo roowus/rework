@@ -1018,6 +1018,97 @@ def test_report_to_library_recognises_an_item_filed_before_the_marker(
     assert len(_library_items(rework_db)) == 1
 
 
+def test_report_to_library_refuses_a_role_fingerprint_spoof(
+    rework_db: Path, library_dir: Path
+) -> None:
+    """The pre-marker fingerprint (mission tag + source tag + hand-off
+    description) is role-supplied input: a role picks its own tags and
+    description through library_contribute. A role item shaped exactly like the
+    backfill fingerprint must therefore NOT be selected; the hand-off files its
+    own item beside it and the role item keeps its body and version 1."""
+    _seed_summary_mission(rework_db, "m-spoof", "the summary")
+    from rework.library.curation import contribute
+    from rework.library.handoff import find_report_item
+    from rework.library.model import ItemType
+    from rework.library.store import GitLibrary, open_library_store
+
+    async def file_spoof() -> str:
+        index = await open_library_store(str(rework_db))
+        try:
+            item, _note = await contribute(
+                index,
+                GitLibrary(library_dir),
+                type_=ItemType.REPORT,
+                name="Spoof",
+                description="Report for mission m-spoof; see threads",
+                body="# the role's own body\n",
+                tags=["mission:m-spoof", "source:from-file"],
+                mission_id="m-spoof",
+                role="coder",
+            )
+            assert item.provenance.role == "coder"
+            return item.id
+        finally:
+            await index.aclose()
+
+    spoof_id = asyncio.run(file_spoof())
+
+    async def lookup() -> Any:
+        index = await open_library_store(str(rework_db))
+        try:
+            return await find_report_item(index, "m-spoof")
+        finally:
+            await index.aclose()
+
+    assert asyncio.run(lookup()) is None
+    dry = runner.invoke(app, ["report", "m-spoof", "--to-library", "--dry-run"])
+    assert "would create report" in dry.output, dry.output
+    assert spoof_id not in dry.output
+
+    result = runner.invoke(app, ["report", "m-spoof", "--to-library"])
+    assert result.exit_code == 0, result.output
+    assert "created report" in result.output
+    items = {i.id: i for i in _library_items(rework_db)}
+    spoof = items[spoof_id]
+    assert spoof.version == 1
+    assert spoof.body == "# the role's own body\n"
+    assert spoof.description == "Report for mission m-spoof; see threads"
+    (own,) = [i for i in items.values() if i.id != spoof_id]
+    assert "handoff:report" in own.tags
+
+
+def test_report_to_library_dedupe_relies_on_the_marker(rework_db: Path, library_dir: Path) -> None:
+    """The marker, not the fingerprint, is the dedupe key for an item this
+    command filed. If the owner hand-edits such an item (tags and description
+    changed, marker kept) a re-run must still find it: the fingerprint is only
+    a backfill for items filed before the marker existed."""
+    _seed_summary_mission(rework_db, "m-mark", "body")
+
+    from rework.library.store import open_library_store
+
+    assert runner.invoke(app, ["report", "m-mark", "--to-library"]).exit_code == 0
+
+    async def hand_edit() -> str:
+        index = await open_library_store(str(rework_db))
+        try:
+            (item,) = await index.list_items(limit=10)
+            item.tags = ["handoff:report", "edited-by-owner"]
+            item.description = "edited by the owner"
+            await index.upsert_item(item)
+            return item.id
+        finally:
+            await index.aclose()
+
+    item_id = asyncio.run(hand_edit())
+    dry = runner.invoke(app, ["report", "m-mark", "--to-library", "--dry-run"])
+    assert "would update report" in dry.output, dry.output
+    assert item_id in dry.output
+    result = runner.invoke(app, ["report", "m-mark", "--to-library"])
+    assert result.exit_code == 0, result.output
+    (only,) = _library_items(rework_db)
+    assert only.id == item_id and "mission:m-mark" in only.tags
+
+
 def test_report_to_library_rerun_keeps_title_tags_and_body_file(
     rework_db: Path, library_dir: Path
 ) -> None:
@@ -1045,6 +1136,28 @@ def test_report_to_library_rerun_keeps_title_tags_and_body_file(
     assert final.name == "Renamed" and "owner-tag" in final.tags
     assert final.body_path == body_path
     assert [p.name for p in (library_dir / "reports").glob("*.md")] == [Path(body_path).name]
+
+
+def test_report_to_library_keeps_an_owner_source_tag_on_a_bare_rerun(
+    rework_db: Path, library_dir: Path
+) -> None:
+    """The command derives one `source:<kind>` tag and replaces that tag on a
+    re-run. An owner `--tag source:worktree` sits in the same namespace, names
+    another source kind, and must survive a bare re-run that passes no tags."""
+    _seed_summary_mission(rework_db, "m-src", "body")
+    first = runner.invoke(app, ["report", "m-src", "--to-library", "--tag", "source:worktree"])
+    assert first.exit_code == 0, first.output
+    (item,) = _library_items(rework_db)
+    assert "source:worktree" in item.tags and "source:summary" in item.tags
+
+    bare = runner.invoke(app, ["report", "m-src", "--to-library"])
+    assert bare.exit_code == 0, bare.output
+    (again,) = _library_items(rework_db)
+    assert "source:worktree" in again.tags, again.tags
+    assert "source:summary" in again.tags, again.tags
+    assert [t for t in again.tags if t.startswith("handoff:derived:")] == [
+        "handoff:derived:summary"
+    ]
 
 
 def test_report_flags_without_to_library_are_usage_errors(

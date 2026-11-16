@@ -925,9 +925,10 @@ def report(
 
     --to-library copies the report BODY into the Library instead, as one report
     item per mission: re-running updates that item, never a duplicate. The body
-    comes from --from-file, else the mission's largest changed docs/*.md in its
-    surviving worktree or branch, else missions.result.summary clearly labelled
-    as a summary. --from-file is an error when the file is missing or empty."""
+    comes from --from-file, else the largest newly ADDED docs/*.md in the
+    mission's surviving worktree or branch (a merely edited doc only stands in
+    as a loud last resort), else missions.result.summary clearly labelled as a
+    summary. --from-file is an error when the file is missing or empty."""
 
     if not to_library:
         stray = [
@@ -1045,10 +1046,14 @@ async def _report_hand_off(
 ) -> None:
     """`rework report --to-library`: one report item per mission, re-run safe.
 
-    Body resolution and the dedupe key live in rework.library.handoff (dedupe
-    on provenance.mission_id, so a second run updates instead of minting an
-    `l-<hex>` duplicate the way `library add` does). Errors are usage errors
-    with a non-zero exit and nothing written."""
+    Body resolution and the dedupe key live in rework.library.handoff. The
+    dedupe key is `provenance.mission_id` PLUS the `handoff:report` marker tag
+    (a report filed before that marker existed is matched by a fingerprint
+    gated on an empty `provenance.role`), because the mission id alone is
+    stamped on role contributions too and would overwrite a report a role
+    authored. A second run updates instead of minting an `l-<hex>` duplicate
+    the way `library add` does. Errors are usage errors with a non-zero exit
+    and nothing written."""
     from rework.config import Config
     from rework.library import handoff
     from rework.library.store import GitLibrary
