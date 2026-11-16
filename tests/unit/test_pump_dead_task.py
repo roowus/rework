@@ -177,3 +177,44 @@ async def test_a_task_error_after_the_row_is_terminal_is_not_raised(terminal: Ru
 
     runner = make_runner(store, {run.id: task})
     assert await asyncio.wait_for(runner._pump_until_terminal([run]), timeout=5) == "ok"
+
+
+async def test_owner_pause_with_a_task_that_dies_on_cancel_pauses_and_resumes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Owner PAUSE through the pump path: pausing cancels the live role, whose cleanup
+    raises. The pump must pause (not raise the cleanup error as the mission's death),
+    then carry on once resumed and kick the run again."""
+    store = FakeStore(MissionStatus.RUNNING)
+    run = make_run()
+    store.runs[run.id] = run
+    task = asyncio.create_task(dies_on_cancel())
+    await asyncio.sleep(0)
+
+    async def owner_pauses_mid_pass(s: FakeStore) -> None:
+        if s.polls == 1:
+            s.mission = MissionStatus.ON_HOLD
+            task.cancel()
+            await asyncio.wait([task])
+
+    store.on_get_run = owner_pauses_mid_pass
+    runner = make_runner(store, {run.id: task})
+    paused: list[bool] = []
+    kicked: list[str] = []
+
+    async def pause_then_resume() -> str:
+        paused.append(True)
+        store.mission = MissionStatus.RUNNING
+        return "ok"
+
+    async def ensure_started(latest: Run) -> None:
+        kicked.append(latest.id)
+        store.runs[run.id] = make_run(RunStatus.COMPLETED)
+
+    monkeypatch.setattr(runner, "_pause_until_resumed", pause_then_resume)
+    runner._supervisor = SimpleNamespace(  # type: ignore[assignment]
+        tasks={run.id: task}, ensure_started=ensure_started
+    )
+    assert await asyncio.wait_for(runner._pump_until_terminal([run]), timeout=5) == "ok"
+    assert paused == [True]
+    assert kicked == [run.id]

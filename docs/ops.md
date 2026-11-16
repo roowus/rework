@@ -578,8 +578,8 @@ Tests never touch `rework_state`. Postgres tests use the dedicated
 The daemon and the TUI hold one store connection each. When it drops (a Postgres
 restart, a network blip, a locked SQLite file), the store proxy retries with capped
 backoff and reconnects the Postgres link, so a mission in flight carries on where it
-was. A run is not started over: it is re-driven from its checkpoint, and a role does not
-repeat a model call that was already charged.
+was. A run is not started over: it is re-driven from its checkpoint, and, in steady state,
+a retried write does not double-charge a model call.
 
 What is retried: reads, status updates, and any write that is safe to repeat (model
 charges and events that carry a dedupe key, so a repeat lands on the row that already
