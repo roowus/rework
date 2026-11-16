@@ -1619,7 +1619,13 @@ async def test_dashboard_drill_down_and_back(ids: dict[str, str]) -> None:
         steps = [str(s.render()) for s in app.query("#m-traj Step")]
         assert any("read_file" in s for s in steps)
         runs = app.query_one("#run-list", RowList)
-        coder = next(k for k in runs.keys if ":coder:" in k)
+        # the run list is painted by the poll, not by open_mission: poll for the
+        # row instead of a bare next() (StopIteration inside the async test is
+        # reported as RuntimeError, and the row is only there once the poll
+        # painted it, so the lookup has to tolerate its absence)
+        await _wait_for(pilot, lambda: any(":coder:" in k for k in runs.keys))
+        coder = next((k for k in runs.keys if ":coder:" in k), None)
+        assert coder is not None, runs.keys
         runs.activate(coder, via_mouse=True)
         await _settle(pilot, 0.5)
         filtered = [str(s.render()) for s in app.query("#m-traj Step")]

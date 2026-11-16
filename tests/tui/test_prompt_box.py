@@ -169,7 +169,7 @@ async def test_a_forty_line_brief_is_bounded_with_a_hint(ids: dict[str, str], en
         assert height > BODY_ROWS, (height, BODY_ROWS)
         assert box.max_scroll_y == height - BODY_ROWS
         hidden = height - BODY_ROWS
-        assert str(hint.render()) == f"{hidden} more lines · scroll", str(hint.render())
+        assert str(hint.render()) == f"{hidden} more lines below · scroll", str(hint.render())
         assert str(hint.styles.visibility) == "visible"
         # the hint is the box's last row, inside the box
         assert hint.region.bottom == box.region.bottom
@@ -182,6 +182,51 @@ async def test_a_forty_line_brief_is_bounded_with_a_hint(ids: dict[str, str], en
         assert runlist.region.y >= flow.region.bottom
         assert runlist.region.height > 0
         assert app.query_one("#m-pages").region.height > 0
+
+
+async def test_the_hint_follows_the_scroll_position(ids: dict[str, str], env: Path) -> None:
+    """(b, the hint is not stale) The hint counts the lines still BELOW THE FOLD,
+    so it goes away once the last line of the brief is on screen and comes back
+    when the box is scrolled up again.
+
+    There is no scroll watcher to miss here: `watch_scroll_y` repaints it, so a
+    scrolled box can never keep claiming "36 more lines below" while its last
+    line is visible (the auditor saw exactly that at scroll_y == 36)."""
+    mid = await _add_brief(env, "m-longbrief06", 40)
+    app = ReworkApp(poll_seconds=3600.0)
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.open_mission(mid)
+        await _settle(pilot)
+        box = app.query_one("#m-prompt", PromptBox)
+        hint = box.query_one("#m-prompt-more", Static)
+        await _wait_for(pilot, lambda: box.has_class("has-more"))
+        top_hint = str(hint.render())
+        assert top_hint.endswith("more lines below · scroll"), top_hint
+
+        # scroll the box itself to the bottom of the brief
+        box.scroll_end(animate=False)
+        await _settle(pilot)
+        assert box.scroll_y == box.max_scroll_y, (box.scroll_y, box.max_scroll_y)
+        await _wait_for(pilot, lambda: not box.has_class("has-more"))
+        assert str(hint.render()) == "", str(hint.render())
+        assert str(hint.styles.visibility) == "hidden", "the hint is hidden, not deleted"
+        # re-wording the hint must not move the scroll position (no feedback
+        # loop between the hint paint and the box's own layout)
+        assert box.scroll_y == box.max_scroll_y, (box.scroll_y, box.max_scroll_y)
+        # the hidden hint keeps its row: the box height did not change
+        assert box.region.height == PROMPT_BOX_ROWS, (box.region, PROMPT_BOX_ROWS)
+
+        # scrolling back up brings it back, with the residue recomputed
+        box.scroll_home(animate=False)
+        await _settle(pilot)
+        assert box.scroll_y == 0
+        await _wait_for(pilot, lambda: box.has_class("has-more"))
+        assert str(hint.render()) == top_hint, (str(hint.render()), top_hint)
+        # and it is a count of what is really left, not a stale one
+        hidden = box.query_one("#m-header", Static).virtual_size.height - BODY_ROWS
+        assert str(hint.render()) == f"{hidden} more lines below · scroll"
+        assert not any("brief line 40" in line for line in _shown_lines(app))
 
 
 async def test_the_tab_body_height_is_the_same_for_a_short_and_a_long_brief(

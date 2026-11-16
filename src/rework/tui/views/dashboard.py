@@ -188,6 +188,9 @@ class PromptBox(VerticalScroll):
     the result.
     """
 
+    #: the hint text currently painted, so an unchanged hint skips update()
+    _hint_text: str = ""
+
     def compose(self) -> ComposeResult:
         yield Static("", id="m-header")
         yield Static("", id="m-prompt-more")
@@ -198,10 +201,19 @@ class PromptBox(VerticalScroll):
         self.sync_hint()
 
     def on_mount(self) -> None:
+        self._hint_text = ""  # a remount composes an empty hint Static
         self.sync_hint()
 
     def on_resize(self) -> None:
         self.sync_hint()
+
+    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
+        """The hint counts the lines below the fold, so scrolling the box has to
+        re-word it: `36 more lines below` with the 40-line brief at its top,
+        nothing once its last line is on screen. The base watcher still runs
+        (`super`), so the viewport itself is repainted exactly as before."""
+        super().watch_scroll_y(old_value, new_value)
+        self._paint_hint()
 
     def sync_hint(self) -> None:
         """Re-measure after the next refresh: virtual size is a layout result."""
@@ -219,9 +231,23 @@ class PromptBox(VerticalScroll):
         height = header.virtual_size.height
         if body <= 0 or height <= 0:
             return  # not laid out yet: no measurement, keep the last hint
-        hidden = max(0, height - body)
-        hint.update("" if not hidden else f"{hidden} more line{'s' * (hidden != 1)} · scroll")
-        self.set_class(hidden > 0, "has-more")
+        # What is left BELOW the fold at the current scroll offset, not the size
+        # of the whole document: the hint is measured against the fold, so it is
+        # only visible while the box is scrolled to its top. (It lives inside the
+        # scrolled content, docked to the bottom of the viewport.)
+        hidden = max(0, height - body - int(self.scroll_y))
+        text = f"{hidden} more line{'s' * (hidden != 1)} below · scroll" if hidden else ""
+        # The header repaints about 10x/s on a running mission and
+        # Static.update() always re-dirties layout, so an unchanged hint must
+        # cost nothing. Writing the values only when they moved also keeps a
+        # hint paint from feeding back into the scroll position: no layout
+        # change means no re-measure and no scroll_y re-clamp.
+        if text != self._hint_text:
+            self._hint_text = text
+            hint.update(text)
+        has_more = hidden > 0
+        if has_more != self.has_class("has-more"):
+            self.set_class(has_more, "has-more")
 
 
 class DashboardView(View):
@@ -1263,13 +1289,14 @@ class DashboardView(View):
             self.report_loaded_for = None
             self.query_one("#m-traj", Trajectory).clear()
             self.query_one("#run-list", RowList).set_rows([])
+            # a NEW mission's prompt starts at its first line. Reopening the
+            # mission that is already open (the Gates tab, a state restore)
+            # keeps the owner's scroll position instead.
+            self.query_one("#m-prompt", PromptBox).scroll_y = 0
         self.mission_id = mission_id
         self.run_id = run_id
         self._painted_key = None
         self.query_one("#dash-pages", ContentSwitcher).current = "dash-mission"
-        # a new mission's prompt starts at its first line, not where the last
-        # mission's brief was left scrolled
-        self.query_one("#m-prompt", PromptBox).scroll_y = 0
         self._paint_head()
         self._paint_mission_static()
         self._poll_mission()
