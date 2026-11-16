@@ -255,6 +255,82 @@ async def test_the_red_is_classified_by_pytests_own_vocabulary(
     assert (result["marker"] is None) == (expected == "fails_for_right_reason")
 
 
+MASKING_SHAPES = [
+    ("pipe to tail", f"{CMD} | tail -3", "fails_for_right_reason"),
+    ("tee", f"{CMD} 2>&1 | tee x.log", "fails_for_right_reason"),
+    # `; true` discards pytest's code and pipefail cannot restore it: the output still
+    # shows the failure, so the run is uninterpretable (never vacuous)
+    ("semicolon true", f"{CMD} ; true", "unverifiable"),
+    ("cd and", "cd {repo} && " + CMD, "fails_for_right_reason"),
+]
+
+
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [c[1:] for c in MASKING_SHAPES],
+    ids=[c[0] for c in MASKING_SHAPES],
+)
+async def test_a_shell_shape_cannot_turn_an_honest_red_into_a_vacuous_one(
+    tmp_path: Path, template: str, expected: str
+) -> None:
+    """The shell's exit code is not pytest's: a pipe, `; true` or `cd ... &&` around a
+    genuinely failing test must still be read as the right-reason red it is."""
+    repo, base = _repo(tmp_path, REAL_TEST)
+    command = template.format(repo=repo)
+    [result] = await verify_red_green(repo, [command], ["calc.py"], base)
+    assert result["classification"] != "vacuously_passes", result["output"]
+    assert result["classification"] == expected, result
+    assert result["vacuous"] is False and "1 failed" in result["output"]
+    notes = await red_green_notes(
+        {
+            "coder_tests": {**GOOD, "commands": [command]},
+            "worktree_path": str(repo),
+            "base_sha": base,
+            "diff": await diff_base(repo, base=base),
+        }
+    )
+    assert "vacuous_test" not in notes[0] and "STILL PASSES" not in notes[0]
+    if expected == "unverifiable":
+        assert "verify by hand" in notes[0]
+    else:
+        assert "fails as it should" in notes[0]
+
+
+async def test_an_honest_failing_test_without_a_pipe_is_still_a_right_reason_red(
+    tmp_path: Path,
+) -> None:
+    repo, base = _repo(tmp_path, REAL_TEST)
+    [result] = await verify_red_green(repo, [CMD], ["calc.py"], base)
+    assert result["exit_code"] == 1
+    assert (result["classification"], result["marker"]) == ("fails_for_right_reason", None)
+
+
+async def test_exit_zero_without_pytest_evidence_is_unverifiable_not_vacuous(
+    tmp_path: Path,
+) -> None:
+    """Exit 0 alone never proves the test cannot fail: with no pytest summary or
+    outcome line the run could not be interpreted, and the coder is not accused."""
+    repo, base = _repo(tmp_path, REAL_TEST)
+    command = "echo all good"
+    [result] = await verify_red_green(repo, [command], ["calc.py"], base)
+    assert result["exit_code"] == 0 and result["vacuous"] is False
+    assert result["classification"] == "unverifiable"
+    assert "pytest" in str(result["marker"])
+    assert classify_red(0, "")[0] == "unverifiable"
+    assert classify_red(0, "..\n2 passed in 0.01s")[0] == "vacuously_passes"
+    assert classify_red(0, "test_a.py::test_x PASSED")[0] == "vacuously_passes"
+    notes = await red_green_notes(
+        {
+            "coder_tests": {**GOOD, "commands": [command]},
+            "worktree_path": str(repo),
+            "base_sha": base,
+            "diff": await diff_base(repo, base=base),
+        }
+    )
+    assert "vacuous_test" not in notes[0] and "STILL PASSES" not in notes[0]
+    assert "could not interpret this run, verify by hand" in notes[0]
+
+
 async def test_a_wrong_red_note_says_it_is_not_proof(tmp_path: Path) -> None:
     repo, base = _two_commit_repo(tmp_path, ADD_ONLY, ADD_AND_MUL, RED_CASES[0][3])
     [note] = await red_green_notes(

@@ -101,6 +101,15 @@ _WRONG_RED_EXCEPTION = re.compile(
     r"|AttributeError(?=: module '[^']*' has no attribute))\b",
     re.MULTILINE,
 )
+# pytest's own outcome vocabulary: the summary line (`1 failed`, `2 passed in 0.1s`,
+# `no tests ran`) or a verbose node line (`test_a.py::test_x PASSED`). Exit 0 with none
+# of these means pytest never visibly ran (a masked or unrelated command).
+_PYTEST_FAILURE = re.compile(r"\b\d+ (?:failed|errors?)\b|::\S+ (?:FAILED|ERROR)\b")
+_PYTEST_EVIDENCE = re.compile(
+    r"\b\d+ (?:passed|failed|skipped|deselected|xfailed|xpassed|errors?)\b"
+    r"|\bno tests ran\b"
+    r"|::\S+ (?:PASSED|FAILED|SKIPPED|XFAIL|XPASS|ERROR)\b"
+)
 # the interpreter itself cannot start the runner: `/usr/bin/python: No module named pytest`
 _RUNNER_MISSING = re.compile(r"^\S*python\S*: No module named\b", re.MULTILINE)
 
@@ -108,10 +117,18 @@ _RUNNER_MISSING = re.compile(r"^\S*python\S*: No module named\b", re.MULTILINE)
 def classify_red(exit_code: int, output: str) -> tuple[str, str | None]:
     """(classification, marker) of a run with the fix reverted, from pytest's own
     vocabulary (exit code, then the exception type opening a traceback line), never
-    a free-text scan: `vacuously_passes` (exit 0, the test cannot fail), `wrong_red`
+    a free-text scan: `vacuously_passes` (exit 0 with pytest's passing summary in the
+    output, so the test cannot fail), `unverifiable` (exit 0 with no pytest evidence,
+    or with pytest's own failure in the output: the run cannot be interpreted, which
+    is no verdict on the test), `wrong_red`
     (the run gave no verdict on the behaviour, or the test died on a missing
     import/name/module attribute) or `fails_for_right_reason`."""
     if exit_code == 0:
+        # an exit code alone never proves the test cannot fail: pytest must have run
+        if not _PYTEST_EVIDENCE.search(output):
+            return "unverifiable", "no pytest summary or test outcome line in the output"
+        if _PYTEST_FAILURE.search(output):  # `pytest ; true`: the shell hid pytest's code
+            return "unverifiable", "exit 0 contradicts the failure pytest printed"
         return "vacuously_passes", None
     if exit_code != 1:
         meaning = _PYTEST_EXIT_MEANING.get(exit_code, f"exit {exit_code}: the tests did not run")
@@ -122,6 +139,21 @@ def classify_red(exit_code: int, output: str) -> tuple[str, str | None]:
     if _RUNNER_MISSING.search(output):
         return "wrong_red", "runner not installed"
     return "fails_for_right_reason", None
+
+
+async def _spawn(command: str, cwd: Path) -> asyncio.subprocess.Process:
+    """Start the coder's command in `cwd`. Through `bash -o pipefail` so a pipeline
+    (`| tail`, `2>&1 | tee`) cannot mask a failing pytest behind the last stage's exit
+    code; plain sh when bash is absent."""
+    kwargs: dict[str, Any] = {
+        "cwd": str(cwd),
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.STDOUT,
+    }
+    bash = shutil.which("bash")
+    if bash:
+        return await asyncio.create_subprocess_exec(bash, "-o", "pipefail", "-c", command, **kwargs)
+    return await asyncio.create_subprocess_shell(command, **kwargs)
 
 
 async def verify_red_green(
@@ -137,9 +169,11 @@ async def verify_red_green(
     Works in a throwaway detached worktree of the change's HEAD, so the real
     worktree is never touched (nothing to restore). In it, `revert_files` are
     checked out from `base` (files the base lacks are deleted), then each of at
-    most MAX_VERIFIED_TESTS `commands` runs (through a shell: they are the coder's
-    own strings, and the worktree is disposable). Each is classified by
-    `classify_red`; `vacuous` (exit 0) is kept as a boolean. Returns one dict per
+    most MAX_VERIFIED_TESTS `commands` runs (through `bash -o pipefail`: they are the
+    coder's own strings, and the worktree is disposable; an absolute path of the real
+    worktree in a command, as in `cd <worktree> && pytest`, is pointed at the
+    throwaway one so the run cannot escape the revert). Each is classified by
+    `classify_red`; `vacuous` is kept as a boolean (`vacuously_passes` only). Returns one dict per
     command: {command, exit_code, vacuous, classification, marker, output}."""
     tmp = Path(tempfile.mkdtemp(prefix="rework-redgreen-"))
     probe = tmp / "wt"
@@ -153,12 +187,7 @@ async def verify_red_green(
             if code != 0:  # absent at base: the fix added it, so reverting removes it
                 (probe / path).unlink(missing_ok=True)
         for command in commands[:MAX_VERIFIED_TESTS]:
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                cwd=str(probe),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
+            proc = await _spawn(command.replace(str(worktree), str(probe)), probe)
             try:
                 raw, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
                 exit_code = proc.returncode if proc.returncode is not None else -1
@@ -173,7 +202,7 @@ async def verify_red_green(
                 {
                     "command": command,
                     "exit_code": exit_code,
-                    "vacuous": exit_code == 0,
+                    "vacuous": classification == "vacuously_passes",
                     "classification": classification,
                     "marker": marker,
                     "output": text[-2000:],

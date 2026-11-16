@@ -272,6 +272,11 @@ async def red_green_notes(run_ctx: dict[str, Any]) -> list[str]:
     for r in results:
         if r["classification"] == "vacuously_passes":
             verdict = "STILL PASSES: vacuous_test"
+        elif r["classification"] == "unverifiable":
+            verdict = (
+                f"could not interpret this run, verify by hand ({r['marker']}): exit 0"
+                " alone is neither proof the test cannot fail nor an accusation"
+            )
         elif r["classification"] == "wrong_red":
             verdict = (
                 f"FAILED FOR THE WRONG REASON (`{r['marker']}`): the run died before the"
