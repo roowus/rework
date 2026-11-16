@@ -508,6 +508,10 @@ async def test_rg_and_grep_branches_return_the_same_file_set(
     (repo / "plain.txt").write_text("needle plain\n")
     (repo / "run.log").write_text("needle in a log\n")
     (repo / ".git" / "NEEDLE_IN_GIT").write_text("needle inside .git\n")
+    # a submodule/worktree gitlink: `.git` as a FILE, which --exclude-dir alone misses
+    (repo / "vendor").mkdir()
+    (repo / "vendor" / "lib.txt").write_text("needle in vendor\n")
+    (repo / "vendor" / ".git").write_text("gitdir: ../.git/modules/vendor\nneedle GITLINK\n")
     ex = ReadOnlyExecutor(LocalExecutor(repo), repo)
 
     def files(out: str) -> set[str]:
@@ -524,11 +528,18 @@ async def test_rg_and_grep_branches_return_the_same_file_set(
         monkeypatch.setattr(shutil, "which", lambda *_a, **_k: None)  # no rg: grep branch
         return with_rg, await ex.execute("search_code", args)
 
-    everything = {".env", ".hidden/x.txt", "build/out.txt", "plain.txt", "run.log"}
+    everything = {
+        ".env",
+        ".hidden/x.txt",
+        "build/out.txt",
+        "plain.txt",
+        "run.log",
+        "vendor/lib.txt",
+    }
     accepted = {
         None: everything,
         "*": everything,
-        "*.txt": {".hidden/x.txt", "build/out.txt", "plain.txt"},
+        "*.txt": {".hidden/x.txt", "build/out.txt", "plain.txt", "vendor/lib.txt"},
         "*.log": {"run.log"},
         ".env": {".env"},
         "?lain.txt": {"plain.txt"},
@@ -540,6 +551,18 @@ async def test_rg_and_grep_branches_return_the_same_file_set(
             args["glob"] = glob
         with_rg, with_grep = await both(args)
         assert files(with_rg) == files(with_grep) == expected, (glob, with_rg, with_grep)
+        assert "GITLINK" not in with_rg + with_grep, glob
+    # the .git FILE is skipped by name in both branches, however it is reached
+    for args in (
+        {"pattern": "needle", "glob": ".git*"},
+        {"pattern": "needle", "path": "vendor"},
+        {"pattern": "GITLINK"},
+    ):
+        with_rg, with_grep = await both(args)
+        assert files(with_rg) == files(with_grep), (args, with_rg, with_grep)
+        assert "GITLINK" not in with_rg + with_grep and "vendor/.git" not in with_rg + with_grep
+    with_rg, with_grep = await both({"pattern": "needle", "path": "vendor"})
+    assert files(with_rg) == files(with_grep) == {"vendor/lib.txt"}
     # a glob grep cannot express is refused in BOTH branches, never half-honoured
     for glob in ("**/*", "!.git", "*.{py,log}", "[ab]*", "sub/*.txt", "-x", "**"):
         with_rg, with_grep = await both({"pattern": "needle", "glob": glob})
@@ -594,6 +617,16 @@ async def test_legitimate_survey_calls_still_work_after_the_git_and_glob_guards(
     assert "upper" in shown and not shown.startswith("error: refused")
     assert "def greet" in await ex.execute("read_file", {"path": "app.py"})
     assert "app.py" in await ex.execute("list_dir", {})
+
+
+async def test_a_rev_naming_git_internals_is_refused(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    ex = ReadOnlyExecutor(LocalExecutor(repo), repo)
+    for rev in (".git/config", ".git", "HEAD:.git/config", "HEAD:./.git/config"):
+        out = await ex.execute("git_read", {"subcommand": "show", "rev": rev})
+        assert out.startswith("error: refused") and ".git internals" in out, (rev, out)
+    ok = await ex.execute("git_read", {"subcommand": "show", "rev": "HEAD:app.py"})
+    assert not ok.startswith("error: refused") and "upper" in ok
 
 
 def _poison_repo(repo: Path, hook: str) -> None:

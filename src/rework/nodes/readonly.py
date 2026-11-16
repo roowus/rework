@@ -208,6 +208,9 @@ def _rev(raw: Any, default: str | None = None) -> str | None:
     rev = _text(raw, "rev", limit=200)
     if rev.startswith("-"):
         raise ToolRefused("rev must not start with '-'")
+    # a rev can name a path too (rev:path); .git internals are not surveyed there either
+    if rev.startswith(".git") or ".git" in re.split(r"[\\/:]+", rev):
+        raise ToolRefused(f"read-only mode: .git internals are not surveyed: {rev!r}")
     if not _REV_OK.match(rev):
         raise ToolRefused(f"rev has characters a revision never needs: {rev!r}")
     return rev
@@ -252,6 +255,9 @@ def build_search_argv(workdir: Path, args: dict[str, Any], *, have_rg: bool) -> 
     argv = ["grep", "-rnI", "--exclude-dir=.git", "-E" if not fixed else "-F"]
     if glob:
         argv.append(f"--include={glob}")
+    # a `.git` FILE (gitlink) too; last, because with contradictory --include and
+    # --exclude the last match wins (so no user glob can re-include .git)
+    argv.append("--exclude=.git")
     return [*argv, "-e", pattern, "--", rel]
 
 
