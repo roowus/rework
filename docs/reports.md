@@ -25,7 +25,7 @@ the owner's examples of permanently forced content.
 | `findings` | numbered findings: title, detail, evidence (file:line actually read, never invented), severity, verdict CONFIRMED/PLAUSIBLE, confidence | findings[] | investigator, auditor |
 | `blockers` | structured open questions: question, 2+ options, recommendation, why it cannot self-answer. The honesty valve: an explicit blocker beats a guess | blockers[] | all roles |
 | `suggested_fix` | concrete fix approach per actionable finding (approach, not the fix) | suggested_fix | investigator |
-| `tests` | the SMALLEST test that would catch the bug: name, what_it_pins, where, should_fail_because, command; an empty list needs `no_tests_reason` | tests[], no_tests_reason | investigator |
+| `tests` | the SMALLEST test that would catch the bug: name, what_it_pins, where, should_fail_because, command; an empty list needs `no_tests_reason`; when both are omitted or blank the artifact gets the marker reason "not provided: the investigator named no test and gave no reason" (plus a `warnings` row if the assembly has one), never a silent pass | tests[], no_tests_reason | investigator |
 | `ruled_out` | areas examined and clean, with the evidence that rules them out | ruled_out[] | investigator |
 | `classification` | complexity + priority judgment with justification | classification | investigator, auditor |
 | `standing_assessments` | the five truss verdicts, present even on a clean audit: proportionality, complexity, priority, coverage, business-logic risk. A bad assessment must also raise a finding | standing_assessments | auditor |

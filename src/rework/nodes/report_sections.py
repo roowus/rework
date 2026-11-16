@@ -394,7 +394,26 @@ def apply_defaults(artifact: dict[str, Any], sections: list[ReportSection]) -> l
         artifact["warnings"].append(
             f"the report omitted {', '.join(filled)}; treated as empty, not as a clean result"
         )
+    if _flag_untested(artifact, sections):
+        filled.append("no_tests_reason")
     return filled
+
+
+NO_TESTS_NO_REASON = "not provided: the investigator named no test and gave no reason"
+
+
+def _flag_untested(artifact: dict[str, Any], sections: list[ReportSection]) -> bool:
+    """An empty `tests` with a blank `no_tests_reason` is an omission, not a judgement.
+    Make it self-describing (a marker reason plus a warning row when there is a
+    `warnings` list) instead of passing silently; a real reason is left alone."""
+    if not any(s.key == "tests" for s in sections):
+        return False
+    if artifact.get("tests") or str(artifact.get("no_tests_reason") or "").strip():
+        return False
+    artifact["no_tests_reason"] = NO_TESTS_NO_REASON
+    if isinstance(artifact.get("warnings"), list):
+        artifact["warnings"].append(NO_TESTS_NO_REASON)
+    return True
 
 
 def resolve_order(artifact: dict[str, Any], sections: list[ReportSection]) -> list[str]:

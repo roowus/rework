@@ -83,6 +83,35 @@ def fix_files(changed: list[str]) -> list[str]:
     return [f for f in changed if not _TEST_PATH.search(f)]
 
 
+# Output that means the run died before the test could judge the behaviour: the
+# red is for the wrong reason, so it is not proof the test pins anything.
+WRONG_RED_MARKERS = (
+    "No module named",
+    "ModuleNotFoundError",
+    "ImportError while importing",
+    "ERROR collecting",
+    "errors during collection",
+    "SyntaxError",
+    "collected 0 items",
+    "unrecognized arguments",
+)
+
+
+def wrong_red_marker(output: str) -> str | None:
+    """The first collection/import/usage marker in a failing run's output, if any."""
+    return next((m for m in WRONG_RED_MARKERS if m in output), None)
+
+
+def classify_red(exit_code: int, output: str) -> tuple[str, str | None]:
+    """(classification, marker) of a run with the fix reverted: `vacuously_passes`
+    (exit 0, the test cannot fail), `wrong_red` (fails, but at collection/import,
+    so not proof), or `fails_for_right_reason`."""
+    if exit_code == 0:
+        return "vacuously_passes", None
+    marker = wrong_red_marker(output)
+    return ("wrong_red", marker) if marker else ("fails_for_right_reason", None)
+
+
 async def verify_red_green(
     worktree: Path,
     commands: list[str],
@@ -96,9 +125,10 @@ async def verify_red_green(
     Works in a throwaway detached worktree of the change's HEAD, so the real
     worktree is never touched (nothing to restore). In it, `revert_files` are
     checked out from `base` (files the base lacks are deleted), then each of at
-    most MAX_VERIFIED_TESTS `commands` runs. A command that still exits 0 is
-    `vacuous`: the test passes without the fix, so it pins nothing. Returns one
-    dict per command: {command, exit_code, vacuous, output}."""
+    most MAX_VERIFIED_TESTS `commands` runs (through a shell: they are the coder's
+    own strings, and the worktree is disposable). Each is classified by
+    `classify_red`; `vacuous` (exit 0) is kept as a boolean. Returns one dict per
+    command: {command, exit_code, vacuous, classification, marker, output}."""
     tmp = Path(tempfile.mkdtemp(prefix="rework-redgreen-"))
     probe = tmp / "wt"
     results: list[dict[str, Any]] = []
@@ -123,12 +153,18 @@ async def verify_red_green(
             except TimeoutError:
                 proc.kill()
                 raw, exit_code = b"timed out", -1
+            text = raw.decode("utf-8", "replace")
+            classification, marker = classify_red(exit_code, text)
+            if exit_code == -1 and text == "timed out":
+                classification, marker = "wrong_red", "timed out"
             results.append(
                 {
                     "command": command,
                     "exit_code": exit_code,
                     "vacuous": exit_code == 0,
-                    "output": raw.decode("utf-8", "replace")[-2000:],
+                    "classification": classification,
+                    "marker": marker,
+                    "output": text[-2000:],
                 }
             )
     finally:

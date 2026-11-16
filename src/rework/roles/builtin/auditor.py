@@ -270,7 +270,16 @@ async def red_green_notes(run_ctx: dict[str, Any]) -> list[str]:
         return [f"Mechanical red-green check could not run: {exc}. Verify it yourself."]
     lines = ["Mechanical red-green check (fix files reverted in a throwaway worktree):"]
     for r in results:
-        verdict = "STILL PASSES: vacuous_test" if r["vacuous"] else "fails as it should"
+        if r["classification"] == "vacuously_passes":
+            verdict = "STILL PASSES: vacuous_test"
+        elif r["classification"] == "wrong_red":
+            verdict = (
+                f"FAILED FOR THE WRONG REASON (`{r['marker']}`): the run died before the"
+                " test could judge the behaviour, so this red-green is NOT proof the"
+                " test pins it. Verify by hand"
+            )
+        else:
+            verdict = "fails as it should"
         lines.append(f"- `{r['command']}` exit {r['exit_code']}: {verdict}\n{r['output'][-600:]}")
     return ["\n".join(lines)]
 

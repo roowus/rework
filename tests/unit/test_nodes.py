@@ -14,6 +14,7 @@ from rework.kernel.llm.types import ChatResult, ToolCall, Usage
 from rework.nodes.repo_map import build_repo_map
 from rework.nodes.report_sections import (
     ASSEMBLY_AUDIT,
+    NO_TESTS_NO_REASON,
     build_report_prompt,
     build_report_schema,
     resolve_order,
@@ -692,6 +693,43 @@ async def test_an_audit_report_missing_coverage_keeps_its_findings(tmp_path: Pat
     assert artifact["findings"] == [finding]
     assert any("coverage" in w for w in artifact["warnings"])
     assert len(fake.requests) == 1  # no retry was needed
+
+
+async def _investigator_artifact(tmp_path: Path, report: dict[str, object], n: int) -> dict:
+    import json
+
+    fake = FakeProvider(
+        [ChatResult(text=json.dumps(report), usage=Usage(input_tokens=1, output_tokens=1))]
+    )
+    node = make_report_writer_node(
+        fake,
+        _catalog(),
+        "fake",
+        await _store(tmp_path),
+        "m1",
+        f"m1:step:investigate:{n}",
+        resolve_sections(["summary", "findings", "tests", "blockers", "warnings"]),
+    )
+    result = await node({"messages": []})
+    assert result["artifact"] is not None and len(fake.requests) == 1
+    return dict(result["artifact"])
+
+
+async def test_an_investigator_that_names_no_test_and_no_reason_is_not_silent(
+    tmp_path: Path,
+) -> None:
+    base = {"summary": "s", "findings": [], "blockers": [], "warnings": []}
+    omitted = await _investigator_artifact(tmp_path, base, 1)
+    assert omitted["tests"] == []
+    assert omitted["no_tests_reason"] == NO_TESTS_NO_REASON
+    assert "no test" in omitted["no_tests_reason"] and "no reason" in omitted["no_tests_reason"]
+    assert NO_TESTS_NO_REASON in omitted["warnings"]
+
+    reasoned = await _investigator_artifact(
+        tmp_path, {**base, "tests": [], "no_tests_reason": "docs-only change"}, 2
+    )
+    assert reasoned["no_tests_reason"] == "docs-only change"
+    assert reasoned["warnings"] == []
 
 
 async def test_a_report_missing_a_section_without_a_default_still_fails(tmp_path: Path) -> None:

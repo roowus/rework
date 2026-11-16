@@ -11,10 +11,12 @@ from pathlib import Path
 
 from rework.nodes.git_ops import _run, diff_base, head_sha
 from rework.nodes.testing import (
+    classify_red,
     fix_files,
     handoff_tests_gap,
     parse_tests_block,
     verify_red_green,
+    wrong_red_marker,
 )
 from rework.roles.builtin.auditor import changed_files, red_green_notes
 
@@ -35,6 +37,12 @@ def _git(repo: Path, *args: str) -> None:
         check=True,
         capture_output=True,
     )
+
+
+def _rev(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True
+    ).stdout.strip()
 
 
 def _repo(tmp_path: Path, test_body: str) -> tuple[Path, str]:
@@ -64,9 +72,7 @@ def assert_real_failure(output: str) -> None:
     """A real red: the assertion failed. A wrong red (no pytest, import or
     collection error, nothing collected) must not satisfy this."""
     assert "assert add(2, 3) == 5" in output and "1 failed" in output, output
-    for wrong_red in ("No module named", "ModuleNotFoundError", "unrecognized arguments"):
-        assert wrong_red not in output, output
-    assert "collected 0 items" not in output and "ERROR collecting" not in output, output
+    assert wrong_red_marker(output) is None, output
 
 
 def test_parse_tests_block_reads_the_last_fenced_json() -> None:
@@ -94,6 +100,7 @@ async def test_a_test_that_fails_without_the_fix_is_not_vacuous(tmp_path: Path) 
     repo, base = _repo(tmp_path, REAL_TEST)
     [result] = await verify_red_green(repo, [CMD], ["calc.py"], base)
     assert result["vacuous"] is False
+    assert result["classification"] == "fails_for_right_reason" and result["marker"] is None
     assert_real_failure(result["output"])
     # the real worktree was never touched: the fix is still in place
     assert "a + b" in (repo / "calc.py").read_text()
@@ -107,6 +114,7 @@ async def test_a_test_that_still_passes_with_the_fix_reverted_is_vacuous(tmp_pat
     repo, base = _repo(tmp_path, VACUOUS_TEST)
     [result] = await verify_red_green(repo, [CMD], ["calc.py"], base)
     assert result["vacuous"] is True and result["exit_code"] == 0
+    assert result["classification"] == "vacuously_passes"
     assert "1 passed" in result["output"]
 
     diff = await diff_base(repo, base=base)
@@ -144,3 +152,63 @@ async def test_an_uncheckable_claim_says_it_was_not_verified() -> None:
     test_only = {**claim, "base_sha": "abc", "diff": "diff --git a/test_c.py b/test_c.py\n"}
     [note] = await red_green_notes(test_only)
     assert "NOT performed" in note and "test-only" in note
+
+
+NEEDS_MUL = "from calc import mul\n\ndef test_mul():\n    assert mul(2, 3) == 6\n"
+
+
+async def test_a_run_that_dies_on_import_is_a_wrong_red_not_proof(tmp_path: Path) -> None:
+    """The fix adds mul() and a test importing it. Reverted, the run exits non-zero
+    at collection (ImportError): that is not a test failing for the behaviour."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    _git(repo, "init", "-b", "main")
+    _git(repo, "add", "calc.py")
+    _git(repo, "commit", "-m", "base")
+    base = _rev(repo)
+    (repo / "calc.py").write_text(
+        "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n"
+    )
+    (repo / "test_calc.py").write_text(NEEDS_MUL)
+    _git(repo, "add", "calc.py", "test_calc.py")
+    _git(repo, "commit", "-m", "fix")
+
+    [result] = await verify_red_green(repo, [CMD], ["calc.py"], base)
+    assert result["exit_code"] != 0 and result["vacuous"] is False
+    assert result["classification"] == "wrong_red"
+    assert result["marker"] in ("ImportError while importing", "ERROR collecting")
+
+    notes = await red_green_notes(
+        {
+            "coder_tests": {**GOOD, "commands": [CMD]},
+            "worktree_path": str(repo),
+            "base_sha": base,
+            "diff": await diff_base(repo, base=base),
+        }
+    )
+    [note] = notes
+    assert "WRONG REASON" in note and "NOT proof" in note and result["marker"] in note
+    assert "fails as it should" not in note and "vacuous_test" not in note
+
+
+def test_classify_red_covers_every_outcome() -> None:
+    assert classify_red(0, "1 passed") == ("vacuously_passes", None)
+    assert classify_red(1, "assert 1 == 2\n1 failed") == ("fails_for_right_reason", None)
+    assert classify_red(2, "ERROR collecting x.py") == ("wrong_red", "ERROR collecting")
+    assert classify_red(1, "No module named 'pytest'") == ("wrong_red", "No module named")
+    assert classify_red(4, "error: unrecognized arguments: -z")[0] == "wrong_red"
+    assert classify_red(5, "collected 0 items") == ("wrong_red", "collected 0 items")
+
+
+def test_the_auditor_cli_view_shows_test_coverage_even_without_evidence() -> None:
+    from rework.cli import _render_artifact
+
+    entry = {"severity": "high", "kind": "vacuous_test", "title": "cannot fail", "detail": "d"}
+    text = "\n".join(_render_artifact("auditor", {"summary": "s", "coverage": [entry]}))
+    assert "TEST COVERAGE" in text
+    assert "[high/vacuous_test] cannot fail" in text
+    assert "evidence: None" in text  # pinned: a missing evidence key neither crashes nor hides
+    with_evidence = {**entry, "evidence": "pytest: 1 passed"}
+    shown = "\n".join(_render_artifact("auditor", {"summary": "s", "coverage": [with_evidence]}))
+    assert "evidence: pytest: 1 passed" in shown
