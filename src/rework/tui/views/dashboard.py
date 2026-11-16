@@ -1340,6 +1340,10 @@ class DashboardView(View):
             # the spinner reads "working" vs "idle 7m" off this stamp: a poll alone
             # (no tick while unfocused) must repaint the header when it moves
             self._stamp(self.mission_id),
+            # connectivity belongs to the key: an offline -> online flip must
+            # repaint this page even when no other keyed field moved
+            self.snap.online,
+            self.snap.error,
         )
 
     async def _load_full_mission(self, mission_id: str) -> None:

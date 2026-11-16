@@ -790,3 +790,17 @@ Project keys live in the project's `settings` JSON (`rework project show <id>`
 prints it). There is no `rework project set` command yet, so changing them today
 means updating that JSON in the store (or creating the project with the keys in
 its settings); the global env vars are the supported knob otherwise.
+
+### When the link to the database drops
+
+The TUI keeps running through an outage. The status bar shows the offline marker
+with the last error, and every list, mission page and chat keeps the last good
+data it fetched instead of blanking, so an open gate is still readable and the
+decision buttons stay where they were. A drop is never a reason to restart: the
+data service reconnects on its own backoff, the open mission page repaints as
+soon as the link is back even when nothing else about the mission changed, and a
+long outage that outlives the backoff cap still recovers without duplicating a
+chat row or losing one. Activity marks do not animate while the link is down: a
+stamp that stopped arriving reads as idle, which is the honest answer. A gate
+answer pressed during an outage fails loudly with a red "Could not answer gate"
+toast, and pressing it again after recovery lands the decision exactly once.
