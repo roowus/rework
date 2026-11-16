@@ -39,6 +39,7 @@ from rework.kernel.state.records import (
     check_priority,
     coerce_priority,
 )
+from rework.kernel.state.retry import retry_transient
 
 _DDL = [
     """
@@ -258,9 +259,20 @@ def _serialized(method: Any) -> Any:
 
     @functools.wraps(method)
     async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        # The lock is OUTERMOST and the retry sits INSIDE it: a retried attempt
+        # must not re-enter the (reentrant) op lock from a nested public call,
+        # and no other task may slip a statement onto the shared connection
+        # between our attempts. A deadlock (SQLSTATE 40P01) or a serialization
+        # failure (40001) is retried here, once, for every read and write the
+        # store exposes; `cleanup` rolls the aborted transaction back so each
+        # attempt starts from a clean connection.
         async with self._op_lock:
             try:
-                return await method(self, *args, **kwargs)
+                return await retry_transient(
+                    lambda: method(self, *args, **kwargs),
+                    cleanup=self._end_idle_transaction,
+                    label=f"PostgresStore.{method.__name__}",
+                )
             finally:
                 await self._end_idle_transaction()
 
@@ -1031,12 +1043,26 @@ class PostgresStore:
 
     @_serialized
     async def delete_chat(self, chat_id: str) -> None:
+        # LOCK ORDER, always: the chats row first, then chat_messages. See the
+        # note on append_chat_message.
+        await self._conn.execute("SELECT 1 FROM chats WHERE id = %s FOR UPDATE", (chat_id,))
         await self._conn.execute("DELETE FROM chat_messages WHERE chat_id = %s", (chat_id,))
         await self._conn.execute("DELETE FROM chats WHERE id = %s", (chat_id,))
         await self._conn.commit()
 
     @_serialized
     async def append_chat_message(self, message: ChatMessage) -> ChatMessage:
+        # LOCK ORDER, always: the chats row first, then chat_messages. Found
+        # live 2026-11-14: a deadlock (40P01) on
+        # `UPDATE chats SET updated_at = $1 WHERE id = $2` because one
+        # transaction took chat_messages then chats while another took them the
+        # other way round. Every statement in this store that touches both
+        # relations takes the chats row first, under FOR UPDATE, so two of our
+        # transactions can no longer form a cycle. Any future write that needs
+        # both tables keeps this order.
+        await self._conn.execute(
+            "SELECT 1 FROM chats WHERE id = %s FOR UPDATE", (message.chat_id,)
+        )
         async with self._conn.cursor() as cur:
             await cur.execute(
                 "INSERT INTO chat_messages (chat_id, role, body, display, ts)"

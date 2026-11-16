@@ -30,7 +30,7 @@ import logging
 import random
 from collections.abc import Awaitable, Callable, Iterator
 from contextvars import ContextVar
-from typing import Any, TypeVar
+from typing import Any
 
 log = logging.getLogger("rework.state.retry")
 
@@ -57,8 +57,6 @@ _SQLITE_LOCKED = ("database is locked", "database table is locked")
 # a transient error inside one attempt re-runs the whole operation and the log
 # carries one warning per retry, not one per nested call.
 _DEPTH: ContextVar[int] = ContextVar("rework_transient_db_depth", default=0)
-
-_T = TypeVar("_T")
 
 
 class TransientDatabaseError(RuntimeError):
@@ -137,13 +135,13 @@ def transient_error_summary(exc: BaseException) -> str:
     return f"{name} (SQLSTATE {state})" if state else f"{name}: {exc}"
 
 
-async def retry_transient(
-    operation: Callable[[], Awaitable[_T]],
+async def retry_transient[T](
+    operation: Callable[[], Awaitable[T]],
     *,
     cleanup: Callable[[], Awaitable[None]] | None = None,
     label: str = "store operation",
     attempts: int = MAX_ATTEMPTS,
-) -> _T:
+) -> T:
     """Await `operation()`, retrying a transient database error.
 
     `cleanup` runs after a failed attempt and BEFORE the next one (roll back the
@@ -196,7 +194,7 @@ async def retry_transient(
         _DEPTH.reset(token)
 
 
-def retry_transient_methods(cls: type[_T]) -> type[_T]:
+def retry_transient_methods[T](cls: type[T]) -> type[T]:
     """Class decorator: give every public async method the shared retry.
 
     SqliteStore has no single wrapper of its own (each method talks to the one
