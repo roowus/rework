@@ -578,8 +578,8 @@ Tests never touch `rework_state`. Postgres tests use the dedicated
 The daemon and the TUI hold one store connection each. When it drops (a Postgres
 restart, a network blip, a locked SQLite file), the store proxy retries with capped
 backoff and reconnects the Postgres link, so a mission in flight carries on where it
-was. A run is not restarted, and a role does not repeat a model call that was already
-charged.
+was. A run is not started over: it is re-driven from its checkpoint, and a role does not
+repeat a model call that was already charged.
 
 What is retried: reads, status updates, and any write that is safe to repeat (model
 charges and events that carry a dedupe key, so a repeat lands on the row that already
@@ -587,12 +587,18 @@ exists). What is not: writes that cannot be repeated safely (creating a mission 
 gate, deciding a gate, un-keyed events, lock acquisition, complaints). Those fail once
 and the error reaches the caller, so an owner action is never applied twice.
 
-What the owner sees: one warning in the daemon log when an outage starts, one info
-line when it clears, and the TUI's offline hint while it lasts. A gate that is waiting
-for an answer keeps waiting, and an answer given during the outage is applied once when
-the store is back. The retry budget is five minutes; an outage that lasts longer ends
-the run's task with the run left RUNNING, and a daemon restart resumes it from its
-checkpoint.
+What the owner sees: one warning in the daemon log when a store call first meets an
+outage, one info line when the store answers again, and the TUI's offline hint while it
+lasts. A gate that is waiting for an answer keeps waiting, and an answer given during the
+outage is applied once when the store is back.
+
+Each store call has a retry budget of five minutes. An outage that outlasts it does not
+end the run or fail the mission. The run's task gives up its role slot, leaves the run
+RUNNING with its checkpoint, and re-drives it from that checkpoint, with exponential
+backoff from 1 second up to 60 seconds, for as long as the outage lasts. The mission's own
+pass is re-run the same way. Each give-up and each re-drive is logged at error level. No
+restart is needed: once the store answers, the mission carries on to its normal end and
+does not end FAILED.
 
 ### Rotating the Postgres password
 

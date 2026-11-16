@@ -29,13 +29,18 @@ from rework.kernel.state.records import (
     EventType,
     Mission,
     MissionStatus,
+    Run,
+    RunStatus,
     new_id,
+)
+from rework.kernel.state.records import (
+    run_id as make_run_id,
 )
 from rework.kernel.state.resilient import ResilientStore, RetryPolicy
 from rework.kernel.state.sqlite import SqliteStore, open_sqlite
 from rework.orchestrator import engine as engine_module
 from rework.orchestrator.daemon import sqlite_checkpointer_factory
-from rework.orchestrator.engine import MissionRunner
+from rework.orchestrator.engine import MissionRunner, RunSupervisor
 from rework.roles.base import RoleBuildCtx, RoleSpec
 from rework.roles.registry import RoleRegistry
 from support.fault_store import FaultStore
@@ -430,3 +435,71 @@ async def test_owner_cancel_stops_a_run_that_is_being_redriven(
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task, timeout=10)
     fault.set_down(False)
+
+
+# -- (g) the ROLE path alone re-drives its run through an outage -----------------------
+
+
+def _role_run(mission_id: str) -> Run:
+    """The row _dispatch_step writes for the one-step plan (no mission pass involved)."""
+    return Run(
+        id=make_run_id(mission_id, "do", "ledger", 1),
+        mission_id=mission_id,
+        role="ledger",
+        step="do",
+        attempt=1,
+    )
+
+
+async def _role_alone(
+    world: dict[str, Any], store: Any, mission_id: str
+) -> tuple[Run, RunSupervisor]:
+    """One role run and the supervisor that drives it, built directly: no MissionRunner,
+    so no mission-level pass can re-drive the run. Only the role's own loop can."""
+    mission = await world["real"].get_mission(mission_id)
+    assert mission is not None
+    run = await world["real"].create_run(_role_run(mission_id))
+    supervisor = RunSupervisor(
+        mission,
+        store,
+        InProcessEventBus(store),
+        world["registry"],
+        world["catalog"],
+        sqlite_checkpointer_factory(world["ck_path"]),
+        world["workroot"],
+    )
+    return run, supervisor
+
+
+async def test_the_role_path_redrives_its_own_run_through_an_outage(
+    world: dict[str, Any], fast_redrive: None
+) -> None:
+    """_execute alone, with a store that is down for far longer than the store's own
+    retries and then recovers. The run must end COMPLETED with exactly one clean run's
+    rows. Making _drive give up instead of re-driving leaves the run RUNNING, and this
+    test goes red on the `not task.done()` check."""
+    clean_id = await _mission(world, ONE_STEP)
+    clean_run, clean_sup = await _role_alone(world, world["real"], clean_id)
+    await asyncio.wait_for(clean_sup._execute(clean_run, False), timeout=30)
+    baseline = await _ledger(world["real"], clean_id)
+    assert baseline["runs"] == [("do", "ledger", RunStatus.COMPLETED.value)]
+
+    mission_id = await _mission(world, ONE_STEP)
+    fault = FaultStore(world["real"])
+    store = ResilientStore(fault, policy=SHORT_BUDGET)
+    run, supervisor = await _role_alone(world, store, mission_id)
+    fault.set_down(True)
+    task = asyncio.create_task(supervisor._execute(run, False))
+
+    async def role_is_redriving() -> bool:
+        # the store gave up many times while the role kept re-driving; or the task already ended
+        return task.done() or fault.calls > 200
+
+    await _wait_for(role_is_redriving, timeout_s=20, what="the role to re-drive")
+    assert not task.done(), "the role gave up instead of re-driving through the outage"
+    fault.set_down(False)
+    await asyncio.wait_for(task, timeout=30)
+
+    row = await world["real"].get_run(run.id)
+    assert row is not None and row.status == RunStatus.COMPLETED
+    assert await _ledger(world["real"], mission_id) == baseline, "one clean run's rows only"
