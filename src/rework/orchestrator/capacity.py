@@ -47,6 +47,10 @@ PRECEDENCE (REWORK_CAPACITY, default auto):
 
 Fixed caps keep the value the daemon was CONSTRUCTED with (which is the
 explicit env value), so `REWORK_CONCURRENCY=3` means 3, never a re-derivation.
+The one exception is the invariant above: a pinned mission cap is still reduced
+to fit the ROLE cap when the role cap is the smaller of the two (roles are the
+resource that protects the box), and a pinned ROLE cap likewise lowers the
+mission cap. A pinned cap is never raised to satisfy it.
 """
 
 from __future__ import annotations
@@ -233,6 +237,12 @@ class CapacityPolicy:
         measured = plan(cpu_count, load1, avail_bytes)
         concurrency = self.concurrency if self.fixed_concurrency else measured.concurrency
         roles = self.max_roles if self.fixed_max_roles else measured.max_roles
+        # The invariant holds on EVERY path, pinned or not: the pinned values stay
+        # authoritative for the cap that was pinned, and the clamp only ever
+        # REDUCES the mission cap to fit the role cap (roles are what protects the
+        # box), never raises a pinned number. REWORK_MAX_ROLES=2 on 12 CPUs is 2
+        # missions / 2 roles; REWORK_CONCURRENCY=3 with 1 planned role is 1 / 1.
+        concurrency = max(1, min(concurrency, roles))
         if (concurrency, roles) == (measured.concurrency, measured.max_roles):
             return measured
         cpus = max(1, int(cpu_count))

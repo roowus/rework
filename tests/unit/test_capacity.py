@@ -96,6 +96,45 @@ def test_the_mission_cap_is_never_more_than_the_role_cap() -> None:
         assert cap.concurrency >= CONCURRENCY_FLOOR
 
 
+MEASUREMENTS: tuple[tuple[int, float, int | None], ...] = (
+    (1, 0.0, None),
+    (1, 12.0, 100),
+    (2, 0.0, None),
+    (4, 0.5, None),
+    (8, 0.0, None),
+    (8, 9.0, None),
+    (8, 12.4, 5_100_000_000),
+    (12, 0.0, None),
+    (16, 40.0, None),
+    (16, 0.0, 2 * GB),
+)
+
+
+def test_the_invariant_holds_on_every_pinned_path_too() -> None:
+    """The unpinned sweep above is not the whole story: `target()` re-applies the
+    explicit env caps with the pin winning for that cap, so the mission cap could
+    come back above the role cap there. Sweep the pinned combinations as well."""
+    for fixed_concurrency, pinned_missions in ((True, 1), (True, 3), (True, 8)):
+        for fixed_max_roles, pinned_roles in ((False, 0), (True, 2), (True, 5)):
+            policy = CapacityPolicy(
+                concurrency=pinned_missions,
+                max_roles=pinned_roles or 1,
+                fixed_concurrency=fixed_concurrency,
+                fixed_max_roles=fixed_max_roles,
+            )
+            for cpus, load, avail in MEASUREMENTS:
+                cap = policy.target(cpus, load, avail)
+                case = (fixed_concurrency, pinned_missions, fixed_max_roles, pinned_roles)
+                assert cap.concurrency >= 1, (case, cpus, load, avail, cap)
+                assert cap.concurrency <= cap.max_roles, (case, cpus, load, avail, cap)
+                assert cap.max_roles >= 1, (case, cpus, load, avail, cap)
+                assert f"{cap.concurrency} missions / {cap.max_roles} roles" in cap.reason
+                if fixed_max_roles:
+                    assert cap.max_roles == pinned_roles, "the pin is honoured, not re-derived"
+                # the clamp only reduces the mission side, never raises it
+                assert cap.concurrency == min(pinned_missions, cap.max_roles), (case, cpus, cap)
+
+
 def test_measure_never_raises_and_reports_no_ram_without_proc(tmp_path: Path) -> None:
     cpus, load1, avail = measure(tmp_path / "no-such-meminfo")
     assert cpus >= 1
@@ -213,8 +252,11 @@ def test_explicit_max_roles_env_fixes_only_that_cap(monkeypatch: pytest.MonkeyPa
     )
     new = policy.apply_initial(8, 0.0, None)
     assert new is not None
-    assert new.max_roles == 5, "an explicit REWORK_MAX_ROLES is never re-derived"
-    assert new.concurrency == 8
+    assert new.max_roles == 5, "an explicit REWORK_MAX_ROLES is never re-derived or raised"
+    # 8 idle CPUs would plan 8 missions, but the pinned role cap of 5 is the
+    # resource that protects the box: the mission cap is clamped down to fit it.
+    assert new.concurrency == 5, "never more mission slots than role slots, pinned or not"
+    assert "5 missions / 5 roles" in new.reason
 
 
 # -- PrioritySlots.set_capacity ----------------------------------------------
