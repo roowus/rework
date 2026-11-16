@@ -393,10 +393,10 @@ class CapacityPolicy:
         else:  # pragma: no cover - programmer error, not a user path
             raise ValueError(f"unknown cap {which!r}")
         if pinned is not None:
-            return f"{which} PINNED at {pinned} by {env}={pinned} (pins=fixed)"
+            return f"{which} {CAP_PINNED} at {pinned} by {env}={pinned} (pins=fixed)"
         if floor is not None:
-            return f"{which} MANAGED, floor {floor} ({env}={floor} is a minimum, pins=floor)"
-        return f"{which} MANAGED, the planner decides ({env} unset)"
+            return f"{which} {CAP_MANAGED}, floor {floor} ({env}={floor} is a minimum, pins=floor)"
+        return f"{which} {CAP_MANAGED}, the planner decides ({env} unset)"
 
     def apply_initial(
         self, cpu_count: int, load1: float, avail_bytes: int | None

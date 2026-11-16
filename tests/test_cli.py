@@ -427,6 +427,9 @@ def test_capacity_prints_a_recomputed_plan_when_auto_is_active(no_capacity_env: 
     assert "missions MANAGED" in result.output and "roles MANAGED" in result.output
     assert "AUTO IS ACTIVE" in result.output
     assert "rework logs daemon -g 'capacity'" in result.output
+    # auto active: the hint points at the live daemon, and never at the auto-off text
+    assert "the live daemon's own view" in result.output, result.output
+    assert "by design" not in result.output, result.output
 
 
 def test_capacity_prints_the_truth_when_auto_is_off(
@@ -451,6 +454,9 @@ def test_capacity_prints_the_truth_when_auto_is_off(
     # nothing measured, so no live measurement line above "no measurement"
     assert "measured on this host now" not in result.output, result.output
     assert "measured nothing" in result.output, result.output
+    # auto off: the log hint says the daemon logs no "capacity" line at all
+    assert "by design" in result.output, result.output
+    assert "the live daemon's own view" not in result.output, result.output
 
 
 def test_capacity_reports_both_pinned_caps_as_pinned_fixed(
@@ -470,6 +476,9 @@ def test_capacity_reports_both_pinned_caps_as_pinned_fixed(
     assert "measured on this host now" not in result.output, result.output
     assert "measured nothing" in result.output, result.output
     assert "recomputed here from the env" not in result.output, result.output
+    # the other auto-off configuration: same hint, never the live-daemon one
+    assert "by design" in result.output, result.output
+    assert "the live daemon's own view" not in result.output, result.output
 
 
 def test_capacity_json_does_not_claim_a_recompute_when_auto_is_off(
@@ -492,6 +501,9 @@ def test_capacity_json_does_not_claim_a_recompute_when_auto_is_off(
     assert facts["planned"]["measured_missions"] is None
     assert facts["planned"]["measured_roles"] is None
     assert (facts["planned"]["missions"], facts["planned"]["roles"]) == (8, 2)
+    # --json carries the same hint string as the text branch
+    assert "by design" in facts["live_daemon_hint"], facts["live_daemon_hint"]
+    assert "the live daemon's own view" not in facts["live_daemon_hint"]
     text = runner.invoke(app, ["capacity"]).output
     assert f"plan: 8 missions / 2 roles  ({facts['planned']['basis']}" in text, text
 
@@ -525,6 +537,8 @@ def test_capacity_json_carries_the_same_facts(no_capacity_env: None) -> None:
     assert facts["measurement"]["cpus"] >= 1
     assert facts["planned"]["missions"] >= 1
     assert "MANAGED" in facts["why"]["missions"]
+    assert "the live daemon's own view" in facts["live_daemon_hint"], facts["live_daemon_hint"]
+    assert "by design" not in facts["live_daemon_hint"]
 
 
 def test_cancel_pause_resume_commands(rework_db: Path) -> None:

@@ -730,7 +730,9 @@ the live daemon's own view: rework logs daemon -g 'capacity' (its 'capacity plan
 ```
 
 With auto active it is a RECOMPUTE (env + one measurement + the planner),
-because the daemon exposes no capacity state over its API, and it says so. With
+because the daemon exposes no capacity state over its API, and it says so. A
+change needs two measurements in a row before the daemon applies it, so a host
+that just changed load may still show the previous pair in the daemon log. With
 `REWORK_CAPACITY=fixed` it prints `AUTO IS OFF` and the pair resolved at
 startup instead of a plan that never runs; with `REWORK_CAPACITY_PINS=fixed` and
 both numbers set it prints `AUTO IS OFF: both caps PINNED`. In both of those
