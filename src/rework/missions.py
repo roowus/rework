@@ -119,6 +119,64 @@ PLAYBOOK_GATES: dict[str, list[str]] = {"echo": [], "fix": ["ship"], "fix-pr": [
 DEFAULT_BUDGET_USD = 2.0  # what a deployment gets when nothing usable is set
 PLAYBOOK_PUBLISH: dict[str, str] = {"echo": "", "fix": "", "fix-pr": "pr", "draft": ""}
 
+# Words that make an objective read-and-report: the deliverable is writing,
+# not a change to the repository. Matched on word boundaries, case-insensitively.
+READS_ONLY_TRIGGERS = (
+    "audit",
+    "review the code base",
+    "review the codebase",
+    "analyse",
+    "analyze",
+    "map out",
+    "survey",
+    "write a report",
+    "document how",
+    "investigate what",
+    "explain how",
+)
+# Words that name a change to make: when one is present the work ends in a
+# repository change, whatever else the objective says.
+CHANGE_VETOES = (
+    "fix",
+    "add",
+    "rename",
+    "bump",
+    "migrate",
+    "implement",
+    "refactor",
+    "update",
+    "remove",
+    "upgrade",
+    "patch",
+    "change",
+)
+
+
+def _mentions(needle: str, haystack: str) -> bool:
+    pattern = r"\b" + r"\s+".join(re.escape(part) for part in needle.split()) + r"\b"
+    return re.search(pattern, haystack) is not None
+
+
+def reads_only_plan(objective: str, text: str = "") -> str | None:
+    """The plan a read-and-report objective should DEFAULT to: "draft" when the
+    work's deliverable is writing (an audit, a survey, a report), else None.
+
+    This is a DEFAULT-selection heuristic only. It is consulted when the caller
+    did not name a plan, and it never overrides an explicit plan.
+
+    Triggers are matched case-insensitively on word boundaries in the objective
+    (plus `text`, when given). Any veto word that names a change to make wins,
+    so "audit the code base and fix the two crashes" is a normal fix mission.
+    """
+    body = f"{objective or ''}\n{text or ''}".lower()
+    if not body.strip():
+        return None
+    if any(_mentions(word, body) for word in CHANGE_VETOES):
+        return None
+    if any(_mentions(word, body) for word in READS_ONLY_TRIGGERS):
+        return "draft"
+    return None
+
 
 BUDGET_ERROR = "budget must be a finite number greater than 0"
 
@@ -420,7 +478,7 @@ async def _project_repo(project_id: str, name: str | None) -> tuple[str | None, 
     return None, url
 
 
-__all__ = ["PRIORITIES"]
+__all__ = ["PRIORITIES", "reads_only_plan"]
 
 
 def _priority(value: str | None) -> str:

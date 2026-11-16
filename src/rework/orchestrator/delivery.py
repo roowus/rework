@@ -185,6 +185,18 @@ async def retry_pr(store: StateStore, bus: Any, mission_id: str) -> tuple[bool, 
     mission = await store.get_mission(mission_id)
     if mission is None:
         return False, f"unknown mission {mission_id}"
+    # the SAME predicate the engine uses before it will ever push (engine.py
+    # `_final_gates`): a plan that does not publish has no branch to deliver.
+    # A draft mission (an audit, a written report) has no branch to publish, so
+    # retry must not create one: the branch fallback below would otherwise push
+    # a coder's branch and open a PR for a plan that never publishes.
+    plan = dict(mission.plan or {})
+    if not (plan.get("publish") or "open_pr" in (plan.get("gates") or [])):
+        return False, (
+            f"mission {mission_id} does not publish (plan {plan.get('kind') or 'default'!r}): "
+            "there is no branch to push and no pull request to retry; a read-and-report "
+            "mission's deliverable is its Report tab"
+        )
     result = dict(mission.result or {})
     branch = str(result.get("pr_branch") or "")
     if not branch:

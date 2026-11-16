@@ -53,6 +53,7 @@ def version() -> None:
 
 @app.command()
 def new(
+    ctx: typer.Context,
     objective: str,
     repo: str | None = typer.Option(
         None,
@@ -69,7 +70,11 @@ def new(
         None,
         help="A few words naming the mission (default: derived from the objective).",
     ),
-    plan: str = typer.Option("echo", help="Playbook: echo | fix | fix-pr | draft"),
+    plan: str = typer.Option(
+        "echo",
+        help="Playbook: echo | fix | fix-pr | draft. Omitted on a read-and-report"
+        " objective (an audit, a survey, a written report) means draft.",
+    ),
     orchestrator: str | None = typer.Option(
         None,
         help="Catalog id for the mission's orchestrator (default: REWORK_DEFAULT_MODEL).",
@@ -102,7 +107,25 @@ def new(
 
     async def go() -> str:
         from rework.config import Config, open_store_from_config
-        from rework.missions import create_mission, resolve_project
+        from rework.missions import create_mission, reads_only_plan, resolve_project
+
+        # the plan is the caller's unless the caller stayed silent: an audit is
+        # a read-and-report job, and the DEFAULT for one is `draft` (its
+        # deliverable is the report, not a branch and a pull request). An
+        # explicit `--plan echo` still means echo: this reads the parameter
+        # SOURCE, not the value, so the classifier never overrides a plan the
+        # owner named. It is a default-selection heuristic only.
+        chosen_plan = plan
+        if _plan_not_given(ctx):
+            suggested = reads_only_plan(objective)
+            if suggested is not None:
+                chosen_plan = suggested
+                # stderr on purpose, like the budget line: stdout stays the id
+                typer.echo(
+                    f"read-and-report objective: plan {suggested} (no branch push,"
+                    " no pull request); pass --plan to override",
+                    err=True,
+                )
 
         # a template plan has NEVER carried a cap of its own: stamping an
         # estimated one on it (see create_mission's comment) would make every
@@ -138,7 +161,7 @@ def new(
                 repo_dir=repo_dir,
                 project_id=project_id,
                 title=title,
-                plan=plan,
+                plan=chosen_plan,
                 priority=priority,
                 orchestrator_model=orch_model,
                 orchestrator_effort=effort,
@@ -156,6 +179,25 @@ def new(
         typer.echo(asyncio.run(go()))
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
+
+
+def _plan_not_given(ctx: Any) -> bool:
+    """True when --plan was not passed on the command line (click's DEFAULT
+    source), so the plan is still a default and a read-and-report objective may
+    pick `draft`. A `--plan echo` typed by the owner is USER source: it wins."""
+    from click.core import ParameterSource
+
+    if ctx is None:
+        return True
+    try:
+        source = ctx.get_parameter_source("plan")
+    except (AttributeError, KeyError):  # no click context: treat it as omitted
+        return True
+    if source is None:
+        return True
+    # typer vendors its own click, so the enum CLASS from `click` is not the
+    # class of the value the context hands back: compare by name
+    return getattr(source, "name", "") == ParameterSource.DEFAULT.name
 
 
 async def _opening_budget(store: Any, objective: str, budget: float | None) -> tuple[float, str]:
