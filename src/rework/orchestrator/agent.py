@@ -514,6 +514,7 @@ AUTO_WIRING: dict[str, dict[str, tuple[str, str | None]]] = {
         "worktree_path": ("coder", "worktree"),
         "coder_tests": ("coder", "tests"),
         "base_sha": ("coder", "base_sha"),
+        "changed_files": ("coder", "changed_files"),
         "investigation": ("investigator", None),
     },
 }

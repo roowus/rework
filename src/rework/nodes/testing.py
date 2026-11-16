@@ -23,6 +23,7 @@ from rework.nodes.git_ops import _run
 
 __all__ = [
     "MAX_VERIFIED_TESTS",
+    "changed_files",
     "fix_files",
     "handoff_tests_gap",
     "parse_tests_block",
@@ -78,6 +79,17 @@ def handoff_tests_gap(artifact: dict[str, Any] | None) -> str | None:
     return None
 
 
+def changed_files(diff: str) -> list[str]:
+    """Paths from `diff --git a/X b/X` headers, in order, deduplicated."""
+    seen: list[str] = []
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            path = line.rsplit(" b/", 1)[-1]
+            if path not in seen:
+                seen.append(path)
+    return seen
+
+
 def fix_files(changed: list[str]) -> list[str]:
     """The non-test files of a change: what to revert to expose a vacuous test."""
     return [f for f in changed if not _TEST_PATH.search(f)]
@@ -118,9 +130,9 @@ def classify_red(exit_code: int, output: str) -> tuple[str, str | None]:
     """(classification, marker) of a run with the fix reverted, from pytest's own
     vocabulary (exit code, then the exception type opening a traceback line), never
     a free-text scan: `vacuously_passes` (exit 0 with pytest's passing summary in the
-    output, so the test cannot fail), `unverifiable` (exit 0 with no pytest evidence,
-    or with pytest's own failure in the output: the run cannot be interpreted, which
-    is no verdict on the test), `wrong_red`
+    output, so the test cannot fail), `unverifiable` (exit 0 or 1 with no pytest
+    evidence, or exit 0 with pytest's own failure in the output: the run cannot be
+    interpreted, which is no verdict on the test), `wrong_red`
     (the run gave no verdict on the behaviour, or the test died on a missing
     import/name/module attribute) or `fails_for_right_reason`."""
     if exit_code == 0:
@@ -138,6 +150,10 @@ def classify_red(exit_code: int, output: str) -> tuple[str, str | None]:
         return "wrong_red", found.group("exc")
     if _RUNNER_MISSING.search(output):
         return "wrong_red", "runner not installed"
+    # exit 1 is only proof when pytest visibly ran: a command that died before
+    # pytest started (`cd missing && pytest`, a missing .venv) also exits 1
+    if not _PYTEST_EVIDENCE.search(output):
+        return "unverifiable", "pytest produced no test output"
     return "fails_for_right_reason", None
 
 

@@ -28,7 +28,7 @@ from rework.nodes.git_ops import (
     stage_all,
     unstage_nested_repos,
 )
-from rework.nodes.testing import parse_tests_block
+from rework.nodes.testing import changed_files, parse_tests_block
 from rework.nodes.toolloop import make_toolloop_node
 from rework.nodes.tools import ComplaintAwareExecutor, LazyExecutor
 from rework.roles.base import RoleBuildCtx, RoleSpec
@@ -246,6 +246,9 @@ class CoderSpec(RoleSpec):
                 "worktree": str(wt),
                 **({"tests": tests_block} if tests_block is not None else {}),
                 **({"excluded_from_commit": excluded} if excluded else {}),
+                # from the FULL diff: the stored copy is cut, and a file listed
+                # only past the cut would escape the auditor's red-green revert
+                "changed_files": changed_files(diff),
                 "diff": diff[:100_000],
             }
             from rework.nodes.run_stats import attach_run_stats

@@ -24,7 +24,12 @@ from rework.nodes.report_sections import (
     resolve_sections,
 )
 from rework.nodes.report_writer import make_report_writer_node
-from rework.nodes.testing import MAX_VERIFIED_TESTS, fix_files, verify_red_green
+from rework.nodes.testing import (
+    MAX_VERIFIED_TESTS,
+    changed_files,
+    fix_files,
+    verify_red_green,
+)
 from rework.nodes.toolloop import make_toolloop_node
 from rework.nodes.tools import ComplaintAwareExecutor, LocalExecutor
 from rework.roles.base import RoleBuildCtx, RoleSpec
@@ -109,6 +114,7 @@ class AuditorSpec(RoleSpec):
         "worktree_path",
         "coder_tests",
         "base_sha",
+        "changed_files",
         "strictness",
     }
 
@@ -175,7 +181,7 @@ class AuditorSpec(RoleSpec):
                 diff = str(run_ctx["diff"])
                 # the complete file list even when the diff below is cut (found
                 # live: 23 junk files sat past the 60k cut, unseen by 2 audits)
-                files = changed_files(diff)
+                files = handoff_files(run_ctx)
                 parts.append(
                     f"Changed files ({len(files)}), complete:\n"
                     + "\n".join(f"- {f}" for f in files)
@@ -260,7 +266,7 @@ async def red_green_notes(run_ctx: dict[str, Any]) -> list[str]:
     if not (isinstance(tests, dict) and tests.get("red_green_verified") and worktree):
         return []
     commands = [str(c) for c in tests.get("commands") or [] if str(c).strip()]
-    files = fix_files(changed_files(str(run_ctx.get("diff") or "")))
+    files = fix_files(handoff_files(run_ctx))
     if not (commands and files and base):
         why = "no base_sha" if not base else "no commands" if not commands else "test-only change"
         return [f"Mechanical red-green check NOT performed ({why}). Verify the claim yourself."]
@@ -274,8 +280,8 @@ async def red_green_notes(run_ctx: dict[str, Any]) -> list[str]:
             verdict = "STILL PASSES: vacuous_test"
         elif r["classification"] == "unverifiable":
             verdict = (
-                f"could not interpret this run, verify by hand ({r['marker']}): exit 0"
-                " alone is neither proof the test cannot fail nor an accusation"
+                f"could not interpret this run, verify by hand ({r['marker']}): exit"
+                f" {r['exit_code']} alone is neither proof nor an accusation"
             )
         elif r["classification"] == "wrong_red":
             verdict = (
@@ -289,12 +295,11 @@ async def red_green_notes(run_ctx: dict[str, Any]) -> list[str]:
     return ["\n".join(lines)]
 
 
-def changed_files(diff: str) -> list[str]:
-    """Paths from `diff --git a/X b/X` headers, in order, deduplicated."""
-    seen: list[str] = []
-    for line in diff.splitlines():
-        if line.startswith("diff --git "):
-            path = line.rsplit(" b/", 1)[-1]
-            if path not in seen:
-                seen.append(path)
-    return seen
+def handoff_files(run_ctx: dict[str, Any]) -> list[str]:
+    """The change's file list: the coder's own `changed_files` (taken from the FULL
+    diff, before the stored copy was cut at 100 KB), else parsed from the diff for
+    older handoffs and plans that do not carry it."""
+    listed = run_ctx.get("changed_files")
+    if isinstance(listed, list) and listed:
+        return [str(f) for f in listed]
+    return changed_files(str(run_ctx.get("diff") or ""))

@@ -19,7 +19,7 @@ from rework.nodes.testing import (
     parse_tests_block,
     verify_red_green,
 )
-from rework.roles.builtin.auditor import changed_files, red_green_notes
+from rework.roles.builtin.auditor import changed_files, handoff_files, red_green_notes
 
 GOOD = {
     "added": ["test_calc.py"],
@@ -331,6 +331,79 @@ async def test_exit_zero_without_pytest_evidence_is_unverifiable_not_vacuous(
     assert "could not interpret this run, verify by hand" in notes[0]
 
 
+@pytest.mark.parametrize(
+    "template",
+    [
+        "cd {repo}/missing-dir && " + CMD,
+        "test -d venv && true",
+        "source .venv/bin/activate && " + CMD,
+    ],
+    ids=["cd missing dir", "test -d", "missing venv"],
+)
+async def test_exit_one_before_pytest_starts_is_unverifiable_not_proof(
+    tmp_path: Path, template: str
+) -> None:
+    """A command that dies before pytest runs exits 1 too. With the test genuinely
+    vacuous, that must not read as "fails as it should"."""
+    repo, base = _repo(tmp_path, VACUOUS_TEST)
+    command = template.format(repo=repo)
+    [result] = await verify_red_green(repo, [command], ["calc.py"], base)
+    assert result["exit_code"] != 0 and result["vacuous"] is False, result
+    assert result["classification"] == "unverifiable", result
+    assert result["marker"] == "pytest produced no test output"
+    [note] = await red_green_notes(
+        {
+            "coder_tests": {**GOOD, "commands": [command]},
+            "worktree_path": str(repo),
+            "base_sha": base,
+            "diff": await diff_base(repo, base=base),
+        }
+    )
+    assert "verify by hand" in note and "pytest produced no test output" in note
+    assert "fails as it should" not in note and "vacuous_test" not in note
+
+
+async def test_a_fix_listed_only_past_the_100kb_cut_is_still_reverted(tmp_path: Path) -> None:
+    """The stored diff is cut at 100 KB, so a big change loses its tail: the fix file
+    must come from the coder's own full-diff `changed_files`, or it stays applied and
+    an honest test is accused of passing without the fix."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "calc.py").write_text("def add(a, b):\n    return a - b\n")
+    _git(repo, "init", "-b", "main")
+    _git(repo, "add", "calc.py")
+    _git(repo, "commit", "-m", "base")
+    base = _rev(repo)
+    (repo / "a_big.txt").write_text("".join(f"line {i} of the big file\n" for i in range(6000)))
+    (repo / "calc.py").write_text(ADD_ONLY)
+    (repo / "test_calc.py").write_text(REAL_TEST)
+    _git(repo, "add", "a_big.txt", "calc.py", "test_calc.py")
+    _git(repo, "commit", "-m", "fix")
+    full = await diff_base(repo, base=base)
+    stored = full[:100_000]  # what the coder's handoff keeps
+    assert len(full) > 100_000 and "calc.py" in changed_files(full)
+    assert "calc.py" not in changed_files(stored)  # the tail is gone from the stored diff
+
+    run_ctx = {
+        "coder_tests": {**GOOD, "commands": [CMD]},
+        "worktree_path": str(repo),
+        "base_sha": base,
+        "diff": stored,
+    }
+    # old handoff without the field: the fallback parses the stored diff (the old blind spot)
+    [old] = await red_green_notes(run_ctx)
+    assert "STILL PASSES: vacuous_test" in old  # the false accusation this field prevents
+    # with the field the fix is reverted, the test fails honestly, nobody is accused
+    [note] = await red_green_notes({**run_ctx, "changed_files": changed_files(full)})
+    assert "NOT performed" not in note and "fails as it should" in note
+    assert "vacuous_test" not in note and "STILL PASSES" not in note
+    assert handoff_files({**run_ctx, "changed_files": changed_files(full)}) == [
+        "a_big.txt",
+        "calc.py",
+        "test_calc.py",
+    ]
+
+
 async def test_a_wrong_red_note_says_it_is_not_proof(tmp_path: Path) -> None:
     repo, base = _two_commit_repo(tmp_path, ADD_ONLY, ADD_AND_MUL, RED_CASES[0][3])
     [note] = await red_green_notes(
@@ -361,13 +434,17 @@ def test_classify_red_covers_every_outcome() -> None:
     attr = "E   AttributeError: module 'calc' has no attribute 'mul'"
     assert classify_red(1, attr) == ("wrong_red", "AttributeError")
     # an AttributeError raised by the code under test is a real red
-    assert classify_red(1, "E   AttributeError: 'NoneType' object has no attribute 'x'")[0] == (
-        "fails_for_right_reason"
-    )
+    nonetype = "E   AttributeError: 'NoneType' object has no attribute 'x'\n1 failed in 0.1s"
+    assert classify_red(1, nonetype)[0] == "fails_for_right_reason"
     # exception names quoted inside an assertion are content, not the exception type
-    quoted = "E   AssertionError: assert 'ImportError' == 'x'\nE     - ImportError\nE     + x"
+    quoted = (
+        "E   AssertionError: assert 'ImportError' == 'x'\nE     - ImportError\nE     + x\n1 failed"
+    )
     assert classify_red(1, quoted)[0] == "fails_for_right_reason"
     assert classify_red(1, "/usr/bin/python3: No module named pytest")[0] == "wrong_red"
+    # exit 1 with no pytest output at all proves nothing: the command never reached pytest
+    assert classify_red(1, "") == ("unverifiable", "pytest produced no test output")
+    assert classify_red(1, "bash: cd: x: No such file or directory")[0] == "unverifiable"
 
 
 def test_the_auditor_cli_view_shows_test_coverage_even_without_evidence() -> None:

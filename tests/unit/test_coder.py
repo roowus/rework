@@ -134,6 +134,7 @@ async def test_coder_edits_in_worktree_and_hands_off_diff(coder_ctx: RoleBuildCt
     assert artifact["commit"] is not None
     assert artifact["summary"].startswith("test passed")
     assert "calc.py" in artifact["diff"]
+    assert "calc.py" in artifact["changed_files"]  # taken from the full diff, not the cut copy
     assert "+    return a + b" in artifact["diff"]
     assert "-    return a - b" in artifact["diff"]
 

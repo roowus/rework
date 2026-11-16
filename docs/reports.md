@@ -12,7 +12,7 @@ and never LLM-written.
 | part | what it is | where from |
 |---|---|---|
 | `run_stats` | model calls, tokens in/out, cached tokens, cost estimate, elapsed seconds, models used | the ledger + run row; stamped by `nodes/run_stats.py` after every artifact (and live-computed by `rework report --md` for old artifacts) |
-| coder handoff extras | branch, commit sha, base sha, mechanical diff, worktree path | `nodes/git_ops.py` at handoff time |
+| coder handoff extras | branch, commit sha, base sha, mechanical diff (stored cut at 100 KB), changed-file list (from the full diff), worktree path | `nodes/git_ops.py` at handoff time |
 
 These exist because objective claims must come from measurement. Cost and time are
 the owner's examples of permanently forced content.
@@ -37,7 +37,7 @@ the owner's examples of permanently forced content.
 
 - **investigator default**: summary, findings, tests, blockers
 - **audit default** (the truss format): summary, findings, standing_assessments,
-  warnings, blockers
+  coverage, warnings, blockers
 - custom: pass any key list in the plan's `requested_sections`
 
 ## Presentation order (model-chosen, mechanically sanitized)

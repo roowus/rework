@@ -57,6 +57,7 @@ PLAN_FIX: dict = {
                 "worktree_path": {"step": "code", "field": "worktree"},
                 "coder_tests": {"step": "code", "field": "tests"},
                 "base_sha": {"step": "code", "field": "base_sha"},
+                "changed_files": {"step": "code", "field": "changed_files"},
                 "investigation": {"step": "investigate"},
             },
             "on_request_changes": {"revise": "code", "max_rounds": 2},
