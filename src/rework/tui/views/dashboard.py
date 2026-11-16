@@ -70,6 +70,18 @@ NONE = "-"
 #: blown deadline comes back as a clean "timed out" rather than an instant 0s call
 _MIN_BUDGET = 0.5
 
+#: Rows the mission detail page gives the orchestrator prompt box: the whole
+#: band, hint row included, so five rows of brief stay visible. Fixed, so a
+#: two-line brief and a forty-line one occupy the same band and nothing below it
+#: (the flow strip, the run list, the tabs) moves. Mirrored by `#m-prompt` in
+#: app.tcss, which must be changed with it.
+PROMPT_BOX_ROWS = 6
+
+#: The hint is one line at the bottom of the box, inside PROMPT_BOX_ROWS. It
+#: keeps its row whether or not it says anything (it hides by `visibility`), so
+#: the box never reflows and the text above it never shifts.
+PROMPT_HINT_ROWS = 1
+
 #: The overview's mission sections, in display order. This list only fixes
 #: ORDER (and "needs you" is the amber one); which section a mission belongs to
 #: is `section_for`'s decision alone, so grouping, counts and the project
@@ -160,6 +172,56 @@ def parse_paths(raw: str) -> list[str]:
         for part in parts:
             paths.extend(str(Path(p).expanduser()) for p in part.replace(",", " ").split())
     return [p for p in paths if p.strip()]
+
+
+class PromptBox(VerticalScroll):
+    """The mission's orchestrator prompt, in a bounded scrollable box.
+
+    `PROMPT_BOX_ROWS` rows at the top of the mission detail page, whatever the
+    brief's length: a long one scrolls here (wheel by default, arrows when the
+    box has focus) instead of covering the flow strip, the run list and the
+    tabs. When the text is taller than the box, one faint line at its bottom
+    says how many lines are still below the fold.
+
+    The inner `#m-header` Static keeps its id and its markup: everything that
+    paints the header keeps painting the same widget, `set_prompt` only measures
+    the result.
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="m-header")
+        yield Static("", id="m-prompt-more")
+
+    def set_prompt(self, markup: str) -> None:
+        """Paint the header, then re-measure whether it still fits."""
+        self.query_one("#m-header", Static).update(markup)
+        self.sync_hint()
+
+    def on_mount(self) -> None:
+        self.sync_hint()
+
+    def on_resize(self) -> None:
+        self.sync_hint()
+
+    def sync_hint(self) -> None:
+        """Re-measure after the next refresh: virtual size is a layout result."""
+        self.call_after_refresh(self._paint_hint)
+
+    def _paint_hint(self) -> None:
+        if not self.is_attached:  # queued sync, widget gone: nothing to measure
+            return
+        try:
+            header = self.query_one("#m-header", Static)
+            hint = self.query_one("#m-prompt-more", Static)
+        except NoMatches:  # mid-teardown, same race as painting the header
+            return
+        body = self.content_size.height - PROMPT_HINT_ROWS
+        height = header.virtual_size.height
+        if body <= 0 or height <= 0:
+            return  # not laid out yet: no measurement, keep the last hint
+        hidden = max(0, height - body)
+        hint.update("" if not hidden else f"{hidden} more line{'s' * (hidden != 1)} · scroll")
+        self.set_class(hidden > 0, "has-more")
 
 
 class DashboardView(View):
@@ -281,7 +343,10 @@ class DashboardView(View):
                             empty=f"[{FAINT}]No missions here yet. Start one from Work.[/]",
                         )
             with Vertical(id="dash-mission"):
-                yield Static("", id="m-header")
+                # the orchestrator prompt lives in a fixed-height, scrollable
+                # box so a long brief scrolls inside it instead of covering the
+                # run list, the flow strip and the tabs (PROMPT_BOX_ROWS)
+                yield PromptBox(id="m-prompt")
                 yield Static("", id="m-flow")
                 with Horizontal():
                     with Vertical(classes="sidebar", id="m-side"):
@@ -1202,6 +1267,9 @@ class DashboardView(View):
         self.run_id = run_id
         self._painted_key = None
         self.query_one("#dash-pages", ContentSwitcher).current = "dash-mission"
+        # a new mission's prompt starts at its first line, not where the last
+        # mission's brief was left scrolled
+        self.query_one("#m-prompt", PromptBox).scroll_y = 0
         self._paint_head()
         self._paint_mission_static()
         self._poll_mission()
@@ -1399,16 +1467,16 @@ class DashboardView(View):
 
     def _paint_mission_static(self, *, frame: str | None = None, now: float | None = None) -> None:
         mission = self._detail_mission()
-        header = self.query_one("#m-header", Static)
+        prompt = self.query_one("#m-prompt", PromptBox)
         if mission is None or (getattr(mission, "light", False) and not self.full_failed):
-            header.update(f"[{FAINT}]loading {esc(self.mission_id)}…[/]")
+            prompt.set_prompt(f"[{FAINT}]loading {esc(self.mission_id)}…[/]")
             return
         if getattr(mission, "light", False):
             # the full row could not be fetched: show the light facts we hold
             # and say what is missing, instead of a permanent "loading"
             st = status_value(mission.status)
             end = time.time() if st in actions.ACTIVE else mission.updated_at
-            header.update(
+            prompt.set_prompt(
                 f"[b]{esc(mission.objective)}[/b]\n{status_text(st)}  [{MUTED}]"
                 + esc(
                     f"started {ago(mission.created_at)} · {duration(end - mission.created_at)}"
@@ -1457,7 +1525,7 @@ class DashboardView(View):
                     head += f"  [{FAINT}]" + esc(", ".join(quiet)) + "[/]"
         else:
             head = status_text(st)
-        header.update(
+        prompt.set_prompt(
             f"[b]{esc(mission.objective)}[/b]\n{head}  [{MUTED}]" + esc("  ·  ".join(bits)) + "[/]"
         )
         # same run-derived round structure as the graph tab, so the two
