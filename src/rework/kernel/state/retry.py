@@ -30,7 +30,7 @@ import logging
 import random
 from collections.abc import Awaitable, Callable, Iterator
 from contextvars import ContextVar
-from typing import Any
+from typing import Any, overload
 
 log = logging.getLogger("rework.state.retry")
 
@@ -194,26 +194,54 @@ async def retry_transient[T](
         _DEPTH.reset(token)
 
 
-def retry_transient_methods[T](cls: type[T]) -> type[T]:
+@overload
+def retry_transient_methods[T](cls: type[T], *, cleanup: str | None = None) -> type[T]: ...
+
+
+@overload
+def retry_transient_methods(
+    cls: None = None, *, cleanup: str | None = None
+) -> Callable[[type[Any]], type[Any]]: ...
+
+
+def retry_transient_methods(
+    cls: type[Any] | None = None, *, cleanup: str | None = None
+) -> Callable[[type[Any]], type[Any]] | type[Any]:
     """Class decorator: give every public async method the shared retry.
 
     SqliteStore has no single wrapper of its own (each method talks to the one
     aiosqlite connection directly), so the class object is its seam. Private
     helpers stay unwrapped: the public method that called them retries the whole
     call. Nested calls share the outer budget (see `_DEPTH`).
+
+    `cleanup` names an optional awaitable no-argument attribute on the instance
+    that runs after a failed attempt and BEFORE the retry, exactly like the
+    `cleanup` argument of `retry_transient`. The sqlite store passes
+    `cleanup="_rollback"`: its retry replays the whole method body, so the work
+    the aborted attempt already stored in its transaction must be discarded
+    first. It is a NAME, not a callable, because the decorator runs at class
+    creation time, when there is no instance to bind to. The default None keeps
+    the previous behaviour (no cleanup) for every other user.
     """
-    for name, value in list(vars(cls).items()):
-        if name.startswith("_") or not inspect.iscoroutinefunction(value):
-            continue
-        setattr(cls, name, _wrap_method(value))
-    return cls
+
+    def decorate(target: type[Any]) -> type[Any]:
+        for name, value in list(vars(target).items()):
+            if name.startswith("_") or not inspect.iscoroutinefunction(value):
+                continue
+            setattr(target, name, _wrap_method(value, cleanup))
+        return target
+
+    return decorate if cls is None else decorate(cls)
 
 
-def _wrap_method(method: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+def _wrap_method(
+    method: Callable[..., Awaitable[Any]], cleanup: str | None = None
+) -> Callable[..., Awaitable[Any]]:
     @functools.wraps(method)
     async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
         return await retry_transient(
             lambda: method(self, *args, **kwargs),
+            cleanup=None if cleanup is None else getattr(self, cleanup),
             label=f"{type(self).__name__}.{method.__name__}",
         )
 

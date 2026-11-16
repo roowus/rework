@@ -70,22 +70,65 @@ class FlakyConnection:
     exactly as it sees a driver error.
     """
 
-    def __init__(self, real: Any, failures: int, sql_prefix: str = "UPDATE missions") -> None:
+    def __init__(
+        self,
+        real: Any,
+        failures: int,
+        sql_prefix: str = "UPDATE missions",
+        *,
+        at_commit: bool = False,
+        write_prefix: str = "insert into events",
+    ) -> None:
         self._real = real
         self._remaining = failures  # -1 keeps failing forever
         self._prefix = sql_prefix.lower()
         self.attempts = 0
+        # at_commit injects the abort where sqlite really reports it: AFTER the
+        # statement ran, so a seam that replays the method body without undoing
+        # the attempt stores the write twice.
+        self._at_commit = at_commit
+        # which pending write the failing commit must swallow: an INSERT is the
+        # non-idempotent case (a replayed UPDATE leaves the same rows behind)
+        self._write_prefix = write_prefix.lower()
+        self._writes: list[str] = []
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._real, name)
 
     def execute(self, sql: str, parameters: Any = None) -> Any:
-        if self._remaining != 0 and sql.strip().lower().startswith(self._prefix):
+        if not self._at_commit and self._remaining != 0 and self._matches(sql):
+            return self._fail(sql)
+        if sql.strip().lower().startswith(("insert", "update", "delete")):
+            # a commit here would make that statement durable
+            self._writes.append(sql)
+        return self._real.execute(sql, parameters)
+
+    async def commit(self) -> None:
+        if self._at_commit and self._remaining != 0 and self._pending_write():
             self.attempts += 1
             if self._remaining > 0:
                 self._remaining -= 1
-            return _FailingExecute(sql)
-        return self._real.execute(sql, parameters)
+            self._writes.clear()
+            raise InjectedDeadlock("COMMIT")
+        self._writes.clear()
+        await self._real.commit()
+
+    def _pending_write(self) -> bool:
+        """True when the pending write is the one a failed commit would leave
+        behind: the commit raises after that statement ran, so a seam that
+        replays the method body stores it twice."""
+        return bool(self._writes) and self._writes[-1].strip().lower().startswith(
+            self._write_prefix
+        )
+
+    def _matches(self, sql: str) -> bool:
+        return sql.strip().lower().startswith(self._prefix)
+
+    def _fail(self, sql: str) -> Any:
+        self.attempts += 1
+        if self._remaining > 0:
+            self._remaining -= 1
+        return _FailingExecute(sql)
 
 
 async def _wait_for(
@@ -177,6 +220,50 @@ async def test_a_single_deadlock_is_absorbed_and_the_mission_reaches_done(
     types = [e.type for e in await store.events_since(0, mission_id=mission.id)]
     assert EventType.MISSION_DONE in types
     assert EventType.MISSION_FAILED not in types
+
+
+async def test_a_deadlock_at_commit_does_not_duplicate_the_mission_row(
+    world: dict, tmp_path: Path
+) -> None:
+    """The incident's shape: sqlite reports the abort at COMMIT, after the DML
+    of that call already ran. The seam must replay from clean state, so the
+    retried attempt stores the mission's work exactly once.
+
+    The proof is a baseline: the same mission runs once with no injection and
+    once with the first commit aborted, and both must leave the SAME event log.
+    A seam that replays the aborted attempt's writes adds an event (and, before
+    the fix, did), which is what the comparison catches."""
+    store: SqliteStore = world["store"]
+
+    baseline_mission = await store.create_mission(Mission(id=new_id("m"), objective="say hello"))
+    baseline_task = asyncio.create_task(make_runner(world, baseline_mission.id).run())
+    await _approve_every_gate(store, baseline_mission.id, baseline_task)
+    await asyncio.wait_for(baseline_task, timeout=20)
+    # the event TYPE sequence: payloads carry freshly generated ids per mission,
+    # while a replayed attempt shows up as an extra event of the same type
+    baseline = [e.type for e in await store.events_since(0, mission_id=baseline_mission.id)]
+    assert EventType.MISSION_DONE in baseline
+
+    mission = await store.create_mission(Mission(id=new_id("m"), objective="say hello"))
+    flaky = FlakyConnection(store._db, failures=1, at_commit=True)
+    store._db = flaky  # type: ignore[assignment]
+
+    runner = make_runner(world, mission.id)
+    task = asyncio.create_task(runner.run())
+    await _approve_every_gate(store, mission.id, task)
+    await asyncio.wait_for(task, timeout=20)
+
+    assert flaky.attempts >= 1, "the abort was never injected: this test proves nothing"
+    done = await store.get_mission(mission.id)
+    assert done is not None and done.status == MissionStatus.DONE
+    runs = await store.list_runs(mission.id)
+    assert len(runs) == 1, "the retried attempt stored the run twice"
+    assert runs[0].status.value == "completed"
+    events = await store.events_since(0, mission_id=mission.id)
+    assert [e.type for e in events] == baseline, (
+        "the aborted attempt's work survived the retry: the event log has duplicates"
+    )
+    assert EventType.MISSION_FAILED not in [e.type for e in events]
 
 
 async def test_a_deadlock_past_the_seam_requeues_instead_of_failing(
