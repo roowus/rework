@@ -559,6 +559,42 @@ async def test_chat_roundtrip(store: StateStore) -> None:
     assert await store.chat_messages(chat.id) == []
 
 
+async def test_chat_ids_with_messages_reports_only_chats_that_hold_a_message(
+    store: StateStore,
+) -> None:
+    """The emptiness probe answers for exactly the chats asked about.
+
+    The Work list hides chats that never got a message (`create_mission` mints
+    one per mission and never writes to it), so a wrong answer here is invisible:
+    returning every id silently restores the blank rows, returning none hides
+    real transcripts. A missing id is simply absent, never an error."""
+    from rework.kernel.state.records import Chat, ChatMessage
+
+    filled = await store.create_chat(Chat(title="has a transcript"))
+    blank = await store.create_chat(Chat(title="never written to"))
+    await store.append_chat_message(
+        ChatMessage(
+            chat_id=filled.id,
+            role="user",
+            body={"role": "user", "content": "hi"},
+            display="hi",
+            ts=100.0,
+        )
+    )
+
+    got = await store.chat_ids_with_messages([filled.id, blank.id])
+    assert got == {filled.id}, got
+
+    # asked for alone, the empty chat still answers empty
+    assert await store.chat_ids_with_messages([blank.id]) == set()
+    # no ids at all: no query, no rows
+    assert await store.chat_ids_with_messages([]) == set()
+    # an id that is not in the db is absent, not an error
+    assert await store.chat_ids_with_messages([filled.id, "chat-does-not-exist"]) == {filled.id}
+    # duplicates are harmless (the probe de-dupes)
+    assert await store.chat_ids_with_messages([filled.id, filled.id]) == {filled.id}
+
+
 async def test_gate_typed_decision_roundtrip(store: StateStore) -> None:
     """A gate can carry a typed answer, and it survives a reload.
 

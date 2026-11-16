@@ -237,8 +237,10 @@ class Hub:
         try:
             filled = await self.data.chat_ids_with_messages([str(c.id) for c in chats])
         except (AttributeError, TypeError):  # fake/older store: keep them all
+            log.debug("chat emptiness probe unavailable, listing all chats", exc_info=True)
             return chats
         except Exception:  # a probe failure must not blank the list either
+            log.debug("chat emptiness probe failed, listing all chats", exc_info=True)
             return chats
         return [c for c in chats if str(c.id) in filled]
 
