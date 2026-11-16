@@ -102,8 +102,9 @@ def new(
     (ADR 0007), following the plan as a playbook: `fix` = investigate, code,
     audit, then a ship gate; `fix-pr` opens a PR instead (no gate by default,
     unless the project's `pr_gate` setting or the orchestrator asks for one);
-    `draft` is document work (research with the web tools, write files, audit
-    the claims) and has no gate: no branch push and no PR."""
+    `draft` is read-and-report work (research with the web tools, audit the
+    claims): its deliverable is the mission's Report tab, not files written into
+    the repository, and it has no gate: no branch push and no PR."""
 
     async def go() -> str:
         from rework.config import Config, open_store_from_config
@@ -147,7 +148,10 @@ def new(
             # `draft` cannot be built without one, so a repo-less audit keeps
             # the caller's plan (and the command keeps succeeding).
             chosen_plan = plan
-            if (repo or repo_dir or project_id) and _plan_not_given(ctx):
+            # `--mechanical` runs the fixed template steps (investigate, code,
+            # audit), so the draft default applies only to the orchestrator
+            # route: a template mission always keeps the caller's plan.
+            if (repo or repo_dir or project_id) and not mechanical and _plan_not_given(ctx):
                 suggested = reads_only_plan(objective)
                 if suggested is not None:
                     chosen_plan = suggested

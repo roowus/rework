@@ -112,8 +112,9 @@ def derive_title(objective: str) -> str | None:
     return line or None
 
 
-# a playbook's FINAL gates. `draft` deliberately has none: its results are
-# the project's files, so there is nothing to push and no PR to open.
+# a playbook's FINAL gates. `draft` deliberately has none: its results are the
+# mission's Report tab, and the plan does not publish, so there is nothing to
+# push and no PR to open.
 PLAYBOOK_GATES: dict[str, list[str]] = {"echo": [], "fix": ["ship"], "fix-pr": [], "draft": []}
 
 DEFAULT_BUDGET_USD = 2.0  # what a deployment gets when nothing usable is set
@@ -197,6 +198,8 @@ _TRAILING_PHRASES = (
     "and tell me what you find",
     "and tell me what you found",
     "and tell me what you think",
+    "and let me know what you think",
+    "and let me know what you find",
     "and tell me",
     "and let me know",
     "and report back",
@@ -211,6 +214,8 @@ _TRAILING_PHRASES = (
     "please tell me what you find",
     "tell me what you find",
     "tell me what you think",
+    "let me know what you think",
+    "let me know what you find",
     "let me know",
     "report back",
 )

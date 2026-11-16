@@ -520,6 +520,24 @@ def test_new_mechanical_keeps_the_legacy_pipeline(rework_db: Path) -> None:
     assert [s["step"] for s in (mission.plan or {})["steps"]] == ["investigate", "code", "audit"]
 
 
+def test_new_mechanical_never_reroutes_an_audit_to_draft(rework_db: Path) -> None:
+    """`--mechanical` runs the fixed template steps (investigate, code, audit),
+    so the draft default must not apply: the coder would still write into the
+    target repo, while a draft plan has no gate and no publish, i.e. the work
+    would be unreachable. The caller's plan stays exactly as it is on base."""
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(app, ["new", "audit the release process", "--repo", url, "--mechanical"])
+
+    assert result.exit_code == 0, result.output
+    mission = _get_mission(rework_db, result.stdout.strip())
+    assert mission is not None
+    # a template mission is built from no playbook spec at all (the engine's
+    # DEFAULT_PLAN template routes it), which is exactly what base did here: a
+    # draft plan would instead carry PLAN_FIX's steps under kind "draft"
+    assert mission.plan is None, "a template mission keeps the caller's plan"
+    assert "read-and-report objective" not in result.stderr
+
+
 def test_report_md_shows_accepted_findings(rework_db: Path) -> None:
     """What the mission shipped with knowingly open belongs in the human report,
     with the same wording the PR body uses (one shared renderer)."""

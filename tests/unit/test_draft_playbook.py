@@ -122,6 +122,10 @@ AUDIT_OBJECTIVES = [
     "Please review the code base.",
     "audit the code base for dead code",
     "write up a report on the deploy process",
+    # item 4: the "let me know what X" twins of the closed "tell me what X"
+    # phrases; both are END-anchored single phrases like the rest
+    "review the codebase and let me know what you think",
+    "review the codebase and let me know what you find",
 ]
 
 # Objectives that need a code change, or that the closed shape cannot prove are
@@ -164,7 +168,6 @@ CHANGE_OBJECTIVES = [
     "migrate the store to postgres",
     # a second clause that is not a closed trailing phrase
     "review the codebase and list the risks",
-    "review the codebase and let me know what you think",
     "audit the code base. then speed it up",
     "audit the code base; then repair the parser",
     "audit the code base (and fix it)",
@@ -205,6 +208,16 @@ def test_the_classifier_errs_toward_a_change_mission() -> None:
         "audit the portfolio page",  # "port" also hits "portfolio"
     ):
         assert reads_only_plan(ambiguous) is None, ambiguous
+
+
+def test_an_opener_must_start_the_objective() -> None:
+    """The trigger is anchored at the START (after an optional "please"): an
+    opener appearing later in the string is not a read-only objective, so the
+    anchor is load-bearing and pinned here."""
+    assert reads_only_plan("also audit the code base") is None
+    assert reads_only_plan("now review the parser") is None
+    # end to end: the objective above is a draft, so the anchor is what does it
+    assert reads_only_plan("audit the code base") == "draft"
 
 
 def test_the_denylist_is_consulted_over_the_whole_objective() -> None:
