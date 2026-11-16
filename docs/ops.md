@@ -546,6 +546,7 @@ rework therefore bounds itself. Five knobs, all optional, all in
 | `REWORK_CONCURRENCY` | `min(cpu_count, 4)` — 2 on rewvis | working MISSIONS at the same time |
 | `REWORK_CAPACITY` | `auto` | whether the two caps above follow the host at runtime, or stay fixed |
 | `REWORK_CAPACITY_INTERVAL_S` | `60` | how often (`auto`) the host is re-measured |
+| `REWORK_CAPACITY_PINS` | `floor` | what a hand-set `REWORK_CONCURRENCY` / `REWORK_MAX_ROLES` means: a minimum the planner may go above, or that exact cap |
 
 `REWORK_MAX_ROLES` is daemon-wide: every `spawn_role` counts, whichever mission
 it belongs to. Runs beyond the cap are not refused, they queue — the run row
@@ -627,15 +628,17 @@ order:
    with 2 GB free plan 1 mission and 1 role.
 
 On the caps auto actually manages, the mission cap never exceeds the role
-cap: pinning a role cap with `REWORK_MAX_ROLES` also lowers the managed mission
-cap to fit it (2 pinned roles on 12 idle CPUs run 2 missions / 2 roles), and a
-pinned `REWORK_CONCURRENCY` above the planned role cap is cut back to that cap.
-Pinning never raises a cap to satisfy the rule, and the cut is never written
-back over the pin, so a pinned mission cap returns to its pinned value as soon
-as the box can hold it again. With BOTH caps set explicitly there is nothing
-left for auto to manage, and the documented exception applies: rework honours
-the two numbers exactly as given (8 and 2 stay 8 missions / 2 roles), measures
-nothing and starts no watchdog. A change is applied only when the same plan
+cap: a `REWORK_MAX_ROLES` under `REWORK_CAPACITY_PINS=fixed` also lowers the
+managed mission cap to fit it (2 pinned roles on 12 idle CPUs run 2 missions /
+2 roles), and a pinned `REWORK_CONCURRENCY` above the planned role cap is cut
+back to that cap. Pinning never raises a cap to satisfy the rule, and the cut is
+never written back over the pin, so a pinned mission cap returns to its pinned
+value as soon as the box can hold it again. Under `REWORK_CAPACITY_PINS=fixed`
+with BOTH caps set there is nothing left for auto to manage, and the documented
+exception applies: rework honours the two numbers exactly as given (8 and 2 stay
+8 missions / 2 roles), measures nothing and starts no watchdog. Under the
+default `REWORK_CAPACITY_PINS=floor` the same two numbers are two floors and the
+watchdog does run (see the next section). A change is applied only when the same plan
 shows up in two measurements in a row, so one `uv sync` burst does not flap the
 caps.
 
@@ -653,14 +656,93 @@ Those numbers are what the code actually prints for that box: 8 CPUs at load
 The same box with 5.1 GB free plans 3 and 3 instead, because the RAM cut takes
 the fourth role away.
 
-Precedence: an EXPLICIT `REWORK_CONCURRENCY` or `REWORK_MAX_ROLES` (a non-empty
-value in the env) fixes that one cap and `auto` manages only the other one;
-with both set there is nothing to watch and no watchdog runs.
-`REWORK_CAPACITY=fixed` restores the old behaviour exactly (the caps are
-resolved once at startup, no measurement, no watchdog, no log line), which is
-what you want when a deployment must not move under load. A typo in the value
-means `auto`: the guard never turns itself off by accident. Check what it did
-with `rework logs daemon -g 'capacity changed'`.
+#### A hand-set cap is a floor, not a freeze (`REWORK_CAPACITY_PINS`)
+
+`REWORK_CAPACITY_PINS` (default `floor`) decides what a hand-set
+`REWORK_CONCURRENCY` / `REWORK_MAX_ROLES` MEANS. A non-empty env value is still
+the only signal that the owner chose a cap; what that number does depends on
+this switch:
+
+| env var set | `pins=floor` (default) | `pins=fixed` |
+| --- | --- | --- |
+| neither | MANAGED, the planner decides | MANAGED, the planner decides |
+| `REWORK_CONCURRENCY=n` | MANAGED with floor `n` | PINNED: exactly `n` |
+| `REWORK_MAX_ROLES=n` | MANAGED with floor `n` | PINNED: exactly `n` |
+| both | MANAGED for both, each with its floor: the watchdog still runs | PINNED for both: no managed cap, no watchdog, the pair exactly as written |
+
+- `floor` (the default): the hand-set number is the MINIMUM the planner may
+  pick. The plan may go above it, so `REWORK_MAX_ROLES=2` on an idle 8-CPU box
+  runs 8 missions and 8 roles rather than 2, and load or RAM pressure may cut
+  the plan back down, but never below the floor. Under `floor`, setting BOTH
+  numbers no longer disables the watchdog: `has_managed_cap` stays true, the
+  daemon measures and scales up and down within the floors.
+- `fixed`: exactly the pre-`REWORK_CAPACITY_PINS` behaviour, byte for byte. The
+  hand-set number IS the cap, and with both set there is nothing to manage: no
+  measurement of the pair, no watchdog, no clamp, the two numbers exactly as
+  written (`8 missions / 2 roles` stays `8 missions / 2 roles`).
+- an unset or empty variable is never a floor; it means "the planner decides".
+- an invalid value (`REWORK_CAPACITY_PINS=floo`) fails loudly at startup with a
+  `ValueError` naming the variable; it is never silently read as `fixed`, which
+  would freeze a cap the owner meant as a minimum.
+- the mission cap still never exceeds the role cap, so a concurrency floor above
+  the role cap is cut to that role cap: raise `REWORK_MAX_ROLES` with it.
+
+`REWORK_CAPACITY=fixed` is a DIFFERENT switch and is unchanged: it restores the
+old behaviour exactly for the whole manager (the caps are resolved once at
+startup, no measurement, no watchdog, no log line), which is what you want when
+a deployment must not move under load. A typo in `REWORK_CAPACITY` means `auto`:
+the guard never turns itself off by accident.
+
+#### Seeing what it decided
+
+Every daemon start WITH AUTO ACTIVE logs exactly ONE `capacity plan:` line at
+INFO on `rework.capacity`, whether or not the caps moved, so a settled box
+(whose startup caps already equal the first plan, e.g. 2 missions / 2 roles on
+an idle 2-core box) is still visibly measured:
+
+```
+capacity plan: 2 CPUs, load 0.1, 9.4 GB (9403 MB) free: 2 missions / 2 roles; missions MANAGED, the planner decides (REWORK_CONCURRENCY unset); roles MANAGED, floor 2 (REWORK_MAX_ROLES=2 is a minimum, pins=floor); AUTO IS ACTIVE: pins=floor, re-measured every 60 s, watchdog runs
+```
+
+It carries the measurement (CPUs, load, available MB), the planned pair, and for
+each cap `MANAGED` or `PINNED` with the reason (the env var and its number). When
+the first plan moves a cap, its `capacity changed:` line is logged FIRST, from
+inside that first apply, and this `capacity plan:` line then follows with the
+summary, so on a box whose plan differs from the constructed caps you see the
+change line first and the plan line after it.
+
+By design no `capacity plan:` line appears when auto is off, which is
+`REWORK_CAPACITY=fixed`, or `REWORK_CAPACITY_PINS=fixed` with BOTH numbers set
+(nothing is measured and no watchdog runs). On such a box `rework capacity`
+tells you which mode is in force, and for a running auto daemon
+`rework logs daemon -g 'capacity'` shows its plan and every change.
+
+`rework capacity` prints the same view without asking the daemon anything:
+
+```
+$ rework capacity
+measured on this host now: 2 CPUs, load 0.06, 9.4 GB free
+plan: 2 missions / 2 roles  (recomputed here from the env and one measurement: NOT read from the daemon)
+  missions MANAGED, the planner decides (REWORK_CONCURRENCY unset)
+  roles MANAGED, floor 2 (REWORK_MAX_ROLES=2 is a minimum, pins=floor)
+AUTO IS ACTIVE: pins=floor, re-measured every 60 s, watchdog runs
+the live daemon's own view: rework logs daemon -g 'capacity' (its 'capacity plan:' startup line and every 'capacity changed:' line)
+```
+
+With auto active it is a RECOMPUTE (env + one measurement + the planner),
+because the daemon exposes no capacity state over its API, and it says so. A
+change needs two measurements in a row before the daemon applies it, so a host
+that just changed load may still show the previous pair in the daemon log. With
+`REWORK_CAPACITY=fixed` it prints `AUTO IS OFF` and the pair resolved at
+startup instead of a plan that never runs; with `REWORK_CAPACITY_PINS=fixed` and
+both numbers set it prints `AUTO IS OFF: both caps PINNED`. In both of those
+(auto off) it takes no measurement at all, says `measured nothing` rather than
+printing a live reading above "no measurement", and reports the pair as
+resolved at startup. `--json` carries the same facts: `auto_active` and
+`recomputed` are both `false`, `measurement` is `null` and `planned.basis` says
+startup, so a script cannot read a frozen pair as a measured one. For what the
+RUNNING daemon actually did, read its log with
+`rework logs daemon -g 'capacity'`.
 
 #### The 2026-11-13 incident
 
