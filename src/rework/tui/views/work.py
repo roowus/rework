@@ -191,11 +191,16 @@ class WorkView(View):
         with self.painting():
             for card in cards:
                 last = stamps.get(card.mission_id)
+                card.online = self.snap.online
                 card.tick(frame, last)
 
     def on_tick(self, snap: Snapshot) -> None:
         self.snap = snap
         cards = list(self.query(MissionCard))
+        for card in cards:  # a link flip changes "working" to "idle" on its own
+            if card.online != snap.online:
+                card.online = snap.online
+                card.paint()
         if self.time_repaint_due():
             self._paint_chat_list()  # "4m ago" on each chat row
             for card in cards:  # "started 3m ago" on each live card

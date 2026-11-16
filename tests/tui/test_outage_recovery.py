@@ -20,14 +20,19 @@ from typing import Any
 
 import psycopg
 import pytest
+from textual.widgets import Static
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from seed import seed
 
-from rework.kernel.state.records import GateStatus
-from rework.tui import spinner
+from rework.kernel.state.records import ChatMessage, EventRecord, GateStatus
+from rework.tui import actions, spinner
 from rework.tui.app import ReworkApp
+from rework.tui.spinner import FRAMES, IDLE_GLYPH
+from rework.tui.theme import run_mark
+from rework.tui.views import dashboard as dashboard_view
+from rework.tui.widgets.base import Stat
 from rework.tui.widgets.cards import MissionCard
 from rework.tui.widgets.trajectory import Trajectory
 
@@ -200,79 +205,212 @@ async def test_open_mission_survives_outage(env: Path, ids: dict[str, str]) -> N
         await _go_offline(app, pilot, factory)
         assert app.hub.snapshot.online is False
         assert dash.mission_id == ids["waiting"], "the page stays open through the outage"
+
+        # the real user path, while the link is down: refused loudly, not lost
+        data = app.hub.data
+        data._reconnecting_hint = ""  # only this decide may set it again
+        toasts = len(app.notifications_sent)
+        assert await actions.decide(app, ids["gate"], True) is False
+        assert data._reconnecting_hint, "a decide that cannot reach the store flags the outage"
+        sent = [text for _, text in app.notifications_sent[toasts:]]
+        assert any(t.startswith("Could not answer gate") for t in sent), sent
+        store = await _fresh_store(env)
+        try:
+            assert (await store.get_gate(ids["gate"])).status is GateStatus.OPEN
+        finally:
+            await store.aclose()
+
+        repaints.clear()  # only a repaint caused by the recovery counts
         await _recover(app, pilot, factory)
         assert app.hub.snapshot.online is True
         assert repaints, "the open mission repainted when the link came back"
         assert dash.full_mission is not None, "header and runs are readable again"
+        assert await data.gates(ids["waiting"]), "the gates of the open mission are readable"
 
-        data = app.hub.data
+        # the retried click now lands, with a note and a typed decision
+        note, decision = "ship it", {"answer": "yes"}
+        assert await actions.decide(app, ids["gate"], True, note=note, decision=decision) is True
         store = await data.store()
-        gates = await data.gates(ids["waiting"])
-        assert gates, "the gates of the open mission are readable"
-        assert await data.decide_gate(ids["gate"], True) is True
-        # a retried click lands once: the same verdict re-reports True, the
-        # opposite verdict is refused, and the row keeps the first answer
-        assert await data.decide_gate(ids["gate"], True) is True
-        assert await data.decide_gate(ids["gate"], False) is False
-        gate = await store.get_gate(ids["gate"])
-        assert gate.status is GateStatus.APPROVED
+        first = await store.get_gate(ids["gate"])
+        assert first.status is GateStatus.APPROVED
+        assert first.decided_at is not None
+        mission = await store.get_mission(ids["waiting"])
+        events = len(await store.events_since(0, ids["waiting"]))
+
+        # a repeated or contradicting click lands exactly once: same verdict
+        # re-reports True, the opposite is refused, and nothing is rewritten
+        assert await actions.decide(app, ids["gate"], True, note="again", decision={"a": 1})
+        assert await actions.decide(app, ids["gate"], False, note="no") is False
+        again = await store.get_gate(ids["gate"])
+        assert again.status is GateStatus.APPROVED
+        assert again.decided_at == first.decided_at
+        assert again.decision_note == first.decision_note == note
+        assert again.decision == first.decision == decision
+        after = await store.get_mission(ids["waiting"])
+        assert after.status == mission.status, "a repeat does not resume the mission again"
+        assert len(await store.events_since(0, ids["waiting"])) == events
+
+
+async def _fresh_store(env: Path) -> Any:
+    """A direct, second connection to the same database: what a daemon on the
+    other side of the link would see, independent of the TUI's own store."""
+    from rework.config import Config, open_store_from_config
+
+    return await open_store_from_config(Config.from_env())
+
+
+def _texts(log: Trajectory) -> list[str]:
+    """What each painted row says (Trajectory children carry no ids)."""
+    return [str(getattr(child, "_head", "")) for child in log.children]
+
+
+async def _chat_through_outage(
+    env: Path, app: ReworkApp, pilot: Any, factory: FlakyFactory, ids: dict[str, str], text: str
+) -> tuple[Any, Any, int]:
+    """Open the seeded chat, drop the link, write a user row to the store while
+    it is down, and return (work view, log, rows painted before the outage)."""
+    work = _work(app)
+    work.open_chat(ids["chat"])
+    await _tick(app, pilot)
+    log = work.query_one("#chat-log", Trajectory)
+    painted = len(log.children)
+    assert painted > 0, "the transcript loaded"
+    await _go_offline(app, pilot, factory)
+    store = await _fresh_store(env)
+    try:
+        await store.append_chat_message(
+            ChatMessage(chat_id=ids["chat"], role="user", body={"content": text}, display=text)
+        )
+    finally:
+        await store.aclose()
+    return work, log, painted
+
+
+async def _assert_chat_intact(
+    app: ReworkApp, pilot: Any, work: Any, log: Trajectory, painted: int, text: str, ids: Any
+) -> None:
+    assert app.hub.snapshot.online is True
+    assert work.convo is not None and work.convo.id == ids["chat"]
+    assert sum(text in t for t in _texts(log)) == 1, "the new row is painted exactly once"
+    assert len(log.children) == painted + 1, "nothing lost, nothing added twice"
+    head = await app.hub.data.chat_messages_max_id(ids["chat"])
+    assert work._chat_cursor == work._rendered_max_id == head
+    await _tick(app, pilot)  # one more poll: no duplicate, no loss
+    assert len(log.children) == painted + 1
+    assert sum(text in t for t in _texts(log)) == 1
 
 
 async def test_open_chat_survives_outage(env: Path, ids: dict[str, str]) -> None:
     async with _running(env) as (app, pilot, factory):
-        work = _work(app)
-        work.open_chat(ids["chat"])
-        await _tick(app, pilot)
-        log = work.query_one("#chat-log", Trajectory)
-        painted = len(log.children)
-        assert painted > 0, "the transcript loaded"
-        await _go_offline(app, pilot, factory)
-        assert app.hub.snapshot.online is False
-        assert len(work.query_one("#chat-log", Trajectory).children) == painted
+        text = "written while the link was down"
+        work, log, painted = await _chat_through_outage(env, app, pilot, factory, ids, text)
+        assert len(log.children) == painted, "an outage paints nothing and loses nothing"
         await _recover(app, pilot, factory)
-        assert app.hub.snapshot.online is True
-        assert work.convo is not None and work.convo.id == ids["chat"]
-        assert len(log.children) == painted, "the transcript is intact"
-        # the store is readable again: the next poll can pick up new rows
-        assert await app.hub.data.chat_messages_max_id(ids["chat"]) > 0
+        await _assert_chat_intact(app, pilot, work, log, painted, text, ids)
 
 
 async def test_long_outage_recovers_without_duplicate_rows(env: Path, ids: dict[str, str]) -> None:
     async with _running(env) as (app, pilot, factory):
-        work = _work(app)
-        work.open_chat(ids["chat"])
-        await _tick(app, pilot)
-        log = work.query_one("#chat-log", Trajectory)
-        painted = len(log.children)
-        await _go_offline(app, pilot, factory)
+        text = "written during a long outage"
+        work, log, painted = await _chat_through_outage(env, app, pilot, factory, ids, text)
         # an outage longer than the backoff cap: the deadline is now far out
-        factory.fail_next = OUTAGE
         app.hub._next_try = time.monotonic() + 3600.0
         calls = factory.calls
         await app.hub.refresh()
         await pilot.pause()
         assert factory.calls == calls, "nothing polls before the deadline expires"
+        assert len(log.children) == painted
         await _recover(app, pilot, factory)
-        assert app.hub.snapshot.online is True
-        rows = [w.id for w in log.children if w.id]
-        assert len(rows) == len(set(rows)), "no row is painted twice"
-        assert len(log.children) >= painted, "the cursor did not lose a row"
-        mark = getattr(work, "_rendered_max_id", 0)
-        assert isinstance(mark, int)
+        await _assert_chat_intact(app, pilot, work, log, painted, text, ids)
 
 
-async def test_spinner_idle_while_offline(env: Path, ids: dict[str, str]) -> None:
+async def _touch_mission(env: Path, mission_id: str) -> None:
+    """A fresh event on the mission: the running mission is genuinely working."""
+    store = await _fresh_store(env)
+    try:
+        await store.append_event(EventRecord(mission_id=mission_id, payload={"note": "tick"}))
+    finally:
+        await store.aclose()
+
+
+def _row_mark(app: ReworkApp, mission_id: str) -> str:
+    """The dashboard row mark of a running mission, rendered with a fixed
+    animation frame so a live and a frozen mark cannot be confused."""
+    dash = _dash(app)
+    mission = app.hub.snapshot.mission(mission_id)
+    return dash._row_mark(mission, "running", FRAMES[3], time.time())
+
+
+def _tile(app: ReworkApp) -> str:
+    """The dashboard running tile, painted now with a fixed frame."""
+    dash = _dash(app)
+    dash._paint_running_tile(FRAMES[3], time.time())
+    tile = dash.query_one("#st-running", Stat)
+    return f"{tile._value}|{tile._sub}"
+
+
+async def test_spinner_idle_while_offline(
+    env: Path, ids: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the seeded running mission waits on a gate, so file it under "running"
+    # for the tile (the row mark does not depend on the section)
+    monkeypatch.setattr(dashboard_view, "section_for", lambda m, snap: "running")
     async with _running(env) as (app, pilot, factory):
         mid = ids["running"]
-        before = app.hub.snapshot.last_event.get(mid)
-        assert before is not None, "the seeded running mission has an activity stamp"
+        animated = run_mark(False, FRAMES[3])
+        idle = run_mark(True)
+        assert IDLE_GLYPH in idle and FRAMES[3] in animated
+
+        # the link is up and the mission is publishing: it animates
+        await _touch_mission(env, mid)
+        await _tick(app, pilot)
+        fresh = app.hub.snapshot.last_event.get(mid)
+        assert fresh is not None and not spinner.is_stalled(time.time(), fresh)
+        row = _row_mark(app, mid)
+        assert row == animated
+        assert "working" in _tile(app)
+
+        # the link drops: the stamp cannot be read, and that is NOT "working"
         await _go_offline(app, pilot, factory)
-        after = app.hub.snapshot.last_event.get(mid)
-        # an outage cannot manufacture a fresh stamp: it is the old one or unknown
-        assert after is None or after <= before
-        if after is None:  # unknown is "nothing observed", never "stalled"
-            assert spinner.is_stalled(time.time(), after) is False
-        assert app.hub.snapshot.online is False
+        assert app.hub.snapshot.last_event.get(mid) is None, "an unreadable stamp is unknown"
+        row = _row_mark(app, mid)
+        assert row == idle, "an offline running mission shows the idle glyph"
+        assert FRAMES[3] not in row
+        assert "working" not in _tile(app) and "idle" in _tile(app)
+
+        # the link is back and the stamp is fresh again: it animates again
         await _recover(app, pilot, factory)
         assert app.hub.snapshot.online is True
-        assert app.hub.snapshot.last_event.get(mid) == before, "the stamp is back after recovery"
+        assert app.hub.snapshot.last_event.get(mid) == fresh
+        row = _row_mark(app, mid)
+        assert row == animated
+        assert "working" in _tile(app)
+
+
+async def test_work_card_idle_while_offline(env: Path, ids: dict[str, str]) -> None:
+    async with _running(env) as (app, pilot, factory):
+        mid = ids["running"]
+        await _touch_mission(env, mid)
+        await _tick(app, pilot)
+        work = _work(app)
+        card = MissionCard(mid)
+        await work.mount(card)
+        card.update_from(app.hub.snapshot.mission(mid), [])
+        await pilot.pause()
+
+        def head() -> str:
+            return str(card.query_one(".mc-head", Static).render())
+
+        def paint() -> None:
+            work.on_tick(app.hub.snapshot)
+            work.tick(FRAMES[3], time.time())
+
+        paint()
+        assert "working" in head() and FRAMES[3] in head()
+        await _go_offline(app, pilot, factory)
+        paint()
+        assert "working" not in head() and FRAMES[3] not in head()
+        assert IDLE_GLYPH in head()
+        await _recover(app, pilot, factory)
+        paint()
+        assert "working" in head() and FRAMES[3] in head()

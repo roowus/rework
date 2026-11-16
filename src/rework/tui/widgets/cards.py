@@ -199,6 +199,7 @@ class MissionCard(Vertical):
         # spinner state: the frame comes from the app's shared clock every tick
         self._frame: str | None = None
         self._last_event: float | None = None
+        self.online = True  # link state of the snapshot: offline never reads as working
         # a finished card backfills its tail once, then is never polled again
         self.tail_filled = False
         # backoff for a failing full-row fetch (monotonic seconds)
@@ -297,11 +298,10 @@ class MissionCard(Vertical):
             # tick has supplied one), never an empty span. The stall clock is
             # read NOW on every paint, never frozen at the last tick.
             clock = time.time()
-            stalled = spinner.is_stalled(clock, self._last_event)
+            stalled = spinner.is_stalled(clock, self._last_event, self.online)
             mark = run_mark(stalled, self._frame) if status == "running" else ""
             if mark and stalled:
-                mark += f" [{FAINT}]idle"
-                mark += f" {spinner.human_duration(spinner.silence(clock, self._last_event))}[/]"
+                mark += f" [{FAINT}]{spinner.idle_text(clock, self._last_event)}[/]"
             elif mark:
                 mark += f" [{FAINT}]working[/]"
             bits = [esc(self.mission_id), esc(plan_label(m.plan))]
