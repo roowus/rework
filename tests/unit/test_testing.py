@@ -6,6 +6,7 @@ test still passes with the fix reverted is reported as vacuous."""
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 from rework.nodes.git_ops import _run, diff_base, head_sha
@@ -21,7 +22,7 @@ GOOD = {
     "added": ["test_calc.py"],
     "changed": [],
     "red_green_verified": True,
-    "commands": ["python3 -m pytest -q"],
+    "commands": ["pytest -q"],
     "result": "red then green",
     "not_testable_reason": "",
 }
@@ -56,7 +57,16 @@ def _repo(tmp_path: Path, test_body: str) -> tuple[Path, str]:
 
 REAL_TEST = "from calc import add\n\ndef test_add():\n    assert add(2, 3) == 5\n"
 VACUOUS_TEST = "from calc import add\n\ndef test_add():\n    assert add(0, 0) == 0\n"
-CMD = "python3 -m pytest -q test_calc.py"
+CMD = f"{sys.executable} -m pytest -q test_calc.py"
+
+
+def assert_real_failure(output: str) -> None:
+    """A real red: the assertion failed. A wrong red (no pytest, import or
+    collection error, nothing collected) must not satisfy this."""
+    assert "assert add(2, 3) == 5" in output and "1 failed" in output, output
+    for wrong_red in ("No module named", "ModuleNotFoundError", "unrecognized arguments"):
+        assert wrong_red not in output, output
+    assert "collected 0 items" not in output and "ERROR collecting" not in output, output
 
 
 def test_parse_tests_block_reads_the_last_fenced_json() -> None:
@@ -84,7 +94,7 @@ async def test_a_test_that_fails_without_the_fix_is_not_vacuous(tmp_path: Path) 
     repo, base = _repo(tmp_path, REAL_TEST)
     [result] = await verify_red_green(repo, [CMD], ["calc.py"], base)
     assert result["vacuous"] is False
-    assert result["exit_code"] != 0
+    assert_real_failure(result["output"])
     # the real worktree was never touched: the fix is still in place
     assert "a + b" in (repo / "calc.py").read_text()
     _code, status = await _run(repo, "status", "--porcelain")
@@ -124,3 +134,13 @@ async def test_no_red_green_claim_means_no_mechanical_check() -> None:
     assert await red_green_notes({}) == []
     unverified = {"coder_tests": {**GOOD, "red_green_verified": False}, "worktree_path": "/x"}
     assert await red_green_notes(unverified) == []
+
+
+async def test_an_uncheckable_claim_says_it_was_not_verified() -> None:
+    """Silence would read as success: the auditor is told the check did not run."""
+    claim = {"coder_tests": GOOD, "worktree_path": "/x", "diff": "diff --git a/c.py b/c.py\n"}
+    [no_base] = await red_green_notes(claim)
+    assert "NOT performed" in no_base and "no base_sha" in no_base
+    test_only = {**claim, "base_sha": "abc", "diff": "diff --git a/test_c.py b/test_c.py\n"}
+    [note] = await red_green_notes(test_only)
+    assert "NOT performed" in note and "test-only" in note

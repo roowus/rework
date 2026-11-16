@@ -18,6 +18,9 @@ class ReportSection:
     prompt_fragment: str  # instructions for the model producing this section
     schema_slice: dict[str, Any]  # json-schema properties this section requires
     required_fields: tuple[str, ...] = field(default_factory=tuple)
+    # safe values for fields the writer may omit: a forgotten field degrades to
+    # these instead of discarding an otherwise valid report
+    defaults: dict[str, Any] = field(default_factory=dict)
 
 
 # kinds of test-quality finding the auditor files under `coverage`
@@ -133,6 +136,7 @@ TESTS = ReportSection(
         "no_tests_reason": {"type": "string"},
     },
     required_fields=("tests", "no_tests_reason"),
+    defaults={"tests": [], "no_tests_reason": ""},
 )
 
 RULED_OUT = ReportSection(
@@ -297,6 +301,7 @@ COVERAGE = ReportSection(
         }
     },
     required_fields=("coverage",),
+    defaults={"coverage": []},
 )
 
 
@@ -373,6 +378,23 @@ def build_report_schema(sections: list[ReportSection]) -> dict[str, Any]:
         "required": required,
         "additionalProperties": False,
     }
+
+
+def apply_defaults(artifact: dict[str, Any], sections: list[ReportSection]) -> list[str]:
+    """Fill omitted fields that have a safe default; returns the keys filled.
+    When the artifact has a `warnings` list, each fill is noted there so a
+    reader knows the section was defaulted, not judged empty."""
+    filled: list[str] = []
+    for s in sections:
+        for key, value in s.defaults.items():
+            if key not in artifact:
+                artifact[key] = list(value) if isinstance(value, list) else value
+                filled.append(key)
+    if filled and isinstance(artifact.get("warnings"), list):
+        artifact["warnings"].append(
+            f"the report omitted {', '.join(filled)}; treated as empty, not as a clean result"
+        )
+    return filled
 
 
 def resolve_order(artifact: dict[str, Any], sections: list[ReportSection]) -> list[str]:

@@ -19,6 +19,7 @@ from rework.nodes.report_sections import (
     resolve_order,
     resolve_sections,
 )
+from rework.nodes.report_writer import make_report_writer_node
 from rework.nodes.toolloop import make_toolloop_node
 from rework.nodes.tools import LocalExecutor
 
@@ -640,3 +641,72 @@ def test_role_env_no_workdir_does_not_set_scratch_vars(monkeypatch: pytest.Monke
     result = role_env(None)
     # Without workdir, we do not inject any scratch paths
     assert "REWORK_TARGETS" not in result
+
+
+async def test_an_audit_report_missing_coverage_keeps_its_findings(tmp_path: Path) -> None:
+    """A forgotten `coverage` section degrades to empty (and says so in warnings);
+    it must not null an otherwise valid audit, which would block finish(done)."""
+    import json
+
+    store = await _store(tmp_path)
+    finding = {
+        "title": "off by one",
+        "detail": "d",
+        "evidence": ["a.py:1"],
+        "severity": "high",
+        "verdict": "CONFIRMED",
+        "confidence": 0.9,
+    }
+    report = {
+        "summary": "s",
+        "findings": [finding],
+        "standing_assessments": {
+            k: "ok"
+            for k in (
+                "proportionality",
+                "complexity",
+                "priority",
+                "coverage",
+                "business_logic_risk",
+            )
+        },
+        "warnings": [],
+        "blockers": [],
+    }
+    fake = FakeProvider(
+        [ChatResult(text=json.dumps(report), usage=Usage(input_tokens=1, output_tokens=1))]
+    )
+    node = make_report_writer_node(
+        fake,
+        _catalog(),
+        "fake",
+        store,
+        "m1",
+        "m1:step:audit:1",
+        resolve_sections(list(ASSEMBLY_AUDIT)),
+    )
+    result = await node({"messages": []})
+    artifact = result["artifact"]
+    assert artifact is not None and "artifact_error" not in result
+    assert artifact["coverage"] == []
+    assert artifact["findings"] == [finding]
+    assert any("coverage" in w for w in artifact["warnings"])
+    assert len(fake.requests) == 1  # no retry was needed
+
+
+async def test_a_report_missing_a_section_without_a_default_still_fails(tmp_path: Path) -> None:
+    store = await _store(tmp_path)
+    bad = ChatResult(text='{"summary": "s"}', usage=Usage(input_tokens=1, output_tokens=1))
+    fake = FakeProvider([bad, bad])
+    node = make_report_writer_node(
+        fake,
+        _catalog(),
+        "fake",
+        store,
+        "m1",
+        "m1:step:audit:2",
+        resolve_sections(list(ASSEMBLY_AUDIT)),
+    )
+    result = await node({"messages": []})
+    assert result["artifact"] is None
+    assert "findings" in result["artifact_error"]

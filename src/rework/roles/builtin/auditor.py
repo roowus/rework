@@ -251,8 +251,9 @@ class AuditorSpec(RoleSpec):
 async def red_green_notes(run_ctx: dict[str, Any]) -> list[str]:
     """Mechanical red-green check of the coder's claim, as prompt context: with
     the fix files reverted, each named test command must fail. Empty when the
-    handoff claims nothing checkable (no worktree, no commands, no base, no
-    non-test change). A failure to run the check is reported, never raised."""
+    handoff claims no red-green. When it does but the check cannot be performed
+    (no base, no commands, test-only change) the note says so: silence would
+    read as success. A failure to run the check is reported, never raised."""
     tests = run_ctx.get("coder_tests")
     worktree = run_ctx.get("worktree_path")
     base = run_ctx.get("base_sha")
@@ -261,7 +262,8 @@ async def red_green_notes(run_ctx: dict[str, Any]) -> list[str]:
     commands = [str(c) for c in tests.get("commands") or [] if str(c).strip()]
     files = fix_files(changed_files(str(run_ctx.get("diff") or "")))
     if not (commands and files and base):
-        return []
+        why = "no base_sha" if not base else "no commands" if not commands else "test-only change"
+        return [f"Mechanical red-green check NOT performed ({why}). Verify the claim yourself."]
     try:
         results = await verify_red_green(Path(str(worktree)), commands, files, str(base))
     except Exception as exc:

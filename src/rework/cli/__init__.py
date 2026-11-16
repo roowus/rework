@@ -552,6 +552,13 @@ def _render_artifact(role: str, artifact: dict[str, Any]) -> list[str]:
                 out.append(f"    {f.get('detail')}")
         else:
             out.append("FINDINGS: none (clean audit)")
+        coverage = artifact.get("coverage", [])
+        if coverage:
+            out.append("TEST COVERAGE")
+            for c in coverage:
+                out.append(f"  [{c.get('severity')}/{c.get('kind')}] {c.get('title')}")
+                out.append(f"    {c.get('detail')}")
+                out.append(f"    evidence: {c.get('evidence')}")
         sa = artifact.get("standing_assessments")
         if sa:
             out.append("STANDING ASSESSMENTS")
