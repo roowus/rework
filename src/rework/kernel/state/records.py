@@ -204,6 +204,9 @@ class EventRecord(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     ts: float = Field(default_factory=now)
     seq: int | None = None  # assigned by the store on append
+    # caller-chosen identity for an append that may be retried: a second append
+    # with the same key is a no-op and returns the first row's seq (None = no dedupe)
+    dedupe_key: str | None = None
 
 
 class Charge(BaseModel):
@@ -218,6 +221,9 @@ class Charge(BaseModel):
     cached_tokens: int = 0
     cost_usd: float = 0.0
     ts: float = Field(default_factory=now)
+    # caller-chosen identity: a second charge with the same key is a no-op, so a
+    # retried model call is recorded once (None = no dedupe)
+    dedupe_key: str | None = None
 
 
 class ComplaintKind(StrEnum):

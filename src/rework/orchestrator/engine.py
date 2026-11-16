@@ -46,6 +46,7 @@ from rework.kernel.state.records import (
 from rework.kernel.state.records import (
     run_id as make_run_id,
 )
+from rework.kernel.state.resilient import is_transient
 from rework.kernel.state.store import StateStore
 from rework.logs import bind
 from rework.missions import project_is_upload
@@ -296,6 +297,11 @@ class RunSupervisor:
             log.info("role %s cancelled", run.role)
             raise
         except Exception as exc:
+            if is_transient(exc):
+                # a store outage is not the role's failure: the run stays RUNNING with its
+                # checkpoint intact, and the mission is not marked FAILED
+                log.error("role %s lost the store (%s); run left RUNNING", run.role, exc)
+                return
             log.exception("role %s failed", run.role)
             await self._store.update_run(run.id, status=RunStatus.FAILED)
             await self._bus.publish(
@@ -382,6 +388,9 @@ class RunSupervisor:
             result = await graph.ainvoke(Command(resume=decision), config=config)
             await self._consume_result(run, result)
         except Exception as exc:
+            if is_transient(exc):
+                log.error("role %s lost the store on resume (%s); run left RUNNING", run.role, exc)
+                return
             log.exception("role %s resume failed", run.role)
             await self._store.update_run(run.id, status=RunStatus.FAILED)
             await self._bus.publish(
@@ -1172,6 +1181,18 @@ class MissionRunner:
             return nullcontext()
         return self._slot.while_waiting()
 
+    async def _poll_store(self, read: Any) -> Any:
+        """One store read inside a gate-wait poll. A transient outage must not end the
+        wait (the wait is the only thing that can apply the owner's decision): return
+        None, so the loop sleeps and asks again."""
+        try:
+            return await read
+        except Exception as exc:
+            if not is_transient(exc):
+                raise
+            log.debug("gate poll: store unavailable (%s); polling again", exc)
+            return None
+
     async def _gate_decision(self, mission_id: str, gate_id: str) -> bool | None:
         """Read the decision from the gate ROW (the source of truth). Returns:
         - True if APPROVED
@@ -1186,7 +1207,7 @@ class MissionRunner:
 
         async with self._waiting():
             while True:
-                gate = await self._store.get_gate(gate_id)
+                gate = await self._poll_store(self._store.get_gate(gate_id))
                 if gate is not None and gate.status != GateStatus.OPEN:
                     break
                 await asyncio.sleep(self._poll)
@@ -1482,7 +1503,8 @@ class MissionRunner:
         )
         async with self._waiting():
             while True:
-                if not await self._store.list_open_gates(self.mission_id):
+                open_gates = await self._poll_store(self._store.list_open_gates(self.mission_id))
+                if open_gates is not None and not open_gates:
                     break
                 await asyncio.sleep(self._poll)
         decision = await self._gate_decision(self.mission_id, gate.id)
@@ -1548,8 +1570,8 @@ class MissionRunner:
         if gated:
             await self._store.update_mission(self.mission_id, status=MissionStatus.AWAITING_GATE)
         while True:
-            open_gates = await self._store.list_open_gates(self.mission_id)
-            if not open_gates:
+            open_gates = await self._poll_store(self._store.list_open_gates(self.mission_id))
+            if open_gates is not None and not open_gates:
                 break
             await asyncio.sleep(self._poll)
         if gated:

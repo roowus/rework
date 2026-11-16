@@ -80,7 +80,11 @@ def make_report_writer_node(
     entry = catalog.resolve(catalog_id)
     schema = build_report_schema(sections)
 
+    report_calls = 0
+
     async def one_shot(messages: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, str]:
+        nonlocal report_calls
+        report_calls += 1
         result = await provider.complete(
             ChatRequest(
                 model=entry.model,
@@ -103,6 +107,7 @@ def make_report_writer_node(
                 mission_id=mission_id,
                 run_id=run_id,
                 model=entry.model,
+                dedupe_key=f"{run_id}:report:{report_calls}",
                 input_tokens=result.usage.input_tokens,
                 output_tokens=result.usage.output_tokens,
                 cached_tokens=result.usage.cached_tokens,

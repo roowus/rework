@@ -595,17 +595,27 @@ class SqliteStore:
     # -- events ---------------------------------------------------------------------
     async def append_event(self, event: EventRecord) -> EventRecord:
         cur = await self._db.execute(
-            "INSERT INTO events (mission_id, run_id, type, payload, ts) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO events (mission_id, run_id, type, payload, ts, dedupe_key)"
+            " VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (dedupe_key) DO NOTHING",
             (
                 event.mission_id,
                 event.run_id,
                 event.type.value,
                 _j(event.payload) or "{}",
                 event.ts,
+                event.dedupe_key,
             ),
         )
+        if cur.rowcount == 0 and event.dedupe_key is not None:  # a retry of an append that landed
+            found = await self._db.execute(
+                "SELECT seq FROM events WHERE dedupe_key = ?", (event.dedupe_key,)
+            )
+            row = await found.fetchone()
+            assert row is not None
+            event.seq = int(row[0])
+        else:
+            event.seq = cur.lastrowid
         await self._db.commit()
-        event.seq = cur.lastrowid
         return event
 
     async def events_since(
@@ -645,7 +655,8 @@ class SqliteStore:
     async def charge(self, charge: Charge) -> None:
         await self._db.execute(
             "INSERT INTO charges (mission_id, run_id, model, input_tokens, output_tokens,"
-            " cached_tokens, cost_usd, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            " cached_tokens, cost_usd, ts, dedupe_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT (dedupe_key) DO NOTHING",
             (
                 charge.mission_id,
                 charge.run_id,
@@ -655,6 +666,7 @@ class SqliteStore:
                 charge.cached_tokens,
                 charge.cost_usd,
                 charge.ts,
+                charge.dedupe_key,
             ),
         )
         await self._db.commit()
@@ -1038,5 +1050,14 @@ async def open_sqlite(path: str) -> SqliteStore:
         await db.execute("ALTER TABLE gates ADD COLUMN decision TEXT")
     if "spec" not in names:
         await db.execute("ALTER TABLE gates ADD COLUMN spec TEXT")
+    for table in ("events", "charges"):
+        cols = await db.execute(f"PRAGMA table_info({table})")
+        names = {row[1] for row in await cols.fetchall()}
+        if "dedupe_key" not in names:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN dedupe_key TEXT")
+        # NULLs never collide in a UNIQUE index, so un-keyed rows are unaffected
+        await db.execute(
+            f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_dedupe ON {table}(dedupe_key)"
+        )
     await db.commit()
     return SqliteStore(db)

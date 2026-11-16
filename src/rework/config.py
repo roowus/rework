@@ -9,7 +9,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from rework.kernel.llm.catalog import ModelCatalog
@@ -238,11 +238,20 @@ async def open_store_from_config(config: Config) -> StateStore:
     """Open the configured StateStore (and create parent dirs for sqlite)."""
     if config.is_postgres:
         from rework.kernel.state.postgres import open_postgres
+        from rework.kernel.state.resilient import ResilientStore
+        from rework.kernel.state.store import StateStore
 
-        return await open_postgres(config.db)
+        url = config.db
+        return cast(
+            StateStore,
+            ResilientStore(await open_postgres(url), reopen=lambda: open_postgres(url)),
+        )
+    from rework.kernel.state.resilient import ResilientStore
     from rework.kernel.state.sqlite import open_sqlite
+    from rework.kernel.state.store import StateStore
 
-    return await open_sqlite(await asyncio.to_thread(_prepare_sqlite_dir, config.db))
+    store = await open_sqlite(await asyncio.to_thread(_prepare_sqlite_dir, config.db))
+    return cast(StateStore, ResilientStore(store))
 
 
 def _configured_model(

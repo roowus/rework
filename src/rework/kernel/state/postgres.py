@@ -744,17 +744,24 @@ class PostgresStore:
     async def append_event(self, event: EventRecord) -> EventRecord:
         async with self._conn.cursor() as cur:
             await cur.execute(
-                "INSERT INTO events (mission_id, run_id, type, payload, ts)"
-                " VALUES (%s, %s, %s, %s, %s) RETURNING seq",
+                "INSERT INTO events (mission_id, run_id, type, payload, ts, dedupe_key)"
+                " VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (dedupe_key) DO NOTHING"
+                " RETURNING seq",
                 (
                     event.mission_id,
                     event.run_id,
                     event.type.value,
                     _j(event.payload) or "{}",
                     event.ts,
+                    event.dedupe_key,
                 ),
             )
             row = await cur.fetchone()
+            if row is None and event.dedupe_key is not None:  # a retry of an append that landed
+                await cur.execute(
+                    "SELECT seq FROM events WHERE dedupe_key = %s", (event.dedupe_key,)
+                )
+                row = await cur.fetchone()
             assert row is not None
             event.seq = int(row["seq"])
         await self._conn.commit()
@@ -799,7 +806,8 @@ class PostgresStore:
     async def charge(self, charge: Charge) -> None:
         await self._conn.execute(
             "INSERT INTO charges (mission_id, run_id, model, input_tokens, output_tokens,"
-            " cached_tokens, cost_usd, ts) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+            " cached_tokens, cost_usd, ts, dedupe_key)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT (dedupe_key) DO NOTHING",
             (
                 charge.mission_id,
                 charge.run_id,
@@ -809,6 +817,7 @@ class PostgresStore:
                 charge.cached_tokens,
                 charge.cost_usd,
                 charge.ts,
+                charge.dedupe_key,
             ),
         )
         await self._conn.commit()
@@ -1208,6 +1217,21 @@ class PostgresStore:
         )
 
 
+# unique indexes on the dedupe keys; created after the column migrations, and only
+# when missing (a plain CREATE INDEX takes a lock even when the index exists)
+_DEDUPE_INDEXES: list[tuple[str, str, str]] = [
+    (
+        "idx_events_dedupe",
+        "events",
+        "CREATE UNIQUE INDEX idx_events_dedupe ON events (dedupe_key)",
+    ),
+    (
+        "idx_charges_dedupe",
+        "charges",
+        "CREATE UNIQUE INDEX idx_charges_dedupe ON charges (dedupe_key)",
+    ),
+]
+
 _MIGRATIONS: list[tuple[str, str, str]] = [
     # (table, column, DDL): check-then-alter. ALTER TABLE takes ACCESS
     # EXCLUSIVE even as a no-op IF NOT EXISTS, so issuing one on every open
@@ -1234,6 +1258,8 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
     ("gates", "for_run", "ALTER TABLE gates ADD COLUMN for_run TEXT"),
     ("gates", "decision", "ALTER TABLE gates ADD COLUMN decision TEXT"),
     ("gates", "spec", "ALTER TABLE gates ADD COLUMN spec TEXT"),
+    ("events", "dedupe_key", "ALTER TABLE events ADD COLUMN dedupe_key TEXT"),
+    ("charges", "dedupe_key", "ALTER TABLE charges ADD COLUMN dedupe_key TEXT"),
 ]
 
 
@@ -1288,6 +1314,12 @@ async def open_postgres(url: str) -> PostgresStore:
             except Exception:
                 await conn.rollback()
                 raise
+        for index, _table, create in _DEDUPE_INDEXES:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT 1 FROM pg_indexes WHERE indexname = %s", (index,))
+                present = await cur.fetchone() is not None
+            if not present:
+                await conn.execute(create)
         await conn.commit()
     except BaseException:
         await conn.close()  # never leak a half-migrated connection

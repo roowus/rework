@@ -215,6 +215,7 @@ def make_toolloop_node(
     on_start: Any | None = None,
     resume_file: Path | None = None,
     progress_check: Any | None = None,
+    charge_scope: str = "loop",
 ) -> ToolLoopNode:
     """`bus` (optional) turns on TRAJECTORY events: one per model turn and one
     per tool call, so the UI can show the agent loop the way Claude Code and
@@ -235,12 +236,13 @@ def make_toolloop_node(
             )
         )
 
-    async def charge(result_usage, model: str) -> None:
+    async def charge(result_usage, model: str, dedupe_key: str) -> None:
         await store.charge(
             Charge(
                 mission_id=mission_id,
                 run_id=run_id,
                 model=model,
+                dedupe_key=dedupe_key,
                 input_tokens=result_usage.input_tokens,
                 output_tokens=result_usage.output_tokens,
                 cached_tokens=getattr(result_usage, "cached_tokens", 0) or 0,
@@ -275,7 +277,7 @@ def make_toolloop_node(
                     session_id=run_id,
                 )
             )
-            await charge(result.usage, entry.model)
+            await charge(result.usage, entry.model, f"{run_id}:{charge_scope}:handoff")
             return (result.text or "").strip()
         except Exception as exc:  # the note is a courtesy; never fail the run
             log.warning("handoff note failed: %s", exc)
@@ -363,7 +365,9 @@ def make_toolloop_node(
                     session_id=run_id,
                 )
             )
-            await charge(result.usage, entry.model)
+            # `turns` is the iteration index and is persisted with the loop, so a resumed
+            # loop reproduces the same keys for the same model calls
+            await charge(result.usage, entry.model, f"{run_id}:{charge_scope}:turn{turns}")
             turns += 1
             await emit(
                 "turn",

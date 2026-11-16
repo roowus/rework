@@ -573,6 +573,27 @@ Tests never touch `rework_state`. Postgres tests use the dedicated
 `rework_test` database:
 `REWORK_TEST_POSTGRES=postgresql://postgres:<password>@<host>:5433/rework_test`.
 
+### When the database link drops
+
+The daemon and the TUI hold one store connection each. When it drops (a Postgres
+restart, a network blip, a locked SQLite file), the store proxy retries with capped
+backoff and reconnects the Postgres link, so a mission in flight carries on where it
+was. A run is not restarted, and a role does not repeat a model call that was already
+charged.
+
+What is retried: reads, status updates, and any write that is safe to repeat (model
+charges and events that carry a dedupe key, so a repeat lands on the row that already
+exists). What is not: writes that cannot be repeated safely (creating a mission or a
+gate, deciding a gate, un-keyed events, lock acquisition, complaints). Those fail once
+and the error reaches the caller, so an owner action is never applied twice.
+
+What the owner sees: one warning in the daemon log when an outage starts, one info
+line when it clears, and the TUI's offline hint while it lasts. A gate that is waiting
+for an answer keeps waiting, and an answer given during the outage is applied once when
+the store is back. The retry budget is five minutes; an outage that lasts longer ends
+the run's task with the run left RUNNING, and a daemon restart resumes it from its
+checkpoint.
+
 ### Rotating the Postgres password
 
 A running TUI and the long-lived `rework library-mcp` process keep the database

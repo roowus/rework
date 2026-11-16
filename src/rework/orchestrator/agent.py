@@ -1037,6 +1037,9 @@ class MissionOrchestrator:
         if entry.id == self.entry.id:
             self._preferred_failures = 0
         usage = result.usage
+        # this model call's turn, computed BEFORE the charge: the charge's dedupe key is
+        # built from it, so a retried or resumed charge for the same turn lands once
+        turn_of_call = sum(1 for m in self.history if m.get("role") == "assistant") + 1
         await self.store.charge(
             Charge(
                 mission_id=self.mid,
@@ -1048,6 +1051,7 @@ class MissionOrchestrator:
                 cost_usd=entry.estimate_cost(
                     usage.input_tokens, usage.output_tokens, usage.cached_tokens
                 ),
+                dedupe_key=f"{self.run_id}:turn{turn_of_call}:orchestrator",
             )
         )
         message: dict[str, Any] = {"role": "assistant", "content": result.text or ""}
