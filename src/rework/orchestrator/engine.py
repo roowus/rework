@@ -1133,6 +1133,9 @@ class MissionRunner:
                 summary = f"{summary.rstrip()}\n\n{extra}" if summary.strip() else extra
                 result["summary"] = summary
         await self._store.update_mission(mission_id, status=status, result=result)
+        # terminal: the transient-crash budget belongs to ONE run, so a later
+        # re-run of this mission starts its count at zero
+        await self._store.reset_transient_crash_count(mission_id)
         log.info("mission %s: %s", mission_id, status.value)
         event = EventType.MISSION_DONE if status == MissionStatus.DONE else EventType.MISSION_FAILED
         await self._bus.publish(
