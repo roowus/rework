@@ -1241,9 +1241,14 @@ def retry_pr_cmd(mission_id: str) -> None:
         from rework.config import Config, open_store_from_config
         from rework.kernel.events.bus import InProcessEventBus
 
-        store = await open_store_from_config(Config.from_env())
+        config = Config.from_env()
+        store = await open_store_from_config(config)
         try:
-            return await retry_pr(store, InProcessEventBus(store), mission_id)
+            # the deployment's commit identity: the retried merge commit must
+            # carry the same author as the mission's own commits
+            return await retry_pr(
+                store, InProcessEventBus(store), mission_id, author=config.git_author
+            )
         finally:
             await store.aclose()
 

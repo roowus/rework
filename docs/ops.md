@@ -152,6 +152,97 @@ at all. `echo` and `fix` missions deliver their result and stop.
 
 Merging is always the owner's decision; no agent merges.
 
+### main is merged into the branch before the PR opens
+
+Other missions merge to main while this one works, so a mission branch that was
+clean when the coder finished arrives conflicting anyway. Every PR delivery
+therefore runs, in the coder's own worktree and just before the push:
+
+1. probe `git remote get-url origin`: a repo-less (upload) project has none and
+   nothing happens at all (no fetch, no event, no change to the PR body);
+2. check `git rev-parse --abbrev-ref HEAD` is the coder branch (the fallback to
+   the daemon's shared clone can be detached or on main, and a merge there would
+   move the wrong ref);
+3. abort a merge a dead daemon left in progress (`MERGE_HEAD` present). A
+   stopped merge in this worktree is never somebody else's to resume (the only
+   merge that ever runs here is this step, synchronously), and leaving it would
+   let a later `git add -A` commit the conflict markers. Staged work that the
+   abort discards is stashed (`git stash create`, which never touches the index
+   or the tree) and pinned on the ref `refs/rework/pre-merge-abort` before the
+   abort runs, so a crash that left both a stopped merge and staged edits loses
+   nothing. That ref is a single mutable ref: the next delivery that discards
+   anything overwrites it, so only the most recently discarded stash is kept.
+   The INFO event of any outcome that discarded work names the ref, including a
+   merge that ends up succeeding after discarding staged work from a leftover
+   merge. The PR body names it only for a refused merge or a real conflict,
+   because those are the only two outcomes that get a **Merge with main**
+   section at all. An abort that discards nothing (the usual case, since a
+   stopped merge leaves unmerged entries that `git stash create` refuses) pins
+   no ref and says nothing;
+4. check `git status --porcelain` is empty, so a merge cannot clobber
+   uncommitted work (and `git add -A` cannot fold it into the merge commit);
+5. `git fetch origin main`, then `git merge-base --is-ancestor origin/main HEAD`:
+   already up to date, nothing to do. A failed fetch is a skip too, but it
+   publishes an INFO event with git's reason (scrubbed and truncated), since the
+   branch may then be stale for a reason worth seeing;
+6. `git merge --no-ff -m "Merge origin/main into <branch>" origin/main`, with the
+   deployment's configured commit identity (`REWORK_GIT_AUTHOR_NAME` /
+   `REWORK_GIT_AUTHOR_EMAIL`, the same `Config.git_author` every mission commit
+   uses; `rework <rework@rework.local>` when nothing is configured). One branch's
+   history never gains a second author. The merge commit is pushed with the
+   coder's commits, so the PR is mergeable. An INFO event names the merge commit.
+
+The silent outcomes are the ones with nothing to act on: **no origin** (step 1),
+**wrong branch** (step 2), **dirty worktree** (step 4) and **already up to
+date** (step 5) publish no event and add no body note. Everything else says
+something. The outcomes that carry a problem publish an INFO event, and the two
+that did not merge also give the body its **Merge with main** section: a failed
+fetch (body untouched), a refused merge and a real conflict. A **successful**
+merge publishes its own INFO event naming the merge commit (body untouched, a
+clean merge needs no note). One exception to the silence: aborting a leftover
+merge (step 3) can discard staged work, and no outcome of this step may drop
+that stash silently. So a skip that discarded work DOES publish an INFO event
+naming `refs/rework/pre-merge-abort`, and so does a merge that still succeeds
+after the abort; a plain skip still adds no body note, and the merge paragraph
+is only ever appended for a refused merge or a real conflict.
+
+A real conflict is never guessed at. The conflicting paths are captured first
+(`git ls-files -u` plus `git diff --name-only --diff-filter=U`, so delete/modify
+conflicts are not invisible), then `git merge --abort` runs and is verified with
+`git rev-parse -q --verify MERGE_HEAD`. The branch is then exactly what the coder
+left, for COMMITTED work: same HEAD, no conflict markers, nothing staged. (The
+dirty check in step 4 keeps uncommitted edits away from this step; the one thing
+an abort can discard is work staged inside a leftover merge, and step 3 pins
+that on `refs/rework/pre-merge-abort` first.) The push and the PR still happen,
+and the PR body gains a **Merge with main** section listing the conflicting
+paths so you see it in the PR; an INFO event carries the same list. If the
+abort itself fails, the event and the body say so and delivery continues: this
+step never blocks a PR and never fails a mission.
+
+A non-zero `git merge` exit is **not** automatically a conflict. When git
+REFUSES the merge instead of conflicting (unrelated histories, an `index.lock`
+it could not write) there are no unmerged paths, so the outcome is
+`failed`, not `conflicted`: the PR body and the INFO event then carry git's own
+reason (scrubbed and truncated) and say the merge was refused, and no path list
+is printed. Nothing ever reports conflicts with zero named paths.
+
+Because the merge lives in the shared delivery step, the **Retry PR** button
+(`rework mission retry-pr`) merges main too instead of re-pushing a stale
+branch, and it uses the same configured author from the environment. The merge
+paragraph is **never persisted**: only the coder's own body is stored with a
+failed delivery, and a **Merge with main** section is recomputed on every
+attempt, so a retry that merges cleanly cannot republish an earlier conflict.
+To make that cleanup exact, the paragraph is appended behind the marker
+`<!-- rework:merge-note -->`, and a retry strips only from that marker. A row
+stored by an older rework carries no marker, so the trailing section is cut
+only when it reads like one of the notes this step writes: it names `main` as
+**not** merged into the branch, lists `Conflicting paths:`, or carries the
+`Staged work that the abort` line about the discarded stash. Without a marker
+that test is only a heuristic, so a coder paragraph that quotes `## Merge with
+main` and then happens to use our own phrasing can still be cut, while a coder
+summary or auditor finding that quotes the heading and then uses other words is
+published verbatim and never truncated.
+
 A sleeping Mac pauses every local mission: nothing fails, it just stops
 until the lid opens (seen 2026-11-09: four stalls that looked like hangs
 were clamshell sleep; check `pmset -g log | grep -E "Sleep|Wake"` before

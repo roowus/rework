@@ -9,10 +9,39 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from rework.nodes.failure_text import HTTP_5XX, RATE_LIMIT, marker_regex, scrub
 from rework.nodes.tools import ToolExecutor
+
+# The fallback commit identity: a deployment that configures nothing
+# (REWORK_GIT_AUTHOR_NAME/EMAIL) gets this, exactly as `commit()` always has.
+DEFAULT_GIT_AUTHOR: tuple[str, str] = ("rework", "rework@rework.local")
+
+
+@dataclass
+class MergeResult:
+    """What `merge_base_into_branch` did. Exactly one of the fields below is
+    meaningful, in this order: skipped_reason, up_to_date, merged, conflicted,
+    failed.
+
+    `conflicted` means git left UNMERGED PATHS behind; a merge git REFUSED
+    outright (unrelated histories, an index it could not write) is `failed`
+    with git's own words in `detail`, never a conflict with zero paths."""
+
+    skipped_reason: str | None = None
+    up_to_date: bool = False
+    merged: bool = False
+    sha: str | None = None
+    conflicted: bool = False
+    conflicting: list[str] = field(default_factory=list)
+    abort_failed: str | None = None
+    failed: bool = False
+    detail: str = ""
+    # sha of the stashed staged work an abort of a LEFTOVER merge would have
+    # thrown away (`refs/rework/pre-merge-abort`), when there was any
+    discarded_work: str | None = None
 
 
 async def _run(repo: Path, *args: str, timeout_s: float = 60.0) -> tuple[int, str]:
@@ -206,9 +235,7 @@ async def unstage_nested_repos(worktree: Path) -> list[str]:
 
 
 async def commit(
-    worktree: Path,
-    message: str,
-    author: tuple[str, str] = ("rework", "rework@rework.local"),
+    worktree: Path, message: str, author: tuple[str, str] = DEFAULT_GIT_AUTHOR
 ) -> str | None:
     """Returns the commit sha, or None when there was nothing to commit.
     Explicit agent identity: runs on machines with no git config (CI runners)."""
@@ -393,6 +420,207 @@ async def push_branch(
 async def head_sha(worktree: Path) -> str | None:
     code, out = await _run(worktree, "rev-parse", "HEAD")
     return out if code == 0 else None
+
+
+# -- merge origin/<base> into the run branch before the PR -------------------
+#
+# Found live: mission PRs arrived CONFLICTING with main (4 to 8 files each)
+# because other missions merged while this one worked. The clean merge belongs
+# in the branch that is pushed, so the PR arrives mergeable. A REAL conflict is
+# never guessed at: the merge is aborted, the branch is left byte-identical to
+# what the coder left, and the PR still opens with the conflicting paths in the
+# body so the owner decides. A merge git REFUSES outright (unrelated histories,
+# an index it cannot write) is not a conflict: it is reported as failed with
+# git's own words, because claiming conflicts with zero named paths is a lie.
+
+
+async def has_origin(repo: Path) -> bool:
+    """True when `repo` has an `origin` remote. Repo-less missions and upload
+    projects have none, and the merge step is then a silent no-op."""
+    code, _ = await _run(repo, "remote", "get-url", "origin")
+    return code == 0
+
+
+async def fetch_origin(repo: Path, base: str, timeout_s: float = 120.0) -> tuple[bool, str]:
+    """`git fetch origin <base>`: brings origin/<base> up to date so the merge
+    sees what main really is. Returns (ok, output); never raises."""
+    code, out = await _run(repo, "fetch", "origin", base, timeout_s=timeout_s)
+    return code == 0, out
+
+
+async def conflict_paths(repo: Path) -> list[str]:
+    """The unmerged paths of a stopped merge.
+
+    `diff --name-only --diff-filter=U` is the primary source. A delete/modify
+    conflict has only ONE stage entry, and `ls-files -u` still lists it, so the
+    two are merged (ls-files first: it is the one that sees every unmerged
+    entry). Order is kept stable for the PR body."""
+    found: list[str] = []
+    code, out = await _run(repo, "ls-files", "-u")
+    if code == 0:
+        for line in out.splitlines():
+            # "<mode> <sha> <stage>\t<path>"
+            _, _, path = line.partition("\t")
+            path = path.strip()
+            if path and path not in found:
+                found.append(path)
+    code, out = await _run(repo, "diff", "--name-only", "--diff-filter=U")
+    if code == 0:
+        for line in out.splitlines():
+            path = line.strip()
+            if path and path not in found:
+                found.append(path)
+    return sorted(found)
+
+
+async def merge_in_progress(repo: Path) -> bool:
+    code, _ = await _run(repo, "rev-parse", "-q", "--verify", "MERGE_HEAD")
+    return code == 0
+
+
+PRE_MERGE_ABORT_REF = "refs/rework/pre-merge-abort"
+
+
+async def stash_staged_work(repo: Path) -> str | None:
+    """Keep a recoverable copy of staged work before an abort would discard it.
+
+    `git stash create` writes the stash commit WITHOUT touching the index or the
+    working tree, so it is safe here; it refuses while the index holds unmerged
+    entries (a stopped merge usually does), and then there is nothing extra to
+    lose, so any failure is simply "nothing stashed". Returns the sha it made,
+    pinned under `refs/rework/pre-merge-abort` so `git gc` cannot collect it.
+    """
+    code, out = await _run(repo, "stash", "create", "rework: pre-merge-abort")
+    sha = out.strip().splitlines()[-1].strip() if code == 0 and out.strip() else ""
+    if not re.fullmatch(r"[0-9a-f]{40,64}", sha):
+        return None
+    if not await keep_ref(repo, PRE_MERGE_ABORT_REF, sha):
+        return None
+    return sha
+
+
+async def keep_ref(repo: Path, ref: str, sha: str) -> bool:
+    """Pin a commit under `ref`, so an unreferenced stash cannot be collected."""
+    code, _ = await _run(repo, "update-ref", ref, sha)
+    return code == 0
+
+
+async def abort_merge(repo: Path) -> tuple[bool, str]:
+    """Undo a stopped merge so the worktree holds exactly what the coder left
+    (no conflict markers, no staged partial merge, same HEAD)."""
+    code, out = await _run(repo, "merge", "--abort")
+    if code != 0:
+        return False, out
+    if await merge_in_progress(repo):
+        return False, f"MERGE_HEAD still present after --abort: {out}"
+    return True, out
+
+
+async def merge_base_into_branch(
+    worktree: Path,
+    branch: str,
+    base: str = "main",
+    author: tuple[str, str] = DEFAULT_GIT_AUTHOR,
+) -> MergeResult:
+    """Merge `origin/<base>` into the CHECKED OUT `branch`, before the push.
+
+    `author` is the deployment's configured commit identity (Config.git_author,
+    the same tuple every mission commit is made with): the merge commit must not
+    add a second author to one branch's history.
+
+    Returns a structured result; never raises for the expected cases:
+      skipped_reason: no-origin / wrong-branch / dirty-worktree / fetch-failed
+      up_to_date:     origin/<base> is already an ancestor of the branch
+      merged + sha:   clean merge commit, worktree left clean
+      conflicted + conflicting: unmerged paths exist, abort already run
+      failed + detail: git refused the merge and named no paths (unrelated
+                      histories, an index that could not be written)
+    """
+    if not await has_origin(worktree):
+        return MergeResult(skipped_reason="no-origin")
+    # _create_pr falls back to the daemon's shared clone when the artifact has
+    # no worktree: its HEAD is NOT the coder branch (often detached), and
+    # merging there would move the wrong ref.
+    current = await head_branch_name(worktree)
+    if current != branch:
+        return MergeResult(skipped_reason="wrong-branch")
+    # A merge a DEAD daemon left in progress (MERGE_HEAD + unmerged index) makes
+    # `status --porcelain` non-empty, so the dirty guard below would skip it and
+    # leave the conflict markers in place for a later `git add -A` to commit.
+    # Nothing can be resuming that merge: the only merge this worktree ever runs
+    # is ours, synchronously, in this process. So abort it first and continue.
+    discarded: str | None = None
+    if await merge_in_progress(worktree):
+        # whatever staged work the abort discards is kept on a ref first, so a
+        # crash that left BOTH a stopped merge and staged edits loses nothing
+        discarded = await stash_staged_work(worktree)
+        await abort_merge(worktree)  # best effort: the dirty guard still holds
+    code, out = await _run(worktree, "status", "--porcelain")
+    if code != 0:
+        return MergeResult(skipped_reason="dirty-worktree", discarded_work=discarded)
+    if out.strip():
+        # uncommitted work: a merge could clobber it, and stage_all would fold
+        # it into the merge commit. Not ours to clean up here.
+        return MergeResult(skipped_reason="dirty-worktree", discarded_work=discarded)
+    fetched, fetch_out = await fetch_origin(worktree, base)
+    if not fetched:
+        return MergeResult(
+            skipped_reason="fetch-failed", detail=fetch_out, discarded_work=discarded
+        )
+    remote_base = f"origin/{base}"
+    code, _ = await _run(worktree, "merge-base", "--is-ancestor", remote_base, "HEAD")
+    if code == 0:
+        return MergeResult(up_to_date=True, discarded_work=discarded)
+    code, out = await _run(
+        worktree,
+        "-c",
+        f"user.name={author[0]}",
+        "-c",
+        f"user.email={author[1]}",
+        "merge",
+        "--no-ff",
+        "-m",
+        f"Merge {remote_base} into {branch}",
+        remote_base,
+        timeout_s=120.0,
+    )
+    if code != 0:
+        # paths FIRST: after --abort the unmerged index entries are gone
+        paths = await conflict_paths(worktree)
+        if not paths:
+            # git REFUSED the merge instead of conflicting (unrelated histories,
+            # an index it could not write): it left nothing to abort, and the PR
+            # body must not claim conflicts with zero named paths.
+            abort_failed = None
+            if await merge_in_progress(worktree):  # a partial merge did start
+                aborted, abort_out = await abort_merge(worktree)
+                abort_failed = None if aborted else (abort_out or out)
+            return MergeResult(
+                failed=True,
+                abort_failed=abort_failed,
+                detail=out,
+                discarded_work=discarded,
+            )
+        aborted, abort_out = await abort_merge(worktree)
+        return MergeResult(
+            conflicted=True,
+            conflicting=paths,
+            abort_failed=None if aborted else (abort_out or out),
+            detail=out,
+            discarded_work=discarded,
+        )
+    sha = await head_sha(worktree)
+    return MergeResult(merged=True, sha=sha, discarded_work=discarded)
+
+
+async def head_branch_name(worktree: Path) -> str:
+    """The branch checked out here, or "" when HEAD is detached (the daemon's
+    shared clone). Unlike `current_branch` this never raises."""
+    code, out = await _run(worktree, "rev-parse", "--abbrev-ref", "HEAD")
+    name = out.strip()
+    if code != 0 or name == "HEAD":
+        return ""
+    return name
 
 
 def worktree_executor(worktree: Path) -> ToolExecutor:

@@ -526,11 +526,16 @@ class TuiData:
         """Retry push+PR for a finished mission whose delivery failed. Shares
         `rework.orchestrator.delivery.retry_pr` with `rework mission retry-pr`,
         so the button and the command can never disagree."""
+        from rework.config import Config
         from rework.kernel.events.bus import InProcessEventBus
         from rework.orchestrator.delivery import retry_pr
 
         store = await self.store()
-        return await retry_pr(store, InProcessEventBus(store), mission_id)
+        # the deployment's commit identity, so the retried merge commit has the
+        # same author as the mission's own commits
+        return await retry_pr(
+            store, InProcessEventBus(store), mission_id, author=Config.from_env().git_author
+        )
 
     async def prioritize_mission(self, mission_id: str, priority: str = "high") -> Any:
         """Pickup priority (normal | high): the daemon reads the row, so this
