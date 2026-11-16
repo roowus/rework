@@ -150,7 +150,10 @@ class Daemon:
         self._limiter = RoleLimiter(max_roles(config), poll_interval_s=config.poll_interval_s)
         # both caps follow the host at runtime (REWORK_CAPACITY=auto, the
         # default); the watchdog is started from inside run_forever, because a
-        # task needs a running loop and this runs outside one
+        # task needs a running loop and this runs outside one. A hand-set
+        # REWORK_CONCURRENCY / REWORK_MAX_ROLES reaches it through
+        # CapacitySettings.from_env() as a FLOOR (REWORK_CAPACITY_PINS=floor, the
+        # default), so both numbers being set no longer disables the watchdog
         self._capacity = DynamicCapacity(self._sem, self._limiter)
         self._runners: dict[str, asyncio.Task[None]] = {}
         self._bg: set[asyncio.Task[None]] = set()

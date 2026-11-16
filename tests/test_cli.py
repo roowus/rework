@@ -396,6 +396,105 @@ def test_report_missing_mission_md_flag(rework_db: Path) -> None:
     assert "Traceback" not in result.output
 
 
+@pytest.fixture()
+def no_capacity_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ambient capacity env must not decide what these tests prove."""
+    for name in (
+        "REWORK_CAPACITY",
+        "REWORK_CAPACITY_INTERVAL_S",
+        "REWORK_CAPACITY_PINS",
+        "REWORK_CONCURRENCY",
+        "REWORK_MAX_ROLES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_capacity_prints_a_recomputed_plan_when_auto_is_active(no_capacity_env: None) -> None:
+    """`rework capacity` recomputes (measure + planner) and says so: it must not
+    pretend to read the daemon's live caps, because there is no such route."""
+    from rework.orchestrator.capacity import measure, plan
+
+    result = runner.invoke(app, ["capacity"])
+    assert result.exit_code == 0, result.output
+    cpus, _load, _avail = measure()
+    planned = plan(*measure())
+    assert "measured on this host now:" in result.output
+    assert f"{cpus} CPUs" in result.output
+    assert f"plan: {planned.concurrency} missions / {planned.max_roles} roles" in result.output, (
+        result.output
+    )
+    assert "NOT read from the daemon" in result.output
+    assert "missions MANAGED" in result.output and "roles MANAGED" in result.output
+    assert "AUTO IS ACTIVE" in result.output
+    assert "rework logs daemon -g 'capacity'" in result.output
+
+
+def test_capacity_prints_the_truth_when_auto_is_off(
+    no_capacity_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """REWORK_CAPACITY=fixed: AUTO IS OFF, and the pair printed is the one resolved
+    at startup, not a plan that never runs."""
+    from rework.config import Config
+    from rework.orchestrator.capacity import measure
+
+    monkeypatch.setenv("REWORK_CAPACITY", "fixed")
+    config = Config.from_env()
+    result = runner.invoke(app, ["capacity"])
+    assert result.exit_code == 0, result.output
+    cpus = measure()[0]
+    roles = config.max_roles or cpus
+    assert "AUTO IS OFF" in result.output
+    assert "REWORK_CAPACITY=fixed" in result.output
+    assert f"plan: {config.concurrency} missions / {roles} roles" in result.output, result.output
+    assert "as resolved at startup" in result.output
+    assert "no planner, no watchdog" in result.output
+
+
+def test_capacity_reports_both_pinned_caps_as_pinned_fixed(
+    no_capacity_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("REWORK_CAPACITY_PINS", "fixed")
+    monkeypatch.setenv("REWORK_CONCURRENCY", "1")
+    monkeypatch.setenv("REWORK_MAX_ROLES", "2")
+    result = runner.invoke(app, ["capacity"])
+    assert result.exit_code == 0, result.output
+    assert "missions PINNED at 1 by REWORK_CONCURRENCY=1 (pins=fixed)" in result.output
+    assert "roles PINNED at 2 by REWORK_MAX_ROLES=2 (pins=fixed)" in result.output
+    assert "AUTO IS OFF" in result.output
+    assert "both caps PINNED under pins=fixed" in result.output
+
+
+def test_capacity_reads_max_roles_as_a_floor_by_default(
+    no_capacity_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("REWORK_MAX_ROLES", "2")
+    result = runner.invoke(app, ["capacity"])
+    assert result.exit_code == 0, result.output
+    assert "roles MANAGED, floor 2" in result.output
+    assert "AUTO IS ACTIVE" in result.output, "a floor never freezes a cap"
+
+
+def test_capacity_rejects_an_invalid_pins_value(
+    no_capacity_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("REWORK_CAPACITY_PINS", "floo")
+    result = runner.invoke(app, ["capacity"])
+    assert result.exit_code == 2, result.output
+    assert "REWORK_CAPACITY_PINS" in result.output
+
+
+def test_capacity_json_carries_the_same_facts(no_capacity_env: None) -> None:
+    result = runner.invoke(app, ["capacity", "--json"])
+    assert result.exit_code == 0, result.output
+    facts = json.loads(result.output)
+    assert facts["recomputed"] is True
+    assert facts["auto_active"] is True
+    assert facts["pins"] == "floor"
+    assert facts["measurement"]["cpus"] >= 1
+    assert facts["planned"]["missions"] >= 1
+    assert "MANAGED" in facts["why"]["missions"]
+
+
 def test_cancel_pause_resume_commands(rework_db: Path) -> None:
     """`rework cancel|pause|resume <id>` write the mission status; that row is
     what the daemon reads, so the commands work from any machine."""
