@@ -612,13 +612,19 @@ class GitLibrary:
         return keep.strip("-") or "item"
 
     def body_path_for(self, item: LibraryItem) -> str:
-        return f"{item.type.value}s/{self._slug(item.name)}.md"
+        """The body file for a NEW item: its type folder, the slug of its name,
+        and its id. The id is what makes the path unique, so two items given
+        the same name (two reports with the same --title) never share a file;
+        an item that already has a path keeps it (see write_body)."""
+        return f"{item.type.value}s/{self._slug(item.name)}-{item.id}.md"
 
     def write_body(self, item: LibraryItem, body: str, message: str) -> str:
         """Write the body file, stage + commit, return the repo-relative path.
         Sync by design; callers wrap in to_thread."""
         self.ensure_repo()
-        rel = self.body_path_for(item)
+        # an item that already has a body file keeps it: a rename must overwrite
+        # the same file, not strand the old one with the old body
+        rel = item.body_path or self.body_path_for(item)
         dest = self.root / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(body)
