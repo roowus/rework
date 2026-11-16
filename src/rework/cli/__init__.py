@@ -1575,8 +1575,9 @@ def capacity(
     state over its API, so with auto active this runs the daemon's own code path
     here (the env, one measurement, the planner) and says so. With auto off it
     measures nothing and prints the pair resolved at startup, because that is the
-    pair in force. For the live daemon's own view of where the caps actually
-    are, read its log: `rework logs daemon -g 'capacity'`."""
+    pair in force, and it says that the daemon logs no capacity lines in that
+    mode, so `rework logs daemon -g 'capacity'` is only for a running auto
+    daemon."""
     import json as _json
 
     from rework.config import Config, max_roles
@@ -1596,11 +1597,12 @@ def capacity(
         raise typer.Exit(2) from exc
 
     config = Config.from_env()
-    # The daemon seeds its policy from the caps it was constructed with, which are
-    # the config defaults for this box: the same values here, so a floor under
-    # them cannot print a pair the daemon would never pick. max_roles as resolved
-    # at startup is the same function the daemon uses, so the pair below is the
-    # daemon's own startup pair and not a guess from the CPU count.
+    # The daemon seeds its policy from the caps it was constructed with, and it
+    # builds them from the same two calls used here: Config.concurrency and
+    # max_roles(config), the function Daemon calls on its own Config. Using them
+    # again (rather than re-deriving one from the CPU count) is what keeps this
+    # pair the one the daemon would start with, so a floor under it cannot print
+    # a pair the daemon would never pick.
     constructed = (config.concurrency, max_roles(config))
     policy = CapacityPolicy(
         concurrency=constructed[0],
@@ -1649,6 +1651,21 @@ def capacity(
             why_missions = "missions as resolved at startup (no planner, no watchdog)"
             why_roles = "roles as resolved at startup (no planner, no watchdog)"
 
+    # The log hint is only true when auto runs: with auto off the daemon logs no
+    # "capacity" line at all (no plan line, no change line), so pointing at
+    # `rework logs daemon -g 'capacity'` would send a reader to a log that can
+    # never contain it. ONE string feeds both the text and the JSON.
+    if active:
+        live_hint = (
+            "the live daemon's own view: rework logs daemon -g 'capacity'"
+            " (its 'capacity plan:' startup line and every 'capacity changed:' line)"
+        )
+    else:
+        live_hint = (
+            "the daemon logs no 'capacity' lines in this mode by design;"
+            " rework logs daemon -g 'capacity' is for a running auto daemon"
+        )
+
     facts = {
         "recomputed": active,
         "auto_active": active,
@@ -1663,6 +1680,7 @@ def capacity(
             **measured_pair,
         },
         "why": {"missions": why_missions, "roles": why_roles},
+        "live_daemon_hint": live_hint,
     }
     if as_json:
         typer.echo(_json.dumps(facts, indent=2))
@@ -1677,10 +1695,7 @@ def capacity(
     typer.echo(f"  {why_missions}")
     typer.echo(f"  {why_roles}")
     typer.echo(state)
-    typer.echo(
-        "the live daemon's own view: rework logs daemon -g 'capacity'"
-        " (its 'capacity plan:' startup line and every 'capacity changed:' line)"
-    )
+    typer.echo(live_hint)
 
 
 @app.command()

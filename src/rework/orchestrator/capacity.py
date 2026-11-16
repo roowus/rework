@@ -283,6 +283,11 @@ class CapacityPolicy:
     The caller feeds each measurement in (:meth:`apply_initial`,
     :meth:`observe`) and gets back a :class:`Capacity` only when the caps should
     move, so hysteresis is unit-testable without sleeping a minute per tick.
+
+    The two `pins` defaults differ on purpose: direct construction defaults to
+    PINS_FIXED, while a real daemon run gets its pins from
+    :meth:`CapacitySettings.from_env`, which defaults to PINS_FLOOR when
+    REWORK_CAPACITY_PINS is unset.
     """
 
     def __init__(
@@ -302,11 +307,10 @@ class CapacityPolicy:
         # at the constructed value). `pins` decides what an explicit env value
         # MEANS: PINS_FIXED -> the exact cap, PINS_FLOOR -> a minimum.
         #
-        # The default here is PINS_FIXED, the semantics this class had before
-        # REWORK_CAPACITY_PINS existed, so direct construction keeps the old
-        # byte-for-byte behaviour. It is NOT the user-facing default: the env
-        # decides, CapacitySettings.from_env() reads REWORK_CAPACITY_PINS as floor
-        # when it is unset, and DynamicCapacity always passes settings.pins.
+        # PINS_FIXED is the default HERE only to keep the semantics this class had
+        # before REWORK_CAPACITY_PINS existed (see the class docstring): it is not
+        # the user-facing default, which is PINS_FLOOR from from_env(), and
+        # DynamicCapacity always passes settings.pins explicitly.
         if pins not in (PINS_FLOOR, PINS_FIXED):
             raise ValueError(f"pins={pins!r} is invalid: use {PINS_FLOOR} or {PINS_FIXED}")
         as_pins = pins == PINS_FIXED

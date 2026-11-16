@@ -705,9 +705,11 @@ capacity plan: 2 CPUs, load 0.1, 9.4 GB (9403 MB) free: 2 missions / 2 roles; mi
 ```
 
 It carries the measurement (CPUs, load, available MB), the planned pair, and for
-each cap `MANAGED` or `PINNED` with the reason (the env var and its number). The
-`capacity changed:` lines below follow as before, one per actual change, so on a
-box whose plan differs from the constructed caps both lines appear.
+each cap `MANAGED` or `PINNED` with the reason (the env var and its number). When
+the first plan moves a cap, its `capacity changed:` line is logged FIRST, from
+inside that first apply, and this `capacity plan:` line then follows with the
+summary, so on a box whose plan differs from the constructed caps you see the
+change line first and the plan line after it.
 
 By design no `capacity plan:` line appears when auto is off, which is
 `REWORK_CAPACITY=fixed`, or `REWORK_CAPACITY_PINS=fixed` with BOTH numbers set
