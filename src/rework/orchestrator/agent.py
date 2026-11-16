@@ -177,9 +177,10 @@ PLAYBOOKS: dict[str, str] = {
         "Document work, not code: the deliverable is WRITING. Usual shape: (1) "
         "RESEARCH: spawn an investigator whose brief is to gather the facts with "
         "`web_search` and `fetch_url`, and to RECORD the source url of every claim it "
-        "makes; (2) DRAFT: spawn a coder (it owns the worktree and can write files, so "
-        "use it here too) to write the deliverables into the project as real files "
-        "(Markdown or whatever format the objective asks for), citing those sources; "
+        "makes; (2) DRAFT: spawn a coder to write the report itself, citing those "
+        "sources. For a draft mission the deliverable is a written report in the "
+        "mission's Report tab, not a change to the repository, so the brief has to say "
+        "so: do not write files into the target repo to carry the report; "
         "(3) REVIEW: spawn an auditor to check the draft claim by claim against the "
         "cited sources, to check any constraint the objective states (length, format, "
         "tone, audience), and to check that nothing about the OWNER is invented, "
@@ -188,8 +189,11 @@ PLAYBOOKS: dict[str, str] = {
         "findings in its brief and review again (pick each audit's `strictness` from "
         "risk and re-decide it every round, as with fix). Use `ask_owner` for facts "
         "only the owner knows (their own details, preferences, commitments) BEFORE "
-        "finalising: never guess them. THERE IS NO BRANCH PUSH AND NO PR: the results "
-        "are the project's files, so the mission finishes with no gate."
+        "finalising: never guess them. THERE IS NO BRANCH PUSH AND NO PR: never push a "
+        "branch and never open a pull request for a draft mission; it finishes with no "
+        "gate because its deliverable is the report in its Report tab. If a draft "
+        "mission discovers that code has to change, it says so in the Report tab and "
+        "does not change code: the recovery is the owner relaunching on the fix plan."
     ),
 }
 

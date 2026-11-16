@@ -1021,3 +1021,150 @@ async def test_git_that_closes_its_pipes_and_keeps_running_is_still_bounded(
     assert code == 124
     assert out.splitlines()[0] == "last words"
     assert out.splitlines()[-1] == "(git timeout after 1s)"
+
+
+# ---------------------------------------------------------------------------
+# a plan that does not publish has no branch to deliver: retry must refuse
+# ---------------------------------------------------------------------------
+
+DRAFT_REFUSAL = "does not publish"
+
+
+async def _draft_mission_with_a_coder_branch(store: Any, work: Path, mid: str) -> Mission:
+    """A finished `draft` mission that DOES carry a coder branch artifact: the
+    exact shape that used to let retry-pr push and open a PR for a mission
+    whose deliverable is its Report tab."""
+    from rework.kernel.state.records import Run, RunStatus, run_id
+    from rework.missions import orchestrated_plan
+
+    mission = await store.create_mission(
+        Mission(
+            id=mid,
+            objective="audit the release process",
+            title="Audit the release process",
+            status=MissionStatus.DONE,
+            plan=orchestrated_plan("draft", "pro"),
+            repo_path=str(work),
+            result={"summary": "kept"},
+        )
+    )
+    await store.create_run(
+        Run(
+            id=run_id(mid, "code", "coder", 1),
+            mission_id=mid,
+            role="coder",
+            step="code",
+            status=RunStatus.COMPLETED,
+            artifact={"branch": "rework/test", "worktree": str(work)},
+        )
+    )
+    return mission
+
+
+async def test_retry_pr_refuses_a_draft_mission_that_carries_a_coder_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The branch fallback in retry_pr used to push any coder branch. For a
+    draft mission there is nothing to publish, so it must refuse before git or
+    gh is reached at all."""
+    bare, work = _make_repo(tmp_path)
+    calls: list[str] = []
+
+    async def boom(*_a: Any, **_k: Any) -> str:
+        calls.append("pr_create")
+        raise AssertionError("pr_create must never be called for a draft mission")
+
+    monkeypatch.setattr("rework.orchestrator.delivery.pr_create", boom)
+    store = await open_sqlite(str(tmp_path / "draft.sqlite3"))
+    try:
+        mission = await _draft_mission_with_a_coder_branch(store, work, "mdraft000001")
+        ok, detail = await retry_pr(store, None, mission.id)
+        assert ok is False, "a draft mission must not be delivered"
+        assert DRAFT_REFUSAL in detail, detail
+        assert "Report tab" in detail, "the refusal says where the deliverable really is"
+        assert calls == [], "pr_create ran for a mission that publishes nothing"
+        after = await store.get_mission(mission.id)
+        assert after is not None
+        assert not (after.result or {}).get("pr_pending"), "nothing was left to retry"
+        assert not (after.result or {}).get("pr_url")
+    finally:
+        await store.aclose()
+    assert _remote_refs(bare) == ["main"], "the coder branch was pushed by a retry"
+
+
+@pytest.mark.parametrize(
+    "legacy_plan",
+    [
+        {"playbook": "fix-pr", "gates": []},
+        {"kind": "fix-pr", "gates": []},
+    ],
+)
+async def test_retry_pr_still_delivers_a_legacy_fix_pr_plan_without_a_publish_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, legacy_plan: dict[str, Any]
+) -> None:
+    """Missions created before the `publish` key existed can carry a pending PR,
+    and `rework mission retry-pr` is the operator's only recovery for them."""
+    bare, work = _make_repo(tmp_path)
+    fake_gh = tmp_path / "fake-gh"
+    log = tmp_path / "gh-calls.log"
+    fake_gh.write_text('#!/bin/sh\necho "$@" >> ' + str(log) + "\necho https://x/pull/9\n")
+    fake_gh.chmod(0o755)
+    monkeypatch.setenv("REWORK_GH_BIN", str(fake_gh))
+    store = await open_sqlite(str(tmp_path / "legacy.sqlite3"))
+    try:
+        mission = await store.create_mission(
+            Mission(
+                id="mlegacy00001",
+                objective="fix the thing",
+                title="Fix",
+                status=MissionStatus.DONE,
+                plan=dict(legacy_plan),
+                repo_path=str(work),
+                result={
+                    "summary": "kept",
+                    "pr_pending": True,
+                    "pr_branch": "rework/test",
+                    "pr_worktree": str(work),
+                },
+            )
+        )
+        assert "publish" not in mission.plan
+        ok, detail = await retry_pr(store, None, mission.id)
+        assert ok, detail
+        assert detail == "https://x/pull/9"
+        after = await store.get_mission(mission.id)
+        assert after is not None
+        assert after.result["pr_pending"] is False
+        assert after.result["pr_url"] == "https://x/pull/9"
+    finally:
+        await store.aclose()
+    assert "rework/test" in _remote_refs(bare), "the retried push landed the branch"
+    assert "pr create" in log.read_text()
+
+
+def test_cli_retry_pr_refuses_a_draft_mission_with_a_clean_message(tmp_path: Path) -> None:
+    """The owner surface: an operator who types retry-pr against an audit gets
+    the refusal in plain words, not a traceback and not a push."""
+    from typer.testing import CliRunner
+
+    from rework.cli import app
+
+    bare, work = _make_repo(tmp_path)
+    db = tmp_path / "cli-draft.sqlite3"
+
+    async def seed() -> None:
+        store = await open_sqlite(str(db))
+        try:
+            await _draft_mission_with_a_coder_branch(store, work, "mdraft000002")
+        finally:
+            await store.aclose()
+
+    asyncio.run(seed())
+    env = {"REWORK_DB": str(db), "PATH": os.environ["PATH"]}
+    result = CliRunner().invoke(app, ["mission", "retry-pr", "mdraft000002"], env=env)
+    combined = result.output + (result.stderr if result.stderr_bytes else "")
+    assert result.exit_code == 1, combined
+    assert DRAFT_REFUSAL in combined, combined
+    assert "Report tab" in combined
+    assert "Traceback" not in combined, "the refusal is an expected outcome, not a crash"
+    assert _remote_refs(bare) == ["main"], "the retry pushed a draft mission's branch"

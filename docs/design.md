@@ -66,8 +66,10 @@ tool-calling agent on the model chosen in the launching chat (or `rework new
 useful, model and effort chosen per role, inputs wired automatically or
 explicitly), `wait` (engine-side, store-derived: a role finished, failed or
 escalated, or the orchestrator's own timeout for a check-in), `read_artifact`,
-`check_in`, `cancel_run`, `message_owner`, `finish`. `fix` / `fix-pr` / `echo`
-are playbooks in its prompt, not pipelines. Rails stay mechanical: the burn gate
+`check_in`, `cancel_run`, `message_owner`, `finish`. `fix` / `fix-pr` / `echo` / `draft`
+are playbooks in its prompt, not pipelines. A `draft` mission (an audit or any
+other read-and-report task) delivers its report in the mission's Report tab,
+never a repository change and never a pull request. Rails stay mechanical: the burn gate
 (`plan.budget.max_usd`, then ask again every `ask_every_usd`), a runaway turn
 cap, owner pause/cancel, escalation policies, and the plan's fixed final gates
 (`_final_gates`, shared with the mechanical runner). Its conversation persists

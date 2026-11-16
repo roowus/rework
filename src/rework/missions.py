@@ -112,12 +112,170 @@ def derive_title(objective: str) -> str | None:
     return line or None
 
 
-# a playbook's FINAL gates. `draft` deliberately has none: its results are
-# the project's files, so there is nothing to push and no PR to open.
+# a playbook's FINAL gates. `draft` deliberately has none: its results are the
+# mission's Report tab, and the plan does not publish, so there is nothing to
+# push and no PR to open.
 PLAYBOOK_GATES: dict[str, list[str]] = {"echo": [], "fix": ["ship"], "fix-pr": [], "draft": []}
 
 DEFAULT_BUDGET_USD = 2.0  # what a deployment gets when nothing usable is set
 PLAYBOOK_PUBLISH: dict[str, str] = {"echo": "", "fix": "", "fix-pr": "pr", "draft": ""}
+
+# --- reads_only_plan: a closed-set DEFAULT-plan heuristic ---------------------
+#
+# The cost of a wrong verdict is asymmetric. A wrong None only costs the owner a
+# relaunch with `--plan draft`; a wrong "draft" silently denies a real fix
+# mission its branch and PR. So every uncertain case falls to None, and the
+# only way to get "draft" is to pass four small checks in a row.
+
+# 1. TRIGGER: the objective must BEGIN with one of these read-only openers.
+_OPENERS = (
+    "audit",
+    "review",
+    "analyse",
+    "analyze",
+    "survey",
+    "assess",
+    "evaluate",
+    "summarise",
+    "summarize",
+    "map out",
+    "document",
+    "investigate",
+    "explain",
+    "report on",
+    "write a report",
+    "write up a report",
+)
+_OPENER = re.compile(
+    r"^(?:" + "|".join(r"\s+".join(o.split()) for o in _OPENERS) + r")\b", re.IGNORECASE
+)
+
+# 2. CHANGE DENYLIST: change verb STEMS, each followed by `\w*` so every
+# inflection hits ("fix" also hits "fixing", "add" also hits "address"). It is
+# scanned over the whole objective and is DELIBERATELY over-generous: it can
+# only ever turn a "draft" into None, which is the cheap direction, so a stem
+# that also catches innocent words ("add" in "address", "port" in "portfolio",
+# "risk" because a risk summary usually ends in "and mitigate them") costs
+# nothing worth an exception. Do not narrow it; widen it. The only stems left
+# out are the ones that would hit a required read-only phrase ("retri" would
+# hit "how retries interact", "cover" would hit "test coverage").
+_CHANGE_STEMS = (
+    "fix", "add", "kill", "stop", "reduc", "tight", "prun", "restructur",
+    "automat", "clos", "speed", "harden", "enabl", "disabl", "adjust", "tun",
+    "configur", "instal", "upgrad", "downgrad", "patch", "convert",
+    "consolidat", "dedup", "extract", "split", "merg", "mov", "remov", "delet",
+    "creat", "introduc", "correct", "clean", "optimi", "optimiz", "simplif",
+    "improv", "replac", "rewrit", "refactor", "renam", "migrat", "bump",
+    "implement", "generat", "build", "ensur", "verif", "check", "identif",
+    "trace", "repair", "mak", "writ", "updat", "chang", "port", "adopt",
+    "eliminat", "mitigat", "resum", "normalis", "normaliz",
+    # beyond the required set: more of the same kind
+    "rotat", "risk", "address", "apply", "appli", "resolv", "redesign",
+    "overhaul", "revert", "rollback", "deprecat", "remediat", "tweak",
+    "polish", "increas", "decreas", "rais", "lower", "drop", "backfill",
+    "rework", "revis", "swap", "wire", "ship",
+)  # fmt: skip
+_CHANGE_DENYLIST = re.compile(r"\b(?:" + "|".join(_CHANGE_STEMS) + r")\w*", re.IGNORECASE)
+
+# 3. CLAUSE-SEPARATOR GUARD: a second clause means a second deliverable, and we
+# cannot tell a report verb from a work verb, so a second clause is never a
+# draft. The one exception is the closed trailing phrases below.
+_CLAUSE_BOUNDARY = re.compile(
+    r"[,;:.\-\u2013\u2014()]|\b(?:and|then|but|so|to|because|since|plus|with"
+    r"|for\s+the\s+purpose\s+of|in\s+order\s+to"
+    # more of the same: subordinators and particles that start a purpose or a
+    # condition ("audit it until the tests pass"); extra words can only give None
+    r"|until|unless|such|if|while|when|whenever|once|after|before|which|that"
+    r"|where|by|via|using|into|away|up|down)\b",
+    re.IGNORECASE,
+)
+
+# 4. CLOSED TRAILING REPORT PHRASES, stripped from the END only, at most one.
+# This is the only path by which a phrase containing "and" or "to" survives.
+# Keep it small: a realistic audit that needs a phrase not listed here is
+# answered None (cheap), not with a new pattern.
+_TRAILING_PHRASES = (
+    "and tell me what you find",
+    "and tell me what you found",
+    "and tell me what you think",
+    "and let me know what you think",
+    "and let me know what you find",
+    "and tell me",
+    "and let me know",
+    "and report back",
+    "and explain what you find",
+    "and summarise what you find",
+    "and summarize what you find",
+    "to tell me what you find",
+    "to tell me what you think",
+    "to let me know",
+    "and summarise the findings",
+    "and summarize the findings",
+    "please tell me what you find",
+    "tell me what you find",
+    "tell me what you think",
+    "let me know what you think",
+    "let me know what you find",
+    "let me know",
+    "report back",
+)
+_TRAILING = re.compile(
+    r"[\s,]*\b(?:"
+    + "|".join(r"\s+".join(p.split()) for p in sorted(_TRAILING_PHRASES, key=len, reverse=True))
+    + r")[\s.!?]*$",
+    re.IGNORECASE,
+)
+
+
+def _read_only_opener(text: str) -> re.Match[str] | None:
+    """Piece 1: the opener the objective begins with (after a leading
+    "please "), or None."""
+    return _OPENER.match(text)
+
+
+def _has_change_verb(text: str) -> bool:
+    """Piece 2: any change verb stem anywhere in `text`."""
+    return _CHANGE_DENYLIST.search(text) is not None
+
+
+def _strip_trailing_report_phrase(text: str) -> str:
+    """Piece 4: drop ONE closed report phrase from the end of `text`."""
+    return _TRAILING.sub("", text, count=1)
+
+
+def _has_second_clause(text: str) -> bool:
+    """Piece 3: any clause boundary left in `text`."""
+    return _CLAUSE_BOUNDARY.search(text) is not None
+
+
+def reads_only_plan(objective: str, text: str = "") -> str | None:
+    """The plan a read-and-report objective should DEFAULT to: "draft" when the
+    work's deliverable is writing (an audit, a survey, a report), else None.
+
+    This is a DEFAULT-selection heuristic only. It is consulted when the caller
+    did not name a plan, and it never overrides an explicit plan.
+
+    A wrong None costs the owner one relaunch with `--plan draft`, while a wrong
+    "draft" silently denies a fix mission its branch and PR. So the verdict is
+    "draft" only for a closed shape (a read-only opener, no change verb
+    anywhere, no second clause) and every uncertain input returns None.
+
+    `text`, when given, is only scanned for change verbs; the opener and the
+    clause guard look at the objective alone.
+    """
+    line = " ".join((objective or "").lower().split()).rstrip(" .!?")
+    if line.startswith("please "):
+        line = line[len("please ") :]
+    opener = _read_only_opener(line)
+    if opener is None:
+        return None
+    # the opener is exempt from the denylist: "write a report" holds "writ"
+    rest = line[opener.end() :]
+    if _has_change_verb(rest) or _has_change_verb(text or ""):
+        return None
+    if _has_second_clause(_strip_trailing_report_phrase(rest)):
+        return None
+    return "draft"
 
 
 BUDGET_ERROR = "budget must be a finite number greater than 0"
@@ -420,7 +578,7 @@ async def _project_repo(project_id: str, name: str | None) -> tuple[str | None, 
     return None, url
 
 
-__all__ = ["PRIORITIES"]
+__all__ = ["PRIORITIES", "reads_only_plan"]
 
 
 def _priority(value: str | None) -> str:
@@ -487,7 +645,8 @@ async def create_mission(
     if plan not in PLANS:
         raise ValueError(f"unknown plan {plan!r}; plans: {', '.join(PLANS)}")
     upload_project = project_id is not None and await _upload_project(project_id)
-    # draft needs one too: the deliverables are files written into the project
+    # draft needs one too: it runs against a repo even though its deliverable
+    # is the mission's Report tab
     if (
         plan in ("fix", "fix-pr", "draft")
         and not resolved["repo_path"]

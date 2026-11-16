@@ -521,6 +521,24 @@ def test_new_mechanical_keeps_the_legacy_pipeline(rework_db: Path) -> None:
     assert [s["step"] for s in (mission.plan or {})["steps"]] == ["investigate", "code", "audit"]
 
 
+def test_new_mechanical_never_reroutes_an_audit_to_draft(rework_db: Path) -> None:
+    """`--mechanical` runs the fixed template steps (investigate, code, audit),
+    so the draft default must not apply: the coder would still write into the
+    target repo, while a draft plan has no gate and no publish, i.e. the work
+    would be unreachable. The caller's plan stays exactly as it is on base."""
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(app, ["new", "audit the release process", "--repo", url, "--mechanical"])
+
+    assert result.exit_code == 0, result.output
+    mission = _get_mission(rework_db, result.stdout.strip())
+    assert mission is not None
+    # a template mission is built from no playbook spec at all (the engine's
+    # DEFAULT_PLAN template routes it), which is exactly what base did here: a
+    # draft plan would instead carry PLAN_FIX's steps under kind "draft"
+    assert mission.plan is None, "a template mission keeps the caller's plan"
+    assert "read-and-report objective" not in result.stderr
+
+
 def test_report_md_shows_accepted_findings(rework_db: Path) -> None:
     """What the mission shipped with knowingly open belongs in the human report,
     with the same wording the PR body uses (one shared renderer)."""
@@ -2439,3 +2457,67 @@ def test_template_plan_without_a_budget_gets_no_budget_through_the_cli(
         assert "budget" not in (mission.plan or {}), extra
         assert "no cap" in result.stderr, extra
         assert "$" not in result.stderr, extra
+
+
+def test_new_reads_a_read_and_report_objective_as_draft(rework_db: Path) -> None:
+    """An audit's deliverable is the report, not a branch and a PR, so with no
+    --plan the CLI defaults the mission to the `draft` playbook and says so on
+    stderr (stdout stays the bare mission id)."""
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(app, ["new", "audit the release process", "--repo", url])
+
+    assert result.exit_code == 0, result.output
+    mission_id = result.stdout.strip()
+    assert mission_id.startswith("m-"), "stdout is still the bare mission id"
+    mission = _get_mission(rework_db, mission_id)
+    assert mission is not None
+    plan = mission.plan or {}
+    assert plan["playbook"] == "draft"
+    assert not plan.get("publish"), "a draft plan never pushes a branch"
+    assert "open_pr" not in (plan.get("gates") or []), "a draft plan never opens a PR gate"
+    assert "read-and-report objective" in result.stderr
+    assert "draft" in result.stderr
+
+
+def test_an_explicit_plan_beats_the_read_and_report_default(rework_db: Path) -> None:
+    """The classifier only picks a DEFAULT: `--plan fix` on the same objective
+    has to stay fix, and the note must not claim a plan the owner did not get."""
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(
+        app, ["new", "audit the release process", "--repo", url, "--plan", "fix"]
+    )
+
+    assert result.exit_code == 0, result.output
+    mission = _get_mission(rework_db, result.stdout.strip())
+    assert mission is not None
+    assert (mission.plan or {})["playbook"] == "fix"
+    assert "read-and-report objective" not in result.stderr
+
+
+def test_an_explicit_echo_plan_is_never_overridden_by_the_classifier(rework_db: Path) -> None:
+    """`--plan echo` is the plumbing check: an audit-shaped objective must not
+    turn it into a draft mission behind the owner's back."""
+    url = "https://github.com/example/repo.git"
+    result = runner.invoke(
+        app, ["new", "audit the release process", "--repo", url, "--plan", "echo"]
+    )
+
+    assert result.exit_code == 0, result.output
+    mission = _get_mission(rework_db, result.stdout.strip())
+    assert mission is not None
+    assert (mission.plan or {})["playbook"] == "echo"
+    assert "read-and-report objective" not in result.stderr
+
+
+def test_a_repo_less_audit_keeps_the_callers_plan_and_still_succeeds(rework_db: Path) -> None:
+    """`draft` cannot be built without a repository, so the classifier must not
+    suggest it when none is being resolved: `rework new "audit the release
+    process"` with no --repo succeeded on base (an echo mission) and has to keep
+    doing so, instead of dying with a usage error about --plan draft."""
+    result = runner.invoke(app, ["new", "audit the release process"])
+
+    assert result.exit_code == 0, result.output
+    mission = _get_mission(rework_db, result.stdout.strip())
+    assert mission is not None
+    assert (mission.plan or {})["playbook"] == "echo"
+    assert "read-and-report objective" not in result.stderr
