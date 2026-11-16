@@ -23,7 +23,6 @@ from typing import Any
 
 import pytest
 
-from rework.config import Config
 from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.llm.catalog import ModelCatalog, ModelEntry
 from rework.kernel.state.records import EventType, Mission, MissionStatus, new_id
@@ -71,7 +70,7 @@ async def test_a_transient_error_in_a_role_run_is_requeued_not_failed(tmp_path: 
                 raise Deadlock()
             return await real_update_run(run_id, **kwargs)
 
-        setattr(store, "update_run", flaky_update_run)  # noqa: B010 - instance seam
+        store.update_run = flaky_update_run  # type: ignore[method-assign]
 
         with pytest.raises(Deadlock) as caught:
             await asyncio.wait_for(runner.run(), timeout=20)
@@ -84,9 +83,7 @@ async def test_a_transient_error_in_a_role_run_is_requeued_not_failed(tmp_path: 
             None,  # type: ignore[arg-type]
             None,  # type: ignore[arg-type]
             tmp_path,
-            SimpleNamespace(
-                concurrency=1, max_roles=1, poll_interval_s=0.05, git_author=None
-            ),  # type: ignore[arg-type]
+            SimpleNamespace(concurrency=1, max_roles=1, poll_interval_s=0.05, git_author=None),  # type: ignore[arg-type]
         )
         await daemon._log_runner_error(mission.id, caught.value)
 

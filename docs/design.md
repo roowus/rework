@@ -103,8 +103,9 @@ transaction is rolled back first). Logical errors (unique violation `23505`,
 syntax `42601`, any other non-transient SQLSTATE) are never retried: they
 propagate on the first attempt, and exhausted attempts surface as
 `TransientDatabaseError` with the original as its cause. Both stores share it:
-`_serialized` wraps every public `PostgresStore` method (the retry sits inside
-the op lock), and `@retry_transient_methods` wraps `SqliteStore` as a class.
+`_serialized` wraps every public `PostgresStore` method (the op lock is taken
+per attempt, inside the retry, so the backoff sleep holds no lock), and
+`@retry_transient_methods` wraps `SqliteStore` as a class.
 
 The retry is the safety net, not the fix. Every statement that touches both
 `chats` and `chat_messages` takes the `chats` row first (`SELECT 1 FROM chats

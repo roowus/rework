@@ -14,7 +14,6 @@ the only two attributes the wrapper touches.
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 
 import pytest
 
@@ -135,7 +134,7 @@ async def test_the_backoff_sleep_does_not_hold_the_op_lock(
         sleeping.set()
         await release.wait()
 
-    monkeypatch.setattr(retry_module, "asyncio", SimpleNamespace(sleep=fake_sleep))
+    monkeypatch.setattr(retry_module.asyncio, "sleep", fake_sleep)
 
     first = asyncio.create_task(store.deadlocking())
     await asyncio.wait_for(sleeping.wait(), timeout=5)
