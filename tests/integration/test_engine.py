@@ -365,7 +365,8 @@ async def test_gate_row_visible_before_mission_parks_then_converges_to_awaiting_
     never regresses to `running` while the gate stays open (the design decision
     recorded in docs/design.md). The wait is bounded, not fire-and-forget: if
     the engine never writes the status the convergence wait raises TimeoutError
-    naming the mission park (not verified by mutation here).
+    naming the mission park: verified by dropping ONLY the ship-path write
+    through a store wrapper, which makes this test fail on that wait.
 
     What it does NOT prove: instantaneous equality at the moment the gate row
     appears. Its own ship-gate wait above is deliberately gate-only, and by the
