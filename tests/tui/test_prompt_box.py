@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from seed import seed
 
-from rework.kernel.state.records import Mission, MissionStatus
+from rework.kernel.state.records import Mission, MissionStatus, Run, RunStatus
 from rework.tui.app import ReworkApp
 from rework.tui.views.dashboard import PROMPT_BOX_ROWS, PROMPT_HINT_ROWS, PromptBox
 from rework.tui.widgets.base import RowList
@@ -72,8 +72,12 @@ def _brief(lines: int) -> str:
     return "\n".join(f"brief line {i:02d}" for i in range(1, lines + 1))
 
 
-async def _add_brief(db: Path, mid: str, lines: int) -> str:
-    """One mission whose objective is `lines` lines long, through the real store."""
+async def _add_brief(db: Path, mid: str, lines: int, *, runs: int = 0) -> str:
+    """One mission whose objective is `lines` lines long, through the real store.
+
+    `runs` seeds real Run rows: the run list always carries the "All activity"
+    row, so a mission with none has exactly ONE selectable row and the arrows
+    cannot move a selection that has nowhere to go."""
     from rework.kernel.state.sqlite import open_sqlite
 
     store = await open_sqlite(str(db))
@@ -86,6 +90,19 @@ async def _add_brief(db: Path, mid: str, lines: int) -> str:
                 created_at=time.time(),
             )
         )
+        for i, (role, step) in enumerate(
+            [("investigator", "investigate"), ("coder", "code"), ("auditor", "audit")][:runs]
+        ):
+            await store.create_run(
+                Run(
+                    id=f"{mid}:{step}:{role}:1",
+                    mission_id=mid,
+                    role=role,
+                    step=step,
+                    status=RunStatus.COMPLETED,
+                    created_at=time.time() + i,
+                )
+            )
     finally:
         await store.aclose()
     return mission.id
@@ -270,8 +287,12 @@ async def test_arrows_move_the_run_list_when_the_box_is_not_focused(
     ids: dict[str, str], env: Path
 ) -> None:
     """(d, other half) Unfocused, the box takes nothing: the run list keeps its
-    arrows and its selection does not move the brief."""
-    mid = await _add_brief(env, "m-longbrief05", 40)
+    arrows and its selection does not move the brief.
+
+    The mission carries three real runs: "All activity" alone would be a single
+    selectable row, and an arrow that cannot move a selection proves nothing
+    about who swallowed the key."""
+    mid = await _add_brief(env, "m-longbrief05", 40, runs=3)
     app = ReworkApp(poll_seconds=3600.0)
     async with app.run_test(size=SIZE) as pilot:
         await _settle(pilot)
@@ -281,10 +302,12 @@ async def test_arrows_move_the_run_list_when_the_box_is_not_focused(
         runlist = app.query_one("#run-list", RowList)
         await _wait_for(pilot, lambda: box.has_class("has-more"))
         assert runlist.has_focus, "open_mission focuses the run list"
-        assert runlist.selectable, runlist.selectable
+        assert not box.has_focus
+        assert len(runlist.selectable) >= 2, runlist.selectable
         first = runlist.selected
         await pilot.press("down")
         await _settle(pilot)
         assert runlist.selected != first, "down still moves the run list"
         assert runlist.has_focus
+        assert not box.has_focus
         assert box.scroll_y == 0, "the unfocused box did not scroll"
