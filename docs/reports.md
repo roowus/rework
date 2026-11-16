@@ -35,7 +35,7 @@ the owner's examples of permanently forced content.
 
 ## Named assemblies (default checkbox sets)
 
-- **investigator default**: summary, findings, blockers
+- **investigator default**: summary, findings, tests, blockers
 - **audit default** (the truss format): summary, findings, standing_assessments,
   warnings, blockers
 - custom: pass any key list in the plan's `requested_sections`

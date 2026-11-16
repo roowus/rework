@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from rework.nodes.git_ops import _run, diff_base, head_sha
 from rework.nodes.testing import (
     classify_red,
@@ -16,7 +18,6 @@ from rework.nodes.testing import (
     handoff_tests_gap,
     parse_tests_block,
     verify_red_green,
-    wrong_red_marker,
 )
 from rework.roles.builtin.auditor import changed_files, red_green_notes
 
@@ -72,7 +73,7 @@ def assert_real_failure(output: str) -> None:
     """A real red: the assertion failed. A wrong red (no pytest, import or
     collection error, nothing collected) must not satisfy this."""
     assert "assert add(2, 3) == 5" in output and "1 failed" in output, output
-    assert wrong_red_marker(output) is None, output
+    assert classify_red(1, output) == ("fails_for_right_reason", None), output
 
 
 def test_parse_tests_block_reads_the_last_fenced_json() -> None:
@@ -157,29 +158,106 @@ async def test_an_uncheckable_claim_says_it_was_not_verified() -> None:
 NEEDS_MUL = "from calc import mul\n\ndef test_mul():\n    assert mul(2, 3) == 6\n"
 
 
-async def test_a_run_that_dies_on_import_is_a_wrong_red_not_proof(tmp_path: Path) -> None:
-    """The fix adds mul() and a test importing it. Reverted, the run exits non-zero
-    at collection (ImportError): that is not a test failing for the behaviour."""
+def _two_commit_repo(tmp_path: Path, base_calc: str, fix_calc: str, test_body: str):
     repo = tmp_path / "repo"
     repo.mkdir()
-    (repo / "calc.py").write_text("def add(a, b):\n    return a + b\n")
+    (repo / "calc.py").write_text(base_calc)
     _git(repo, "init", "-b", "main")
     _git(repo, "add", "calc.py")
     _git(repo, "commit", "-m", "base")
     base = _rev(repo)
-    (repo / "calc.py").write_text(
-        "def add(a, b):\n    return a + b\n\ndef mul(a, b):\n    return a * b\n"
-    )
-    (repo / "test_calc.py").write_text(NEEDS_MUL)
+    (repo / "calc.py").write_text(fix_calc)
+    (repo / "test_calc.py").write_text(test_body)
     _git(repo, "add", "calc.py", "test_calc.py")
     _git(repo, "commit", "-m", "fix")
+    return repo, base
 
+
+ADD_ONLY = "def add(a, b):\n    return a + b\n"
+ADD_AND_MUL = ADD_ONLY + "\ndef mul(a, b):\n    return a * b\n"
+DESCRIBE_BUG = 'def describe(t):\n    return "TokenError: " + t\n'
+DESCRIBE_FIX = 'def describe(t):\n    return "SyntaxError: " + t\n'
+STRICT = (
+    "import argparse\n\n"
+    "def parse(argv):\n"
+    "    p = argparse.ArgumentParser(prog='calc')\n"
+    "    return p.parse_args(argv)\n"
+)
+STRICT_FIX = STRICT.replace(
+    "    return p", "    p.add_argument('--strict', action='store_true')\n    return p"
+)
+
+# the six audited cases: (id, base calc.py, fixed calc.py, test body, expected)
+RED_CASES = [
+    (
+        "module-level import",
+        ADD_ONLY,
+        ADD_AND_MUL,
+        "from calc import mul\n\ndef test_mul():\n    assert mul(2, 3) == 6\n",
+        "wrong_red",
+    ),
+    (
+        "local import in the test body",
+        ADD_ONLY,
+        ADD_AND_MUL,
+        "def test_mul():\n    from calc import mul\n    assert mul(2, 3) == 6\n",
+        "wrong_red",
+    ),
+    (
+        "attribute access calc.mul",
+        ADD_ONLY,
+        ADD_AND_MUL,
+        "import calc\n\ndef test_mul():\n    assert calc.mul(2, 3) == 6\n",
+        "wrong_red",
+    ),
+    (
+        "honest assertion, expected string holds SyntaxError",
+        DESCRIBE_BUG,
+        DESCRIBE_FIX,
+        "from calc import describe\n\n"
+        "def test_describe():\n"
+        '    assert describe("bad token") == "SyntaxError: bad token"\n',
+        "fails_for_right_reason",
+    ),
+    (
+        "honest argparse red, unrecognized arguments",
+        STRICT,
+        STRICT_FIX,
+        "import pytest\nfrom calc import parse\n\n"
+        "def test_strict():\n"
+        "    with pytest.raises(SystemExit) as e:\n"
+        '        parse(["--strict"])\n'
+        "    assert e.value.code == 0\n",
+        "fails_for_right_reason",
+    ),
+    (
+        "genuine assertion failure",
+        "def add(a, b):\n    return a - b\n",
+        ADD_ONLY,
+        REAL_TEST,
+        "fails_for_right_reason",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("base_calc", "fix_calc", "body", "expected"),
+    [c[1:] for c in RED_CASES],
+    ids=[c[0] for c in RED_CASES],
+)
+async def test_the_red_is_classified_by_pytests_own_vocabulary(
+    tmp_path: Path, base_calc: str, fix_calc: str, body: str, expected: str
+) -> None:
+    repo, base = _two_commit_repo(tmp_path, base_calc, fix_calc, body)
     [result] = await verify_red_green(repo, [CMD], ["calc.py"], base)
-    assert result["exit_code"] != 0 and result["vacuous"] is False
-    assert result["classification"] == "wrong_red"
-    assert result["marker"] in ("ImportError while importing", "ERROR collecting")
+    assert result["exit_code"] != 0 and result["vacuous"] is False, result["output"]
+    assert result["classification"] == expected, result["output"]
+    assert (result["marker"] is None) == (expected == "fails_for_right_reason")
 
-    notes = await red_green_notes(
+
+async def test_a_wrong_red_note_says_it_is_not_proof(tmp_path: Path) -> None:
+    repo, base = _two_commit_repo(tmp_path, ADD_ONLY, ADD_AND_MUL, RED_CASES[0][3])
+    [note] = await red_green_notes(
         {
             "coder_tests": {**GOOD, "commands": [CMD]},
             "worktree_path": str(repo),
@@ -187,18 +265,33 @@ async def test_a_run_that_dies_on_import_is_a_wrong_red_not_proof(tmp_path: Path
             "diff": await diff_base(repo, base=base),
         }
     )
-    [note] = notes
-    assert "WRONG REASON" in note and "NOT proof" in note and result["marker"] in note
+    assert "WRONG REASON" in note and "NOT proof" in note
     assert "fails as it should" not in note and "vacuous_test" not in note
 
 
 def test_classify_red_covers_every_outcome() -> None:
     assert classify_red(0, "1 passed") == ("vacuously_passes", None)
-    assert classify_red(1, "assert 1 == 2\n1 failed") == ("fails_for_right_reason", None)
-    assert classify_red(2, "ERROR collecting x.py") == ("wrong_red", "ERROR collecting")
-    assert classify_red(1, "No module named 'pytest'") == ("wrong_red", "No module named")
-    assert classify_red(4, "error: unrecognized arguments: -z")[0] == "wrong_red"
-    assert classify_red(5, "collected 0 items") == ("wrong_red", "collected 0 items")
+    assert classify_red(1, "E   AssertionError: assert 1 == 2\n1 failed") == (
+        "fails_for_right_reason",
+        None,
+    )
+    for code in (2, 3, 4, 5):
+        assert classify_red(code, "")[0] == "wrong_red"
+    assert classify_red(1, "E   ImportError: cannot import name 'mul'") == (
+        "wrong_red",
+        "ImportError",
+    )
+    assert classify_red(1, "E       NameError: name 'x' is not defined")[0] == "wrong_red"
+    attr = "E   AttributeError: module 'calc' has no attribute 'mul'"
+    assert classify_red(1, attr) == ("wrong_red", "AttributeError")
+    # an AttributeError raised by the code under test is a real red
+    assert classify_red(1, "E   AttributeError: 'NoneType' object has no attribute 'x'")[0] == (
+        "fails_for_right_reason"
+    )
+    # exception names quoted inside an assertion are content, not the exception type
+    quoted = "E   AssertionError: assert 'ImportError' == 'x'\nE     - ImportError\nE     + x"
+    assert classify_red(1, quoted)[0] == "fails_for_right_reason"
+    assert classify_red(1, "/usr/bin/python3: No module named pytest")[0] == "wrong_red"
 
 
 def test_the_auditor_cli_view_shows_test_coverage_even_without_evidence() -> None:

@@ -83,33 +83,45 @@ def fix_files(changed: list[str]) -> list[str]:
     return [f for f in changed if not _TEST_PATH.search(f)]
 
 
-# Output that means the run died before the test could judge the behaviour: the
-# red is for the wrong reason, so it is not proof the test pins anything.
-WRONG_RED_MARKERS = (
-    "No module named",
-    "ModuleNotFoundError",
-    "ImportError while importing",
-    "ERROR collecting",
-    "errors during collection",
-    "SyntaxError",
-    "collected 0 items",
-    "unrecognized arguments",
+# pytest's own exit codes: none of these is a verdict on the behaviour.
+_PYTEST_EXIT_MEANING = {
+    2: "pytest exit 2: interrupted (collection error or interrupt)",
+    3: "pytest exit 3: internal error",
+    4: "pytest exit 4: usage error",
+    5: "pytest exit 5: no tests collected",
+}
+
+# Exit 1 means tests ran and something failed. The exception TYPE that opens a
+# traceback detail line (`E   ImportError: ...`) says whether the test died on a
+# missing name or on the behaviour. Anchored to the line start so an exception
+# name quoted inside an assertion (`E   AssertionError: assert 'SyntaxError'...`)
+# cannot match. AttributeError only counts in the missing-module-attribute shape.
+_WRONG_RED_EXCEPTION = re.compile(
+    r"^E\s+(?P<exc>ImportError|ModuleNotFoundError|NameError"
+    r"|AttributeError(?=: module '[^']*' has no attribute))\b",
+    re.MULTILINE,
 )
-
-
-def wrong_red_marker(output: str) -> str | None:
-    """The first collection/import/usage marker in a failing run's output, if any."""
-    return next((m for m in WRONG_RED_MARKERS if m in output), None)
+# the interpreter itself cannot start the runner: `/usr/bin/python: No module named pytest`
+_RUNNER_MISSING = re.compile(r"^\S*python\S*: No module named\b", re.MULTILINE)
 
 
 def classify_red(exit_code: int, output: str) -> tuple[str, str | None]:
-    """(classification, marker) of a run with the fix reverted: `vacuously_passes`
-    (exit 0, the test cannot fail), `wrong_red` (fails, but at collection/import,
-    so not proof), or `fails_for_right_reason`."""
+    """(classification, marker) of a run with the fix reverted, from pytest's own
+    vocabulary (exit code, then the exception type opening a traceback line), never
+    a free-text scan: `vacuously_passes` (exit 0, the test cannot fail), `wrong_red`
+    (the run gave no verdict on the behaviour, or the test died on a missing
+    import/name/module attribute) or `fails_for_right_reason`."""
     if exit_code == 0:
         return "vacuously_passes", None
-    marker = wrong_red_marker(output)
-    return ("wrong_red", marker) if marker else ("fails_for_right_reason", None)
+    if exit_code != 1:
+        meaning = _PYTEST_EXIT_MEANING.get(exit_code, f"exit {exit_code}: the tests did not run")
+        return "wrong_red", meaning
+    found = _WRONG_RED_EXCEPTION.search(output)
+    if found:
+        return "wrong_red", found.group("exc")
+    if _RUNNER_MISSING.search(output):
+        return "wrong_red", "runner not installed"
+    return "fails_for_right_reason", None
 
 
 async def verify_red_green(

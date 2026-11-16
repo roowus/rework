@@ -119,7 +119,7 @@ def test_resolve_sections_unknown_key_loud() -> None:
 
 def test_resolve_sections_none_is_investigator_default() -> None:
     keys = [s.key for s in resolve_sections(None)]
-    assert keys == ["summary", "findings", "blockers"]
+    assert keys == ["summary", "findings", "blockers", "tests"]  # registry order
 
 
 def test_audit_assembly_has_standing_assessments() -> None:
@@ -695,7 +695,14 @@ async def test_an_audit_report_missing_coverage_keeps_its_findings(tmp_path: Pat
     assert len(fake.requests) == 1  # no retry was needed
 
 
-async def _investigator_artifact(tmp_path: Path, report: dict[str, object], n: int) -> dict:
+async def _investigator_artifact(
+    tmp_path: Path,
+    report: dict[str, object],
+    n: int,
+    requested: list[str] | None = ["summary", "findings", "tests", "blockers", "warnings"],  # noqa: B006
+) -> dict:
+    """The artifact for `requested` sections; None is the plain spawn_role path
+    (no requested_sections), which resolves to the default investigator assembly."""
     import json
 
     fake = FakeProvider(
@@ -708,7 +715,7 @@ async def _investigator_artifact(tmp_path: Path, report: dict[str, object], n: i
         await _store(tmp_path),
         "m1",
         f"m1:step:investigate:{n}",
-        resolve_sections(["summary", "findings", "tests", "blockers", "warnings"]),
+        resolve_sections(requested),
     )
     result = await node({"messages": []})
     assert result["artifact"] is not None and len(fake.requests) == 1
@@ -730,6 +737,20 @@ async def test_an_investigator_that_names_no_test_and_no_reason_is_not_silent(
     )
     assert reasoned["no_tests_reason"] == "docs-only change"
     assert reasoned["warnings"] == []
+
+
+async def test_a_plain_spawned_investigator_owes_the_test_or_the_reason(tmp_path: Path) -> None:
+    """The orchestrator's spawn_role passes no requested_sections, so the default
+    assembly itself must carry `tests`; otherwise the marker can never fire there."""
+    assert "tests" in [s.key for s in resolve_sections(None)]
+    report = {"summary": "s", "findings": [], "blockers": []}
+    silent = await _investigator_artifact(tmp_path, report, 1, requested=None)
+    assert silent["tests"] == []
+    assert silent["no_tests_reason"] == NO_TESTS_NO_REASON
+    reasoned = await _investigator_artifact(
+        tmp_path, {**report, "tests": [], "no_tests_reason": "docs-only change"}, 2, requested=None
+    )
+    assert reasoned["no_tests_reason"] == "docs-only change"
 
 
 async def test_a_report_missing_a_section_without_a_default_still_fails(tmp_path: Path) -> None:

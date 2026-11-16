@@ -324,7 +324,7 @@ SECTION_REGISTRY: dict[str, ReportSection] = {
 
 # named assemblies: the default checkbox sets (ADR 0003: truss format is the
 # auditor's default; investigator has its own)
-ASSEMBLY_INVESTIGATOR = ("summary", "findings", "blockers")
+ASSEMBLY_INVESTIGATOR = ("summary", "findings", "tests", "blockers")
 ASSEMBLY_AUDIT = (
     "summary",
     "findings",

@@ -135,7 +135,7 @@ happened. What each role owes:
 | auditor | a `coverage` section (`untested_behavior`, `vacuous_test`); a claimed red-green is re-checked mechanically (`nodes/testing.py: verify_red_green` reverts the fix files in a throwaway worktree and re-runs at most 3 named commands; one that still passes is vacuous) |
 | orchestrator | `finish(done)` is refused when the latest coder handoff has no `tests` field, or says `red_green_verified: false` with no `not_testable_reason` (`_enforce_audit_fresh`, coder runs only) |
 
-The mechanical check runs the coder's named commands through a shell in a disposable worktree, bounded to three commands, and classifies each run as `vacuously_passes`, `wrong_red` (it died at import or collection, so it is not proof) or `fails_for_right_reason`.
+The mechanical check runs the coder's named commands through a shell in a disposable worktree, bounded to three commands, and classifies each run by pytest's own vocabulary: exit 0 is `vacuously_passes`; exit 2 to 5 (interrupted, internal error, usage error, nothing collected) is `wrong_red`; at exit 1, a traceback line opening with `ImportError`, `ModuleNotFoundError`, `NameError` or a missing module attribute (`AttributeError: module ... has no attribute`) is `wrong_red`, and any other exit 1 is `fails_for_right_reason`.
 
 The mission acceptance re-run of pytest lives in the eval grader, not the engine; the
 engine has no verification step and none was added.
