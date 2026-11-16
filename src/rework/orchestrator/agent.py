@@ -190,7 +190,9 @@ PLAYBOOKS: dict[str, str] = {
         "only the owner knows (their own details, preferences, commitments) BEFORE "
         "finalising: never guess them. THERE IS NO BRANCH PUSH AND NO PR: never push a "
         "branch and never open a pull request for a draft mission; it finishes with no "
-        "gate because its deliverable is the report in its Report tab."
+        "gate because its deliverable is the report in its Report tab. If a draft "
+        "mission discovers that code has to change, it says so in the Report tab and "
+        "does not change code: the recovery is the owner relaunching on the fix plan."
     ),
 }
 

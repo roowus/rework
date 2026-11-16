@@ -99,6 +99,9 @@ def test_every_playbook_has_a_gate_entry(playbook: str) -> None:
     assert set(PLAYBOOK_GATES) == set(PLAYBOOKS)
 
 
+# Every objective below is a read-and-report job: the deliverable is writing,
+# so the DEFAULT plan is `draft`. These are the plain audits the classifier must
+# keep recognising after the change-word matching was tightened to stems.
 AUDIT_OBJECTIVES = [
     "audit the code base for dead code",
     "Audit the release process",  # capitalised trigger
@@ -108,8 +111,23 @@ AUDIT_OBJECTIVES = [
     "survey the test suite for gaps",
     "write a report on the deploy process",
     "document how the gate rail works",
+    # the ten "must stay draft" controls named in the audit of the fix: the
+    # stem matching and the continuation rule must not eat real audits
+    "audit the release process",
+    "review the codebase for security issues",
+    "analyse the auth flow",
+    "map out the module boundaries",
+    "survey how errors propagate",
+    "write a report on test coverage",
+    "document how the scheduler works",
+    "investigate what causes the flaky test",
+    "explain how retries interact",
 ]
 
+# Objectives that name a change, in whatever inflection. The direction matters:
+# a real fix mission misrouted to `draft` produces no branch and no PR, so the
+# fix silently never lands and the stderr note makes it look intentional. A
+# false "draft" is therefore the COSTLIER error, and these all must veto.
 CHANGE_OBJECTIVES = [
     "fix the login crash",
     "add a --json flag to rework ls",
@@ -119,6 +137,27 @@ CHANGE_OBJECTIVES = [
     "implement retries for push_branch",
     "refactor the delivery module",
     "audit the code base and fix the two crashes",
+    # inflections of a change word: matched by stem, not as literal base forms
+    # (matching the literals only is what let these through as audits)
+    "audit the code base and fixing the two crashes",
+    "audit the code base and refactoring the delivery module",
+    "audit the code base and adding a --json flag",
+    "audit the code base and migrating the store",
+    "audit the code base and implementing retries",
+    "audit the code base and applying the fixes it recommends",
+    "audit the code base and improve error handling",
+    "review the code base and rewrite the parser",
+    "audit the codebase and delete the unused tables",
+    # a coordinating continuation that introduces further work, with verbs no
+    # stem list holds: these are caught by the structural rule
+    # inflections with no "and" continuation in front of them: only the stem
+    # matching can catch these, so they pin FIX 1 on their own
+    "fixing the two crashes found in the audit",
+    "audit findings: refactoring the delivery module",
+    "adding a --json flag, as the audit recommends",
+    "the audit recommends migrating the store to postgres",
+    "audit the code base and make the tests pass",
+    "audit the code base and speed it up",
 ]
 
 
@@ -134,3 +173,33 @@ def test_change_objectives_get_no_plan_suggestion(objective: str) -> None:
     """The classifier is a DEFAULT only: anything that asks for a change stays
     on the caller's plan (the last case is an audit that also asks for a fix)."""
     assert reads_only_plan(objective) is None
+
+
+def test_the_classifier_errs_toward_a_change_mission() -> None:
+    """Which way the mistake leans, asserted rather than assumed: a real fix
+    mission misrouted to `draft` produces no branch and no PR, so the fix
+    silently never lands and the CLI note makes it look intentional. A missed
+    draft suggestion only leaves the caller on its own plan. So an objective
+    that can be read either way must read as a CHANGE, and the deliberate
+    word collisions resolve that way too."""
+    assert len(AUDIT_OBJECTIVES) >= 8 and len(CHANGE_OBJECTIVES) >= 8
+    assert "audit the code base and fix the two crashes" in CHANGE_OBJECTIVES
+    for ambiguous in (
+        "audit the docs and address the gaps",  # "add" also vetoes "address"
+        "audit the copy and make it more creative",  # "creat" also vetoes "creative"
+        "review the module and remove the dead branch",
+        "audit the code base and then fix what you find",  # "and then"
+    ):
+        assert reads_only_plan(ambiguous) is None, ambiguous
+
+
+def test_both_change_signals_are_load_bearing() -> None:
+    """Two independent mechanisms, one case each, so neither can rot silently:
+    the stem alternation catches inflections of a known change word, and the
+    continuation rule catches a novel verb after a coordinating "and"."""
+    from rework.missions import _has_change_veto, _has_further_work
+
+    inflected = "audit the code base and the delivery module needs refactoring"
+    assert _has_change_veto(inflected) and not _has_further_work(inflected)
+    novel_verb = "audit the code base and make the tests pass"
+    assert _has_further_work(novel_verb) and not _has_change_veto(novel_verb)

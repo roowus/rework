@@ -67,9 +67,9 @@ Plans you can choose:
             content — anything whose deliverable is writing, not code. The roles
             research with the web tools, write the report in the mission's Report
             tab, and audit every claim against its cited source. No branch push
-            and no PR. Suggest draft for an objective whose deliverable is reading
-            something and reporting on it (an audit, a review, an analysis), while
-            an explicitly chosen plan stays authoritative.
+            and no PR. Choose draft when the objective only reads and reports (an
+            audit, a review, an analysis): put draft in propose_mission's plan
+            yourself. A plan the owner names explicitly stays authoritative.
 
 A project may also be repo-less: its transport is "upload", which means rework
 keeps that project's files itself. For an upload project, fix and fix-pr do NOT

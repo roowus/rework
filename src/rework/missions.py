@@ -136,25 +136,114 @@ READS_ONLY_TRIGGERS = (
 )
 # Words that name a change to make: when one is present the work ends in a
 # repository change, whatever else the objective says.
-CHANGE_VETOES = (
+#
+# These are STEMS, not whole words, and they are matched as ONE alternation
+# followed by `\w*`: "fix" must also veto "fixing", "fixes" and "fixed",
+# "add" must also veto "adding", "migrat" -> "migrating", and so on. Matching
+# the literal base form only was a real misrouting bug: "audit the code base
+# and fixing the two crashes" slipped through as an audit, so the fix mission
+# became a draft mission with no branch and no PR, and the fix silently never
+# landed.
+#
+# Deliberate collisions, decided rather than overlooked:
+# - "add" also vetoes "address" ("addressing the flaky test" is a fix, so the
+#   veto is the right answer there; the cost is that "review the codebase and
+#   address the risks" stays a fix mission, which is the safer direction).
+# - "creat" also vetoes "creative"/"creatively" (ordinary prose that happens to
+#   follow the trigger), same trade: a change word next to an audit means work.
+# - "mov" matches "move"/"moves"/"moving", never "remove" (that is "remov").
+# - "clean" vetoes "clean", "cleanup", "cleaning", which is what we want; the
+#   near-cousin "cleanse" comes along with it and is not worth an exception.
+# - "correct" is a change word; a request to "review and correct" edits files.
+# The direction of every one of these is the same on purpose: a word that can
+# be read two ways is read as a change, because a fix mission run as an audit
+# is the error that loses work.
+CHANGE_VETO_STEMS = (
     "fix",
     "add",
-    "rename",
+    "renam",
     "bump",
-    "migrate",
+    "migrat",
     "implement",
     "refactor",
-    "update",
-    "remove",
-    "upgrade",
+    "updat",
+    "remov",
+    "upgrad",
     "patch",
-    "change",
+    "chang",
+    "rewrit",
+    "replac",
+    "delet",
+    "creat",
+    "introduc",
+    "correct",
+    "clean",
+    "harden",
+    "optimi",
+    "optimiz",
+    "simplif",
+    "improv",
+    "extract",
+    "inlin",
+    "mov",
+    "split",
+    "merg",
+    "convert",
+    "swap",
+    "restor",
+    "revert",
+    "roll",
+)
+# "make" is left out of the stems on purpose: its inflections ("makes",
+# "making") are ordinary report prose, and the continuation rule below already
+# catches it where it matters ("audit X and make the tests pass").
+CHANGE_VETO = re.compile(r"\b(?:" + "|".join(CHANGE_VETO_STEMS) + r")\w*\b", re.IGNORECASE)
+
+# FIX 2: a trigger phrase nominates the work, but a coordinating continuation
+# ("and then", "and <verb>") after it introduces MORE work -- and when the extra
+# work is a change, the mission is a change mission. This catches the verbs no
+# stem list holds ("audit the code base and make the tests pass", "audit the
+# code base and speed it up") and it is deterministic: a word after "and" is
+# continuation work unless it is one of the words below.
+CONTINUATION_WORDS = re.compile(r"\band\s+then\b|\band\s+([a-z]+)", re.IGNORECASE)
+# Words that may follow "and" in a read-and-report objective without turning it
+# into further work: report verbs (the list IS the deliverable), the words of a
+# reported sentence ("and how it fails"), and connective articles/prepositions
+# that continue the same clause.
+REPORT_ONLY_WORDS = frozenset(
+    """
+    report reports listing list describe describes summarise summarize explain
+    document tell show note flag identify assess evaluate rank compare map
+    survey review audit analyse analyze check verify confirm trace find give
+    include cover recommend suggest highlight read write keep leave cite quote
+    state mention spell outline clarify point how what where when why who
+    whether which that this these those the a an its their it any all each
+    not no also still only without with for in on to of by if and or
+    """.split()
 )
 
 
 def _mentions(needle: str, haystack: str) -> bool:
     pattern = r"\b" + r"\s+".join(re.escape(part) for part in needle.split()) + r"\b"
     return re.search(pattern, haystack) is not None
+
+
+def _has_change_veto(body: str) -> bool:
+    """True when the text names a change to make, in any inflection."""
+    return CHANGE_VETO.search(body) is not None
+
+
+def _has_further_work(body: str) -> bool:
+    """True when a coordinating continuation introduces work the trigger does
+    not cover: "and then ...", or "and <word>" where <word> is not one of the
+    read-and-report words. Structure only, no word list of verbs to maintain."""
+    for match in CONTINUATION_WORDS.finditer(body):
+        following = match.group(1)
+        if following is None:  # "and then"
+            return True
+        if following.lower() not in REPORT_ONLY_WORDS:
+            return True
+    return False
 
 
 def reads_only_plan(objective: str, text: str = "") -> str | None:
@@ -164,14 +253,30 @@ def reads_only_plan(objective: str, text: str = "") -> str | None:
     This is a DEFAULT-selection heuristic only. It is consulted when the caller
     did not name a plan, and it never overrides an explicit plan.
 
-    Triggers are matched case-insensitively on word boundaries in the objective
-    (plus `text`, when given). Any veto word that names a change to make wins,
-    so "audit the code base and fix the two crashes" is a normal fix mission.
+    Matching is case-insensitive on word boundaries in the objective (plus
+    `text`, when given). A trigger phrase only NOMINATES the work; either of two
+    change signals defeats it and returns None:
+
+    1. A change word, matched by STEM and therefore in every inflection:
+       "audit the code base and fixing the two crashes" is a fix mission, not an
+       audit. See CHANGE_VETO_STEMS for the deliberate collisions ("add" wins
+       over "address", "creat" over "creative").
+    2. A coordinating continuation that introduces further work: "and then", or
+       "and <word>" where <word> is not a read-and-report word. "audit the code
+       base and make the tests pass" and "audit the code base and speed it up"
+       are change missions; "review the codebase and list the risks" stays an
+       audit because "list" is the deliverable.
+
+    Both signals err toward None (no plan suggestion). That direction is chosen
+    deliberately: a real fix mission misrouted to `draft` produces no branch and
+    no PR, so the fix silently never lands and the CLI note makes it look
+    intentional. Losing a draft suggestion only means the caller's own plan is
+    used.
     """
     body = f"{objective or ''}\n{text or ''}".lower()
     if not body.strip():
         return None
-    if any(_mentions(word, body) for word in CHANGE_VETOES):
+    if _has_change_veto(body) or _has_further_work(body):
         return None
     if any(_mentions(word, body) for word in READS_ONLY_TRIGGERS):
         return "draft"
