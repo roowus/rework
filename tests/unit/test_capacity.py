@@ -40,6 +40,7 @@ def _no_ambient_capacity_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "REWORK_CAPACITY_INTERVAL_S",
         "REWORK_CONCURRENCY",
         "REWORK_MAX_ROLES",
+        "REWORK_CAPACITY_PINS",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -507,11 +508,14 @@ def test_fixed_mode_does_nothing_at_all(caplog: pytest.LogCaptureFixture) -> Non
 
 
 def test_both_explicit_caps_leave_nothing_to_manage() -> None:
+    """Two hand-set numbers are a total no-op under pins=fixed (REWORK_CAPACITY_PINS).
+    Under pins=floor, the new default, they are FLOORS and the watchdog still
+    runs: see test_floor_with_both_numbers_set_still_runs_the_watchdog."""
     slots, limiter = PrioritySlots(2), RoleLimiter(3)
     dyn = DynamicCapacity(
         slots,
         limiter,
-        settings=_settings(fixed_concurrency=True, fixed_max_roles=True),
+        settings=_settings(pins="fixed", fixed_concurrency=True, fixed_max_roles=True),
         measure_fn=lambda: (8, 0.0, None),
     )
     assert dyn.policy.has_managed_cap is False
@@ -520,15 +524,17 @@ def test_both_explicit_caps_leave_nothing_to_manage() -> None:
 
 
 def test_both_pinned_caps_are_a_total_no_op(caplog: pytest.LogCaptureFixture) -> None:
-    """REWORK_CONCURRENCY=8 plus REWORK_MAX_ROLES=2 is honoured exactly as given:
-    every entry point returns None, no clamp runs on that pair and the live caps
-    stay 8 / 2 (the documented behaviour, see docs/ops.md)."""
+    """REWORK_CONCURRENCY=8 plus REWORK_MAX_ROLES=2 with REWORK_CAPACITY_PINS=fixed
+    is honoured exactly as given: every entry point returns None, no clamp runs on
+    that pair and the live caps stay 8 / 2 (the documented behaviour, see
+    docs/ops.md). The same two numbers under the default pins=floor are floors,
+    not a freeze: the watchdog runs (see the floor tests below)."""
     slots, limiter = PrioritySlots(8), RoleLimiter(2)
     calls = [(16, 0.0, 2 * GB), (16, 0.0, None), (16, 0.0, None)]
     dyn = DynamicCapacity(
         slots,
         limiter,
-        settings=_settings(fixed_concurrency=True, fixed_max_roles=True),
+        settings=_settings(pins="fixed", fixed_concurrency=True, fixed_max_roles=True),
         measure_fn=lambda: calls.pop(0),
     )
     assert dyn.policy.has_managed_cap is False
@@ -777,3 +783,336 @@ async def test_run_forever_cancelled_leaves_no_capacity_task_behind(tmp_path: Pa
         await store.aclose()
     assert daemon._capacity.task is None
     assert watchdog.done(), "no leaked task after the daemon is cancelled"
+
+
+# -- FIX 1: the startup line, on a settled box too ----------------------------
+
+
+async def test_start_logs_the_plan_exactly_once_with_the_measurement_and_the_cap_state(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """start() says what it decided, ALWAYS, at INFO: the measurement (cpus, load,
+    available MB), the planned pair, and per cap MANAGED or PINNED with the reason.
+    Exactly one such line per start() call, whatever the caps were before."""
+    slots, limiter = PrioritySlots(2), RoleLimiter(3)
+    dyn = DynamicCapacity(
+        slots,
+        limiter,
+        settings=_settings(),
+        measure_fn=lambda: (8, 1.5, 5_100_000_000),
+    )
+    with caplog.at_level(logging.INFO, logger="rework.capacity"):
+        task = dyn.start()
+        assert task is not None
+        await dyn.stop()
+    # 5.1 GB free covers 3 roles at 1.5 GB each (4.5 GB) and not the fourth
+    assert (slots.capacity, limiter.cap) == (3, 3), "8 CPUs, 5.1 GB free: the RAM cut"
+    lines = [r for r in caplog.records if r.name == "rework.capacity"]
+    plans = [r for r in lines if r.message.startswith("capacity plan:")]
+    assert len(plans) == 1, [r.message for r in lines]
+    message = plans[0].message
+    assert "8 CPUs" in message, "the measurement: CPUs"
+    assert "load 1.5" in message, "the measurement: load"
+    assert "5100 MB" in message, "the measurement: available MB"
+    assert "3 missions / 3 roles" in message, "the planned pair"
+    assert "missions MANAGED" in message and "roles MANAGED" in message
+    assert "REWORK_CONCURRENCY unset" in message, "why: nothing pinned it"
+    assert "AUTO IS ACTIVE" in message
+
+
+async def test_a_settled_box_still_logs_the_plan_and_no_change_line(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The rewvis case: a 2-core idle box whose constructed caps already equal the
+    first plan. Nothing changed, so no `capacity changed:` line may appear, but the
+    startup line must, or the daemon looks like it never measured anything."""
+    slots, limiter = PrioritySlots(2), RoleLimiter(2)
+    dyn = DynamicCapacity(slots, limiter, settings=_settings(), measure_fn=lambda: (2, 0.0, None))
+    with caplog.at_level(logging.INFO, logger="rework.capacity"):
+        task = dyn.start()
+        assert task is not None
+        await dyn.stop()
+    assert (slots.capacity, limiter.cap) == (2, 2), "the settled box did not move"
+    messages = [r.message for r in caplog.records if r.name == "rework.capacity"]
+    assert len(messages) == 1, messages
+    assert messages[0].startswith("capacity plan:"), messages[0]
+    assert "2 missions / 2 roles" in messages[0]
+    assert not [m for m in messages if m.startswith("capacity changed:")], "no move, no change line"
+
+
+async def test_the_plan_line_is_logged_once_per_start_even_when_the_watchdog_ticks(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A second start() (a restart) logs one more; ticking does not log it again."""
+    slots, limiter = PrioritySlots(2), RoleLimiter(2)
+    dyn = DynamicCapacity(
+        slots, limiter, settings=_settings(interval_s=0.01), measure_fn=lambda: (2, 0.0, None)
+    )
+    with caplog.at_level(logging.INFO, logger="rework.capacity"):
+        task = dyn.start()
+        assert task is not None
+        try:
+            assert dyn.observe_now() is None
+            assert dyn.observe_now() is None
+            plan_lines = [
+                r.message
+                for r in caplog.records
+                if r.name == "rework.capacity" and r.message.startswith("capacity plan:")
+            ]
+        finally:
+            await dyn.stop()
+    assert len(plan_lines) == 1, plan_lines
+
+
+async def test_the_plan_line_reports_a_pinned_cap_with_its_env_var(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """pins=fixed answers the "why" with the env var and the number it pinned."""
+    slots, limiter = PrioritySlots(4), RoleLimiter(2)
+    dyn = DynamicCapacity(
+        slots,
+        limiter,
+        settings=_settings(pins="fixed", fixed_max_roles=True),
+        measure_fn=lambda: (8, 0.0, None),
+    )
+    with caplog.at_level(logging.INFO, logger="rework.capacity"):
+        task = dyn.start()
+        assert task is not None
+        await dyn.stop()
+    plans = [
+        r.message
+        for r in caplog.records
+        if r.name == "rework.capacity" and r.message.startswith("capacity plan:")
+    ]
+    assert len(plans) == 1, plans
+    assert "roles PINNED at 2 by REWORK_MAX_ROLES=2 (pins=fixed)" in plans[0], plans[0]
+    assert "missions MANAGED" in plans[0], plans[0]
+
+
+async def test_the_daemon_wiring_logs_the_plan_on_a_settled_box(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The wiring, not just the class: a box whose config caps already equal the
+    first plan (the settled rewvis case) still gets the line, through
+    Daemon.run_forever's self._capacity.start().
+
+    The measurement is STUBBED on the daemon's own DynamicCapacity, so this
+    proves the wiring and not the reviewer's box. On a loaded 4-core runner
+    (load 9.0) or a box with 2 GB free the real measurement moves the caps and
+    logs `capacity changed:` instead, which says nothing about the wiring."""
+    from rework.kernel.events.bus import InProcessEventBus
+    from rework.kernel.state.sqlite import open_sqlite
+
+    db, ck = tmp_path / "state.sqlite3", tmp_path / "checkpoints.sqlite3"
+    store = await open_sqlite(str(db))
+    # 4 CPUs, idle, RAM unknown (no RAM cut): plan(4, 0.0, None) is 4 missions /
+    # 4 roles, exactly the caps below, so the plan cannot move whatever the host
+    cpus = 4
+    daemon = Daemon(
+        store=store,
+        bus=InProcessEventBus(store),
+        registry=None,  # type: ignore[arg-type]
+        catalog=None,  # type: ignore[arg-type]
+        make_checkpointer=None,  # type: ignore[arg-type]
+        workroot=tmp_path / "work",
+        config=Config(
+            db=str(db),
+            checkpoints_db=str(ck),
+            poll_interval_s=0.01,
+            concurrency=cpus,
+            max_roles=cpus,
+        ),
+    )
+    daemon._capacity._measure = lambda: (cpus, 0.0, None)
+    with caplog.at_level(logging.INFO, logger="rework.capacity"):
+        task = asyncio.create_task(daemon.run_forever())
+        try:
+            for _ in range(100):
+                if daemon._capacity.task is not None:
+                    break
+                await asyncio.sleep(0.01)
+            assert daemon._capacity.task is not None
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await store.aclose()
+    messages = [r.message for r in caplog.records if r.name == "rework.capacity"]
+    plans = [m for m in messages if m.startswith("capacity plan:")]
+    assert len(plans) == 1, messages
+    assert not [m for m in messages if m.startswith("capacity changed:")], messages
+    assert "AUTO IS ACTIVE" in plans[0]
+    assert f"{cpus} missions / {cpus} roles" in plans[0], "the settled pair is printed"
+    assert f"{cpus} CPUs, load 0.0" in plans[0], "the stubbed measurement is what it printed"
+
+
+# -- FIX 2: a pinned number is a floor ---------------------------------------
+
+
+def test_pins_default_to_floor_and_fixed_is_recognised(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert CapacitySettings.from_env().pins == "floor", "floor is the documented default"
+    for raw in ("fixed", " FIXED "):
+        monkeypatch.setenv("REWORK_CAPACITY_PINS", raw)
+        assert CapacitySettings.from_env().pins == "fixed"
+    monkeypatch.setenv("REWORK_CAPACITY_PINS", " Floor ")
+    assert CapacitySettings.from_env().pins == "floor"
+
+
+@pytest.mark.parametrize("raw", ["floo", "pinned", "1", "frozen"])
+def test_an_invalid_pins_value_fails_loudly(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+    """A typo must not be read as `fixed` (which would freeze a cap the owner
+    meant as a floor) and must not be read as `floor` either: it raises."""
+    monkeypatch.setenv("REWORK_CAPACITY_PINS", raw)
+    with pytest.raises(ValueError, match="REWORK_CAPACITY_PINS"):
+        CapacitySettings.from_env()
+
+
+def test_an_empty_pins_value_means_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REWORK_CAPACITY_PINS", "  ")
+    assert CapacitySettings.from_env().pins == "floor"
+
+
+def test_floor_with_max_roles_two_on_an_idle_eight_cpu_box_plans_eight() -> None:
+    """FIX 2's headline: a hand-set REWORK_MAX_ROLES=2 is the MINIMUM, not a freeze."""
+    policy = CapacityPolicy(concurrency=1, max_roles=2, fixed_max_roles=True, pins="floor")
+    assert policy.has_managed_cap is True, "a floor is not a freeze: the watchdog still runs"
+    new = policy.apply_initial(8, 0.0, None)
+    assert new is not None
+    assert (new.concurrency, new.max_roles) == (8, 8), "8 idle CPUs, floor 2: plan 8, not 2"
+    assert policy.describe("roles") == (
+        "roles MANAGED, floor 2 (REWORK_MAX_ROLES=2 is a minimum, pins=floor)"
+    )
+
+
+def test_floor_never_plans_below_the_hand_set_number() -> None:
+    """The other half: load and RAM may cut, and the cut STOPS at the floor."""
+    # BOTH numbers hand-set, both read as floors of 6
+    policy = CapacityPolicy(
+        concurrency=6, max_roles=6, fixed_concurrency=True, fixed_max_roles=True, pins="floor"
+    )
+    # idle 8 CPUs: 8 and 8, above both floors
+    assert (policy.target(8, 0.0, None).concurrency, policy.target(8, 0.0, None).max_roles) == (
+        8,
+        8,
+    )
+    # load above the CPU count halves 8 to 4, which would be under the floor of 6
+    clamped = policy.target(8, 40.0, None)
+    assert (clamped.concurrency, clamped.max_roles) == (6, 6), "the floor is respected"
+    # starved of RAM the measured plan wants 1 role; the floors still hold
+    starved = policy.target(16, 0.0, 2 * GB)
+    assert (starved.concurrency, starved.max_roles) == (6, 6), "never below the floor"
+    assert "6 missions / 6 roles" in starved.reason
+
+    # a ROLE floor alone still holds (the mission cap is not hand-set there, so it
+    # keeps whatever the measured plan and the role clamp give it)
+    roles_only = CapacityPolicy(concurrency=1, max_roles=6, fixed_max_roles=True, pins="floor")
+    tight = roles_only.target(8, 40.0, None)
+    assert tight.max_roles == 6, "the role floor is the clamped end"
+    assert tight.concurrency <= tight.max_roles
+
+
+async def test_floor_with_both_numbers_set_still_runs_the_watchdog(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Under pins=floor two hand-set numbers are two FLOORS: has_managed_cap stays
+    True, the watchdog runs, and the plan may sit above both of them."""
+    slots, limiter = PrioritySlots(2), RoleLimiter(2)
+    dyn = DynamicCapacity(
+        slots,
+        limiter,
+        settings=_settings(pins="floor", fixed_concurrency=True, fixed_max_roles=True),
+        measure_fn=lambda: (8, 0.0, None),
+    )
+    assert dyn.policy.has_managed_cap is True
+    assert dyn.enabled is True
+    with caplog.at_level(logging.INFO, logger="rework.capacity"):
+        task = dyn.start()
+    assert task is not None, "a floor never freezes: the watchdog must start"
+    try:
+        assert (slots.capacity, limiter.cap) == (8, 8), "8 idle CPUs, floors of 2: plan 8"
+    finally:
+        await dyn.stop()
+
+
+async def test_floor_with_both_numbers_set_scales_down_to_the_floor_and_not_past() -> None:
+    """The watchdog under two floors: a busy box scales down, clamped at the floor."""
+    slots, limiter = PrioritySlots(2), RoleLimiter(2)
+    readings = [(8, 0.0, None), (8, 40.0, None), (8, 40.0, None)]
+    dyn = DynamicCapacity(
+        slots,
+        limiter,
+        settings=_settings(pins="floor", fixed_concurrency=True, fixed_max_roles=True),
+        measure_fn=lambda: readings.pop(0),
+    )
+    task = dyn.start()
+    assert task is not None
+    try:
+        assert (slots.capacity, limiter.cap) == (8, 8), "it scaled UP above both floors"
+        assert dyn.observe_now() is None, "one sighting: hysteresis holds"
+        assert dyn.observe_now() is not None
+        assert (slots.capacity, limiter.cap) == (4, 4), "load halves 8 to 4, above the floor"
+        # now a floor of 6 on both caps: the same load cannot take it under 6
+        readings2 = [(8, 0.0, None), (8, 40.0, None), (8, 40.0, None)]
+        slots2, limiter2 = PrioritySlots(6), RoleLimiter(6)
+        dyn2 = DynamicCapacity(
+            slots2,
+            limiter2,
+            settings=_settings(pins="floor", fixed_concurrency=True, fixed_max_roles=True),
+            measure_fn=lambda: readings2.pop(0),
+        )
+        task2 = dyn2.start()
+        assert task2 is not None
+        try:
+            assert (slots2.capacity, limiter2.cap) == (8, 8)
+            dyn2.observe_now()
+            assert dyn2.observe_now() is not None
+            assert (slots2.capacity, limiter2.cap) == (6, 6), "clamped at the floor, not 4"
+        finally:
+            await dyn2.stop()
+    finally:
+        await dyn.stop()
+
+
+def test_pins_fixed_reproduces_the_old_behaviour_exactly(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """pins=fixed: both caps pinned -> no managed cap, no watchdog, the exact pair."""
+    slots, limiter = PrioritySlots(8), RoleLimiter(2)
+    dyn = DynamicCapacity(
+        slots,
+        limiter,
+        settings=_settings(pins="fixed", fixed_concurrency=True, fixed_max_roles=True),
+        measure_fn=lambda: (16, 0.0, 2 * GB),
+    )
+    assert dyn.policy.has_managed_cap is False
+    assert dyn.enabled is False
+    assert dyn.policy.target(16, 0.0, 2 * GB) == Capacity(
+        8, 2, "16 CPUs, load 0.0, 2.0 GB free: 8 missions / 2 roles"
+    )
+    with caplog.at_level(logging.INFO, logger="rework.capacity"):
+        assert dyn.start() is None
+        assert dyn.apply_now() is None
+        assert dyn.observe_now() is None
+    assert (slots.capacity, limiter.cap) == (8, 2), "byte for byte: what was written"
+    assert [r for r in caplog.records if r.name == "rework.capacity"] == []
+
+
+def test_pins_fixed_single_pin_still_plans_todays_numbers() -> None:
+    """One pinned cap under pins=fixed behaves exactly as before (the clamp included)."""
+    policy = CapacityPolicy(concurrency=1, max_roles=5, fixed_max_roles=True, pins="fixed")
+    assert policy.has_managed_cap is True
+    new = policy.apply_initial(8, 0.0, None)
+    assert new is not None
+    assert (new.concurrency, new.max_roles) == (5, 5), "8 idle CPUs clamped to the pinned 5"
+    assert policy.describe("roles") == "roles PINNED at 5 by REWORK_MAX_ROLES=5 (pins=fixed)"
+
+
+def test_a_directly_constructed_policy_keeps_the_old_pin_semantics() -> None:
+    """The constructor's own default stays PINS_FIXED (the pre-REWORK_CAPACITY_PINS
+    meaning) so older call sites and tests keep their exact behaviour; the
+    user-facing default (floor) comes from CapacitySettings.from_env()."""
+    policy = CapacityPolicy(
+        concurrency=8, max_roles=2, fixed_concurrency=True, fixed_max_roles=True
+    )
+    assert policy.has_managed_cap is False
+    assert policy.target(16, 0.0, None) == Capacity(8, 2, "16 CPUs, load 0.0: 8 missions / 2 roles")

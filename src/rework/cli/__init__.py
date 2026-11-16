@@ -1566,6 +1566,139 @@ def gc(
 
 
 @app.command()
+def capacity(
+    as_json: bool = typer.Option(False, "--json", help="Print the same facts as JSON."),
+) -> None:
+    """What the daemon's two caps are on THIS host, and whether auto is active.
+
+    RECOMPUTED, not read from the daemon: `rework serve` exposes no capacity
+    state over its API, so with auto active this runs the daemon's own code path
+    here (the env, one measurement, the planner) and says so. With auto off it
+    measures nothing and prints the pair resolved at startup, because that is the
+    pair in force, and it says that the daemon logs no capacity lines in that
+    mode, so `rework logs daemon -g 'capacity'` is only for a running auto
+    daemon."""
+    import json as _json
+
+    from rework.config import Config, max_roles
+    from rework.orchestrator.capacity import (
+        GB,
+        CapacityPolicy,
+        CapacitySettings,
+        auto_state,
+        measure,
+        plan,
+    )
+
+    try:
+        settings = CapacitySettings.from_env()
+    except ValueError as exc:  # REWORK_CAPACITY_PINS=floo: loudly, exit 2
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(2) from exc
+
+    config = Config.from_env()
+    # The daemon seeds its policy from the caps it was constructed with, and it
+    # builds them from the same two calls used here: Config.concurrency and
+    # max_roles(config), the function Daemon calls on its own Config. Using them
+    # again (rather than re-deriving one from the CPU count) is what keeps this
+    # pair the one the daemon would start with, so a floor under it cannot print
+    # a pair the daemon would never pick.
+    constructed = (config.concurrency, max_roles(config))
+    policy = CapacityPolicy(
+        concurrency=constructed[0],
+        max_roles=constructed[1],
+        fixed_concurrency=settings.fixed_concurrency,
+        fixed_max_roles=settings.fixed_max_roles,
+        pins=settings.pins,
+    )
+    active, state = auto_state(settings, policy)
+    # no measurement at all when auto is off: one taken here would be printed next
+    # to "no measurement", and could only invite reading the frozen pair as its
+    # result. The raw values stay None so the JSON says so too.
+    cpus: int | None = None
+    load1 = 0.0
+    avail: int | None = None
+    measurement: dict[str, Any] | None = None
+    if active:
+        cpus, load1, avail = measure()
+        measured = plan(cpus, load1, avail)
+        measurement = {
+            "cpus": cpus,
+            "load1": round(load1, 2),
+            "available_mb": None if avail is None else avail // 1_000_000,
+        }
+        planned = policy.target(cpus, load1, avail)
+        missions, roles = planned.concurrency, planned.max_roles
+        measured_pair: dict[str, int | None] = {
+            "measured_missions": measured.concurrency,
+            "measured_roles": measured.max_roles,
+        }
+        basis = "recomputed here from the env and one measurement"
+        why_missions = policy.describe("missions")
+        why_roles = policy.describe("roles")
+    else:
+        # AUTO IS OFF: nothing measures and nothing moves, so the honest answer is
+        # the pair resolved at startup. No measurement is taken at all, and the
+        # frozen pair is never presented as if a measurement produced it.
+        missions, roles = constructed
+        measured_pair = {"measured_missions": None, "measured_roles": None}
+        if settings.auto:
+            basis = "as resolved at startup, because REWORK_CAPACITY_PINS=fixed pins both caps"
+            why_missions = policy.describe("missions")
+            why_roles = policy.describe("roles")
+        else:
+            basis = "as resolved at startup, because REWORK_CAPACITY=fixed"
+            why_missions = "missions as resolved at startup (no planner, no watchdog)"
+            why_roles = "roles as resolved at startup (no planner, no watchdog)"
+
+    # The log hint is only true when auto runs: with auto off the daemon logs no
+    # "capacity" line at all (no plan line, no change line), so pointing at
+    # `rework logs daemon -g 'capacity'` would send a reader to a log that can
+    # never contain it. ONE string feeds both the text and the JSON.
+    if active:
+        live_hint = (
+            "the live daemon's own view: rework logs daemon -g 'capacity'"
+            " (its 'capacity plan:' startup line and every 'capacity changed:' line)"
+        )
+    else:
+        live_hint = (
+            "the daemon logs no 'capacity' lines in this mode by design;"
+            " rework logs daemon -g 'capacity' is for a running auto daemon"
+        )
+
+    facts = {
+        "recomputed": active,
+        "auto_active": active,
+        "auto": state,
+        "mode": settings.mode,
+        "pins": settings.pins,
+        "measurement": measurement,
+        "planned": {
+            "missions": missions,
+            "roles": roles,
+            "basis": basis,
+            **measured_pair,
+        },
+        "why": {"missions": why_missions, "roles": why_roles},
+        "live_daemon_hint": live_hint,
+    }
+    if as_json:
+        typer.echo(_json.dumps(facts, indent=2))
+        return
+
+    if cpus is not None:
+        free = "RAM unknown" if avail is None else f"{avail / GB:.1f} GB free"
+        typer.echo(f"measured on this host now: {cpus} CPUs, load {load1:.2f}, {free}")
+    else:
+        typer.echo("measured nothing: auto is off, so no measurement feeds these caps")
+    typer.echo(f"plan: {missions} missions / {roles} roles  ({basis}: NOT read from the daemon)")
+    typer.echo(f"  {why_missions}")
+    typer.echo(f"  {why_roles}")
+    typer.echo(state)
+    typer.echo(live_hint)
+
+
+@app.command()
 def tui() -> None:
     """Open the TUI dashboard (the same one bare `rework` starts)."""
     from rework.tui import run_tui
