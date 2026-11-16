@@ -56,7 +56,8 @@ _DDL = [
         plan TEXT,
         result TEXT,
         created_at DOUBLE PRECISION NOT NULL,
-        updated_at DOUBLE PRECISION NOT NULL
+        updated_at DOUBLE PRECISION NOT NULL,
+        transient_crash_count INTEGER NOT NULL DEFAULT 0
     )
     """,
     """
@@ -463,6 +464,28 @@ class PostgresStore:
             )
             await self._conn.commit()
         return await self.get_mission(mission_id)
+
+    # -- transient crash counter (daemon requeue policy) --------------------
+    # Read only through these methods: Mission does not carry the field, so a
+    # `SELECT *` row mapper is unaffected by the extra column.
+    @_serialized
+    async def increment_transient_crash_count(self, mission_id: str) -> int:
+        """Bump and return the mission's transient crash count (0 if no row)."""
+        row = await self._fetch_one(
+            "UPDATE missions SET transient_crash_count = transient_crash_count + 1"
+            " WHERE id = %s RETURNING transient_crash_count",
+            (mission_id,),
+        )
+        await self._conn.commit()
+        return int(row["transient_crash_count"]) if row else 0
+
+    @_serialized
+    async def reset_transient_crash_count(self, mission_id: str) -> None:
+        """Zero the mission's transient crash count (fresh dispatch, terminal)."""
+        await self._conn.execute(
+            "UPDATE missions SET transient_crash_count = 0 WHERE id = %s", (mission_id,)
+        )
+        await self._conn.commit()
 
     @_serialized
     async def list_missions(
@@ -1060,9 +1083,7 @@ class PostgresStore:
         # relations takes the chats row first, under FOR UPDATE, so two of our
         # transactions can no longer form a cycle. Any future write that needs
         # both tables keeps this order.
-        await self._conn.execute(
-            "SELECT 1 FROM chats WHERE id = %s FOR UPDATE", (message.chat_id,)
-        )
+        await self._conn.execute("SELECT 1 FROM chats WHERE id = %s FOR UPDATE", (message.chat_id,))
         async with self._conn.cursor() as cur:
             await cur.execute(
                 "INSERT INTO chat_messages (chat_id, role, body, display, ts)"
@@ -1256,6 +1277,11 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
         "missions",
         "priority",
         "ALTER TABLE missions ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'",
+    ),
+    (
+        "missions",
+        "transient_crash_count",
+        "ALTER TABLE missions ADD COLUMN transient_crash_count INTEGER NOT NULL DEFAULT 0",
     ),
     ("gates", "for_run", "ALTER TABLE gates ADD COLUMN for_run TEXT"),
     ("gates", "decision", "ALTER TABLE gates ADD COLUMN decision TEXT"),

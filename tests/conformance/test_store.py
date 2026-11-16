@@ -586,6 +586,21 @@ async def test_gate_typed_decision_roundtrip(store: StateStore) -> None:
     assert done is not None and done.decision is None
 
 
+async def test_transient_crash_count_increments_then_resets(store: StateStore) -> None:
+    """The daemon's requeue budget: one atomic bump returning the new value,
+    and a reset that really zeroes the stored one (fresh dispatch / terminal).
+    The counter is NOT on Mission: it is read only through these two methods.
+    """
+    m = await store.create_mission(Mission(id=new_id("m"), objective="flaky runner"))
+    assert await store.increment_transient_crash_count(m.id) == 1
+    assert await store.increment_transient_crash_count(m.id) == 2
+    # a row that does not exist reports 0 instead of raising
+    assert await store.increment_transient_crash_count("missing") == 0
+    await store.reset_transient_crash_count(m.id)
+    # 1, not 3: the reset hit the stored value and the bump read it back
+    assert await store.increment_transient_crash_count(m.id) == 1
+
+
 async def test_a_schema_change_does_not_break_a_live_connection(
     store: StateStore, tmp_path
 ) -> None:  # type: ignore[no-untyped-def]

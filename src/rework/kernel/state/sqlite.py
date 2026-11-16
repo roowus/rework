@@ -35,6 +35,7 @@ from rework.kernel.state.records import (
     check_priority,
     coerce_priority,
 )
+from rework.kernel.state.retry import retry_transient_methods
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS missions (
@@ -49,6 +50,7 @@ CREATE TABLE IF NOT EXISTS missions (
     priority TEXT NOT NULL DEFAULT 'normal',
     plan TEXT,
     result TEXT,
+    transient_crash_count INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -159,8 +161,15 @@ def _uj(value: str | None) -> dict[str, Any]:
     return json.loads(value) if value else {}
 
 
+@retry_transient_methods
 class SqliteStore:
-    """Async SQLite StateStore. Open with `open_sqlite(path)`."""
+    """Async SQLite StateStore. Open with `open_sqlite(path)`.
+
+    Every public method carries the shared transient-error retry (deadlock /
+    serialization class in Postgres terms, `database is locked` in sqlite's):
+    the class decorator is the seam, since this store has no single wrapper.
+    Nested calls share the outer attempt's budget.
+    """
 
     def __init__(self, db: aiosqlite.Connection) -> None:
         self._db = db
@@ -325,6 +334,26 @@ class SqliteStore:
         await self._db.execute(f"UPDATE missions SET {', '.join(sets)} WHERE id = ?", tuple(params))
         await self._db.commit()
         return await self.get_mission(mission_id)
+
+    # -- transient crash counter -------------------------------------------
+    # One statement each, committed: a counter bump must survive the crash it
+    # is counting. Mission does not carry the field (SELECT * is unaffected).
+    async def increment_transient_crash_count(self, mission_id: str) -> int:
+        """Bump and return the mission's transient crash count (0 if no row)."""
+        row = await self._fetch_one(
+            "UPDATE missions SET transient_crash_count = transient_crash_count + 1"
+            " WHERE id = ? RETURNING transient_crash_count",
+            (mission_id,),
+        )
+        await self._db.commit()
+        return int(row["transient_crash_count"]) if row else 0
+
+    async def reset_transient_crash_count(self, mission_id: str) -> None:
+        """Zero the mission's transient crash count (fresh dispatch, terminal)."""
+        await self._db.execute(
+            "UPDATE missions SET transient_crash_count = 0 WHERE id = ?", (mission_id,)
+        )
+        await self._db.commit()
 
     async def list_missions(
         self,
@@ -843,12 +872,18 @@ class SqliteStore:
         rows = await self._fetch_all(sql, (limit,))
         return [self._chat(r) for r in rows]
 
+    # Lock order for chat writes: the chats row first, then chat_messages.
+    # sqlite has no `SELECT ... FOR UPDATE`, so the write intent on chats is
+    # taken with a no-op UPDATE on that row; on one shared file this is parity
+    # with Postgres (which locks the row with FOR UPDATE), not a deadlock fix.
     async def delete_chat(self, chat_id: str) -> None:
+        await self._db.execute("UPDATE chats SET id = id WHERE id = ?", (chat_id,))
         await self._db.execute("DELETE FROM chat_messages WHERE chat_id = ?", (chat_id,))
         await self._db.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
         await self._db.commit()
 
     async def append_chat_message(self, message: ChatMessage) -> ChatMessage:
+        await self._db.execute("UPDATE chats SET id = id WHERE id = ?", (message.chat_id,))
         cur = await self._db.execute(
             "INSERT INTO chat_messages (chat_id, role, body, display, ts) VALUES (?, ?, ?, ?, ?)",
             (message.chat_id, message.role, _j(message.body) or "{}", message.display, message.ts),
@@ -1030,6 +1065,10 @@ async def open_sqlite(path: str) -> SqliteStore:
         await db.execute("ALTER TABLE missions ADD COLUMN title TEXT")
     if "priority" not in names:
         await db.execute("ALTER TABLE missions ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'")
+    if "transient_crash_count" not in names:
+        await db.execute(
+            "ALTER TABLE missions ADD COLUMN transient_crash_count INTEGER NOT NULL DEFAULT 0"
+        )
     cols = await db.execute("PRAGMA table_info(gates)")
     names = {row[1] for row in await cols.fetchall()}
     if "for_run" not in names:

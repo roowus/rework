@@ -53,6 +53,14 @@ class StateStore(Protocol):
         priority: str | None = None,
     ) -> Mission | None: ...
 
+    async def increment_transient_crash_count(self, mission_id: str) -> int:
+        """Bump and return the mission's transient crash count (0 if no row)."""
+        ...
+
+    async def reset_transient_crash_count(self, mission_id: str) -> None:
+        """Zero the mission's transient crash count (fresh dispatch, terminal)."""
+        ...
+
     async def list_missions(
         self,
         status: MissionStatus | None = None,
