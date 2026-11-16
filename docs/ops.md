@@ -429,7 +429,7 @@ fresh; systemd's restart retry wins after one stale window.
 
 rewvis is 2 CPUs, 12 GB of RAM, 4 GB of swap, and it is shared: sshd,
 tailscaled, Postgres (`rework-dev-pg`), journald and the daemon all live on it.
-rework therefore bounds itself. Three knobs, all optional, all in
+rework therefore bounds itself. Five knobs, all optional, all in
 `~/.rework/rework.env`:
 
 | variable | default | what it caps |
@@ -437,6 +437,8 @@ rework therefore bounds itself. Three knobs, all optional, all in
 | `REWORK_MAX_ROLES` | one per CPU (`os.cpu_count()`, min 1) — 2 on rewvis | roles RUNNING at the same time, across all missions |
 | `REWORK_ROLE_MEMORY_MAX` | 60% of RAM | the memory one role's command tree may use before the kernel kills it |
 | `REWORK_CONCURRENCY` | `min(cpu_count, 4)` — 2 on rewvis | working MISSIONS at the same time |
+| `REWORK_CAPACITY` | `auto` | whether the two caps above follow the host at runtime, or stay fixed |
+| `REWORK_CAPACITY_INTERVAL_S` | `60` | how often (`auto`) the host is re-measured |
 
 `REWORK_MAX_ROLES` is daemon-wide: every `spawn_role` counts, whichever mission
 it belongs to. Runs beyond the cap are not refused, they queue — the run row
@@ -488,11 +490,48 @@ any `awaiting_gate` row with no open gate on every poll (a log line and an INFO
 event say so).
 
 A sqlite deployment keeps its historical concurrency of 1 unless the env says
-otherwise; Postgres deployments get the host-aware default.
+otherwise, and Postgres deployments get the host-aware default. With
+`REWORK_CAPACITY=auto` (the default) both are only the STARTING value: the caps
+then follow the host on either backend, so pin one with an explicit
+`REWORK_CONCURRENCY` / `REWORK_MAX_ROLES` or turn the watchdog off with
+`REWORK_CAPACITY=fixed` when a deployment must not move.
+
+#### Capacity: the two caps follow the box (`REWORK_CAPACITY`)
+
+With the default `REWORK_CAPACITY=auto`, `REWORK_CONCURRENCY` and
+`REWORK_MAX_ROLES` are no longer read only at startup: every
+`REWORK_CAPACITY_INTERVAL_S` seconds (default 60) the daemon re-measures the
+host and moves both caps, so switching from a busy box to an idle one needs no
+edit and no restart. A quiet box plans one role and one mission per CPU (2 and
+2 on a 2-core box, 8 and 8 on an idle 8-core box); when the 1-minute load
+average is above the CPU count the role count halves (never below 2 on a
+multi-core box); and when `MemAvailable` in /proc/meminfo is under 1.5 GB per
+planned role, roles are cut until it is (floor 1). The mission cap never
+exceeds the role cap. A change is applied only when the same plan shows up in
+two measurements in a row, so one `uv sync` burst does not flap the caps.
+
+Shrinking never cancels work: running missions keep their slots until they
+finish (the free-slot count goes negative until their releases bring it back),
+and new work simply stops being admitted. Every change is ONE log line with
+the reason, and nothing is logged while the caps hold:
+
+```
+capacity changed: 8 missions / 8 roles -> 4 missions / 4 roles
+(8 CPUs, load 12.4, 5.1 GB free: 4 missions / 4 roles)
+```
+
+Precedence: an EXPLICIT `REWORK_CONCURRENCY` or `REWORK_MAX_ROLES` (a non-empty
+value in the env) fixes that one cap and `auto` manages only the other one;
+with both set there is nothing to watch and no watchdog runs.
+`REWORK_CAPACITY=fixed` restores the old behaviour exactly (the caps are
+resolved once at startup, no measurement, no watchdog, no log line), which is
+what you want when a deployment must not move under load. A typo in the value
+means `auto`: the guard never turns itself off by accident. Check what it did
+with `rework logs daemon -g 'capacity changed'`.
 
 #### The 2026-11-13 incident
 
-The reason all three exist. The kernel OOM killer fired three times — Nov 12
+The reason the caps exist. The kernel OOM killer fired three times — Nov 12
 19:23, Nov 13 06:23 and 06:58 UTC — the last killing a role's `mypy` at 790 MB
 *inside* `rework.service`, which took the service itself down. From about
 16:20 UTC the box was swap-thrashing instead: journald wrote its lines out of
@@ -501,7 +540,9 @@ order, no OOM kill came, and nothing answered until a hard reboot at 17:02.
 The load that did it: between 15:57 and 16:24 UTC four missions ran at once,
 one of them a batch mission running four investigators in parallel — 6-7 roles
 at a time, each running `pytest`, `mypy` and `uv sync` on 2 CPUs and 12 GB.
-`REWORK_CONCURRENCY=1` was the stopgap until the caps above existed.
+`REWORK_CONCURRENCY=1` was the stopgap until the caps above existed. That is
+also why they follow the host at runtime rather than being set once: the box
+that fell over was shared, and its headroom depends on the hour.
 
 Look for OOM kills before blaming the network, a bad deploy or a hung daemon;
 they are logged by the kernel, not by rework:

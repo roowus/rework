@@ -23,6 +23,7 @@ from rework.kernel.events.bus import EventBus
 from rework.kernel.llm.catalog import ModelCatalog
 from rework.kernel.state.records import EventRecord, EventType, MissionStatus
 from rework.kernel.state.store import StateStore
+from rework.orchestrator.capacity import DynamicCapacity
 from rework.orchestrator.engine import CheckpointerFactory, MissionRunner
 from rework.orchestrator.limits import MissionSlot, PrioritySlots, RoleLimiter
 from rework.roles.registry import RoleRegistry
@@ -128,6 +129,10 @@ class Daemon:
         # daemon-wide cap on concurrently RUNNING roles, shared by every
         # mission's RunSupervisor (REWORK_MAX_ROLES, orchestrator/limits.py)
         self._limiter = RoleLimiter(max_roles(config), poll_interval_s=config.poll_interval_s)
+        # both caps follow the host at runtime (REWORK_CAPACITY=auto, the
+        # default); the watchdog is started from inside run_forever, because a
+        # task needs a running loop and this runs outside one
+        self._capacity = DynamicCapacity(self._sem, self._limiter)
         self._runners: dict[str, asyncio.Task[None]] = {}
         self._bg: set[asyncio.Task[None]] = set()
         self._owner = f"daemon-{uuid.uuid4().hex[:8]}"
@@ -143,6 +148,9 @@ class Daemon:
                 f"(heartbeat fresh within {stale_after:.0f}s); refusing to double-run"
             )
         try:
+            # BEFORE the first dispatch: a fresh daemon starts at the caps the
+            # box can take right now, not at the value resolved at import time
+            self._capacity.start()
             await self._recover()
             self._code = CodeChangeWatcher()
             # resolved once: the checkout this daemon runs from (may be None
@@ -158,6 +166,9 @@ class Daemon:
                 await self._maybe_auto_update()
                 await asyncio.sleep(self._config.poll_interval_s)
         finally:
+            # no leaked task on any exit path: CancelledError, a normal return
+            # and `raise SystemExit(0)` from auto-update all come through here
+            await self._capacity.stop()
             await self._store.release_lock(self._owner)
 
     def _check_code(self) -> None:
