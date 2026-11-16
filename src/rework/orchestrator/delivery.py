@@ -112,6 +112,16 @@ MERGE_NOTE_HEADING = "## Merge with main"
 # legitimately quotes: that text is embedded in the body verbatim.
 MERGE_NOTE_SENTINEL = "<!-- rework:merge-note -->"
 
+# The phrases `_merge_note` writes. A row stored by an OLDER rework carries no
+# sentinel, so the only way to tell our paragraph from a coder body that merely
+# quotes the heading is the text itself: a trailing `## Merge with main`
+# section is stripped only when it reads like one of these notes.
+MERGE_NOTE_MARKERS = (
+    "**not** merged into",
+    "Conflicting paths:",
+    "Staged work that the abort",
+)
+
 
 def _body_with_merge_note(body: str, note: str) -> str:
     """The coder's body with THIS delivery's merge paragraph appended."""
@@ -130,18 +140,23 @@ def _without_merge_note(body: str) -> str:
     Only a paragraph this feature appended may be stripped. A body that merely
     CONTAINS the heading (a summary quoting docs, an auditor finding) has to
     survive intact: with the sentinel present the cut is at the sentinel, and
-    for rows persisted by an older rework (no sentinel) only a TRAILING section
-    counts, i.e. a heading still followed by the end of the body."""
+    for rows persisted by an older rework (no sentinel) the trailing section
+    must also READ like our note, i.e. carry one of MERGE_NOTE_MARKERS. A coder
+    summary that quotes the heading and then ends in prose or `###`
+    subsections used to lose that tail."""
     index = body.find(MERGE_NOTE_SENTINEL)
     if index >= 0:
         return body[:index].rstrip() + "\n"
-    # legacy rows: the old note was the LAST thing appended, so a heading that
-    # is followed by another section is the coder's own
+    # legacy rows: no marker to cut at, so the section has to look like ours
     index = body.rfind(f"\n\n{MERGE_NOTE_HEADING}")
     if index < 0:
         return body
-    tail_lines = body[index + 2 :].splitlines()[1:]
-    if any(line.startswith("## ") for line in tail_lines):
+    section = body[index + 2 :]
+    if any(line.startswith("## ") for line in section.splitlines()[1:]):
+        # still followed by another section: the coder's own heading
+        return body
+    if not any(marker in section for marker in MERGE_NOTE_MARKERS):
+        # the coder's own heading, followed only by its own words
         return body
     return body[:index].rstrip() + "\n"
 

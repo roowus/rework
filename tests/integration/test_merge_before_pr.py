@@ -34,6 +34,7 @@ from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.state.records import Mission, MissionStatus
 from rework.kernel.state.sqlite import open_sqlite
 from rework.missions import PLAN_FIX_PR
+from rework.nodes import git_ops
 from rework.nodes.git_ops import MergeResult, merge_base_into_branch
 from rework.orchestrator import delivery
 from rework.orchestrator.delivery import deliver_pr, retry_pr
@@ -1225,5 +1226,158 @@ async def test_a_dirty_skip_that_discarded_staged_work_is_reported(
         assert "<<<<<<<" not in (work / "a.txt").read_text()
         assert (work / "leftover.txt").read_text() == "the coder's own uncommitted note\n"
         assert not _is_ancestor(bare, _rev(bare, "refs/heads/main"), coder_tip)
+    finally:
+        await store.aclose()
+
+
+# ---------------------------------------------------------------------------
+# the merge step NEVER fails a mission
+# ---------------------------------------------------------------------------
+
+
+async def test_a_crashing_merge_step_still_pushes_and_opens_the_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The mission requirement: the merge step never fails a mission.
+
+    `merge_main_before_push` is the blanket `except Exception` around it: a
+    crash (not a merge outcome git reported, but a bug or a broken call) is
+    turned into an INFO event saying the merge step failed, and delivery goes on
+    with the coder's own body and the ordinary push."""
+    bare, work, other = _movable_repo(tmp_path)
+    _advance_main(other, {"other.txt": "another mission's work\n"})
+    coder_tip = _rev(work, "HEAD")
+    fake_gh, body_file = _fake_gh(tmp_path)
+    monkeypatch.setenv("REWORK_GH_BIN", str(fake_gh))
+    body = "## What changed\n\nsomething\n"
+
+    async def exploding_merge(*_a: Any, **_k: Any) -> MergeResult:
+        raise RuntimeError("merge helper blew up")
+
+    monkeypatch.setattr(delivery, "merge_base_into_branch", exploding_merge)
+
+    store = await open_sqlite(str(tmp_path / "crashmerge.sqlite3"))
+    try:
+        mission = await _done_mission(store, work, "mcrashmerge1")
+        url = await deliver_pr(
+            store,
+            InProcessEventBus(store),
+            mission.id,
+            branch=BRANCH,
+            worktree=str(work),
+            title="rework: Deliver",
+            body=body,
+        )
+        assert url == "https://github.com/roowus/repo/pull/1", "the PR must still open"
+
+        notes = await _notes(store, mission.id)
+        events = _merge_events(notes)
+        assert len(events) == 1, events
+        assert "merge step failed" in str(events[0]["note"]), events[0]
+        assert "merge helper blew up" in str(events[0]["error"]), events[0]
+
+        # ... and delivery carried on exactly as if the merge were not there
+        assert body_file.read_text() == body, "no merge paragraph for a crashed merge step"
+        assert _rev(work, "HEAD") == coder_tip, "nothing was merged"
+        assert _rev(bare, f"refs/heads/{BRANCH}") == coder_tip, "the push still happened"
+        assert any("PR opened" in str(n.get("note", "")) for n in notes), notes
+    finally:
+        await store.aclose()
+
+
+async def test_a_failed_abort_is_reported_and_delivery_still_completes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other path that must not fail a mission: the abort AFTER a real
+    conflict fails too. The branch may then need a manual `git merge --abort`,
+    so both the INFO event and the PR body say the abort failed, and the PR
+    still opens."""
+    bare, work, other = _movable_repo(tmp_path)
+    _advance_main(other, {"a.txt": "line one\nanother mission's edit\n"})
+    (work / "a.txt").write_text("line one\ncoder's edit\n")
+    coder_tip = _commit(work, "coder edit")
+    fake_gh, body_file = _fake_gh(tmp_path)
+    monkeypatch.setenv("REWORK_GH_BIN", str(fake_gh))
+
+    async def failing_abort(_repo: Path) -> tuple[bool, str]:
+        return False, "fatal: could not abort the merge"
+
+    monkeypatch.setattr(git_ops, "abort_merge", failing_abort)
+
+    store = await open_sqlite(str(tmp_path / "abortfail.sqlite3"))
+    try:
+        mission = await _done_mission(store, work, "mabortfail01")
+        url = await deliver_pr(
+            store,
+            InProcessEventBus(store),
+            mission.id,
+            branch=BRANCH,
+            worktree=str(work),
+            title="rework: Deliver",
+            body="## What changed\n\nsomething\n",
+        )
+        assert url == "https://github.com/roowus/repo/pull/1", "delivery must still complete"
+
+        events = _merge_events(await _notes(store, mission.id))
+        assert len(events) == 1, events
+        assert events[0]["conflicting_paths"] == ["a.txt"], events[0]
+        assert "git merge --abort failed" in str(events[0]["error"]), events[0]
+        assert "could not abort the merge" in str(events[0]["error"]), events[0]
+
+        body = body_file.read_text()
+        assert "## Merge with main" in body, body
+        assert "The merge abort also failed" in body, body
+        assert "could not abort the merge" in body, body
+        # the coder's own commits are what got pushed, whatever the worktree holds
+        assert _rev(bare, f"refs/heads/{BRANCH}") == coder_tip
+    finally:
+        await store.aclose()
+
+
+# ---------------------------------------------------------------------------
+# a legacy row: only OUR note is stripped, never the coder's own words
+# ---------------------------------------------------------------------------
+
+
+async def test_a_legacy_body_quoting_the_heading_keeps_its_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row written by an OLDER rework has no sentinel, so the cut used to fall
+    at any TRAILING `## Merge with main` section. A coder body that quotes the
+    heading and then ends in prose lost everything after the heading.
+
+    The legacy fallback now also requires the section to READ like our note."""
+    bare, work, other = _movable_repo(tmp_path)
+    _advance_main(other, {"other.txt": "another mission's work\n"})  # a clean merge
+    fake_gh, body_file = _fake_gh(tmp_path)
+    monkeypatch.setenv("REWORK_GH_BIN", str(fake_gh))
+    quoted = (
+        "## What changed\n\nsummary\n\n"
+        "## Merge with main\n\nwe merged main by hand earlier\n\n"
+        "Full report: `rework report x`\n"
+    )
+
+    store = await open_sqlite(str(tmp_path / "legacyquote.sqlite3"))
+    try:
+        mission = await _done_mission(
+            store,
+            work,
+            "mlegacyq0001",
+            pr_pending=True,
+            pr_branch=BRANCH,
+            pr_worktree=str(work),
+            pr_title="rework: Deliver",
+            pr_body=quoted,
+        )
+        ok, detail = await retry_pr(store, InProcessEventBus(store), mission.id)
+        assert ok, detail
+        body = body_file.read_text()
+        assert "## Merge with main\n\nwe merged main by hand earlier" in body, body
+        assert "Full report: `rework report x`" in body, "the tail must survive"
+        assert body.startswith("## What changed"), body
+        assert (
+            "Merge origin/main into rework/test"
+            in _git("log", "--oneline", f"refs/heads/{BRANCH}", cwd=bare).stdout
+        )
     finally:
         await store.aclose()

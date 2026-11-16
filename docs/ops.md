@@ -158,9 +158,10 @@ therefore runs, in the coder's own worktree and just before the push:
    abort runs, so a crash that left both a stopped merge and staged edits loses
    nothing. That ref is a single mutable ref: the next delivery that discards
    anything overwrites it, so only the most recently discarded stash is kept.
-   It is named by every outcome that reports an abort (the INFO event always,
-   plus the **Merge with main** section of a refused merge or a real conflict);
-   an abort that discards nothing (the usual case, since a stopped merge leaves
+   It is always named in the INFO event of any outcome that discarded work; the
+   PR body names it only for a refused merge or a real conflict, because those
+   are the only two outcomes that get a **Merge with main** section at all. An
+   abort that discards nothing (the usual case, since a stopped merge leaves
    unmerged entries that `git stash create` refuses) pins no ref and says
    nothing;
 4. check `git status --porcelain` is empty, so a merge cannot clobber
@@ -180,9 +181,14 @@ An up-to-date branch is a silent no-op. The same is true of the three skips,
 **no origin** (step 1), **wrong branch** (step 2) and **dirty worktree** (step 4):
 no event and no body note, since there is nothing the owner can act on.
 
-Exactly three outcomes publish an INFO event: a failed fetch (body untouched),
-and a refused merge or a real conflict (body gains the **Merge with main**
-section). Every other delivery is silent, with one exception: a leftover merge
+The silent outcomes are the ones with nothing to act on: **no origin** (step 1),
+**wrong branch** (step 2), **dirty worktree** (step 4) and **already up to
+date** (step 5) publish no event and add no body note. Everything else says
+something. The outcomes that carry a problem publish an INFO event, and the two
+that did not merge also give the body its **Merge with main** section: a failed
+fetch (body untouched), a refused merge and a real conflict. A **successful**
+merge publishes its own INFO event naming the merge commit (body untouched, a
+clean merge needs no note). One exception to the silence: a leftover merge
 (step 3) can coexist with a wrong branch or a dirty worktree, and the abort then
 discards staged work, which that skip cannot drop silently. Such a skip DOES
 publish an INFO event naming `refs/rework/pre-merge-abort`, so the discarded
@@ -216,10 +222,12 @@ paragraph is **never persisted**: only the coder's own body is stored with a
 failed delivery, and a **Merge with main** section is recomputed on every
 attempt, so a retry that merges cleanly cannot republish an earlier conflict.
 To make that cleanup exact, the paragraph is appended behind the marker
-`<!-- rework:merge-note -->`, and a retry strips only from that marker (or, for
-a row stored by an older rework, a **Merge with main** section that is still the
-last thing in the body). A coder summary or auditor finding that itself quotes
-`## Merge with main` is published verbatim and never truncated.
+`<!-- rework:merge-note -->`, and a retry strips only from that marker. A row
+stored by an older rework carries no marker, so there the trailing section has
+to read like one of the notes this step writes (it names `main` as **not**
+merged, or lists conflicting paths) before anything is cut. A coder summary or
+auditor finding that itself quotes `## Merge with main` is published verbatim
+and never truncated.
 
 A sleeping Mac pauses every local mission: nothing fails, it just stops
 until the lid opens (seen 2026-11-09: four stalls that looked like hangs
