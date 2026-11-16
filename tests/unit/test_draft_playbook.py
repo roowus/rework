@@ -122,6 +122,9 @@ AUDIT_OBJECTIVES = [
     "document how the scheduler works",
     "investigate what causes the flaky test",
     "explain how retries interact",
+    "audit the doubletake code base and tell me what you find",  # the incident
+    "audit the code base and report back",
+    "review the codebase and let me know what you think",
 ]
 
 # Objectives that name a change, in whatever inflection. The direction matters:
@@ -158,6 +161,29 @@ CHANGE_OBJECTIVES = [
     "the audit recommends migrating the store to postgres",
     "audit the code base and make the tests pass",
     "audit the code base and speed it up",
+    # round 3: change verbs that used to sit in the report allowlist
+    "audit the code base and write the missing tests",
+    "audit the code base and write the missing unit tests",
+    "audit the code base and cover the untested branches",
+    "audit the code base and include the missing tests",
+    "audit the code base and confirm the tests pass",
+    "audit the code base and verify the build is green",
+    "audit the code base and check that ci passes",
+    "audit the code base and trace the crash",
+    "audit the code base and find the bug in the parser",
+    "audit the code base and identify the crash",
+    "audit the code base; write the missing tests",
+    "audit the code base and explain the bug, then repair it",
+    # the continuation anchor is not only the literal "and"
+    "audit the code base and then repair the parser",
+    "audit the code base, then repair the parser",
+    "audit the code base; then repair the parser",
+    "audit the code base. then repair the parser",
+    # the same anchors with a verb no stem holds, so ONLY the anchor can catch it
+    "audit the code base and then speed it up",
+    "audit the code base, then speed it up",
+    "audit the code base; then speed it up",
+    "audit the code base. then speed it up",
 ]
 
 
@@ -195,11 +221,49 @@ def test_the_classifier_errs_toward_a_change_mission() -> None:
 
 def test_both_change_signals_are_load_bearing() -> None:
     """Two independent mechanisms, one case each, so neither can rot silently:
-    the stem alternation catches inflections of a known change word, and the
-    continuation rule catches a novel verb after a coordinating "and"."""
+    the stem/form alternation catches a known change word, and the continuation
+    rule catches a novel verb that no list holds."""
     from rework.missions import _has_change_veto, _has_further_work
 
     inflected = "audit the code base and the delivery module needs refactoring"
     assert _has_change_veto(inflected) and not _has_further_work(inflected)
-    novel_verb = "audit the code base and make the tests pass"
+    novel_verb = "audit the code base and speed it up"
     assert _has_further_work(novel_verb) and not _has_change_veto(novel_verb)
+
+
+def test_report_phrases_and_forms_do_not_false_veto() -> None:
+    """ "write a report" is a trigger phrase, stripped before the scan, and
+    "coverage" is not the change verb "cover"; yet a bare "write" or "cover"
+    still vetoes."""
+    from rework.missions import _has_change_veto
+
+    assert not _has_change_veto("write a report on test coverage")
+    assert not _has_change_veto("audit it and tell me what you find")
+    assert _has_change_veto("audit it and write the tests")
+    assert _has_change_veto("audit it, covering the branches")
+
+
+def test_report_only_words_hold_no_change_verb() -> None:
+    """The allowlist is fail-safe only while it holds verbs that can never head
+    real work."""
+    from rework.missions import REPORT_ONLY_WORDS
+
+    for verb in (
+        "write", "include", "cover", "confirm", "verify", "check", "find",
+        "identify", "trace", "repair", "fix",
+    ):  # fmt: skip
+        assert verb not in REPORT_ONLY_WORDS, verb
+
+
+def test_the_chat_defaults_a_missing_plan_but_never_overrides_a_named_one() -> None:
+    """The launching chat is where the incident came from: a proposal with NO
+    plan falls back to the classifier's default, a plan the model named stays."""
+    from rework.orchestrator.chat import proposal_plan
+
+    audit = "audit the release process"
+    assert proposal_plan({}, audit) == "draft"
+    assert proposal_plan({"plan": ""}, audit) == "draft"
+    assert proposal_plan({"plan": "fix"}, audit) == "fix"  # named: never overridden
+    assert proposal_plan({"plan": "echo"}, audit) == "echo"
+    assert proposal_plan({}, "audit the code base and write the missing tests") == "fix"
+    assert proposal_plan({}, "fix the login crash") == "fix"

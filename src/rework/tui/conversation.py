@@ -59,14 +59,14 @@ def proposal_from_args(args: dict[str, Any], *, cost_history: float | None = Non
     it, so a replay without it would show — and then stamp at launch — a
     different cap than the live card. A caller that has no store (a pure
     replay test) may omit it and gets the keyword estimate."""
-    from rework.orchestrator.chat import Proposal, proposal_budget
+    from rework.orchestrator.chat import Proposal, proposal_budget, proposal_plan
 
     objective = str(args.get("objective", "")).strip()
     budget_usd, budget_reason = proposal_budget(args, objective, cost_history=cost_history)
     return Proposal(
         objective=objective,
         title=str(args.get("title", "")).strip(),
-        plan=str(args.get("plan", "fix")).strip() or "fix",
+        plan=proposal_plan(args, objective),
         project=str(args.get("project", "")).strip(),
         repo=str(args.get("repo", "")).strip(),
         model=str(args.get("model", "")).strip(),

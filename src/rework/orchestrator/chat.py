@@ -249,6 +249,18 @@ class Proposal:
         return " · ".join(bits)
 
 
+def proposal_plan(args: dict[str, Any], objective: str) -> str:
+    """The plan a proposal carries: the one the model named, else a default.
+    The classifier (`reads_only_plan`) only picks the DEFAULT, when the plan is
+    absent; a plan the model explicitly named is never overridden."""
+    named = str(args.get("plan", "")).strip()
+    if named:
+        return named
+    from rework.missions import reads_only_plan
+
+    return reads_only_plan(objective) or "fix"
+
+
 def proposal_budget(
     args: dict[str, Any], text: str = "", *, cost_history: float | None = None
 ) -> tuple[float, str]:
@@ -737,7 +749,7 @@ class OrchestratorChat:
                     Proposal(
                         objective=objective,
                         title=str(args.get("title", "")).strip(),
-                        plan=str(args.get("plan", "fix")).strip() or "fix",
+                        plan=proposal_plan(args, objective),
                         project=str(args.get("project", "")).strip(),
                         repo=str(args.get("repo", "")).strip(),
                         model=str(args.get("model", "")).strip(),

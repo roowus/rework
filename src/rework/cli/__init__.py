@@ -109,24 +109,6 @@ def new(
         from rework.config import Config, open_store_from_config
         from rework.missions import create_mission, reads_only_plan, resolve_project
 
-        # the plan is the caller's unless the caller stayed silent: an audit is
-        # a read-and-report job, and the DEFAULT for one is `draft` (its
-        # deliverable is the report, not a branch and a pull request). An
-        # explicit `--plan echo` still means echo: this reads the parameter
-        # SOURCE, not the value, so the classifier never overrides a plan the
-        # owner named. It is a default-selection heuristic only.
-        chosen_plan = plan
-        if _plan_not_given(ctx):
-            suggested = reads_only_plan(objective)
-            if suggested is not None:
-                chosen_plan = suggested
-                # stderr on purpose, like the budget line: stdout stays the id
-                typer.echo(
-                    f"read-and-report objective: plan {suggested} (no branch push,"
-                    " no pull request); pass --plan to override",
-                    err=True,
-                )
-
         # a template plan has NEVER carried a cap of its own: stamping an
         # estimated one on it (see create_mission's comment) would make every
         # `--plan fix` mission pause at a burn gate it never used to have. So
@@ -155,6 +137,26 @@ def new(
             if not mechanical:
                 orch_model = orchestrator or default_orchestrator_model()
             project_id = await resolve_project(project)
+            # the plan is the caller's unless the caller stayed silent: an audit
+            # is a read-and-report job, and the DEFAULT for one is `draft` (its
+            # deliverable is the report, not a branch and a pull request). An
+            # explicit `--plan echo` still means echo: this reads the parameter
+            # SOURCE, not the value, so the classifier never overrides a plan
+            # the owner named. It is a default-selection heuristic only, and it
+            # only applies when a repository or project is being resolved:
+            # `draft` cannot be built without one, so a repo-less audit keeps
+            # the caller's plan (and the command keeps succeeding).
+            chosen_plan = plan
+            if (repo or repo_dir or project_id) and _plan_not_given(ctx):
+                suggested = reads_only_plan(objective)
+                if suggested is not None:
+                    chosen_plan = suggested
+                    # stderr on purpose, like the budget line: stdout stays the id
+                    typer.echo(
+                        f"read-and-report objective: plan {suggested} (no branch push,"
+                        " no pull request); pass --plan to override",
+                        err=True,
+                    )
             mission = await create_mission(
                 objective,
                 repo=repo,

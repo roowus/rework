@@ -1823,3 +1823,17 @@ def test_an_explicit_echo_plan_is_never_overridden_by_the_classifier(rework_db: 
     assert mission is not None
     assert (mission.plan or {})["playbook"] == "echo"
     assert "read-and-report objective" not in result.stderr
+
+
+def test_a_repo_less_audit_keeps_the_callers_plan_and_still_succeeds(rework_db: Path) -> None:
+    """`draft` cannot be built without a repository, so the classifier must not
+    suggest it when none is being resolved: `rework new "audit the release
+    process"` with no --repo succeeded on base (an echo mission) and has to keep
+    doing so, instead of dying with a usage error about --plan draft."""
+    result = runner.invoke(app, ["new", "audit the release process"])
+
+    assert result.exit_code == 0, result.output
+    mission = _get_mission(rework_db, result.stdout.strip())
+    assert mission is not None
+    assert (mission.plan or {})["playbook"] == "echo"
+    assert "read-and-report objective" not in result.stderr

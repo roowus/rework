@@ -130,6 +130,7 @@ READS_ONLY_TRIGGERS = (
     "map out",
     "survey",
     "write a report",
+    "write up a report",
     "document how",
     "investigate what",
     "explain how",
@@ -193,32 +194,78 @@ CHANGE_VETO_STEMS = (
     "restor",
     "revert",
     "roll",
+    # added after the second audit round; each was run against the ten
+    # report-only controls (AUDIT_OBJECTIVES) and none occurs in one. "mak" and
+    # "generat" are over-broad on purpose ("maker", "generates"): a false veto
+    # costs a relaunch, a missed one costs a fix mission its branch and PR.
+    "confirm",
+    "verif",
+    "identif",
+    "trace",
+    "repair",
+    "ensur",
+    "mak",
+    "generat",
 )
-# "make" is left out of the stems on purpose: its inflections ("makes",
-# "making") are ordinary report prose, and the continuation rule below already
-# catches it where it matters ("audit X and make the tests pass").
-CHANGE_VETO = re.compile(r"\b(?:" + "|".join(CHANGE_VETO_STEMS) + r")\w*\b", re.IGNORECASE)
+# Change verbs whose stem would also eat ordinary report prose, so they are
+# matched as EXPLICIT forms (no `\w*` tail): "cover" must veto "covering the
+# untested branches" but never "coverage" ("write a report on test coverage"),
+# "pass" must not eat "password", "run" must not eat "runtime", "check" stays
+# a stem-free form so "checkpoint" is not a veto, and so on. Anything a form
+# misses is still caught by the continuation rule or simply defaults to None.
+CHANGE_VETO_FORMS = (
+    "writ(?:e|es|ing|ten)",
+    "cover(?:s|ed|ing)?",
+    "check(?:s|ed|ing)?",
+    "pass(?:es|ed|ing)?",
+    "run(?:s|ning)?",
+    "build(?:s|ing)?",
+    "built",
+    "green(?:s|ed|ing)?",
+)
+CHANGE_VETO = re.compile(
+    r"\b(?:(?:" + "|".join(CHANGE_VETO_STEMS) + r")\w*|" + "|".join(CHANGE_VETO_FORMS) + r")\b",
+    re.IGNORECASE,
+)
 
-# FIX 2: a trigger phrase nominates the work, but a coordinating continuation
-# ("and then", "and <verb>") after it introduces MORE work -- and when the extra
-# work is a change, the mission is a change mission. This catches the verbs no
-# stem list holds ("audit the code base and make the tests pass", "audit the
-# code base and speed it up") and it is deterministic: a word after "and" is
-# continuation work unless it is one of the words below.
-CONTINUATION_WORDS = re.compile(r"\band\s+then\b|\band\s+([a-z]+)", re.IGNORECASE)
-# Words that may follow "and" in a read-and-report objective without turning it
-# into further work: report verbs (the list IS the deliverable), the words of a
-# reported sentence ("and how it fails"), and connective articles/prepositions
-# that continue the same clause.
+# The report-context phrases are a tiny EXPLICIT list on purpose, not a growing
+# word allowlist: they are change-y or work-y on their own ("write", "tell me
+# what you find") but are report prose as a fixed phrase. Matched whole and
+# STRIPPED from the text before the change scan, so the scan never sees them.
+# Longest first, so "tell me what you find" goes before "tell me".
+REPORT_PHRASES = (
+    "tell me what you find",
+    "write up a report",
+    "write a report",
+    "what you find",
+    "let me know",
+    "report back",
+    "tell me",
+)
+
+# A trigger phrase nominates the work, but a coordinating continuation after it
+# introduces MORE work: "and then", ", then", "; then", ". then", and "and
+# <word>". The word after a bare "and" decides: only a verb that can NEVER imply
+# a code change keeps the objective an audit.
+CONTINUATION_WORDS = re.compile(r"(?:\band\s+|[,;.]\s*)then\b|\band\s+([a-z]+)", re.IGNORECASE)
+
+# FAIL-SAFE BY CONSTRUCTION. The cost of a wrong verdict is asymmetric: a false
+# "draft" silently denies a real fix mission its branch and PR, while a false
+# "change" only costs the owner a relaunch with `--plan draft`. So this set is
+# the ONLY thing that may follow "and" in an audit, and it holds verbs that can
+# never imply a code change, plus the words of a reported sentence and the
+# articles/prepositions that continue the same clause. Anything not listed is
+# NOT positively read-only and returns None. Imperatives that can head real work
+# (write, include, cover, confirm, verify, check, find, identify, trace, repair,
+# fix, ...) are deliberately absent: the earlier allowlist held them and routed
+# "audit X and write the missing tests" to a branchless draft.
 REPORT_ONLY_WORDS = frozenset(
     """
-    report reports listing list describe describes summarise summarize explain
-    document tell show note flag identify assess evaluate rank compare map
-    survey review audit analyse analyze check verify confirm trace find give
-    include cover recommend suggest highlight read write keep leave cite quote
-    state mention spell outline clarify point how what where when why who
-    whether which that this these those the a an its their it any all each
-    not no also still only without with for in on to of by if and or
+    tell report reports describe describes summarise summarize list listing
+    outline explain assess evaluate highlight mention say show note
+    how what where when why who whether which that this these those the a an its
+    their it any all each not no also still only without with for in on to of by
+    if and or
     """.split()
 )
 
@@ -228,18 +275,28 @@ def _mentions(needle: str, haystack: str) -> bool:
     return re.search(pattern, haystack) is not None
 
 
+def _action_text(body: str) -> str:
+    """The text the change scan sees: matched report phrases are removed first,
+    so "tell me what you find" and "write a report" cannot trip a veto."""
+    for phrase in REPORT_PHRASES:
+        pattern = r"\b" + r"\s+".join(re.escape(part) for part in phrase.split()) + r"\b"
+        body = re.sub(pattern, " ", body)
+    return body
+
+
 def _has_change_veto(body: str) -> bool:
     """True when the text names a change to make, in any inflection."""
-    return CHANGE_VETO.search(body) is not None
+    return CHANGE_VETO.search(_action_text(body)) is not None
 
 
 def _has_further_work(body: str) -> bool:
-    """True when a coordinating continuation introduces work the trigger does
-    not cover: "and then ...", or "and <word>" where <word> is not one of the
-    read-and-report words. Structure only, no word list of verbs to maintain."""
-    for match in CONTINUATION_WORDS.finditer(body):
+    """True when a continuation introduces work the trigger does not cover:
+    "and then" / ", then" / "; then" / ". then", or "and <word>" where <word> is
+    not a verb that can never imply a change. Fail-safe: an unknown word counts
+    as further work."""
+    for match in CONTINUATION_WORDS.finditer(_action_text(body)):
         following = match.group(1)
-        if following is None:  # "and then"
+        if following is None:  # a "then" continuation
             return True
         if following.lower() not in REPORT_ONLY_WORDS:
             return True
@@ -254,24 +311,28 @@ def reads_only_plan(objective: str, text: str = "") -> str | None:
     did not name a plan, and it never overrides an explicit plan.
 
     Matching is case-insensitive on word boundaries in the objective (plus
-    `text`, when given). A trigger phrase only NOMINATES the work; either of two
-    change signals defeats it and returns None:
+    `text`, when given). A trigger phrase only NOMINATES the work; the verdict
+    is "draft" only when nothing in the text suggests a change. Two signals
+    defeat the nomination, after REPORT_PHRASES ("tell me what you find", "write
+    a report", ...) are stripped from the text:
 
     1. A change word, matched by STEM and therefore in every inflection:
-       "audit the code base and fixing the two crashes" is a fix mission, not an
-       audit. See CHANGE_VETO_STEMS for the deliberate collisions ("add" wins
-       over "address", "creat" over "creative").
-    2. A coordinating continuation that introduces further work: "and then", or
-       "and <word>" where <word> is not a read-and-report word. "audit the code
-       base and make the tests pass" and "audit the code base and speed it up"
-       are change missions; "review the codebase and list the risks" stays an
-       audit because "list" is the deliverable.
+       "audit the code base and fixing the two crashes" is a fix mission. See
+       CHANGE_VETO_STEMS for the deliberate collisions ("add" wins over
+       "address", "creat" over "creative"); CHANGE_VETO_FORMS are explicit forms
+       so "cover" vetoes but "coverage" does not.
+    2. A continuation ("and then", ", then", "; then", ". then", or "and
+       <word>") whose word is not in REPORT_ONLY_WORDS. That set holds only
+       verbs that can never imply a code change, so an unknown word is further
+       work: "audit the code base and speed it up" is a change mission, while
+       "review the codebase and list the risks" stays an audit.
 
-    Both signals err toward None (no plan suggestion). That direction is chosen
-    deliberately: a real fix mission misrouted to `draft` produces no branch and
-    no PR, so the fix silently never lands and the CLI note makes it look
-    intentional. Losing a draft suggestion only means the caller's own plan is
-    used.
+    FAIL-SAFE BY CONSTRUCTION: the classifier returns "draft" only for what it
+    positively recognises as read-only and None for everything else. The cost of
+    a wrong verdict is asymmetric: a false "draft" silently denies a real fix
+    mission its branch and PR, while a false "change" merely costs the owner a
+    relaunch with `--plan draft`. So every list here is built so that a missing
+    entry errs toward None.
     """
     body = f"{objective or ''}\n{text or ''}".lower()
     if not body.strip():
