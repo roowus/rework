@@ -4,10 +4,14 @@ the whole map."""
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import re
 import shlex
+import shutil
 import subprocess
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,6 +38,7 @@ from rework.missions import (
 from rework.nodes.readonly import (
     READ_ONLY_TOOL_NAMES,
     ReadOnlyExecutor,
+    ToolRefused,
     build_git_argv,
     build_search_argv,
     build_tree_argv,
@@ -429,6 +434,95 @@ async def test_real_tools_run_and_return_cited_lines(tmp_path: Path) -> None:
     assert "app.py" in await ex.execute("list_dir", {})
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"start_line": -5, "max_lines": 0},
+        {"start_line": 1, "max_lines": 0},
+        {"start_line": 1, "max_lines": -3},
+        {"start_line": 0},
+        {"start_line": -5},
+    ],
+)
+async def test_blame_refuses_a_non_positive_range_instead_of_clamping_it(
+    tmp_path: Path, args: dict[str, int]
+) -> None:
+    """`start_line=-5, max_lines=0` used to clamp to `-L 1,0`, git printed
+    nothing and the tool reported a misleading cut note. Now it is refused."""
+    repo = _repo(tmp_path)
+    ex = ReadOnlyExecutor(LocalExecutor(repo), repo)
+    out = await ex.execute("git_read", {"subcommand": "blame", "path": "app.py", **args})
+    assert out.startswith("error: refused") and "at least 1" in out
+    assert "cut" not in out
+    with pytest.raises(ToolRefused):
+        build_git_argv(repo, {"subcommand": "blame", "path": "app.py", **args})
+
+
+def test_blame_still_clamps_an_over_large_max_lines(tmp_path: Path) -> None:
+    from rework.nodes.readonly import MAX_LINES_CAP
+
+    argv = build_git_argv(
+        tmp_path,
+        {"subcommand": "blame", "path": "a.py", "start_line": 3, "max_lines": 10**9},
+    )
+    assert argv[argv.index("-L") + 1] == f"3,{3 + MAX_LINES_CAP - 1}"
+
+
+_RG_EXTRA_DIRS = ("/home/ubuntu/.pi/agent/bin",)
+
+
+def _rg_path() -> str | None:
+    """A PATH that finds ripgrep: the ambient one, else a known extra dir."""
+    ambient = os.environ.get("PATH", "")
+    for candidate in (ambient, os.pathsep.join([ambient, *_RG_EXTRA_DIRS])):
+        if shutil.which("rg", path=candidate):
+            return candidate
+    return None
+
+
+def test_search_argv_covers_dotfiles_and_ignored_paths_in_both_branches(tmp_path: Path) -> None:
+    rg = build_search_argv(tmp_path, {"pattern": "x"}, have_rg=True)
+    assert "--hidden" in rg and "--no-ignore" in rg and rg[-1] == "."
+    assert rg[rg.index("--glob=!.git")] == "--glob=!.git"
+    grep = build_search_argv(tmp_path, {"pattern": "x"}, have_rg=False)
+    assert "--exclude-dir=.git" in grep
+    # a user glob cannot re-include .git: ours comes last
+    both = build_search_argv(tmp_path, {"pattern": "x", "glob": "*"}, have_rg=True)
+    assert both.index("--glob=*") < both.index("--glob=!.git")
+
+
+@pytest.mark.skipif(_rg_path() is None, reason="ripgrep is not installed")
+async def test_rg_and_grep_branches_return_the_same_file_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same call, same map, whichever searcher the host has: a dotfile and a
+    gitignored dir are found by both, and .git is skipped by both."""
+    repo = _repo(tmp_path)
+    (repo / ".env").write_text("needle in a dotfile\n")
+    (repo / ".hidden").mkdir()
+    (repo / ".hidden" / "x.txt").write_text("needle hidden dir\n")
+    (repo / "build").mkdir()
+    (repo / "build" / "out.txt").write_text("needle ignored dir\n")
+    (repo / ".gitignore").write_text("build/\n.env\n")
+    (repo / "plain.txt").write_text("needle plain\n")
+    (repo / ".git" / "needle-note").write_text("needle inside .git\n")
+    ex = ReadOnlyExecutor(LocalExecutor(repo), repo)
+
+    def files(out: str) -> set[str]:
+        return {
+            line.split(":", 1)[0].removeprefix("./")
+            for line in out.splitlines()
+            if re.match(r"\.?/?[\w.-]+(/[\w.-]+)*:\d+:", line)
+        }
+
+    monkeypatch.setenv("PATH", _rg_path() or "")
+    with_rg = files(await ex.execute("search_code", {"pattern": "needle"}))
+    monkeypatch.setattr(shutil, "which", lambda *_a, **_k: None)  # no rg: grep branch
+    with_grep = files(await ex.execute("search_code", {"pattern": "needle"}))
+    expected = {".env", ".hidden/x.txt", "build/out.txt", "plain.txt"}
+    assert with_rg == with_grep == expected
+
+
 def _poison_repo(repo: Path, hook: str) -> None:
     for key in ("core.fsmonitor", "diff.evil.textconv", "diff.evil.command", "core.pager"):
         subprocess.run(["git", "config", key, hook], cwd=repo, check=True)
@@ -531,3 +625,56 @@ def test_render_md_surveyor_only_mission_shows_the_map() -> None:
     assert "were cut" in md
     assert "no tests were found" in md
     assert "coder" not in md.replace("(surveyor)", "")
+
+
+async def test_surveyor_only_mission_end_to_end_renders_the_map_via_report_md(
+    sv_ctx: RoleBuildCtx, tmp_path: Path
+) -> None:
+    """A scripted survey through the real role graph, stored, then rendered by
+    the real `rework report --md` path (a subprocess on the same sqlite DB):
+    the Report output is the actual map, not just run stats, and an over-cap
+    survey says how many findings were dropped."""
+    fake = sv_ctx.provider
+    assert isinstance(fake, FakeProvider)
+    risks = [
+        {"severity": "low", "area": f"area {i}", "detail": f"risk {i}", "where": f"app.py:{i + 1}"}
+        for i in range(30)
+    ]
+    big = {**ARTIFACT, "risks": risks, "gaps": [f"gap {i}" for i in range(20)]}  # 50 > 40
+    _push(fake, ChatResult(text="mapped", usage=Usage(input_tokens=5, output_tokens=5)))
+    _push(fake, ChatResult(text=json.dumps(big), usage=Usage(input_tokens=9, output_tokens=9)))
+    graph = autodiscover().get("surveyor").build_graph(sv_ctx)
+    graph.checkpointer = InMemorySaver()
+    final = await graph.ainvoke(
+        {"objective": "map this repo"}, config={"configurable": {"thread_id": "t-e2e"}}
+    )
+    artifact = final["artifact"]
+    assert artifact is not None, final.get("artifact_error")
+    required = {
+        "title", "summary", "layout", "entry_points", "dependencies", "config",
+        "tests", "ci", "risks", "gaps", "next_steps",
+    }  # fmt: skip
+    assert required <= set(artifact), "all eleven required keys"
+    assert len(artifact["risks"]) + len(artifact["gaps"]) == MAX_RISKS_AND_GAPS
+    assert "10 of 50" in artifact["cut_note"]
+
+    store = sv_ctx.store
+    await store.update_run(sv_ctx.run.id, status=RunStatus.COMPLETED, artifact=artifact)
+    await store.update_mission("mi", status=MissionStatus.DONE)
+    dbfile = tmp_path / "sv.sqlite3"
+    md_path = tmp_path / "report.md"
+    env = {**os.environ, "REWORK_DB": str(dbfile), "NO_COLOR": "1"}
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-m", "rework", "report", "mi", "--md", "--out", str(md_path),
+        env=env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )  # fmt: skip
+    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+    assert proc.returncode == 0, stderr.decode()
+    md = md_path.read_text()
+    assert "tiny app" in md and "A one-file greeter." in md
+    assert "### Layout" in md and "app.py" in md and "the greeter" in md
+    assert "greet" in md and "app.py:1-2" in md  # entry point
+    assert "### Risks" in md and "`app.py:2`" in md  # file:line visible in where
+    assert "### Gaps" in md and "- gap 0" in md  # gaps (the cut keeps the first ones)
+    assert "add a test for greet" in md  # next steps
+    assert "10 of 50" in md and "were cut" in md  # the cut note names how many

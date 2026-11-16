@@ -173,6 +173,16 @@ def _int(raw: Any, name: str, default: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
+def _positive(raw: Any, name: str, default: int, high: int) -> int:
+    """A count that must be at least 1: a non-positive value is refused, not
+    clamped into an empty range that would read as a result. Only an
+    over-large value is clamped (to `high`)."""
+    value = _int(raw, name, default, -(10**9), high)
+    if value < 1:
+        raise ToolRefused(f"{name} must be at least 1, got {value}")
+    return value
+
+
 def _text(raw: Any, name: str, *, limit: int = 500) -> str:
     if not isinstance(raw, str) or not raw:
         raise ToolRefused(f"{name} must be a non-empty string")
@@ -204,12 +214,15 @@ def build_search_argv(workdir: Path, args: dict[str, Any], *, have_rg: bool) -> 
         glob = None
     fixed = args.get("fixed") is True
     if have_rg:
+        # --hidden --no-ignore: the same file set as the grep fallback (dotfiles
+        # and gitignored paths included); .git is skipped in both branches
         argv = ["rg", "--no-config", "--color=never", "-n", "--no-heading", "--max-columns=300"]
-        argv += ["--max-columns-preview"]
+        argv += ["--max-columns-preview", "--hidden", "--no-ignore"]
         if fixed:
             argv.append("-F")
         if glob:
             argv.append(f"--glob={glob}")
+        argv.append("--glob=!.git")  # last, so no user glob can re-include .git
         return [*argv, "-e", pattern, "--", rel]
     argv = ["grep", "-rnI", "--exclude-dir=.git", "-E" if not fixed else "-F"]
     if glob:
@@ -234,7 +247,7 @@ def build_git_argv(workdir: Path, args: dict[str, Any]) -> list[str]:
     rel = jail_relative(workdir, raw_path) if raw_path not in (None, "") else None
     paths = ["--", rel] if rel is not None else []
     rev = _rev(args.get("rev"))
-    max_lines = _int(args.get("max_lines"), "max_lines", DEFAULT_MAX_LINES, 1, MAX_LINES_CAP)
+    max_lines = _positive(args.get("max_lines"), "max_lines", DEFAULT_MAX_LINES, MAX_LINES_CAP)
     base = list(_GIT_BASE)
     if sub == "log":
         fmt = ["-n", str(max_lines), "--date=short", "--format=%h %ad %an %s", *_DIFF_SAFE]
@@ -244,7 +257,7 @@ def build_git_argv(workdir: Path, args: dict[str, Any]) -> list[str]:
             raise ToolRefused("blame needs a path")
         window: list[str] = []
         if args.get("start_line") not in (None, ""):
-            start = _int(args.get("start_line"), "start_line", 1, 1, 10**7)
+            start = _positive(args.get("start_line"), "start_line", 1, 10**7)
             window = ["-L", f"{start},{start + max_lines - 1}"]
         return [*base, "blame", "--no-textconv", "--date=short", *window, rev or "HEAD", "--", rel]
     if sub in ("show", "diff"):
@@ -316,7 +329,7 @@ class ReadOnlyExecutor:
             if name == "repo_tree":
                 return await self._run(build_tree_argv(self._workdir, args), 500)
             argv = build_git_argv(self._workdir, args)
-            limit = _int(args.get("max_lines"), "max_lines", DEFAULT_MAX_LINES, 1, MAX_LINES_CAP)
+            limit = _positive(args.get("max_lines"), "max_lines", DEFAULT_MAX_LINES, MAX_LINES_CAP)
             return await self._run(argv, limit)
         except ToolRefused as exc:
             return f"error: refused ({exc}). {HELP}"

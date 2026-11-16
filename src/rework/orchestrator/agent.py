@@ -656,6 +656,15 @@ def artifact_summary(artifact: dict[str, Any] | None) -> str:
     return "; ".join(bits) or _short(artifact, 200)
 
 
+def _plan_allows_unaudited_done(plan: dict[str, Any]) -> bool:
+    """True only for a plan that can never change or ship anything: no coder
+    step, no gates and no publish. The audit-rail exemption for a survey-only
+    mission is keyed on this, not on which runs happened to be spawned."""
+    steps = plan.get("steps") or []
+    has_coder = any(isinstance(s, dict) and s.get("role") == "coder" for s in steps)
+    return not has_coder and not plan.get("gates") and not plan.get("publish")
+
+
 class MissionOrchestrator:
     def __init__(self, runner: MissionRunner, mission: Mission) -> None:
         self.r = runner
@@ -1240,14 +1249,17 @@ class MissionOrchestrator:
         Rule: when ANY coder run exists in the mission (whatever its status:
         completed, failed, aborted, still running), finish(done) needs a
         completed auditor, and no coder run may have finished after that
-        audit STARTED. The only exemption is a mission with NO coder run at
-        all in which a surveyor completed: a survey changes nothing, so there
-        is no diff to audit. A surveyor never excuses a coder."""
+        audit STARTED. The only exemption needs ALL of: the mission's PLAN
+        allows an unaudited done (no coder step, no gates, no publish: see
+        `_plan_allows_unaudited_done`), no coder run exists, and a surveyor
+        completed. A survey changes nothing, so there is no diff to audit; a
+        surveyor never excuses a coder, and never a gated or publishing plan."""
         runs = await self.store.list_runs(self.mid)
         audits = [r for r in runs if r.role == "auditor" and r.status == RunStatus.COMPLETED]
         coders = [r for r in runs if r.role == "coder"]
         if not coders and not audits:
-            if any(r.role == "surveyor" and r.status == RunStatus.COMPLETED for r in runs):
+            surveyed = any(r.role == "surveyor" and r.status == RunStatus.COMPLETED for r in runs)
+            if surveyed and _plan_allows_unaudited_done(await self._fresh_plan()):
                 return
         if not audits:
             raise ToolError(
