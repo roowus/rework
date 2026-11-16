@@ -1520,7 +1520,12 @@ class MissionRunner:
                 dead = self._supervisor.tasks.get(run.id)
                 if dead is not None and dead.done() and not dead.cancelled():
                     dead_exc = dead.exception()
+                    # an owner cancel that landed while this pass was awaiting may have
+                    # killed the task (its cleanup raised): the owner's cancel wins, the
+                    # mission ends CANCELLED, not with the cleanup's error
                     if dead_exc is not None:
+                        if await self._owner_signal() == "cancelled":
+                            return "cancelled"
                         raise dead_exc
             await asyncio.sleep(self._poll)
 
