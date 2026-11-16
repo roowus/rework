@@ -5572,6 +5572,33 @@ async def test_a_normal_chat_still_opens_and_paints(ids: dict[str, str]) -> None
         assert not app.swallowed
 
 
+async def test_a_restored_session_comes_back_to_a_mission_transcript(
+    ids: dict[str, str], env: Path
+) -> None:
+    """A session saved while looking at `orch-<mission-id>` must reopen that
+    transcript. The orch chat is filtered OUT of the snapshot (one per mission),
+    so the old "is it in snap.chats?" restore guard dropped it and the owner
+    landed on a blank Work tab."""
+    from rework.tui import reload as reload_mod
+    from rework.tui.reload import ReloadState
+
+    line = "restored turn: round 1 passed"
+    chat_id = await _seed_orch_chat(env, ids["running"], line)
+    assert reload_mod.save_state(ReloadState(tab="work", chat_id=chat_id, at=1.0))
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot, 1.0)
+        work = app.view("work")
+        await _wait_for(pilot, lambda: work.convo is not None and work.convo.id == chat_id)
+        await _settle(pilot, 0.6)
+        assert app.active_tab == "work"
+        assert work.convo is not None and work.convo.id == chat_id
+        assert line in _log_text(app)
+        assert not app.swallowed
+    assert not reload_mod.state_path().exists(), "the state applies exactly once"
+
+
 # -- rotated credentials: an auth failure re-reads the env file ----------------
 
 
