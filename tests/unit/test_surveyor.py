@@ -385,10 +385,11 @@ async def test_the_audited_write_flag_shapes_are_inert_as_search_values(tmp_path
     for args in (
         {"pattern": f"-o{target}", "fixed": True},
         {"pattern": "- uniq_out.txt", "fixed": True},
-        {"pattern": "a", "glob": f"-o{target}"},
     ):
         out = await ex.execute("search_code", args)
         assert not out.startswith("error: refused"), out
+    out = await ex.execute("search_code", {"pattern": "a", "glob": f"-o{target}"})
+    assert out.startswith("error: refused"), out  # a leading '-' glob is refused
     for rev in (f"-o{target}", "- out.txt"):
         out = await ex.execute("git_read", {"subcommand": "log", "rev": rev})
         assert out.startswith("error: refused")
@@ -505,7 +506,8 @@ async def test_rg_and_grep_branches_return_the_same_file_set(
     (repo / "build" / "out.txt").write_text("needle ignored dir\n")
     (repo / ".gitignore").write_text("build/\n.env\n")
     (repo / "plain.txt").write_text("needle plain\n")
-    (repo / ".git" / "needle-note").write_text("needle inside .git\n")
+    (repo / "run.log").write_text("needle in a log\n")
+    (repo / ".git" / "NEEDLE_IN_GIT").write_text("needle inside .git\n")
     ex = ReadOnlyExecutor(LocalExecutor(repo), repo)
 
     def files(out: str) -> set[str]:
@@ -515,12 +517,83 @@ async def test_rg_and_grep_branches_return_the_same_file_set(
             if re.match(r"\.?/?[\w.-]+(/[\w.-]+)*:\d+:", line)
         }
 
-    monkeypatch.setenv("PATH", _rg_path() or "")
-    with_rg = files(await ex.execute("search_code", {"pattern": "needle"}))
-    monkeypatch.setattr(shutil, "which", lambda *_a, **_k: None)  # no rg: grep branch
-    with_grep = files(await ex.execute("search_code", {"pattern": "needle"}))
-    expected = {".env", ".hidden/x.txt", "build/out.txt", "plain.txt"}
-    assert with_rg == with_grep == expected
+    async def both(args: dict[str, Any]) -> tuple[str, str]:
+        monkeypatch.undo()
+        monkeypatch.setenv("PATH", _rg_path() or "")
+        with_rg = await ex.execute("search_code", args)
+        monkeypatch.setattr(shutil, "which", lambda *_a, **_k: None)  # no rg: grep branch
+        return with_rg, await ex.execute("search_code", args)
+
+    everything = {".env", ".hidden/x.txt", "build/out.txt", "plain.txt", "run.log"}
+    accepted = {
+        None: everything,
+        "*": everything,
+        "*.txt": {".hidden/x.txt", "build/out.txt", "plain.txt"},
+        "*.log": {"run.log"},
+        ".env": {".env"},
+        "?lain.txt": {"plain.txt"},
+        ".git": set(),  # a glob cannot reach .git either
+    }
+    for glob, expected in accepted.items():
+        args: dict[str, Any] = {"pattern": "needle"}
+        if glob is not None:
+            args["glob"] = glob
+        with_rg, with_grep = await both(args)
+        assert files(with_rg) == files(with_grep) == expected, (glob, with_rg, with_grep)
+    # a glob grep cannot express is refused in BOTH branches, never half-honoured
+    for glob in ("**/*", "!.git", "*.{py,log}", "[ab]*", "sub/*.txt", "-x", "**"):
+        with_rg, with_grep = await both({"pattern": "needle", "glob": glob})
+        assert with_rg.startswith("error: refused") and "glob" in with_rg, (glob, with_rg)
+        assert with_grep == with_rg, glob
+    # a path inside .git is refused in both branches (rg would otherwise descend)
+    for path in (".git", ".git/", "./.git", ".git/objects"):
+        with_rg, with_grep = await both({"pattern": "needle", "path": path})
+        assert with_rg.startswith("error: refused") and ".git internals" in with_rg, path
+        assert with_grep == with_rg and "NEEDLE_IN_GIT" not in with_rg
+
+
+async def test_git_internals_are_refused_by_every_path_tool(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    (repo / ".git" / "NEEDLE_IN_GIT").write_text("needle SECRETBODY\n")
+    (repo / "viaLink").symlink_to(repo / ".git")
+    ex = ReadOnlyExecutor(LocalExecutor(repo), repo)
+    for tool, args in (
+        ("read_file", {"path": ".git/config"}),
+        ("read_file", {"path": ".git/NEEDLE_IN_GIT"}),
+        ("list_dir", {"path": ".git"}),
+        ("list_dir", {"path": "./.git/"}),
+        ("repo_tree", {"path": ".git"}),
+        ("search_code", {"pattern": "needle", "path": ".git"}),
+        ("search_code", {"pattern": "needle", "path": "viaLink"}),
+        ("git_read", {"subcommand": "ls-files", "path": ".git"}),
+        ("git_read", {"subcommand": "log", "path": ".git/config"}),
+    ):
+        out = await ex.execute(tool, args)
+        assert out.startswith("error: refused") and ".git internals are not surveyed" in out, (
+            tool,
+            args,
+            out,
+        )
+        assert "SECRETBODY" not in out and "[core]" not in out
+
+
+async def test_legitimate_survey_calls_still_work_after_the_git_and_glob_guards(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path)
+    (repo / "notes.txt").write_text("--dash-leading flag text\n")
+    ex = ReadOnlyExecutor(LocalExecutor(repo), repo)
+    assert "app.py:2:" in await ex.execute("search_code", {"pattern": "upper"})
+    assert "app.py:2:" in await ex.execute("search_code", {"pattern": "upper", "glob": "*.py"})
+    dash = await ex.execute("search_code", {"pattern": "--dash-leading", "fixed": True})
+    assert "notes.txt:1:" in dash
+    blame = await ex.execute("git_read", {"subcommand": "blame", "path": "app.py"})
+    assert "hello" in blame and "(exit 0)" in blame
+    # a revision with a path part is a rev, not a path argument: not blocked
+    shown = await ex.execute("git_read", {"subcommand": "show", "rev": "HEAD:app.py"})
+    assert "upper" in shown and not shown.startswith("error: refused")
+    assert "def greet" in await ex.execute("read_file", {"path": "app.py"})
+    assert "app.py" in await ex.execute("list_dir", {})
 
 
 def _poison_repo(repo: Path, hook: str) -> None:
@@ -657,6 +730,7 @@ async def test_surveyor_only_mission_end_to_end_renders_the_map_via_report_md(
     assert required <= set(artifact), "all eleven required keys"
     assert len(artifact["risks"]) + len(artifact["gaps"]) == MAX_RISKS_AND_GAPS
     assert "10 of 50" in artifact["cut_note"]
+    assert all(re.search(r"\S+:\d+", r["where"]) for r in artifact["risks"]), "file:line"
 
     store = sv_ctx.store
     await store.update_run(sv_ctx.run.id, status=RunStatus.COMPLETED, artifact=artifact)

@@ -84,7 +84,10 @@ _OWN_SPECS: tuple[ToolSpec, ...] = (
             "properties": {
                 "pattern": {"type": "string", "description": "text or regex to find"},
                 "path": {"type": "string", "description": "relative file or directory"},
-                "glob": {"type": "string", "description": "only files matching, e.g. *.py"},
+                "glob": {
+                    "type": "string",
+                    "description": "file-name pattern, e.g. *.py (no ** ! {} or /)",
+                },
                 "fixed": {"type": "boolean", "description": "literal text, not a regex"},
                 "max_results": {"type": "integer", "description": "max lines returned"},
             },
@@ -135,8 +138,9 @@ class ToolRefused(Exception):
 def jail_relative(workdir: Path, raw: Any, *, default: str | None = None) -> str:
     """The read_file jail, applied BEFORE a path reaches an argv. Returns the path
     relative to the workdir ('.' for the workdir itself). Refuses non-strings,
-    NUL/newline, absolute paths, `~`, any `..` component and anything that
-    resolves (symlinks included) outside the workdir."""
+    NUL/newline, absolute paths, `~`, any `..` component, anything that
+    resolves (symlinks included) outside the workdir, and any path that is or
+    lies inside a `.git` directory."""
     if raw is None or raw == "":
         if default is None:
             raise ToolRefused("a path is required")
@@ -153,7 +157,12 @@ def jail_relative(workdir: Path, raw: Any, *, default: str | None = None) -> str
     resolved = (root / raw).resolve()
     if resolved != root and root not in resolved.parents:
         raise ToolRefused(f"path escapes the workspace: {raw!r}")
-    return os.path.relpath(resolved, root).replace(os.sep, "/")
+    rel = os.path.relpath(resolved, root).replace(os.sep, "/")
+    # .git internals are out of scope for a survey; checked on the raw path and on
+    # the resolved one, so a symlink into .git is refused too
+    if ".git" in re.split(r"[\\/]+", raw) or ".git" in rel.split("/"):
+        raise ToolRefused(f"read-only mode: .git internals are not surveyed: {raw!r}")
+    return rel
 
 
 def _dash_safe(rel: str) -> str:
@@ -204,12 +213,28 @@ def _rev(raw: Any, default: str | None = None) -> str | None:
     return rev
 
 
+# A glob that ripgrep and grep honour identically: a bare file-name pattern matched
+# against the base name. grep cannot express `**`, `!` or `{a,b}`, so those are
+# refused rather than silently ignored.
+_SIMPLE_GLOB = re.compile(r"^[A-Za-z0-9_.*?][A-Za-z0-9_.*?-]*$")
+
+
+def _simple_glob(raw: str) -> str:
+    if not _SIMPLE_GLOB.match(raw) or "**" in raw:
+        raise ToolRefused(
+            f"glob {raw!r} is not supported: use a plain file-name pattern such as"
+            " *.py or test_*.py (letters, digits, _ . - and the wildcards * and ?;"
+            " no **, !, {a,b}, [..], path separators or leading -)"
+        )
+    return raw
+
+
 def build_search_argv(workdir: Path, args: dict[str, Any], *, have_rg: bool) -> list[str]:
     pattern = _text(args.get("pattern"), "pattern")
     rel = _dash_safe(jail_relative(workdir, args.get("path"), default="."))
     glob = args.get("glob")
     if glob not in (None, ""):
-        glob = _text(glob, "glob", limit=200)
+        glob = _simple_glob(_text(glob, "glob", limit=200))
     else:
         glob = None
     fixed = args.get("fixed") is True
