@@ -840,6 +840,7 @@ class MissionRunner:
             # transient to `awaiting_gate` with no gate row, which the daemon
             # repair pass and the _handle_halted wait loop both assume away.
             if gate.status == GateStatus.OPEN:
+                await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
             ship_decision = await self._gate_decision(mission.id, gate.id)
             if ship_decision is None:
                 # Send-back: mission back to running, don't synthesize
