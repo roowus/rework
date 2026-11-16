@@ -103,9 +103,19 @@ PR_BASE = "main"
 # the reason, not the tutorial.
 MERGE_DETAIL_LIMIT = 1200
 
-# The heading every merge paragraph starts with, exactly as `_merge_note` emits
-# it (`f"{body.rstrip()}\n\n{note}\n"`).
-MERGE_NOTE_HEADING = "\n\n## Merge with main\n"
+# The heading every merge paragraph starts with.
+MERGE_NOTE_HEADING = "## Merge with main"
+
+# The marker THIS feature writes immediately before the heading it appends, so
+# the paragraph added by an earlier attempt can be told apart from a
+# `## Merge with main` heading the coder's own summary (or an auditor finding)
+# legitimately quotes: that text is embedded in the body verbatim.
+MERGE_NOTE_SENTINEL = "<!-- rework:merge-note -->"
+
+
+def _body_with_merge_note(body: str, note: str) -> str:
+    """The coder's body with THIS delivery's merge paragraph appended."""
+    return f"{body.rstrip()}\n\n{MERGE_NOTE_SENTINEL}\n{note}\n"
 
 
 def _without_merge_note(body: str) -> str:
@@ -115,10 +125,23 @@ def _without_merge_note(body: str) -> str:
     failed attempt must never survive into the next one: attempt 1 that
     conflicted and then failed to push used to persist its body, and the retry
     that merged cleanly republished "the merge conflicts ... `a.txt`" for a
-    conflict that no longer existed. Bodies persisted by an older rework have
-    the note baked in, so this strips on the way in as well."""
-    index = body.find(MERGE_NOTE_HEADING)
+    conflict that no longer existed.
+
+    Only a paragraph this feature appended may be stripped. A body that merely
+    CONTAINS the heading (a summary quoting docs, an auditor finding) has to
+    survive intact: with the sentinel present the cut is at the sentinel, and
+    for rows persisted by an older rework (no sentinel) only a TRAILING section
+    counts, i.e. a heading still followed by the end of the body."""
+    index = body.find(MERGE_NOTE_SENTINEL)
+    if index >= 0:
+        return body[:index].rstrip() + "\n"
+    # legacy rows: the old note was the LAST thing appended, so a heading that
+    # is followed by another section is the coder's own
+    index = body.rfind(f"\n\n{MERGE_NOTE_HEADING}")
     if index < 0:
+        return body
+    tail_lines = body[index + 2 :].splitlines()[1:]
+    if any(line.startswith("## ") for line in tail_lines):
         return body
     return body[:index].rstrip() + "\n"
 
@@ -188,10 +211,21 @@ def _merge_note(result: MergeResult, branch: str) -> str | None:
     return "\n".join(lines)
 
 
+# how a silent skip is named when discarded work forces it to be reported
+_SKIP_REASONS = {
+    "wrong-branch": "the worktree is not on the coder branch",
+    "dirty-worktree": "the worktree has uncommitted changes",
+    "no-origin": "the repo has no origin",
+}
+
+
 def _merge_event(result: MergeResult, branch: str) -> dict[str, Any] | None:
     """The INFO payload for the merge step, or None when there is nothing worth
     an event (no origin, up to date, and the silent skips: wrong branch, dirty
-    worktree). An event never carries a merge note without saying so."""
+    worktree). An event never carries a merge note without saying so.
+
+    A silent skip that DISCARDED staged work is not silent: the owner has to be
+    able to find that stash, so the skip is reported after all."""
     if result.failed:
         payload: dict[str, Any] = {
             "note": f"{PR_BASE} was not merged into {branch}: git refused the merge "
@@ -229,6 +263,19 @@ def _merge_event(result: MergeResult, branch: str) -> dict[str, Any] | None:
             "note": f"{PR_BASE} was not merged into {branch} before the PR "
             "(the fetch failed); the PR opens as it is",
             "error": _truncated(scrub(result.detail)) or "git fetch failed",
+            "base": PR_BASE,
+        }
+    if result.discarded_work:
+        # a leftover merge (aborted above) coexisted with this skip: staging was
+        # thrown away, and only the ref makes it recoverable
+        return {
+            "note": f"{PR_BASE} was not merged into {branch} before the PR "
+            f"({_SKIP_REASONS.get(result.skipped_reason or '', 'skipped')}); staged "
+            f"work discarded by aborting a leftover merge is kept on "
+            f"{PRE_MERGE_ABORT_REF}",
+            "skipped_reason": result.skipped_reason,
+            "pre_merge_abort_ref": PRE_MERGE_ABORT_REF,
+            "pre_merge_abort_sha": result.discarded_work,
             "base": PR_BASE,
         }
     # dirty-worktree / wrong-branch: silent, like no-origin. Nothing the owner
@@ -320,7 +367,7 @@ async def deliver_pr(
     # A real conflict leaves the branch untouched and is reported in the body.
     note = await merge_main_before_push(bus, mission_id, branch, worktree, author)
     if note:
-        body = f"{body.rstrip()}\n\n{note}\n"
+        body = _body_with_merge_note(body, note)
     try:
         await push_branch(Path(worktree), branch)
         url = await pr_create(Path(worktree), head=branch, title=title, body=body)

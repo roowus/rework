@@ -155,11 +155,14 @@ therefore runs, in the coder's own worktree and just before the push:
    let a later `git add -A` commit the conflict markers. Staged work that the
    abort discards is stashed (`git stash create`, which never touches the index
    or the tree) and pinned on the ref `refs/rework/pre-merge-abort` before the
-   abort runs. That ref is reported where an abort was involved, i.e. in the
-   INFO event and the PR body of a refused merge or a real conflict, so a crash
-   that left both a stopped merge and staged edits loses nothing. An abort that
-   discards nothing (the usual case, since a stopped merge leaves unmerged
-   entries that `git stash create` refuses) pins no ref and says nothing;
+   abort runs, so a crash that left both a stopped merge and staged edits loses
+   nothing. That ref is a single mutable ref: the next delivery that discards
+   anything overwrites it, so only the most recently discarded stash is kept.
+   It is named by every outcome that reports an abort (the INFO event always,
+   plus the **Merge with main** section of a refused merge or a real conflict);
+   an abort that discards nothing (the usual case, since a stopped merge leaves
+   unmerged entries that `git stash create` refuses) pins no ref and says
+   nothing;
 4. check `git status --porcelain` is empty, so a merge cannot clobber
    uncommitted work (and `git add -A` cannot fold it into the merge commit);
 5. `git fetch origin main`, then `git merge-base --is-ancestor origin/main HEAD`:
@@ -173,23 +176,31 @@ therefore runs, in the coder's own worktree and just before the push:
    history never gains a second author. The merge commit is pushed with the
    coder's commits, so the PR is mergeable. An INFO event names the merge commit.
 
-An up-to-date branch is a silent no-op. The same is true of **no origin** (step
-1) and of the **wrong branch** (step 2) and **dirty worktree** (step 4) skips: no
-event and no body note, since there is nothing the owner can act on. Three
-outcomes DO publish an INFO event: a failed fetch (body untouched), and a refused
-merge or a real conflict (body gains the **Merge with main** section).
+An up-to-date branch is a silent no-op. The same is true of the three skips,
+**no origin** (step 1), **wrong branch** (step 2) and **dirty worktree** (step 4):
+no event and no body note, since there is nothing the owner can act on.
+
+Exactly three outcomes publish an INFO event: a failed fetch (body untouched),
+and a refused merge or a real conflict (body gains the **Merge with main**
+section). Every other delivery is silent, with one exception: a leftover merge
+(step 3) can coexist with a wrong branch or a dirty worktree, and the abort then
+discards staged work, which that skip cannot drop silently. Such a skip DOES
+publish an INFO event naming `refs/rework/pre-merge-abort`, so the discarded
+stash stays findable; a plain skip still adds no body note, and the merge
+paragraph is only ever appended for a refused merge or a real conflict.
 
 A real conflict is never guessed at. The conflicting paths are captured first
 (`git ls-files -u` plus `git diff --name-only --diff-filter=U`, so delete/modify
 conflicts are not invisible), then `git merge --abort` runs and is verified with
 `git rev-parse -q --verify MERGE_HEAD`. The branch is then exactly what the coder
-left, for COMMITTED work: same HEAD, no conflict markers, nothing staged (edits
-that were never committed were the coder's own leftovers, and the merge step
-does not preserve them). The push and the PR still happen, and the PR body gains
-a **Merge with main** section listing the conflicting paths so you see it in the
-PR; an INFO event carries the same list. If the abort itself fails, the event and
-the body say so and delivery continues: this step never blocks a PR and never
-fails a mission.
+left, for COMMITTED work: same HEAD, no conflict markers, nothing staged. (The
+dirty check in step 4 keeps uncommitted edits away from this step; the one thing
+an abort can discard is work staged inside a leftover merge, and step 3 pins
+that on `refs/rework/pre-merge-abort` first.) The push and the PR still happen,
+and the PR body gains a **Merge with main** section listing the conflicting
+paths so you see it in the PR; an INFO event carries the same list. If the
+abort itself fails, the event and the body say so and delivery continues: this
+step never blocks a PR and never fails a mission.
 
 A non-zero `git merge` exit is **not** automatically a conflict. When git
 REFUSES the merge instead of conflicting (unrelated histories, an `index.lock`
@@ -204,6 +215,11 @@ branch, and it uses the same configured author from the environment. The merge
 paragraph is **never persisted**: only the coder's own body is stored with a
 failed delivery, and a **Merge with main** section is recomputed on every
 attempt, so a retry that merges cleanly cannot republish an earlier conflict.
+To make that cleanup exact, the paragraph is appended behind the marker
+`<!-- rework:merge-note -->`, and a retry strips only from that marker (or, for
+a row stored by an older rework, a **Merge with main** section that is still the
+last thing in the body). A coder summary or auditor finding that itself quotes
+`## Merge with main` is published verbatim and never truncated.
 
 A sleeping Mac pauses every local mission: nothing fails, it just stops
 until the lid opens (seen 2026-11-09: four stalls that looked like hangs

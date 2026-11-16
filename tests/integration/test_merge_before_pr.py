@@ -977,3 +977,253 @@ async def test_a_persisted_body_with_an_old_merge_note_is_cleaned_on_retry(
         )
     finally:
         await store.aclose()
+
+
+async def test_a_coder_body_that_quotes_the_merge_heading_survives_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the paragraph THIS feature appended may be stripped.
+
+    `_pr_body` embeds the coder's finish summary and the auditor's findings in
+    the PR body verbatim, so a heading like `## Merge with main` can appear in
+    the middle of a body that has nothing to do with the merge step. Cutting
+    from the FIRST such heading truncated everything after it.
+    """
+    bare, work, other = _movable_repo(tmp_path)
+    pre_main_sha = _rev(bare, "refs/heads/main")
+    (other / "a.txt").write_text("line one\nanother mission's edit\n")
+    _commit(other, "another mission edits a.txt")
+    _git("push", "origin", "main", cwd=other)
+    fake_gh, body_file = _fake_gh(tmp_path)
+    monkeypatch.setenv("REWORK_GH_BIN", str(fake_gh))
+
+    user_body = (
+        "## What changed\n\nsummary with a heading:\n\n"
+        "## Merge with main\n\nwe merged main by hand earlier\n\n"
+        "## Tests\n\nall green\n"
+    )
+
+    async def failing_push(*_a: Any, **_k: Any) -> None:
+        raise RuntimeError("git push rejected: the remote hung up")
+
+    store = await open_sqlite(str(tmp_path / "userheading.sqlite3"))
+    try:
+        mission = await _done_mission(store, work, "muserhead001")
+        monkeypatch.setattr(delivery, "push_branch", failing_push)
+        first = await deliver_pr(
+            store,
+            InProcessEventBus(store),
+            mission.id,
+            branch=BRANCH,
+            worktree=str(work),
+            title="rework: Deliver",
+            body=user_body,
+        )
+        assert first is None, "attempt 1 must fail at the push"
+        pending = await store.get_mission(mission.id)
+        persisted = str(((pending.result if pending else None) or {}).get("pr_body") or "")
+        assert persisted == user_body, "the coder's own sections are stored untruncated"
+
+        # main stops conflicting so the retry merges cleanly and appends nothing
+        _git("reset", "--hard", pre_main_sha, cwd=other)
+        _git("push", "-f", "origin", f"{pre_main_sha}:main", cwd=other)
+        _advance_main(other, {"unrelated.txt": "landed while the PR was pending\n"})
+        monkeypatch.setattr(delivery, "push_branch", _REAL_PUSH)
+
+        ok, detail = await retry_pr(store, InProcessEventBus(store), mission.id)
+        assert ok, detail
+
+        body = body_file.read_text()
+        # the coder's mid-document heading and everything after it survive
+        assert "## Merge with main\n\nwe merged main by hand earlier" in body, body
+        assert "## Tests\n\nall green" in body, body
+        assert "<!-- rework:merge-note -->" not in body, "no note was appended here"
+        assert "Conflicting paths" not in body, body
+        assert "`a.txt`" not in body, "the retry must not claim a conflict that is gone"
+        assert body.startswith("## What changed"), body
+        assert (
+            "Merge origin/main into rework/test"
+            in _git("log", "--oneline", f"refs/heads/{BRANCH}", cwd=bare).stdout
+        )
+    finally:
+        await store.aclose()
+
+
+async def test_a_generated_note_is_stripped_from_a_body_that_quotes_the_heading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The generated note is still stripped on a retry when the persisted body
+    ALSO carries a user-written `## Merge with main` heading: the sentinel marks
+    where our paragraph starts, so the cut lands there and not at the first
+    heading."""
+    _bare, work, other = _movable_repo(tmp_path)
+    (other / "a.txt").write_text("line one\nanother mission's edit\n")
+    _commit(other, "another mission edits a.txt")
+    _git("push", "origin", "main", cwd=other)
+    fake_gh, body_file = _fake_gh(tmp_path)
+    monkeypatch.setenv("REWORK_GH_BIN", str(fake_gh))
+
+    user_body = (
+        "## What changed\n\nsummary with a heading:\n\n"
+        "## Merge with main\n\nwe merged main by hand earlier\n\n"
+        "## Tests\n\nall green\n"
+    )
+    # a row an earlier attempt persisted WITH the generated note, sentinel and all
+    persisted_note = "\n".join(
+        [
+            "## Merge with main",
+            "",
+            f"`main` was **not** merged into `{BRANCH}`: the merge conflicts, so "
+            "this branch needs a human to resolve it before merging.",
+            "",
+            "Conflicting paths:",
+            "",
+            "- `a.txt`",
+        ]
+    )
+    stale = delivery._body_with_merge_note(user_body, persisted_note)
+
+    store = await open_sqlite(str(tmp_path / "sentinel.sqlite3"))
+    try:
+        mission = await _done_mission(
+            store,
+            work,
+            "msentinel001",
+            pr_pending=True,
+            pr_branch=BRANCH,
+            pr_worktree=str(work),
+            pr_title="rework: Deliver",
+            pr_body=stale,
+        )
+        ok, detail = await retry_pr(store, InProcessEventBus(store), mission.id)
+        assert ok, detail
+        body = body_file.read_text()
+        assert "<!-- rework:merge-note -->" not in body, body
+        assert "Conflicting paths" not in body, body
+        assert "`a.txt`" not in body, body
+        # ... and the coder's own heading and its trailing sections are intact
+        assert "## Merge with main\n\nwe merged main by hand earlier" in body, body
+        assert "## Tests\n\nall green" in body, body
+        assert body.startswith("## What changed"), body
+    finally:
+        await store.aclose()
+
+
+# ---------------------------------------------------------------------------
+# staged work an abort would discard is kept on a ref, never silently lost
+# ---------------------------------------------------------------------------
+
+
+async def test_discarded_staged_work_is_pinned_on_the_pre_merge_abort_ref(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """docs/ops.md promises that work the abort of a leftover merge discards is
+    stashed (`git stash create`, which never touches the index or the tree) and
+    pinned on `refs/rework/pre-merge-abort` before `git merge --abort` runs.
+
+    Built by hand: a merge stopped mid-conflict, then a human RESOLVES it and
+    stages the resolution. `git merge --abort` throws that staging away, so
+    without the stash the only copy of the resolution would be gone.
+    """
+    _bare, work, other = _movable_repo(tmp_path)
+    (work / "a.txt").write_text("line one\ncoder's edit\n")
+    coder_tip = _commit(work, "coder edit")
+    _advance_main(other, {"a.txt": "line one\nanother mission's edit\n"})
+    _git("fetch", "origin", "main", cwd=work)
+    _stopped_merge(work)  # the crash: a merge stopped with an unmerged index
+    resolved = "line one\nboth edits, resolved by hand\n"
+    (work / "a.txt").write_text(resolved)
+    _git("add", "a.txt", cwd=work)  # the hand resolution is STAGED
+    assert _git("status", "--porcelain", cwd=work).stdout.strip() == "M  a.txt"
+
+    fake_gh, body_file = _fake_gh(tmp_path)
+    monkeypatch.setenv("REWORK_GH_BIN", str(fake_gh))
+
+    store = await open_sqlite(str(tmp_path / "discarded.sqlite3"))
+    try:
+        mission = await _done_mission(store, work, "mdiscarded01")
+        url = await deliver_pr(
+            store,
+            InProcessEventBus(store),
+            mission.id,
+            branch=BRANCH,
+            worktree=str(work),
+            title="rework: Deliver",
+            body="## What changed\n\nsomething\n",
+        )
+        assert url == "https://github.com/roowus/repo/pull/1"
+
+        # the discarded staging is recoverable: the ref holds a stash whose tree
+        # is the hand resolution, not the coder's tip
+        stash = _rev(work, "refs/rework/pre-merge-abort")
+        assert _git("cat-file", "-t", stash, cwd=work).stdout.strip() == "commit"
+        assert _git("show", f"{stash}:a.txt", cwd=work).stdout.rstrip("\n") == resolved.rstrip("\n")
+        # ... and it is not merely HEAD re-pointed: the branch is untouched
+        assert _rev(work, "HEAD") == coder_tip
+        assert not _merge_head_present(work), "the leftover merge must be aborted"
+        content = (work / "a.txt").read_text()
+        assert "<<<<<<<" not in content, content
+        assert content == "line one\ncoder's edit\n", content
+        assert _git("status", "--porcelain", cwd=work).stdout == "", "nothing may stay staged"
+
+        # the outcome is reported: the INFO event and the PR body name the ref
+        events = _merge_events(await _notes(store, mission.id))
+        assert events, "the discarded work must be reported"
+        assert events[0]["pre_merge_abort_ref"] == "refs/rework/pre-merge-abort", events
+        assert events[0]["pre_merge_abort_sha"] == stash, events
+        body = body_file.read_text()
+        assert "refs/rework/pre-merge-abort" in body, body
+        assert stash in body, body
+    finally:
+        await store.aclose()
+
+
+async def test_a_dirty_skip_that_discarded_staged_work_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dirty worktree is otherwise a silent skip, but when the leftover-merge
+    abort threw staged work away the owner must be able to find that stash: the
+    skip publishes an INFO event naming `refs/rework/pre-merge-abort`. The PR
+    body stays the coder's own (no **Merge with main** section)."""
+    bare, work, other = _movable_repo(tmp_path)
+    (work / "a.txt").write_text("line one\ncoder's edit\n")
+    coder_tip = _commit(work, "coder edit")
+    _advance_main(other, {"a.txt": "line one\nanother mission's edit\n"})
+    _git("fetch", "origin", "main", cwd=work)
+    _stopped_merge(work)
+    resolved = "line one\nboth edits, resolved by hand\n"
+    (work / "a.txt").write_text(resolved)
+    _git("add", "a.txt", cwd=work)
+    (work / "leftover.txt").write_text("the coder's own uncommitted note\n")
+    assert "leftover.txt" in _git("status", "--porcelain", cwd=work).stdout
+    fake_gh, body_file = _fake_gh(tmp_path)
+    monkeypatch.setenv("REWORK_GH_BIN", str(fake_gh))
+    body = "## What changed\n\nsomething\n"
+
+    store = await open_sqlite(str(tmp_path / "dirtyskip.sqlite3"))
+    try:
+        mission = await _done_mission(store, work, "mdirtyskip01")
+        url = await deliver_pr(
+            store,
+            InProcessEventBus(store),
+            mission.id,
+            branch=BRANCH,
+            worktree=str(work),
+            title="rework: Deliver",
+            body=body,
+        )
+        assert url == "https://github.com/roowus/repo/pull/1"
+        events = _merge_events(await _notes(store, mission.id))
+        assert len(events) == 1, events
+        assert events[0]["skipped_reason"] == "dirty-worktree", events
+        assert events[0]["pre_merge_abort_ref"] == "refs/rework/pre-merge-abort", events
+        stash = events[0]["pre_merge_abort_sha"]
+        assert _git("show", f"{stash}:a.txt", cwd=work).stdout.rstrip("\n") == resolved.rstrip("\n")
+        assert body_file.read_text() == body, "a skip adds no body note"
+        assert not _merge_head_present(work), "the leftover merge must be aborted"
+        assert _rev(work, "HEAD") == coder_tip
+        assert "<<<<<<<" not in (work / "a.txt").read_text()
+        assert (work / "leftover.txt").read_text() == "the coder's own uncommitted note\n"
+        assert not _is_ancestor(bare, _rev(bare, "refs/heads/main"), coder_tip)
+    finally:
+        await store.aclose()
