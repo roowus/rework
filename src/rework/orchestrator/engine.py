@@ -35,6 +35,7 @@ from rework.kernel.llm.catalog import ModelCatalog, ModelProvider, UnknownModelE
 from rework.kernel.state.records import (
     EventRecord,
     EventType,
+    Gate,
     GateKind,
     GateStatus,
     Mission,
@@ -700,7 +701,17 @@ class MissionRunner:
                     index += 1
                     steps[index:index] = [{**step}]
                     continue
-            if step.get("on_request_changes") and fresh is not None:
+            if (
+                step.get("on_request_changes")
+                and fresh is not None
+                and fresh.status == RunStatus.COMPLETED
+                and fresh.artifact
+            ):
+                # only a FINISHED audit that produced an artifact may stand in
+                # for "the last audit": a failed one carries an empty artifact,
+                # and handing that on would hide the round that ended the
+                # mission (the orchestrator path's _results_by_role already
+                # requires COMPLETED for the same reason)
                 last_audit_artifact = fresh.artifact
 
             # routing rule: an audit that requests changes sends the revise
@@ -774,13 +785,10 @@ class MissionRunner:
         ship_decision: bool | None = None
         if "ship" in gates_spec:
             gate = await self._latest_gate_of_kind(GateKind.SHIP)
+            verdict, round_text = await self._audit_stamp(mission.id, last_audit_artifact)
+            question = f"Ship the mission result? audit verdict: {verdict}{round_text}"
             if gate is None:
-                verdict = mechanical_verdict(last_audit_artifact)
-                gate = await self._gates.request(
-                    mission.id,
-                    kind=GateKind.SHIP,
-                    question=f"Ship the mission result? audit verdict: {verdict}",
-                )
+                gate = await self._gates.request(mission.id, kind=GateKind.SHIP, question=question)
                 await self._bus.publish(
                     EventRecord(
                         mission_id=mission.id,
@@ -788,6 +796,8 @@ class MissionRunner:
                         payload={"note": f"ship gate {gate.id} open (verdict: {verdict})"},
                     )
                 )
+            else:
+                gate = await self._refresh_gate_question(gate, question)
             if gate.status == GateStatus.OPEN:
                 await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
             ship_decision = await self._gate_decision(mission.id, gate.id)
@@ -832,20 +842,19 @@ class MissionRunner:
 
         if want_gate:
             gate = await self._latest_gate_of_kind(GateKind.OPEN_PR)
+            verdict, round_text = await self._audit_stamp(mission.id, last_audit_artifact)
+            question = f"Open a pull request for this change? audit verdict: {verdict}{round_text}"
+            if reason:
+                # the strict gate (issue #36): the category leads, then why
+                label = gate_category or "unspecified"
+                question += f". Gate category: {label} — {reason}"
+            elif setting == "always":
+                # forced by the project setting, no category to show: say so
+                # instead of printing an empty one
+                question += (
+                    ". Forced by project setting pr_gate=always; the orchestrator named no category"
+                )
             if gate is None:
-                verdict = mechanical_verdict(last_audit_artifact)
-                question = f"Open a pull request for this change? audit verdict: {verdict}"
-                if reason:
-                    # the strict gate (issue #36): the category leads, then why
-                    label = gate_category or "unspecified"
-                    question += f". Gate category: {label} — {reason}"
-                elif setting == "always":
-                    # forced by the project setting, no category to show: say so
-                    # instead of printing an empty one
-                    question += (
-                        ". Forced by project setting pr_gate=always; "
-                        "the orchestrator named no category"
-                    )
                 gate = await self._gates.request(
                     mission.id, kind=GateKind.OPEN_PR, question=question
                 )
@@ -856,6 +865,8 @@ class MissionRunner:
                         payload={"note": f"open_pr gate {gate.id} open (verdict: {verdict})"},
                     )
                 )
+            else:
+                gate = await self._refresh_gate_question(gate, question)
             if gate.status == GateStatus.OPEN:
                 await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
             pr_approved = await self._gate_decision(mission.id, gate.id)
@@ -868,6 +879,56 @@ class MissionRunner:
             pr_url = await self._create_pr(mission, results)
 
         return ship_decision, pr_url, None
+
+    async def _audit_stamp(
+        self, mission_id: str, last_audit_artifact: dict[str, Any] | None
+    ) -> tuple[str, str]:
+        """The audit the mission FINISHED on, as (verdict, round text).
+
+        One store read: every auditor run of the mission, ordered by
+        (created_at, id) so the order is stable even when two runs were created
+        in the same instant (with `created_at` alone the verdict would flip on
+        the DB's return order). The parenthetical counts RUNS, not review
+        rounds: a run is the unit this engine can name deterministically, and a
+        parallel fan-out of auditors over one review legitimately counts as
+        more than one. The last run of that order is the final round; it is
+        still a round when it produced nothing, so it is always named.
+
+        The verdict comes from that final run's artifact and ONLY when the run
+        actually produced one: FAILED, or COMPLETED with no artifact, means
+        `mechanical_verdict(None)`, the fail-closed "not audited". Filtering the
+        empty round away instead would quote an earlier clean round at the very
+        moment the mission's last audit had nothing to say.
+
+        This is deliberately authoritative rather than the caller's
+        `last_audit_artifact`: that value can be one round behind. With no
+        auditor run at all there is nothing to count, so the argument is used
+        and the round is left out instead of the gate failing."""
+        audits = sorted(
+            (r for r in await self._store.list_runs(mission_id) if r.role == "auditor"),
+            key=lambda r: (r.created_at, r.id),
+        )
+        if not audits:
+            return mechanical_verdict(last_audit_artifact), ""
+        final = audits[-1]
+        artifact = final.artifact if final.status == RunStatus.COMPLETED else None
+        return mechanical_verdict(artifact), f" (round {len(audits)} of {len(audits)})"
+
+    async def _refresh_gate_question(self, gate: Gate, question: str) -> Gate:
+        """Keep a REUSED gate's question in step with the audit it asks about.
+
+        A gate row is reused across audit rounds (a restart must not open a
+        duplicate gate for a decision already given), so its stored text would
+        otherwise stay frozen at the round that first opened it: found live, an
+        open_pr gate read "audit verdict: request changes" while the final
+        round had no findings at all. Identical text means nothing at all
+        happens (no write, no event); an OPEN gate is re-worded and the refresh
+        is published as INFO; a DECIDED gate is never re-worded, because its
+        text is the record of what the owner saw when answering. The caller
+        already holds the row it just looked up, so `reword` takes it instead
+        of reading the same gate a second time."""
+        refreshed = await self._gates.reword(gate, question)
+        return refreshed if refreshed is not None else gate
 
     async def _deliver_branch(self, mission: Mission, results: dict[str, Run]) -> None:
         """Honor the project's `results` setting on ship (ADR 0005): for a

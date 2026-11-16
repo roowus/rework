@@ -163,6 +163,27 @@ async def test_gate_lifecycle(store: StateStore) -> None:
     assert again.decision_note == "lgtm"  # first decision stands
 
 
+async def test_set_gate_question_rewords_an_open_gate_only(store: StateStore) -> None:
+    """A final gate is reused across audit rounds, so its question has to be
+    re-wordable while it is open. A decided gate is the record of what the
+    owner answered: its text never changes."""
+    m = await store.create_mission(Mission(id=new_id("m"), objective="o"))
+    gate = Gate(id=new_id("gate"), mission_id=m.id, kind=GateKind.SHIP, question="ship? r1")
+    await store.create_gate(gate)
+
+    refreshed = await store.set_gate_question(gate.id, "ship? r2")
+    assert refreshed is not None and refreshed.question == "ship? r2"
+    assert refreshed.status == GateStatus.OPEN
+    stored = await store.get_gate(gate.id)
+    assert stored is not None and stored.question == "ship? r2"
+
+    await store.decide_gate(gate.id, approved=True, note="lgtm")
+    refused = await store.set_gate_question(gate.id, "ship? r3")
+    assert refused is not None and refused.question == "ship? r2", "a decided gate is frozen"
+    assert refused.status == GateStatus.APPROVED
+    assert await store.set_gate_question("missing", "whatever") is None
+
+
 async def test_events_seq_cursor(store: StateStore) -> None:
     m = await store.create_mission(Mission(id=new_id("m"), objective="o"))
     other = await store.create_mission(Mission(id=new_id("m"), objective="p"))

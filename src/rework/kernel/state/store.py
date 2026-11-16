@@ -140,6 +140,17 @@ class StateStore(Protocol):
         the mission returns to `running` with the owner's feedback)."""
         ...
 
+    async def set_gate_question(self, gate_id: str, question: str) -> Gate | None:
+        """Re-word an OPEN gate's question in place and hand the row back.
+
+        Only a gate that is still OPEN may be re-worded: what a DECIDED gate
+        says is the record of what the owner actually answered, so a refused
+        write leaves that row untouched (and still returns it). The final
+        gates use this to keep "audit verdict: ... (round N of M)" in step with
+        the audit the mission really finished on, instead of the round that
+        first opened the row."""
+        ...
+
     async def list_open_gates(self, mission_id: str | None = None) -> list[Gate]: ...
 
     async def list_gates(self, mission_id: str | None = None) -> list[Gate]: ...
