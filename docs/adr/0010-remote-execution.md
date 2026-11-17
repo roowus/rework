@@ -434,8 +434,8 @@ on a machine that comes and goes.
 | `GET /remote/hosts` | enrolled host list and last heartbeat, for the CLI and TUI |
 | `GET /healthz` | existing route, reused by the worker for reachability checks |
 
-**Message kinds.** Every message, in both directions, carries `protocol_version`. Twelve kinds
-on the wire (the table also lists CANCEL, which never travels as its own request):
+**Message kinds.** Every message, in both directions, carries `protocol_version`. Twelve kinds,
+the last of which (CANCEL) never travels as its own request:
 
 | Kind | Direction | Payload (abridged) |
 |---|---|---|
