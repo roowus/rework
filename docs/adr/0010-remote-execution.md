@@ -13,9 +13,10 @@ design first, with the file-level plan attached, is the honest form of that revi
 verified yet, so what the reader gets is exact paths, exact strings and named rejected alternatives
 instead of a claim that it works.
 
-It moves to Accepted when phase 1 has landed and been verified on rewver: one role's `run_command`
-executes on rewver, the output reaches the TUI as ordinary trajectory rows for that run, and the
-mission record names the host. Nothing wider than that is needed to flip the status.
+It moves to Accepted when phase 1 has landed and been verified on rewver: a placed role's
+`run_command`, `read_file` and `list_dir` all execute on rewver, their output reaches the TUI as
+ordinary trajectory rows for that run, and the mission record and the run record name the host.
+Nothing wider than that is needed to flip the status.
 
 ## Context
 
@@ -33,13 +34,13 @@ wrong:
 | Concurrency | `RoleLimiter`, `PrioritySlots`, `MissionSlot` | `src/rework/orchestrator/limits.py:22`, `:121`, `:198` |
 | Capacity control | `measure`, `plan`, `CapacitySettings`, `CapacityPolicy`, `auto_state`, `DynamicCapacity`; retunes the two caps through `set_capacity` / `set_cap` | `src/rework/orchestrator/capacity.py:165`, `:197`, `:220`, `:280`, `:444`, `:467` |
 | State schema | `CREATE TABLE IF NOT EXISTS` plus an inline check-then-alter list in each store; no migrations directory, no version counter | `src/rework/kernel/state/sqlite.py:45`, `:1175`; `src/rework/kernel/state/postgres.py:46`, `:1307` |
-| Transport | aiohttp app with a workspace API, mounted on the daemon's own loop | `src/rework/orchestrator/workspace.py`, `build_workspace_app` (`:529`), `start_workspace_server` |
+| Transport | aiohttp app with a workspace API, mounted on the daemon's own loop | `src/rework/orchestrator/workspace.py`, `build_workspace_app` (`:530`), `start_workspace_server` |
 | Auth | one shared bearer string, `REWORK_TOKEN`; absent token means open | `src/rework/orchestrator/workspace.py:519`, `:523`-`:527` |
 | Bind | loopback by default, tailnet when `REWORK_HTTP_HOST` says so | `default_bind` in `src/rework/orchestrator/workspace.py` |
 | Host targets | `targets.toml` carries `daemon_url` and `ssh` per named target | `src/rework/targets.py`, `Target` |
 | Git identity | one deployment-wide author, `rework <rework@rework.local>` | `src/rework/config.py:157`-`:162`; `DEFAULT_GIT_AUTHOR` at `src/rework/nodes/git_ops.py:20` |
 | Commit path | `commit()` passes `-c user.name` / `-c user.email` explicitly | `src/rework/nodes/git_ops.py:238` |
-| TUI | polls the database; mission rows from `MissionCard`, live output from the `#chat-log` `Trajectory` | `src/rework/tui/widgets/cards.py:178`, `:50`; `src/rework/tui/views/work.py:98` |
+| TUI | polls the database; mission rows from `MissionCard`, live output from the `#chat-log` `Trajectory` | `src/rework/tui/widgets/cards.py:178`, `:50`; `src/rework/tui/views/work.py:170`, `:532` |
 
 Three corrections to the obvious reading of the code, because the plan depends on them:
 
@@ -114,29 +115,30 @@ binding point, not a second home: `LazyExecutor.attach` (`:105`-`:106`) hard-cod
 executor) instead (R11). Roles call `executor.execute(name, args)` and never learn where the
 process ran.
 
-**What the seam covers, and what it does not.** `execute("run_command", ...)` becomes remote. Nothing
-else does. Every other tool in a role's toolset is still pure Python running on the daemon against
-`self._workdir`: `read_file`, `list_dir` and `file_complaint` are branches and wrappers of the same
-`LocalExecutor` (`execute` at `src/rework/nodes/tools.py:191`, `BUILTIN_TOOLS` at `:22`), and
-`ask_orchestrator`, the web tools and the library tools are wrapper layers built on top of it. The
-coder's handoff is daemon-side too: `stage_all` (`src/rework/nodes/git_ops.py:182`),
-`unstage_nested_repos` (`:202`), `commit` (`:237`) and `diff_base` (`:262`) all take a local path,
-and the coder stores `"worktree": str(wt)` (`src/rework/roles/builtin/coder.py:213`) in its
-artifact. The auditor's and the investigator's read root is `ctx.read_root`, a daemon path
-(`src/rework/roles/builtin/investigator.py:116`). Enclosing only the subprocess spawn is therefore
-**not** sufficient for a remote coder run, and R2.1 turns that into a hard placement gate instead
-of a footnote. What the seam does buy is that the decision is one object, so the diff stays
-reviewable (a new module plus a factory) and every existing role test stays valid. Putting the decision above
-the executor level, for example in the plan or in `command_prefix`, would either duplicate the tool
-loop on the host or require a second copy of `rework`'s jail semantics in a shell string.
+**What the seam covers, and what it does not.** In phase 1 three tools become remote:
+`run_command`, and also `read_file` and `list_dir`, because all three read or run inside the run's
+working tree. R2.1 sorts the whole toolbox on exactly that line and is the authoritative statement of
+it; the short version is that a tool which touches the working tree must run where the tree is, and a
+tool that does not touch it keeps running on the daemon wherever the job is placed. What stays
+daemon-side in phase 1 is therefore the coder's handoff, not the file reads: `stage_all`
+(`src/rework/nodes/git_ops.py:182`), `unstage_nested_repos` (`:202`), `commit` (`:237`) and
+`diff_base` (`:262`) all take a local path, and the coder stores `"worktree": str(wt)`
+(`src/rework/roles/builtin/coder.py:213`) in its artifact. Enclosing only the subprocess spawn is
+therefore **not** sufficient for a remote coder run, and R2.1 turns that into a hard placement gate
+instead of a footnote. `file_complaint` is the one tool whose classification is not obvious from its
+name and it is settled in R2.1. What the seam buys is that the decision is one object, so the diff
+stays reviewable (a new module plus a factory) and every existing role test stays valid. Putting the
+decision above the executor level, for example in the plan or in `command_prefix`, would either
+duplicate the tool loop on the host or require a second copy of `rework`'s jail semantics in a shell
+string.
 
 **Consequences to state plainly.** A remote host runs its own `command_prefix`, never the daemon's:
 the memory cap it applies is the host's own `MemoryMax`/`ulimit` policy, and `LocalExecutor`'s own
 docstring already concedes that the `run_command` memory cap is advisory. A remote host inherits
 that weakness, and this ADR does not fix it. One further consequence, stated once here and relied on
-by R2.1 and R4: an artifact carrying a daemon-local `"worktree"` path must not be produced by a
-remote run in phase 1, and RESULT must never carry a path the daemon will later use as if it were
-local.
+by R2.1 and R4: a job carries only its own workspace, so an artifact carrying a daemon-local
+`"worktree"` path must not be produced by a remote run in phase 1, and RESULT must never carry a path
+the daemon will later use as if it were local.
 
 **Rejected.** Replicating `rework` or the state database to hosts (two writers, split brain, and the
 daemon's schema discipline would have to ship as a second deployable). A second full daemon per host
@@ -175,48 +177,129 @@ daemon-side decision at all.
 
 #### R2.1: the toolset gate
 
-**Recommendation.** A host may be chosen for a run only if every tool the role can call is in the
-remote-capable set, and in phase 1 that set is exactly `{run_command}`. A role whose toolset includes
-anything else is not placeable on a host: the policy refuses, with a reason string naming the first
-non-remote-capable tool, for example
-`role coder is not placeable on a host: ask_orchestrator is not remote-capable`.
+**Recommendation.** A host may be chosen for a run only if every *worktree-bound* tool in the role's
+toolset is remote-capable, and in phase 1 that set is exactly `{run_command, read_file, list_dir}`. A
+role whose toolset includes a worktree-bound tool outside that set is not placeable on a host: the
+policy refuses, with a reason string naming the first such tool. The phase 1 set as written above
+already covers every worktree-bound tool that exists today, so on the tool axis alone no existing role
+is refused. The coder is refused anyway, and for a reason the gate has to carry by name: its toolset
+is placeable but its handoff is a daemon path (stated under "what it still refuses" below).
 
-**What the non-remote set is, read from the code.** Every tool that exists today is answered either
-by a branch of `LocalExecutor.execute` (`src/rework/nodes/tools.py:191`) or by one of the wrappers
-that compose around it: `read_file`, `list_dir`, `run_command` in `BUILTIN_TOOLS`
-(`src/rework/nodes/tools.py:22`), `file_complaint` (`COMPLAINT_SPEC`, `:57`), `ask_orchestrator`
-(`src/rework/nodes/escalate.py:27`), `web_search` and `fetch_url` (`src/rework/web/tools.py:19`), and
-`library_search`, `library_read`, `library_contribute` (`src/rework/library/tools.py:123`). There is
-no file-writing or patch tool at all: the coder edits files through `run_command` (heredocs,
-`git apply`), not through a write tool.
+**The partition, read from the code.** Every tool that exists today is answered either by a branch of
+`LocalExecutor.execute` (`src/rework/nodes/tools.py:191`) or by one of the wrappers that compose around
+it. The toolset partitions cleanly into two classes, and the distinction is real rather than a
+convenience: it is the working tree that decides where a tool has to run, not the process that
+implements it.
+
+*Class 1, worktree-bound: the tool needs the run's working tree, so it must run where the tree is.*
+
+| Tool | Why it is worktree-bound | Anchor |
+|---|---|---|
+| `run_command` | the subprocess is spawned with `cwd=str(self._workdir)` inside the jail | `src/rework/nodes/tools.py:209`, `:233`, `:235` |
+| `read_file` | resolves the path through the jail, then reads it | `src/rework/nodes/tools.py:193`, `_jail` at `:160` |
+| `list_dir` | resolves the path through the jail, then lists it | `src/rework/nodes/tools.py:200`, `_jail` at `:160` |
+
+`file_complaint` is worktree-bound **only** in the sense that its spec is appended to whatever
+executor the role built: it is not a `LocalExecutor` branch at all. It is answered by the
+`ComplaintAwareExecutor` wrapper (`src/rework/nodes/tools.py:474`), whose `execute` writes a
+`Complaint` row through the store (`:511`) and delegates everything else untouched; it reads no file
+and names no path. It is therefore *class 2 in behaviour*, and this ADR's placement rule does not
+count it: keeping `file_complaint` answered on the daemon is one row insert, and it is the daemon that
+owns the complaints table anyway (R9: no state database on the host, so it could not be answered on
+the host even in principle). The wrapper's `specs()` (`:515`) appends the same spec regardless of
+where the inner executor runs, so a placed role keeps the tool and its tests stay valid. Saying it
+plainly once, because the name invites the opposite reading: **`file_complaint` is not a reason to
+refuse placement.**
+
+*Class 2, worktree-free: the tool never touches the working tree, so it runs on the daemon wherever
+the job is placed, and it does not constrain placement.*
+
+| Tool | What it actually touches | Anchor |
+|---|---|---|
+| `ask_orchestrator` | the run row and the daemon's event bus: a blocking row write, no local path | `src/rework/nodes/escalate.py:27`, wrapper `specs()` at `:62` |
+| `web_search`, `fetch_url` | HTTP to the search backend and to public URLs | `src/rework/web/tools.py:19` |
+| `library_search`, `library_read`, `library_contribute` | the Library handle on the daemon | `src/rework/library/tools.py:123` |
+
+There is no file-writing or patch tool at all: the coder edits files through `run_command` (heredocs,
+`git apply`), not through a write tool. That is why the phase 1 remote-capable set can be exactly the
+three worktree-bound tools and still be honest about reading versus writing: the only way to write a
+file is `run_command`, which is already remote.
+
+**What that buys, concretely.** `read_file` and `list_dir` are two trivial worker messages (a path in,
+bytes or an entry list out), and they are cheap in a way that matters: leaving them daemon-side would
+have made every real role unplaceable, because no builtin role's toolset is `run_command` alone. Putting
+them in phase 1 is what makes **any** role placeable at all. Read from the per-role wrap chains, three
+roles become placeable on a host once the phase 1 set is `{run_command, read_file, list_dir}`:
+
+- **auditor**: `library_executor(ctx, ComplaintAwareExecutor(EscalationAwareExecutor(LocalExecutor(...),
+  ctx), ...))` (`src/rework/roles/builtin/auditor.py:192`-`:199`) with no `web_executor`: every
+  worktree-bound tool it can call is one of the three.
+- **investigator**: `web_executor(library_executor(ctx, ComplaintAwareExecutor(
+  EscalationAwareExecutor(LocalExecutor(ctx.read_root, ...), ctx), ...)))`
+  (`src/rework/roles/builtin/investigator.py:107`-`:115`): the two web tools are class 2, so they
+  neither block placement nor move.
+- **coder**: the same chain shape (`src/rework/roles/builtin/coder.py:236`-`:244`) reaches the
+  worktree through `LazyExecutor` (`:91`, attached at `:128`), and its tool loop calls
+  `executor.specs()` with no allowed set (`src/rework/nodes/toolloop.py:293`), so its toolset is the
+  same three plus class 2.
+
+**What it still refuses, and why: the coder does not become placeable in phase 1.** Its *toolset* is
+fine; its *handoff* is not. After the loop the coder node runs `stage_all` (`:188`), `unstage_nested_repos`,
+`commit` with `author=ctx.git_author` (`:205`) and `diff_base` (`:206`) against a local `Path`, and it
+stores `"worktree": str(wt)` in the artifact (`:213`). A remote coder would therefore produce no commit
+and no diff: the run would look green and deliver nothing, which is the exact defect this gate exists to
+prevent. The coder's file and git path is phase 2 work (R10, R11), so the coder is a phase 2 role. The
+`echo` role is not the counterexample it looks like: it is the M1 stub and makes no tool calls at all
+(`src/rework/roles/builtin/echo.py`, no `ToolExecutor` in its graph), so it is trivially placeable and
+tests nothing about this gate.
+
+**The invariant that keeps this from rotting.** A role is placeable if and only if every worktree-bound
+tool it can call has a worker implementation, and any new worktree-bound tool added later is
+daemon-only by default until it is given one. That is the general rule, and it is what makes the gate
+safe rather than a one-off: the phase 1 set is a snapshot of the codebase today, while the rule is what
+holds when someone adds `write_file` or `apply_patch` next quarter. It is a necessary condition, not a
+sufficient one, and the coder is the standing example: code in the role itself that reaches for a
+daemon path outside the tool loop (the handoff) blocks placement just as hard as a tool without a
+worker, so the gate carries a second, explicitly named refusal for it, and phase 2 removes the refusal
+by moving the handoff, not by widening the tool set. Enforced by reading the composed executor's
+`specs()` and matching against a named set in one module (R11), never by a comment.
 
 **Where the toolset is actually declared.** Not in `RoleSpec.tools`: the declarative `ToolPack.allowed`
 field (`src/rework/roles/base.py:54`, used at `:108`) is dead code that nothing reads, exactly as the
 `src/rework/web/tools.py:5` comment says, so a tool registered there would never appear. A role's real
 toolset is the wrapper chain it builds at its own `make_toolloop_node` call
 (`src/rework/roles/builtin/coder.py:236`-`:244`, `auditor.py:192`-`:199`,
-`investigator.py:107`-`:115`). All three builtin roles wrap `ComplaintAwareExecutor`,
-`EscalationAwareExecutor`, `library_executor` and (for two of them) `web_executor`, so all three carry
-non-remote tools today and none of them is placeable on a host in phase 1. The gate therefore reads
-the composed executor's `specs()`, not a declarative field.
+`investigator.py:107`-`:115`), and the loop asks for it with no allowed set
+(`src/rework/nodes/toolloop.py:293`), which is why narrowing a role by declaring a `ToolPack` would
+change nothing. All three builtin roles compose the same layers: `LocalExecutor` (or the coder's
+`LazyExecutor`), then `EscalationAwareExecutor`, then `ComplaintAwareExecutor`, then
+`library_executor`, then (for the coder and the investigator) `web_executor`. Because every one of
+those wrapper layers answers class 2 tools and delegates the rest, the composed toolset is the three
+worktree-bound tools plus class 2 tools, and the gate reduces to: are the three worktree-bound tools
+remote-capable? The gate therefore reads the composed executor's `specs()`, not a declarative field.
 
 **`prefer_host` cannot override the gate.** R2 already makes the policy the sole arbiter of an
 explicit request, and this is that rule applied to one of its inputs: a pin narrows the candidate set,
 and an empty candidate set stays empty. An explicit request that fails the gate is refused with the
 tool name, never silently downgraded to a remote run that cannot finish.
 
-**What phase 1 still delivers.** Test suites, lint matrices, soak and fuzz runs, doc builds, and any
-role that shells out without editing files: in one line, a role whose whole toolset is
-`run_command`.
+**What phase 1 delivers.** Every role whose remaining daemon-side work is class 2 only, which is the
+auditor and the investigator (named above), and with them the workloads that motivated this ADR: test
+suites, lint matrices, soak and fuzz runs, doc builds, and the Playwright case once phase 3 adds
+browsers. In one line: a role that reads and runs inside its working tree, and whose result is the text
+it reports.
 
-**What it does not deliver yet.** A coder role that edits files, an auditor or investigator that reads
-them, and any run whose result depends on a commit or a diff. Those need R10 phase 2.
+**What it does not deliver yet.** No remote coder: a coder's result is a commit and a diff, and both
+are still produced daemon-side, so a remote coder would report success with nothing to show. That is
+R10 phase 2, together with the remote file API and the on-host git path.
 
 **Rejected.** A warning instead of a refusal (produces a remote coder run with no commit and no diff,
-which is the defect this gate exists to prevent). Proxying `read_file` back to the daemon per call
-while leaving the handoff local (the half-remote state R1 describes, and it would make a remote run
-depend on a daemon path that does not exist on the host). Inferring capability from what the model
-says it needs instead of from the toolset (the toolset is a fact about the code; the intent is not).
+which is the defect this gate exists to prevent). Keeping `read_file` and `list_dir` local in phase 1
+and accepting that no existing role can be placed (an accurate gate that certifies nothing). Proxying
+`read_file` back to the daemon per call while leaving the handoff local (the half-remote state R1
+describes, and it would make a remote run depend on a daemon path that does not exist on the host).
+Inferring capability from what the model says it needs instead of from the toolset (the toolset is a
+fact about the code; the intent is not).
 
 ### R3: one fresh clone per job, on the host, proven by SHA and tree
 
@@ -385,6 +468,10 @@ operational surface for a two-host tailnet).
 **Recommendation.** A commit made by a job on host `H` in project `P` carries author name
 `rework+H` and author email `P-sanitised@rework+H.rewis` when the job is project-scoped, and
 `rework+H@rewis` when it is not. Both parts are derived, never hand-edited into the repo.
+
+**When it is implemented.** R5 is a decision, not a phase 1 deliverable: phase 1 makes no remote
+commit, so nothing in phase 1 can carry this identity. The derivation and the `git_ops.commit` change
+land in R10 phase 2, the first phase in which a remote job commits.
 
 Sanitisation rule for an email local part (applies to the project name and to the host name):
 
@@ -583,8 +670,12 @@ Not in scope, deliberately and completely:
 - No automatic host discovery: enrolment is explicit and out of band.
 - No Windows.
 - No shared or network-mounted workspace.
-- No remote file editing, no remote commit and no remote diff in phase 1 (R2.1): the file tools,
-  `stage_all`, `commit` and `diff_base` all stay daemon-side until R10 phase 2.
+- No remote commit and no remote diff in phase 1, and no remote coder worktree handoff: `stage_all`,
+  `commit` and `diff_base` stay daemon-side until R10 phase 2, so a remote role cannot produce a commit
+  or a diff and the coder is a phase 2 role (R2.1). Reading is not editing: `read_file` and `list_dir`
+  are worktree-bound and therefore go remote in phase 1, and the only tool that can change a file is
+  `run_command`, which is remote in phase 1 too. What phase 1 lacks is the committing of those edits,
+  not the reading and not the running.
 - No orchestrator or scheduling logic inside the worker: it claims, executes, reports.
 - No protocol feature whose absence a single box cannot reveal (multi-daemon consensus, cross-host
   ordering, distributed locks).
@@ -665,40 +756,62 @@ does not do yet.
 ### Phase 1: the protocol, the worker, the `RemoteExecutor`, one host by name
 
 **Lands.** R4's protocol and endpoints, the stdlib-only worker, `RemoteExecutor` implementing
-`ToolExecutor` (R1), per-host enrolment token issuance and verification (R6a), and one host
-configured by explicit name in config (no registry, no capability filtering yet). The R2.1 toolset
-gate lands here as well, because it is the only placement rule phase 1 has: the placeable set is a
-role whose whole toolset is `run_command`. R5's identity
-derivation lands here too, because the commits a remote job makes need it from day one.
+`ToolExecutor` (R1), per-host enrolment token issuance and verification (R6a), and one host configured
+by explicit name in config (no registry, no capability filtering yet). The R2.1 toolset gate lands
+here as well, because it is the only placement rule phase 1 has, and so do the worker messages for the
+three worktree-bound tools: `run_command`, `read_file` and `list_dir`. Those three are what make the
+auditor and the investigator placeable in phase 1 (R2.1).
 
-**Proves it works.** One role's `run_command` executes on rewver, and the trajectory rows appear in
-the TUI exactly as they would locally, with the host named in the mission record. Concretely: a
-mission whose single step is a `run_command` that prints a marker; the marker appears in the run's
-`#chat-log`; `git log --format='%an %ae'` on the resulting commit shows
-`rework+rewver <rework@rework+rewver.rewis>`; the run row carries `host = "rewver"`.
+**Proves it works.** A placed role's three worktree-bound tools all execute on rewver, their output
+reaches the TUI as ordinary trajectory rows for that run, and both records name the host. Concretely,
+with an auditor run placed on rewver against a real project:
+
+1. `run_command` prints a marker on the host and it appears in the run's `#chat-log` row by row, exactly
+   as a local run's output does, because it is the same trajectory event kind (no new channel).
+2. `read_file` and `list_dir` answer from the host's own workspace: a file the daemon does not have at
+   that path is readable, and a path that exists only on the daemon is not. The entry list comes back
+   from the host's tree, and `read_file` of a path outside the workspace is refused with the host's own
+   jail error, not the daemon's.
+3. The run row carries `host = "rewver"` and the mission record names the host that ran the step.
+
+Phase 1 makes **no** remote commit and **no** remote diff, so nothing here inspects a commit authored
+on rewver: there is none to inspect. R5 is a decision, not a phase 1 deliverable: its derivation and
+the `git_ops.commit` change land in phase 2, where a remote job actually commits.
 
 **Does not do yet.** No capability filtering, no `requires`, no per-host slot pools, no lease expiry
-and re-queue, no artifacts, no revocation tooling. And, by R2.1: no remote file editing, no remote
-commit, no remote diff.
+and re-queue (phase 2 owns both, and phase 2 proves them), no artifacts, no revocation tooling. And, by
+R2.1 and R9: no remote write to the working tree (the only tool that can write is `run_command`, which
+is why it is remote in phase 1, but no remote commit and no remote diff), and no remote coder.
 
 ### Phase 2: the registry, capabilities, requirements, leases
 
 **Lands.** `HostRegistry` and the capability vocabulary (R7), `requires` on steps and roles, the
 placement policy with the R2 precedence rule, per-host slot pools in `limits.py`, lease expiry and
-re-queue (R8's first three rows), and the retry budget. Two more things land in phase 2 and are the
-reason it is bigger than phase 1: the **remote file API** (the file-touching tools become messages
-to the worker, so `read_file`, `list_dir` and any later write or patch tool answer from the host's
-own workspace) and the **on-host git path** (stage, commit and diff are produced on the host and
-shipped back in RESULT, so no daemon-local path is ever handed to a remote run).
+re-queue (R8's first three rows), and the retry budget. Three more things land in phase 2 and are the
+reason it is bigger than phase 1:
 
-**Recommendation on the file tools.** Reimplement them as protocol messages handled by the worker,
-for the same reason `run_command` is a message: one jail implementation, one place a path is
-resolved, one place to bound size. The obvious shortcut, rejected: `rsync` or a shared mount of the
-worktree back to the daemon, which breaks R3's one-fresh-clone-per-job rule and reinstates every
-failure the R3 table removes.
+- the **authoring side of the file API**: a write or patch tool, so a role can change files through a
+  message instead of a heredoc. The *reading* half is already phase 1 work, because a role that
+  cannot read cannot do anything useful on a host.
+- the **on-host git path**: stage, commit and diff are produced on the host and shipped back in
+  RESULT, so no daemon-local path is ever handed to a remote run. This is what makes the coder
+  placeable.
+- **R5's identity, implemented**: the derivation wired next to `Config.git_author`
+  (`src/rework/config.py:157`-`:162`) and `git_ops.commit` taking the derived author. R5's design,
+  exact strings and worked examples are unchanged and already decided; only its implementation moves
+  here, because this is the first phase in which a remote job commits anything.
+
+**Recommendation on the file tools.** Serve them from the worker's own jail, for the same reason
+`run_command` is served there: one jail implementation, one place a path is resolved, one place to
+bound size. The obvious shortcut, rejected: `rsync` or a shared mount of the worktree back to the
+daemon, which breaks R3's one-fresh-clone-per-job rule and reinstates every failure the R3 table
+removes.
 
 **Proves it works.** A suite tagged `cpus>=4` lands on rewver while an untagged role stays local; a
-`kill -9` on the worker mid-job re-queues the run and it completes on the next attempt.
+`kill -9` on the worker mid-job re-queues the run and it completes on the next attempt; and a coder
+placed on rewver produces a real commit whose author line is `rework+rewver <rework@rework+rewver.rewis>`
+(`git log --format='%an %ae'` on that commit) with a non-empty diff back on the daemon, which is the
+first point at which that assertion can be made at all.
 
 **Does not do yet.** No browsers, no artifacts, no guardrails beyond load and memory, no revocation
 CLI, no host health in the TUI.
@@ -742,22 +855,21 @@ means it touches a file whose existing behaviour other features depend on.
 | `src/rework/remote/protocol.py` | new | the message dataclasses and `protocol_version`, one place for the R4 shapes so client and server cannot drift | additive |
 | `src/rework/remote/server.py` | new | the aiohttp routes from R4, mounted by the same `build_workspace_app` call site (`src/rework/orchestrator/workspace.py:530`) so there is one app, not two | additive |
 | `src/rework/remote/leases.py` | new | claim, renew, expire, idempotency keyed on run id plus job id plus attempt | additive |
-| `src/rework/remote/identity.py` | new | the R5 derivation (`sanitise`, `author_for(host, project)`) and nothing else | additive |
-| `src/rework/remote/worker/worker.py` | new | the single stdlib-only file that is copied to the host by scp; it imports nothing from `rework` | additive |
+| `src/rework/remote/gate.py` | new | the R2.1 partition itself as code: the worktree-bound set, the class 2 set, and the pure predicate the gate calls, so the refusal is testable without a host | additive |
+| `src/rework/remote/worker/worker.py` | new | the single stdlib-only file that is copied to the host by scp; it imports nothing from `rework`, and it serves the three worktree-bound tools (`run_command`, `read_file`, `list_dir`) inside its own jail | additive |
 | `src/rework/nodes/tools.py` | changed | `LazyExecutor.attach` takes an executor factory (or a resolved executor) instead of hard-coding `LocalExecutor` (`:105`-`:106`); the `ToolExecutor` Protocol (`:82`) is unchanged. This file is the binding point, `nodes/remote.py` is `RemoteExecutor`'s only home | risky |
-| `src/rework/remote/registry.py` | new | the R2.1 toolset gate: the remote-capable set and the refusal reason, keyed on the composed executor's `specs()`; phase 2 grows the same file into `HostRegistry` | additive |
-| `src/rework/config.py` | changed | host settings and the identity hook next to the existing `git_author` property (`:157`-`:162`); `git_author` itself is untouched | additive |
+| `src/rework/remote/registry.py` | new | the R2.1 toolset gate: the worktree-bound partition, the remote-capable set `{run_command, read_file, list_dir}` and the refusal reason, keyed on the composed executor's `specs()`; phase 2 grows the same file into `HostRegistry` | additive |
+| `src/rework/config.py` | changed | host settings only (the one host's name and address). The R5 identity hook, next to the existing `git_author` property (`:157`-`:162`), is phase 2, because phase 1 makes no commit | additive |
 | `src/rework/roles/builtin/coder.py` | changed | choose `RemoteExecutor` instead of `LazyExecutor`/`LocalExecutor` at the `LazyExecutor(...)` construction (`:91`) and its `attach` call (`:128`), per the placement decision | risky |
 | `src/rework/roles/builtin/auditor.py` | changed | same choice at the direct `LocalExecutor(...)` (`:120`) | risky |
 | `src/rework/roles/builtin/investigator.py` | changed | same choice at `LocalExecutor(ctx.read_root, ...)` (`:116`) | risky |
-| `src/rework/nodes/git_ops.py` | changed | `commit` (`:237`) takes the R5 author; `worktree_executor` (`:626`) is dead code and this ADR neither wires nor edits it | risky |
 | `src/rework/kernel/state/sqlite.py` | changed | `CREATE TABLE IF NOT EXISTS hosts` plus `host` and attempt columns, added to the inline check-then-alter list (`:1175`-`:1188`) | risky |
 | `src/rework/kernel/state/postgres.py` | changed | the same three additions in its own list (`:1307`-`:1334`), with the 5 s `lock_timeout` lesson from `:258` respected | risky |
 | `src/rework/kernel/state/records.py` | changed | `host` on `Run` and on `Mission.result`; a new `Host` model | additive |
 | `tests/conformance/test_store.py` | changed | round-trip `hosts` and `Run.host` on both stores, or they silently diverge | additive |
-| `tests/test_remote_identity.py` | new | the R5 worked examples as literal string assertions | additive |
 | `tests/test_remote_protocol.py` | new | message round-trip, version refusal with 409, auth 401 | additive |
-| `tests/test_remote_executor.py` | new | `RemoteExecutor` against a fake worker: output becomes events, tree mismatch becomes a failure | additive |
+| `tests/test_remote_executor.py` | new | `RemoteExecutor` against a fake worker: `run_command`, `read_file` and `list_dir` output becomes events, tree mismatch becomes a failure | additive |
+| `tests/test_remote_gate.py` | new | the R2.1 partition: every tool in the tree is classified, a role whose worktree-bound set is `{run_command, read_file, list_dir}` is placeable (auditor, investigator), and a new worktree-bound tool is refused until it has a worker implementation | additive |
 
 ### Phase 2
 
@@ -765,6 +877,8 @@ means it touches a file whose existing behaviour other features depend on.
 |---|---|---|---|
 | `src/rework/remote/registry.py` | changed | `HostRegistry`, the R7 vocabulary, eligibility, guardrails, the deterministic choice, beside the R2.1 gate the file already holds | additive |
 | `src/rework/remote/placement.py` | new | the R2 precedence rule as one pure function, so it is testable without a host | additive |
+| `src/rework/config.py` | changed | the R5 identity hook next to `git_author` (`:157`-`:162`); `git_author` itself is untouched | additive |
+| `src/rework/remote/identity.py` | new | the R5 derivation (`sanitise`, `author_for(host, project)`) and nothing else; it lands here because this is the first phase that commits | additive |
 | `src/rework/orchestrator/limits.py` | changed | per-host `PrioritySlots` pools beside `MissionSlot` (`:198`); `RoleLimiter` (`:22`) stays global | risky |
 | `src/rework/orchestrator/capacity.py` | changed | feed per-host measurements into the existing plan/retune path (`measure` `:165`, `DynamicCapacity` `:467`); no new scheduling logic here | risky |
 | `src/rework/orchestrator/engine.py` | changed | apply placement at step dispatch (`_run_steps_once`, `:686`) and record the chosen host on the run | risky |
@@ -772,9 +886,10 @@ means it touches a file whose existing behaviour other features depend on.
 | `src/rework/tui/views/work.py` | changed | render the R7 waiting reason and the R8 requeue note from existing events; both are recommendations this ADR makes, so showing them is part of the design, not cosmetics | additive |
 | `src/rework/nodes/remote.py` | changed | the file-touching tool names become worker messages (R10 phase 2); `run_command` is untouched | risky |
 | `src/rework/remote/worker/worker.py` | changed | serve the file tool messages and run the git steps on the host | additive |
-| `src/rework/nodes/git_ops.py` | changed | `stage_all` (`:182`), `commit` (`:237`) and `diff_base` (`:262`) produce their result on the host and ship it back in RESULT | risky |
+| `src/rework/nodes/git_ops.py` | changed | `stage_all` (`:182`), `commit` (`:237`) and `diff_base` (`:262`) produce their result on the host and ship it back in RESULT, and `commit` takes the R5 author (`author` at `:238`); `worktree_executor` (`:626`) is dead code and this ADR neither wires nor edits it | risky |
 | `tests/test_remote_placement.py` | new | the 2x3 cross product of `requires`/`prefer_host` against eligible, busy and incompatible hosts | additive |
 | `tests/test_remote_leases.py` | new | missed heartbeat, duplicate result, clock skew, exhausted budget | additive |
+| `tests/test_remote_identity.py` | new | the R5 worked examples as literal string assertions | additive |
 
 ### Phase 3
 
