@@ -20,7 +20,7 @@ from rework.kernel.llm.catalog import ModelCatalog, ModelEntry
 from rework.kernel.llm.types import ChatResult, ToolCall, Usage
 from rework.kernel.state.records import Mission, Run, run_id
 from rework.kernel.state.sqlite import SqliteStore, open_sqlite
-from rework.nodes.report_sections import mechanical_verdict
+from rework.nodes.report_sections import blocking_findings, mechanical_verdict
 from rework.roles.base import RoleBuildCtx
 from rework.roles.registry import autodiscover
 
@@ -42,6 +42,14 @@ def test_verdict_mapping() -> None:
     assert mechanical_verdict({}) == "not audited"
     # open blockers count, and they were ignored before this change
     assert mechanical_verdict(blockers) == "request changes"
+
+
+def test_a_coverage_finding_counts_toward_the_verdict() -> None:
+    """A vacuous test is a coverage entry, not a `findings` row: it must still block."""
+    vacuous = {"findings": [], "coverage": [{"kind": "vacuous_test", "severity": "high"}]}
+    assert len(blocking_findings(vacuous)) == 1
+    assert mechanical_verdict(vacuous) == "approve with fixes"
+    assert mechanical_verdict(vacuous) != mechanical_verdict({"findings": []})
 
 
 # -- scripted audit ----------------------------------------------------------------
@@ -138,6 +146,7 @@ async def test_auditor_reads_context_and_reports(audit_ctx: RoleBuildCtx) -> Non
                         "coverage": "adequate for the one-line change",
                         "business_logic_risk": "none",
                     },
+                    "coverage": [],
                     "warnings": [],
                     "blockers": [],
                 }

@@ -12,7 +12,7 @@ and never LLM-written.
 | part | what it is | where from |
 |---|---|---|
 | `run_stats` | model calls, tokens in/out, cached tokens, cost estimate, elapsed seconds, models used | the ledger + run row; stamped by `nodes/run_stats.py` after every artifact (and live-computed by `rework report --md` for old artifacts) |
-| coder handoff extras | branch, commit sha, base sha, mechanical diff, worktree path | `nodes/git_ops.py` at handoff time |
+| coder handoff extras | branch, commit sha, base sha, mechanical diff (stored cut at 100 KB), changed-file list (from the full diff), worktree path | `nodes/git_ops.py` at handoff time |
 
 These exist because objective claims must come from measurement. Cost and time are
 the owner's examples of permanently forced content.
@@ -25,18 +25,19 @@ the owner's examples of permanently forced content.
 | `findings` | numbered findings: title, detail, evidence (file:line actually read, never invented), severity, verdict CONFIRMED/PLAUSIBLE, confidence | findings[] | investigator, auditor |
 | `blockers` | structured open questions: question, 2+ options, recommendation, why it cannot self-answer. The honesty valve: an explicit blocker beats a guess | blockers[] | all roles |
 | `suggested_fix` | concrete fix approach per actionable finding (approach, not the fix) | suggested_fix | investigator |
-| `proposed_tests` | tests that would prove the fix: name + what it exercises | proposed_tests[] | investigator |
+| `tests` | the SMALLEST test that would catch the bug: name, what_it_pins, where, should_fail_because, command; an empty list needs `no_tests_reason`; when both are omitted or blank the artifact gets the marker reason "not provided: the investigator named no test and gave no reason" (plus a `warnings` row if the assembly has one), never a silent pass | tests[], no_tests_reason | investigator |
 | `ruled_out` | areas examined and clean, with the evidence that rules them out | ruled_out[] | investigator |
 | `classification` | complexity + priority judgment with justification | classification | investigator, auditor |
 | `standing_assessments` | the five truss verdicts, present even on a clean audit: proportionality, complexity, priority, coverage, business-logic risk. A bad assessment must also raise a finding | standing_assessments | auditor |
+| `coverage` | can each test actually fail? findings of kind `untested_behavior` or `vacuous_test` (a test that passes with the fix reverted), with command output as evidence; they count toward the verdict like findings | coverage[] | auditor |
 | `warnings` | what this review could NOT cover: unchecked paths, unavailable runtime. The honesty valve for coverage | warnings[] | auditor |
 | `dispositions` | one response per prior finding, no silence: fixed (commit) / refuted (ground truth) / out-of-scope / accepted (tradeoff) / deferred (tracked) | dispositions[] | coder (after an audit) |
 
 ## Named assemblies (default checkbox sets)
 
-- **investigator default**: summary, findings, blockers
+- **investigator default**: summary, findings, tests, blockers
 - **audit default** (the truss format): summary, findings, standing_assessments,
-  warnings, blockers
+  coverage, warnings, blockers
 - custom: pass any key list in the plan's `requested_sections`
 
 ## Presentation order (model-chosen, mechanically sanitized)

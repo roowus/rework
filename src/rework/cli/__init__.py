@@ -565,11 +565,13 @@ def _render_artifact(role: str, artifact: dict[str, Any]) -> list[str]:
         if fix:
             out.append("SUGGESTED FIX")
             out.append(f"  {fix}")
-        tests = artifact.get("proposed_tests", [])
+        tests = artifact.get("tests", [])
         if tests:
-            out.append("PROPOSED TESTS")
+            out.append("TESTS THAT WOULD CATCH IT")
             for t in tests:
-                out.append(f"  {t.get('name')}: {t.get('exercises')}")
+                out.append(f"  {t.get('name')}: {t.get('what_it_pins')} [{t.get('command')}]")
+        elif artifact.get("no_tests_reason"):
+            out.append(f"NO TESTS: {artifact.get('no_tests_reason')}")
         ruled = artifact.get("ruled_out", [])
         if ruled:
             out.append("RULED OUT")
@@ -598,6 +600,13 @@ def _render_artifact(role: str, artifact: dict[str, Any]) -> list[str]:
                 out.append(f"    {f.get('detail')}")
         else:
             out.append("FINDINGS: none (clean audit)")
+        coverage = artifact.get("coverage", [])
+        if coverage:
+            out.append("TEST COVERAGE")
+            for c in coverage:
+                out.append(f"  [{c.get('severity')}/{c.get('kind')}] {c.get('title')}")
+                out.append(f"    {c.get('detail')}")
+                out.append(f"    evidence: {c.get('evidence')}")
         sa = artifact.get("standing_assessments")
         if sa:
             out.append("STANDING ASSESSMENTS")
@@ -671,9 +680,17 @@ def _md_section(key: str, artifact: dict[str, Any]) -> list[str]:
         out.append(str(artifact.get("suggested_fix", "")))
         out.append("")
         return out
-    if key == "proposed_tests":
-        for t in artifact.get("proposed_tests", []):
-            out.append(f"- **{t.get('name')}:** {t.get('exercises')}")
+    if key == "tests":
+        for t in artifact.get("tests", []):
+            out.append(f"- **{t.get('name')}:** {t.get('what_it_pins')} (`{t.get('command')}`)")
+        if artifact.get("no_tests_reason"):
+            out.append(f"- no tests: {artifact.get('no_tests_reason')}")
+        out.append("")
+        return out
+    if key == "coverage":
+        for c in artifact.get("coverage", []):
+            out.append(f"- **{c.get('kind')} [{c.get('severity')}]:** {c.get('title')}")
+            out.append(f"  {c.get('detail')}")
         out.append("")
         return out
     if key == "ruled_out":
@@ -722,17 +739,25 @@ _ROLE_DEFAULT_ORDER: dict[str, tuple[str, ...]] = {
         "summary",
         "findings",
         "suggested_fix",
-        "proposed_tests",
+        "tests",
         "ruled_out",
         "blockers",
     ),
-    "auditor": ("summary", "findings", "standing_assessments", "warnings", "blockers"),
+    "auditor": (
+        "summary",
+        "findings",
+        "standing_assessments",
+        "coverage",
+        "warnings",
+        "blockers",
+    ),
 }
 _SECTION_TITLES = {
     "summary": "Summary",
     "findings": "Findings",
     "suggested_fix": "Suggested fix",
-    "proposed_tests": "Proposed tests",
+    "tests": "Tests that would catch the bug",
+    "coverage": "Test coverage",
     "ruled_out": "Ruled out",
     "classification": "Classification",
     "standing_assessments": "Standing assessments",
