@@ -434,7 +434,8 @@ on a machine that comes and goes.
 | `GET /remote/hosts` | enrolled host list and last heartbeat, for the CLI and TUI |
 | `GET /healthz` | existing route, reused by the worker for reachability checks |
 
-**Message kinds.** Every message, in both directions, carries `protocol_version`. Twelve kinds:
+**Message kinds.** Every message, in both directions, carries `protocol_version`. Twelve kinds
+on the wire (the table also lists CANCEL, which never travels as its own request):
 
 | Kind | Direction | Payload (abridged) |
 |---|---|---|
@@ -953,6 +954,7 @@ means it touches a file whose existing behaviour other features depend on.
 | `src/rework/config.py` | changed | host settings only (the one host's name and address). The R5 identity hook, next to the existing `git_author` property (`:157`-`:162`), is phase 2, because phase 1 makes no commit | additive |
 | `src/rework/orchestrator/workspace.py` | changed | mounts the remote routes from `src/rework/remote/server.py` on the same app; the existing ADR 0005 routes and their auth are untouched | risky (Accepted transport) |
 | `src/rework/roles/builtin/investigator.py` | changed | `RemoteExecutor` at `LocalExecutor(ctx.read_root, ...)` (`:116`), and the repo map source: `build_repo_map` takes the executor instead of a `Path` (`:85`), and the prompt's path line at `:97` becomes the host label plus the workspace id | risky |
+| `src/rework/nodes/repo_map.py` | changed | `build_repo_map` takes a source (a local `Path` or the remote executor) instead of a bare `Path` (`:85`); the local path stays the default, so the existing caller (`roles/builtin/investigator.py:85`) and `tests/unit/test_nodes.py:102` keep passing | moderate (one signature, one caller) |
 | `src/rework/kernel/state/sqlite.py` | changed | `CREATE TABLE IF NOT EXISTS hosts` plus `host` and attempt columns, added to the inline check-then-alter list (`:1175`-`:1188`) | risky |
 | `src/rework/kernel/state/postgres.py` | changed | the same three additions in its own list (`:1307`-`:1334`), with the 5 s `lock_timeout` lesson from `:258` respected | risky |
 | `src/rework/kernel/state/records.py` | changed | `host` on `Run` and on `Mission.result`; a new `Host` model | additive |
