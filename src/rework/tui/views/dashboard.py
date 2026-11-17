@@ -24,7 +24,9 @@ from textual.css.query import NoMatches
 from textual.timer import Timer
 from textual.widgets import ContentSwitcher, Input, Markdown, Static
 
+from rework.kernel.state.records import orchestrator_chat_id
 from rework.tui import actions, search, spinner
+from rework.tui.conversation import items_from_messages
 from rework.tui.hub import Snapshot
 from rework.tui.theme import (
     ACCENT,
@@ -62,7 +64,7 @@ from rework.tui.widgets.graph import (
     mission_nodes,
 )
 from rework.tui.widgets.modals import Field, Form
-from rework.tui.widgets.trajectory import Trajectory, role_of
+from rework.tui.widgets.trajectory import Step, Trajectory, item_step, role_of
 
 ALL = "*"
 NONE = "-"
@@ -129,6 +131,7 @@ MTABS = [
     ("Diff", "diff"),
     ("Report", "report"),
     ("Gates", "gates"),
+    ("Chat", "chat"),
 ]
 
 
@@ -215,6 +218,12 @@ class DashboardView(View):
         self.run_cost: dict[str, float] = {}
         self.mission_gates: list[Any] = []
         self.report_loaded_for: str | None = None
+        # the Chat tab: which mission its body was painted for, the highest
+        # chat_messages.id already painted (append-only, so a poll only asks
+        # for newer rows), and the one state line while there are no rows
+        self._chat_for: str | None = None
+        self._chat_cursor = 0
+        self._chat_state: Step | None = None
         # overview enrichment (throttled)
         self.mission_cost: dict[str, float] = {}
         self.mission_role: dict[str, str] = {}
@@ -303,12 +312,19 @@ class DashboardView(View):
                                 yield Markdown("", id="m-report-body")
                             with VerticalScroll(id="m-gates", classes="doc"):
                                 yield Vertical(id="m-gates-body")
+                            # the mission's orch-<id> transcript, read-only: a
+                            # Trajectory like the first tab, so arrows/PageUp/
+                            # PageDown scroll it the same way
+                            yield Trajectory(id="m-chat")
                 with Horizontal(id="m-msgbar"):
                     yield Input(
                         placeholder="Message this mission's orchestrator…  (enter to send)",
                         id="m-msg",
                     )
                     yield Btn("Send", "msg-send", variant="primary")
+                    # the mission's real transcript is not in the CHATS list
+                    # (one orchestrator chat per mission); this is its door
+                    yield Btn("Transcript", "transcript", variant="ghost", id="m-transcript")
 
     def on_mount(self) -> None:
         self._paint_head()
@@ -316,7 +332,12 @@ class DashboardView(View):
 
     def hints(self) -> list[tuple[str, str]]:
         if self.mission_id:
-            return [("click", "focus a session"), ("esc", "back"), ("ctrl+c", "copy")]
+            return [
+                ("click", "focus a session"),
+                ("click", "transcript"),
+                ("esc", "back"),
+                ("ctrl+c", "copy"),
+            ]
         return [
             ("/", "search"),
             ("tab ⇥", "cycle focus"),
@@ -574,7 +595,8 @@ class DashboardView(View):
         Strictly that entity's own stamp. It is never a max over several keys
         (every run event also stamps its mission, so a max would let one live
         run make a wedged sibling look busy) and never falls back to another
-        entity's stamp. No key means UNKNOWN, and unknown animates. "*" is the
+        entity's stamp. No key means UNKNOWN: it animates while the link is up (a mission
+        that has not published yet) and never while offline. "*" is the
         newest across all running missions: use it only where an aggregate is
         genuinely meant (the stats tile, the project badge)."""
         return self.snap.last_event.get(key) if key else None
@@ -592,7 +614,7 @@ class DashboardView(View):
         if status_value(status) != "running":
             return glyph(status)
         clock = time.time() if now is None else now
-        return run_mark(spinner.is_stalled(clock, last), frame)
+        return run_mark(spinner.is_stalled(clock, last, self.snap.online), frame)
 
     def _row_mark(
         self, mission: Any, section: str, frame: str | None = None, now: float | None = None
@@ -617,9 +639,8 @@ class DashboardView(View):
             return
         clock = time.time() if now is None else now
         last = self._stamp("*")
-        if spinner.is_stalled(clock, last):
-            human = spinner.human_duration(spinner.silence(clock, last))
-            stat.set(str(running), f"idle {human}")
+        if spinner.is_stalled(clock, last, self.snap.online):
+            stat.set(str(running), spinner.idle_text(clock, last))
         else:
             stat.set(f"{run_mark(False, frame)} {running}", "working", markup=True)
 
@@ -798,6 +819,11 @@ class DashboardView(View):
             self.mtab = event.value
             self.query_one("#m-pages", ContentSwitcher).current = f"m-{event.value}"
             self._paint_detail_tabs()
+            if event.value == "chat":
+                # the keys must scroll the transcript, and a key goes to the
+                # focused widget: hand it the focus (a scroll view, so up/down,
+                # PageUp/PageDown and home/end all move it)
+                self.query_one("#m-chat", Trajectory).focus()
 
     # -- search -----------------------------------------------------------------------
 
@@ -1093,6 +1119,11 @@ class DashboardView(View):
         if event.action == "msg-send":
             self._send_message()
             return
+        if event.action == "transcript":
+            # its own door, not a control verb: the orchestrator chat is not in
+            # the CHATS list, so it is opened by mission id (see open_transcript)
+            self.open_transcript()
+            return
         verb = event.action
         if verb == "copy-id":
             self.rw.copy_to_clipboard(self.mission_id)
@@ -1183,6 +1214,7 @@ class DashboardView(View):
             self._full_failures = 0
             self._full_next_try = 0.0
             self.report_loaded_for = None
+            self._reset_chat_tab()
             self.query_one("#m-traj", Trajectory).clear()
             self.query_one("#run-list", RowList).set_rows([])
         self.mission_id = mission_id
@@ -1301,6 +1333,8 @@ class DashboardView(View):
         # NoMatches and failed tests under load (m7 findings #19: 2 of 8 runs)
         key = self._paint_key()
         if key == self._painted_key:
+            if self.mtab == "chat":
+                self._poll_chat_tab()  # a new transcript row moves no mission field
             return  # nothing this poll read has changed since the last paint
         self._painted_key = key
         try:
@@ -1340,6 +1374,10 @@ class DashboardView(View):
             # the spinner reads "working" vs "idle 7m" off this stamp: a poll alone
             # (no tick while unfocused) must repaint the header when it moves
             self._stamp(self.mission_id),
+            # connectivity belongs to the key: an offline -> online flip must
+            # repaint this page even when no other keyed field moved
+            self.snap.online,
+            self.snap.error,
         )
 
     async def _load_full_mission(self, mission_id: str) -> None:
@@ -1428,11 +1466,11 @@ class DashboardView(View):
         # silent run is named next to "working" instead of being masked.
         last = self._stamp(mission.id)
         clock = time.time() if now is None else now
-        stalled = st == "running" and spinner.is_stalled(clock, last)
+        stalled = st == "running" and spinner.is_stalled(clock, last, self.snap.online)
         if st == "running":
             mark = self._mark(st, last, frame, clock)
             if stalled:
-                head = f"{mark} idle {spinner.human_duration(spinner.silence(clock, last))}"
+                head = f"{mark} {spinner.idle_text(clock, last)}"
             else:
                 head = f"{mark} working"
                 quiet = self._quiet_runs(clock)
@@ -1553,8 +1591,8 @@ class DashboardView(View):
         clock = time.time() if now is None else now
         last = self._stamp(key)
         age = spinner.human_duration(spinner.silence(clock, last))
-        if spinner.is_stalled(clock, last):
-            label = " ".join(x for x in (f"idle {age}", subject, step) if x)
+        if spinner.is_stalled(clock, last, self.snap.online):
+            label = " ".join(x for x in (spinner.idle_text(clock, last), subject, step) if x)
         else:
             label = " ".join(x for x in ("working", subject, step, age) if x)
         traj.spinner(f"{self._mark('running', last, frame, clock)} [{FAINT}]{esc(label)}[/]")
@@ -1586,6 +1624,8 @@ class DashboardView(View):
     # -- detail tabs ----------------------------------------------------------------------------
 
     def _paint_detail_tabs(self) -> None:
+        if self.mtab == "chat":
+            self._poll_chat_tab()  # its own data, so it needs no full mission row
         mission = self._detail_mission()
         if mission is None or getattr(mission, "light", False):
             return
@@ -1651,6 +1691,96 @@ class DashboardView(View):
         follow = self.query_one("#m-follow", Static)
         live = status_value(mission.status) in actions.ACTIVE
         follow.update(f"[{ACCENT}]● live[/]" if live else "")
+
+    # -- chat tab (read-only orchestrator transcript) ------------------------------------------
+
+    def _reset_chat_tab(self) -> None:
+        self._chat_for = None
+        self._chat_cursor = 0
+        self._chat_state = None
+        try:
+            self.query_one("#m-chat", Trajectory).clear()
+        except NoMatches:
+            pass
+
+    def _chat_text(self, log: Trajectory, text: str, *, error: bool = False) -> None:
+        """The ONE explicit state line (loading / no transcript / failed) in an
+        otherwise empty body; replaced in place, removed when rows arrive."""
+        colour = WARN if error else FAINT
+        markup = f"[{colour}]{esc(text)}[/]"
+        if self._chat_state is not None and self._chat_state.parent is not None:
+            self._chat_state.update(markup)
+            return
+        self._chat_state = Step(markup, kind="note")
+        log.add(self._chat_state)
+
+    @work(exclusive=True, group="dash-chat")
+    async def _poll_chat_tab(self) -> None:
+        """Keep the Chat tab current: the open mission's `orch-<id>` transcript.
+
+        Cheap like the other tabs: a max-id probe first, rows are read
+        only when something is newer than what is painted, and only the new
+        rows are mounted. Every outcome leaves a visible state: loading, no
+        transcript yet (the row is created lazily when the orchestrator first
+        runs), no messages, could not load, or the rows."""
+        mission_id = self.mission_id
+        if not mission_id or self.mtab != "chat":
+            return
+        chat_id = orchestrator_chat_id(mission_id)
+        data = self.hub.data
+        log = self.query_one("#m-chat", Trajectory)
+        if self._chat_for != mission_id:
+            self._reset_chat_tab()
+            self._chat_for = mission_id
+            self._chat_text(log, "loading…")
+        head = await self.hub.guard(partial(data.chat_messages_max_id, chat_id), None)
+        if self.mission_id != mission_id or self.mtab != "chat":
+            return
+        if head is None:
+            if not self._chat_cursor:
+                with self.painting():
+                    self._chat_text(log, "could not load the transcript (retrying)", error=True)
+            return
+        if head <= self._chat_cursor:
+            if not self._chat_cursor and head == 0:
+                # nothing to paint: say whether the transcript exists at all
+                chat = await self.hub.guard(partial(data.chat, chat_id), None)
+                if self.mission_id != mission_id or self.mtab != "chat":
+                    return
+                text = (
+                    "No orchestrator transcript yet. It starts when the orchestrator first runs."
+                    if chat is None
+                    else "No messages in this transcript yet."
+                )
+                with self.painting():
+                    self._chat_text(log, text)
+            return
+        after = self._chat_cursor
+        messages = await self.hub.guard(partial(data.chat_messages_since, chat_id, after), None)
+        if self.mission_id != mission_id or self.mtab != "chat":
+            return
+        if messages is None:
+            if not self._chat_cursor:
+                with self.painting():
+                    self._chat_text(log, "could not load the transcript (retrying)", error=True)
+            return
+        if not messages:
+            return
+        self._chat_cursor = max(self._chat_cursor, *(int(m.id or 0) for m in messages))
+        steps = [s for s in (item_step(i) for i in items_from_messages(messages)) if s]
+        # the app can close during the awaits above: guard the paint only
+        with self.painting():
+            if not steps:  # rows that render to nothing: keep an explicit state
+                if not after:
+                    self._chat_text(log, "No messages in this transcript yet.")
+                return
+            if self._chat_state is not None:
+                self._chat_state.remove()
+                self._chat_state = None
+            first = not after
+            log.add(*steps)
+            if first:
+                self.call_after_refresh(log.scroll_end, animate=False)
 
     def _orchestrator_output(self, mission: Any) -> str:
         """The orchestrator's own Output: its notes to the owner (INFO events
@@ -1780,6 +1910,18 @@ class DashboardView(View):
         with self.painting():
             self.query_one("#m-msg", Input).value = ""
         self.toast(f"Sent to {mission_id}'s orchestrator")
+
+    def open_transcript(self) -> None:
+        """Open the OPEN mission's orchestrator transcript on the Work tab.
+
+        That chat is filtered out of the CHATS list (one per mission,
+        machinery rather than a conversation), so it is opened by id through
+        the Work view, which toasts "no transcript yet" when the orchestrator
+        never ran instead of painting a blank panel."""
+        if not self.mission_id:
+            return
+        self.rw.action_tab("work")
+        self.rw.view("work").open_transcript(self.mission_id)
 
     def _gate_button(self, btn: Btn) -> bool:
         if not btn.action.startswith("gate-"):

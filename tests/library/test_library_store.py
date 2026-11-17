@@ -102,7 +102,7 @@ def test_git_library_commits(tmp_path) -> None:
     lib = GitLibrary(tmp_path / "lib")
     item = _item("toyrepo fix recipe")
     rel = lib.write_body(item, "# recipe\nrun pytest\n", "library: add skill")
-    assert rel == "skills/toyrepo-fix-recipe.md"
+    assert rel == f"skills/toyrepo-fix-recipe-{item.id}.md"
     item.body_path = rel  # callers persist the returned path on the item
     body = lib.read_body(item)
     assert body is not None and "pytest" in body

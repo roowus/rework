@@ -22,13 +22,28 @@ from rework.config import Config, max_roles
 from rework.kernel.events.bus import EventBus
 from rework.kernel.llm.catalog import ModelCatalog
 from rework.kernel.state.records import EventRecord, EventType, MissionStatus
+from rework.kernel.state.retry import is_transient_db_error, transient_error_summary
 from rework.kernel.state.store import StateStore
+from rework.orchestrator.capacity import DynamicCapacity
 from rework.orchestrator.engine import CheckpointerFactory, MissionRunner
 from rework.orchestrator.limits import MissionSlot, PrioritySlots, RoleLimiter
 from rework.roles.registry import RoleRegistry
 from rework.runtime import CODE_CHANGED, CodeChangeWatcher, find_repo_root
 
 log = logging.getLogger("rework.daemon")
+
+# A transient database error is not the mission's fault: requeue it from its
+# checkpoint instead of failing it. The bound stops an unbounded requeue loop
+# against a database that stays unreachable. 2026-11-14: an unclassified
+# DeadlockDetected failed a nearly finished mission and threw its work away.
+MAX_TRANSIENT_CRASHES = 3
+
+# setup() on the postgres saver runs its migrations: DDL that takes ACCESS
+# EXCLUSIVE on the checkpointer tables of the SAME database the store writes to,
+# so running it per run connection races store writes (the 2026-11-14 lock
+# cycle). It is idempotent, so once per process and database is enough.
+_checkpointer_setup_lock = asyncio.Lock()
+_checkpointer_setup_done: set[str] = set()
 
 
 class DaemonLocked(Exception):
@@ -74,14 +89,19 @@ def postgres_checkpointer_factory(db_url: str) -> CheckpointerFactory:
     """One checkpointer connection per run, against Postgres (the M4
     deployment-grade path: checkpoints share the state database, so a daemon
     restart resumes threads with no local files). setup() runs the saver's
-    migrations once per connection (idempotent DDL)."""
+    migrations at most once per process and database: that setup is DDL and must
+    not race store writes, so it is not repeated per run connection."""
 
     async def make(run_id: str) -> tuple[Any, Callable[[], Awaitable[None]]]:
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
         cm = AsyncPostgresSaver.from_conn_string(db_url)
         saver = await cm.__aenter__()
-        await saver.setup()
+        if db_url not in _checkpointer_setup_done:
+            async with _checkpointer_setup_lock:
+                if db_url not in _checkpointer_setup_done:
+                    await saver.setup()
+                    _checkpointer_setup_done.add(db_url)
 
         async def close() -> None:
             await cm.__aexit__(None, None, None)
@@ -128,6 +148,13 @@ class Daemon:
         # daemon-wide cap on concurrently RUNNING roles, shared by every
         # mission's RunSupervisor (REWORK_MAX_ROLES, orchestrator/limits.py)
         self._limiter = RoleLimiter(max_roles(config), poll_interval_s=config.poll_interval_s)
+        # both caps follow the host at runtime (REWORK_CAPACITY=auto, the
+        # default); the watchdog is started from inside run_forever, because a
+        # task needs a running loop and this runs outside one. A hand-set
+        # REWORK_CONCURRENCY / REWORK_MAX_ROLES reaches it through
+        # CapacitySettings.from_env() as a FLOOR (REWORK_CAPACITY_PINS=floor, the
+        # default), so both numbers being set no longer disables the watchdog
+        self._capacity = DynamicCapacity(self._sem, self._limiter)
         self._runners: dict[str, asyncio.Task[None]] = {}
         self._bg: set[asyncio.Task[None]] = set()
         self._owner = f"daemon-{uuid.uuid4().hex[:8]}"
@@ -143,6 +170,9 @@ class Daemon:
                 f"(heartbeat fresh within {stale_after:.0f}s); refusing to double-run"
             )
         try:
+            # BEFORE the first dispatch: a fresh daemon starts at the caps the
+            # box can take right now, not at the value resolved at import time
+            self._capacity.start()
             await self._recover()
             self._code = CodeChangeWatcher()
             # resolved once: the checkout this daemon runs from (may be None
@@ -158,6 +188,9 @@ class Daemon:
                 await self._maybe_auto_update()
                 await asyncio.sleep(self._config.poll_interval_s)
         finally:
+            # no leaked task on any exit path: CancelledError, a normal return
+            # and `raise SystemExit(0)` from auto-update all come through here
+            await self._capacity.stop()
             await self._store.release_lock(self._owner)
 
     def _check_code(self) -> None:
@@ -318,6 +351,47 @@ class Daemon:
                 MissionStatus.FAILED,
                 MissionStatus.CANCELLED,
             ):
+                if is_transient_db_error(exc):
+                    # Requeue, do not fail: the transaction was rolled back
+                    # server side, and the mission resumes from its checkpoint.
+                    summary = transient_error_summary(exc)
+                    count = await self._store.increment_transient_crash_count(mission_id)
+                    if count <= MAX_TRANSIENT_CRASHES:
+                        log.warning(
+                            "%s: transient database error (%s), crash %d of %d,"
+                            " requeueing the mission to resume from its checkpoint",
+                            mission_id,
+                            summary,
+                            count,
+                            MAX_TRANSIENT_CRASHES,
+                        )
+                        await self._store.update_mission(
+                            mission_id,
+                            status=MissionStatus.PENDING,
+                            result={
+                                **(mission.result or {}),
+                                "transient_db_error": summary,
+                                "crash": f"transient database error, crash {count} of"
+                                f" {MAX_TRANSIENT_CRASHES}, resuming from its checkpoint",
+                            },
+                        )
+                        await self._bus.publish(
+                            EventRecord(
+                                mission_id=mission_id,
+                                type=EventType.INFO,
+                                payload={
+                                    "note": f"transient database error ({summary}), crash"
+                                    f" {count} of {MAX_TRANSIENT_CRASHES}: the mission is"
+                                    " requeued and will resume from its checkpoint"
+                                },
+                            )
+                        )
+                        return
+                    # bound reached: fail, but keep the reason visible
+                    error = (
+                        f"transient database error, crash {count} after"
+                        f" {MAX_TRANSIENT_CRASHES} requeues, giving up: {summary}"
+                    )
                 await self._store.update_mission(
                     mission_id,
                     status=MissionStatus.FAILED,
@@ -326,6 +400,8 @@ class Daemon:
                         "error": error if keep_whole else error[:2000],
                     },
                 )
+                # terminal: a later fresh run of this mission gets a full budget
+                await self._store.reset_transient_crash_count(mission_id)
         except Exception:
             log.exception("could not mark %s failed", mission_id)
         await self._bus.publish(

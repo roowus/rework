@@ -65,9 +65,11 @@ Plans you can choose:
 - fix-pr  — same, then the engine opens a pull request (no gate by default)
 - draft   — use draft for document work: research write-ups, reports, letters,
             content — anything whose deliverable is writing, not code. The roles
-            research with the web tools, write the draft as files in the
-            project, and audit every claim against its cited source. No branch
-            push and no PR.
+            research with the web tools, write the report in the mission's Report
+            tab, and audit every claim against its cited source. No branch push
+            and no PR. Choose draft when the objective only reads and reports (an
+            audit, a review, an analysis): put draft in propose_mission's plan
+            yourself. A plan the owner names explicitly stays authoritative.
 - audit   - read-only understanding work: map, survey or assess a codebase. A
             surveyor reads it and returns a cited map. It changes nothing: no
             coder, no branch push and no PR.
@@ -248,6 +250,18 @@ class Proposal:
                 line = f"{line} ({self.budget_reason})"
             bits.append(line)
         return " · ".join(bits)
+
+
+def proposal_plan(args: dict[str, Any], objective: str) -> str:
+    """The plan a proposal carries: the one the model named, else a default.
+    The classifier (`reads_only_plan`) only picks the DEFAULT, when the plan is
+    absent; a plan the model explicitly named is never overridden."""
+    named = str(args.get("plan", "")).strip()
+    if named:
+        return named
+    from rework.missions import reads_only_plan
+
+    return reads_only_plan(objective) or "fix"
 
 
 def proposal_budget(
@@ -604,10 +618,14 @@ class OrchestratorChat:
         user_msg: dict[str, Any] = {"role": "user", "content": text}
         if images:
             user_msg["images"] = images
-        self._history.append(user_msg)
         chips = " ".join(f"📎 {p.split('/')[-1]}" for p in images)
-        self._display.append(("you", f"{text}  {chips}".strip() if chips else text))
-        await self._record("user", user_msg, self._display[-1][1])
+        shown_user = f"{text}  {chips}".strip() if chips else text
+        self._history.append(user_msg)
+        self._display.append(("you", shown_user))
+        # the owner's row is written BEFORE the model is called, so even a turn
+        # that fails leaves the question in the chat. A failed write is logged
+        # and remembered: the reply below says so, it is never silent.
+        user_saved = await self._record("user", user_msg, shown_user)
         specs = [PROPOSE_TOOL, ASK_TOOL]
         if self._toolbox is not None:
             specs = [*specs, *LOOK_TOOLS]
@@ -700,7 +718,12 @@ class OrchestratorChat:
             logger.exception("orchestrator chat turn failed")
             note = f"⚠ {type(exc).__name__}: {exc}"
             self._display.append(("orchestrator", note))
-            await self._record("assistant", {}, note)
+            # the failed turn leaves a visible row, never an empty chat; if even
+            # this write fails the reply below still carries the error
+            error_saved = await self._record("assistant", {}, note)
+            if not (user_saved and error_saved):
+                note = f"{note}\n(not saved — could not persist the chat turn)"
+                self._display[-1] = ("orchestrator", note)
             return ChatResult(
                 reply=note, transcript=[Turn("you", text), Turn("orchestrator", note)]
             )
@@ -738,7 +761,7 @@ class OrchestratorChat:
                     Proposal(
                         objective=objective,
                         title=str(args.get("title", "")).strip(),
-                        plan=str(args.get("plan", "fix")).strip() or "fix",
+                        plan=proposal_plan(args, objective),
                         project=str(args.get("project", "")).strip(),
                         repo=str(args.get("repo", "")).strip(),
                         model=str(args.get("model", "")).strip(),
@@ -782,7 +805,7 @@ class OrchestratorChat:
         # without re-feeding an empty assistant message on reload
         body = assistant_msg if ((result.text or "").strip() or result.tool_calls) else {}
         saved = await self._record("assistant", body, shown)
-        if not saved:
+        if not (saved and user_saved):
             # the reply still reaches the owner; only the note marks it unsaved
             reply = f"{reply}\n(not saved — could not persist the chat turn)"
             transcript[-1] = Turn("orchestrator", reply)

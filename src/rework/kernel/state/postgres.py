@@ -39,6 +39,7 @@ from rework.kernel.state.records import (
     check_priority,
     coerce_priority,
 )
+from rework.kernel.state.retry import retry_transient
 
 _DDL = [
     """
@@ -55,7 +56,8 @@ _DDL = [
         plan TEXT,
         result TEXT,
         created_at DOUBLE PRECISION NOT NULL,
-        updated_at DOUBLE PRECISION NOT NULL
+        updated_at DOUBLE PRECISION NOT NULL,
+        transient_crash_count INTEGER NOT NULL DEFAULT 0
     )
     """,
     """
@@ -172,6 +174,8 @@ _DDL = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_chat_messages_chat ON chat_messages(chat_id, id)",
+    # newest-message-per-chat (list_chats ordering): an index-only MAX(ts) probe
+    "CREATE INDEX IF NOT EXISTS idx_chat_messages_chat_ts ON chat_messages(chat_id, ts)",
 ]
 
 _TABLES = [
@@ -258,11 +262,28 @@ def _serialized(method: Any) -> Any:
 
     @functools.wraps(method)
     async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
-        async with self._op_lock:
-            try:
-                return await method(self, *args, **kwargs)
-            finally:
-                await self._end_idle_transaction()
+        # The lock is PER ATTEMPT and the retry sits OUTSIDE it. A deadlock
+        # (SQLSTATE 40P01) or a serialization failure (40001) is retried here,
+        # once, for every read and write the store exposes, and retry_transient
+        # sleeps 10 to 100 ms between attempts. This store owns ONE async
+        # connection, so holding the op lock across that sleep would stall the
+        # whole daemon: the event pump, every role task's update_run and the
+        # leader heartbeat would all wait out the backoff. Hence the lock covers
+        # one attempt only. The connection is left clean INSIDE the lock (the
+        # `finally` commits or rolls back) before the lock is released, so no
+        # other task can observe a half-finished transaction and a retried
+        # attempt starts from a clean connection. The lock stays reentrant per
+        # task, so a nested public call (update_mission -> get_mission) still
+        # takes it without self-deadlocking, and retry.py's depth guard keeps
+        # one warning per retry rather than one per nested call.
+        async def attempt() -> Any:
+            async with self._op_lock:
+                try:
+                    return await method(self, *args, **kwargs)
+                finally:
+                    await self._end_idle_transaction()
+
+        return await retry_transient(attempt, label=f"PostgresStore.{method.__name__}")
 
     return wrapper
 
@@ -451,6 +472,28 @@ class PostgresStore:
             )
             await self._conn.commit()
         return await self.get_mission(mission_id)
+
+    # -- transient crash counter (daemon requeue policy) --------------------
+    # Read only through these methods: Mission does not carry the field, so a
+    # `SELECT *` row mapper is unaffected by the extra column.
+    @_serialized
+    async def increment_transient_crash_count(self, mission_id: str) -> int:
+        """Bump and return the mission's transient crash count (0 if no row)."""
+        row = await self._fetch_one(
+            "UPDATE missions SET transient_crash_count = transient_crash_count + 1"
+            " WHERE id = %s RETURNING transient_crash_count",
+            (mission_id,),
+        )
+        await self._conn.commit()
+        return int(row["transient_crash_count"]) if row else 0
+
+    @_serialized
+    async def reset_transient_crash_count(self, mission_id: str) -> None:
+        """Zero the mission's transient crash count (fresh dispatch, terminal)."""
+        await self._conn.execute(
+            "UPDATE missions SET transient_crash_count = 0 WHERE id = %s", (mission_id,)
+        )
+        await self._conn.commit()
 
     @_serialized
     async def list_missions(
@@ -714,6 +757,16 @@ class PostgresStore:
         return await self.get_gate(gate_id)
 
     @_serialized
+    async def set_gate_question(self, gate_id: str, question: str) -> Gate | None:
+        """Re-word an OPEN gate in place; a decided row is left alone."""
+        await self._conn.execute(
+            "UPDATE gates SET question = %s WHERE id = %s AND status = %s",
+            (question, gate_id, GateStatus.OPEN.value),
+        )
+        await self._conn.commit()
+        return await self.get_gate(gate_id)
+
+    @_serialized
     async def list_open_gates(self, mission_id: str | None = None) -> list[Gate]:
         if mission_id is not None:
             rows = await self._fetch_all(
@@ -955,6 +1008,7 @@ class PostgresStore:
             mission_id=row["mission_id"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            last_message_at=row.get("last_message_at"),
         )
 
     @staticmethod
@@ -1022,21 +1076,38 @@ class PostgresStore:
 
     @_serialized
     async def list_chats(self, limit: int = 50, include_missions: bool = True) -> list[Chat]:
-        sql = "SELECT * FROM chats"
+        # newest MESSAGE first (what the owner sees as "last active"), with
+        # updated_at only as the tiebreaker and chats with no message last
+        sql = (
+            "SELECT c.*, (SELECT MAX(m.ts) FROM chat_messages m WHERE m.chat_id = c.id)"
+            " AS last_message_at FROM chats c"
+        )
         if not include_missions:
-            sql += " WHERE mission_id IS NULL"
-        sql += " ORDER BY updated_at DESC LIMIT %s"
+            sql += " WHERE c.mission_id IS NULL"
+        sql += " ORDER BY last_message_at DESC NULLS LAST, c.updated_at DESC LIMIT %s"
         rows = await self._fetch_all(sql, (limit,))
         return [self._chat(r) for r in rows]
 
     @_serialized
     async def delete_chat(self, chat_id: str) -> None:
+        # LOCK ORDER, always: the chats row first, then chat_messages. See the
+        # note on append_chat_message.
+        await self._conn.execute("SELECT 1 FROM chats WHERE id = %s FOR UPDATE", (chat_id,))
         await self._conn.execute("DELETE FROM chat_messages WHERE chat_id = %s", (chat_id,))
         await self._conn.execute("DELETE FROM chats WHERE id = %s", (chat_id,))
         await self._conn.commit()
 
     @_serialized
     async def append_chat_message(self, message: ChatMessage) -> ChatMessage:
+        # LOCK ORDER, always: the chats row first, then chat_messages. Found
+        # live 2026-11-14: a deadlock (40P01) on
+        # `UPDATE chats SET updated_at = $1 WHERE id = $2` because one
+        # transaction took chat_messages then chats while another took them the
+        # other way round. Every statement in this store that touches both
+        # relations takes the chats row first, under FOR UPDATE, so two of our
+        # transactions can no longer form a cycle. Any future write that needs
+        # both tables keeps this order.
+        await self._conn.execute("SELECT 1 FROM chats WHERE id = %s FOR UPDATE", (message.chat_id,))
         async with self._conn.cursor() as cur:
             await cur.execute(
                 "INSERT INTO chat_messages (chat_id, role, body, display, ts)"
@@ -1071,6 +1142,30 @@ class PostgresStore:
         )
         assert row is not None
         return int(row["max_id"] or 0)
+
+    @_serialized
+    async def chat_ids_with_messages(self, chat_ids: list[str]) -> set[str]:
+        """One probe for the whole list (idx_chat_messages_chat covers it)."""
+        ids = list(dict.fromkeys(chat_ids))
+        if not ids:
+            return set()
+        rows = await self._fetch_all(
+            "SELECT DISTINCT chat_id FROM chat_messages WHERE chat_id = ANY(%s)", (ids,)
+        )
+        return {str(r["chat_id"]) for r in rows}
+
+    @_serialized
+    async def chat_ids_with_conversation(self, chat_ids: list[str]) -> set[str]:
+        """The subset holding at least one user or assistant message."""
+        ids = list(dict.fromkeys(chat_ids))
+        if not ids:
+            return set()
+        rows = await self._fetch_all(
+            "SELECT DISTINCT chat_id FROM chat_messages"
+            " WHERE role IN ('user', 'assistant') AND chat_id = ANY(%s)",
+            (ids,),
+        )
+        return {str(r["chat_id"]) for r in rows}
 
     @_serialized
     async def chat_messages_since(self, chat_id: str, after_id: int) -> list[ChatMessage]:
@@ -1230,6 +1325,11 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
         "missions",
         "priority",
         "ALTER TABLE missions ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'",
+    ),
+    (
+        "missions",
+        "transient_crash_count",
+        "ALTER TABLE missions ADD COLUMN transient_crash_count INTEGER NOT NULL DEFAULT 0",
     ),
     ("gates", "for_run", "ALTER TABLE gates ADD COLUMN for_run TEXT"),
     ("gates", "decision", "ALTER TABLE gates ADD COLUMN decision TEXT"),

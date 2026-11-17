@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+from conftest import wait_for_gate_park
 from rework.config import Config
 from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.gates import GateManager
@@ -354,6 +355,86 @@ async def test_send_back_at_gate_returns_mission_to_running(world: dict) -> None
     done = await store.get_mission(mission.id)
     assert done is not None and done.status == MissionStatus.DONE
     assert not (done.result or {}).get("pr_url")  # no coder artifact in an echo plan
+
+
+async def test_gate_row_visible_before_mission_parks_then_converges_to_awaiting_gate(
+    world: dict,
+) -> None:
+    """What this proves: on a SECOND connection, after the ship gate row is
+    visible, the engine CONVERGES to AWAITING_GATE within a bounded wait and
+    never regresses to `running` while the gate stays open (the design decision
+    recorded in docs/design.md). The wait is bounded, not fire-and-forget: if
+    the engine never writes the status the convergence wait raises TimeoutError
+    naming the mission park: verified by dropping ONLY the ship-path write
+    through a store wrapper, which makes this test fail on that wait.
+
+    What it does NOT prove: instantaneous equality at the moment the gate row
+    appears. Its own ship-gate wait above is deliberately gate-only, and by the
+    time it returns the status has landed, so this test also passes against a
+    gate-row-only proxy and is NOT the lock for that contract. The barrier
+    contract itself (the helper must not return on the gate row alone) is
+    locked in tests/integration/test_gate_park_barrier.py."""
+    store: SqliteStore = world["store"]
+    mission = await store.create_mission(
+        Mission(
+            id=new_id("m"),
+            objective="ship me",
+            plan={"steps": [{"step": "echo", "role": "echo"}], "gates": ["ship"]},
+        )
+    )
+    runner = make_runner(world, mission.id)
+    run_task = asyncio.create_task(runner.run())
+
+    # every observation below is made on a FRESH connection, like the CLI or a
+    # test process watching the daemon from outside
+    second: SqliteStore = await open_sqlite(world["db_path"])
+    try:
+        gates = GateManager(second, InProcessEventBus(second))
+        ship_gate = None
+        while ship_gate is None:
+            # a gate-only wait is legitimate for THIS step: it is about seeing
+            # the committed row on a fresh connection, before the status lands.
+            # The echo role's own escalation gate blocks the plan, so it is
+            # approved as it appears and the wait re-arms for the ship gate.
+            await wait_for_gate_park(
+                second,
+                mission.id,
+                what="the plan's next gate to be visible on a fresh connection",
+            )
+            for gate in await second.list_open_gates(mission.id):
+                if gate.kind == GateKind.SHIP:
+                    ship_gate = gate
+                else:  # the echo role's own escalation gate
+                    await gates.decide(gate.id, approved=True)
+        assert ship_gate is not None, "the plan never reached its ship gate"
+
+        # the gate row is committed; the status write is what this test is about
+        await wait_for_gate_park(
+            second,
+            mission.id,
+            mission_status=MissionStatus.AWAITING_GATE,
+            what="the mission to park at the ship gate the fresh connection can see",
+        )
+
+        # convergence, not a sampled instant: while the gate stays open the
+        # mission must keep reading AWAITING_GATE and never regress to RUNNING
+        for _ in range(20):  # 1s of sustained observation
+            fresh = await second.get_mission(mission.id)
+            assert fresh is not None
+            assert fresh.status == MissionStatus.AWAITING_GATE, fresh.status
+            open_now = await second.list_open_gates(mission.id)
+            assert [g.id for g in open_now] == [ship_gate.id]
+            await asyncio.sleep(0.05)
+
+        # a rejected gate ends the wait, and the parked status goes with it
+        await gates.decide(ship_gate.id, approved=False, note="not today")
+    finally:
+        await second.aclose()
+    await asyncio.wait_for(run_task, timeout=30)
+    done = await store.get_mission(mission.id)
+    assert done is not None and done.status != MissionStatus.AWAITING_GATE
+    decided = await store.get_gate(ship_gate.id)
+    assert decided is not None and decided.status == GateStatus.REJECTED
 
 
 async def test_plain_reject_at_open_pr_gate_terminates_without_pr(world: dict) -> None:

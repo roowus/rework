@@ -88,6 +88,17 @@ class RoleLimiter:
         self.running = max(0, self.running - 1)
         self._admit()
 
+    def set_cap(self, cap: int) -> None:
+        """Move the cap at RUNTIME (orchestrator/capacity.py, REWORK_CAPACITY).
+
+        Grow admits queued runs immediately; shrink just stops admitting, and
+        the roles already running keep their slots until they finish, because
+        :meth:`_admit` no-ops while `running >= cap`. Nothing is cancelled: a
+        cap that killed running work would lose a mission mid-edit.
+        """
+        self.cap = max(1, int(cap))
+        self._admit()
+
     def _forget(self, run_id: str) -> None:
         try:
             self._queue.remove(run_id)
@@ -124,8 +135,36 @@ class PrioritySlots:
         if value < 1:
             raise ValueError("slots must be >= 1")
         self._free = value
+        self._cap = value
         self._resumed: list[asyncio.Future[None]] = []
         self._fresh: list[asyncio.Future[None]] = []
+
+    @property
+    def capacity(self) -> int:
+        """The intended cap (mission slots), as last set by the constructor or
+        :meth:`set_capacity`. `_free` is what is left of it right now."""
+        return self._cap
+
+    @property
+    def free(self) -> int:
+        """Slots free at this instant; NEGATIVE after a shrink while that many
+        missions are still running (their releases bring it back to 0)."""
+        return self._free
+
+    def set_capacity(self, value: int) -> None:
+        """Move the number of mission slots at RUNTIME (REWORK_CAPACITY).
+
+        This is a signed DELTA on the free count, never an assignment: running
+        missions each still hold a slot and will each `release()` once, so an
+        assignment would be re-inflated and overshot by every in-flight
+        release. Shrinking past the number of running missions therefore drives
+        `_free` NEGATIVE on purpose, and those releases bring it back up with
+        no mission killed. Growing wakes parked waiters at once.
+        """
+        cap = max(1, int(value))
+        self._free += cap - self._cap
+        self._cap = cap
+        self._wake()
 
     async def acquire(self, *, resumed: bool = False) -> None:
         if self._free > 0 and not self._resumed and (resumed or not self._fresh):

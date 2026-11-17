@@ -66,8 +66,10 @@ tool-calling agent on the model chosen in the launching chat (or `rework new
 useful, model and effort chosen per role, inputs wired automatically or
 explicitly), `wait` (engine-side, store-derived: a role finished, failed or
 escalated, or the orchestrator's own timeout for a check-in), `read_artifact`,
-`check_in`, `cancel_run`, `message_owner`, `finish`. `fix` / `fix-pr` / `echo`
-are playbooks in its prompt, not pipelines. Rails stay mechanical: the burn gate
+`check_in`, `cancel_run`, `message_owner`, `finish`. `fix` / `fix-pr` / `echo` / `draft`
+are playbooks in its prompt, not pipelines. A `draft` mission (an audit or any
+other read-and-report task) delivers its report in the mission's Report tab,
+never a repository change and never a pull request. Rails stay mechanical: the burn gate
 (`plan.budget.max_usd`, then ask again every `ask_every_usd`), a runaway turn
 cap, owner pause/cancel, escalation policies, and the plan's fixed final gates
 (`_final_gates`, shared with the mechanical runner). Its conversation persists
@@ -82,13 +84,59 @@ receives the owner's messages to a running mission.
 
 The engine (`orchestrator/engine.py`) is the heart: MissionRunner streams the graph,
 materializes interrupts as gate rows, waits on store-derived wake conditions, resumes with
-`Command(resume=...)`. RunSupervisor reconciles INTENT rows into live role asyncio tasks.
+`Command(resume=...)`.
+A gate row is committed before the mission status and the pair is never atomic, so both
+an open gate beside a `running` mission and an `awaiting_gate` mission whose gate row is
+not committed yet are legal transients: readers converge and wait for both facts
+(`conftest.wait_for_gate_park`), never for the gate row alone. The write order is
+deliberately not flipped, because status-first would move the transient to
+`awaiting_gate` with no gate row, which the daemon's repair pass and the
+`_handle_halted` wait loop (it waits for no open gate before writing `running`) both
+assume away.
+RunSupervisor reconciles INTENT rows into live role asyncio tasks.
 The daemon runs one runner per mission under a semaphore, holds a leader lock, and runs a
 boot recovery pass (reopen missions, re-enumerate runs, pick up gates decided while down,
 before the first astream call).
 
 Roles are NOT subgraphs of the orchestrator checkpoint; each Run is an independent
 asyncio task with its own checkpointer thread. Parallelism = N run rows for one step.
+
+### Reliability
+
+A mission must survive a database that aborts a transaction on purpose.
+`kernel/state/retry.py` is the one place that recognises those events and
+retries them: SQLSTATE `40P01` (deadlock_detected), `40001`
+(serialization_failure) and sqlite's `database is locked`. A store operation
+gets 3 total attempts (`MAX_ATTEMPTS`) with a short jittered sleep between them
+(`RETRY_SLEEP_RANGE_S`, 10 to 100 ms), exactly one WARNING per retry naming the
+attempt number and the SQLSTATE, and a clean connection per attempt (the aborted
+transaction is rolled back first). Logical errors (unique violation `23505`,
+syntax `42601`, any other non-transient SQLSTATE) are never retried: they
+propagate on the first attempt, and exhausted attempts surface as
+`TransientDatabaseError` with the original as its cause. Both stores share it:
+`_serialized` wraps every public `PostgresStore` method (the op lock is taken
+per attempt, inside the retry, so the backoff sleep holds no lock), and
+`@retry_transient_methods` wraps `SqliteStore` as a class.
+
+The retry is the safety net, not the fix. Every statement that touches both
+`chats` and `chat_messages` takes the `chats` row first (`SELECT 1 FROM chats
+WHERE id = $1 FOR UPDATE`), then `chat_messages`: found live on 2026-11-14, a
+deadlock on `UPDATE chats SET updated_at = $1 WHERE id = $2` when one
+transaction took the two relations the other way round. sqlite does the parity
+equivalent (a no-op `UPDATE chats SET id = id`), and the Postgres checkpointer's
+`setup()` (DDL on the same database) runs at most once per process and database
+URL instead of per run connection, so it cannot race store writes.
+
+`MAX_TRANSIENT_CRASHES` = 3: a runner that dies on a transient database error
+does not fail its mission while `transient_crash_count` (a missions column, in
+both stores' DDL and idempotent migrations) is at most 3. The mission goes back
+to PENDING with `transient_db_error` and a `crash` note in its result
+("transient database error, crash 1 of 3, resuming from its checkpoint"), a
+WARNING is logged, an INFO event says it will resume from its checkpoint, and
+the pickup machinery restarts it from there. Past 3 crashes it fails with
+"transient database error, crash N after 3 requeues, giving up: <error>" as the result
+error, and a non-transient error fails at once. The counter resets to 0 at a
+terminal status, so a later run gets the full budget.
 
 ### Logs
 
@@ -156,11 +204,12 @@ specified in `docs/tui/DESIGN.md`; every view is built from that kit.
   (status, last steps, inline gate answers, pause/cancel). Nothing runs until
   you confirm: typing "yes" launches every pending proposal and "no" scraps
   every one of them. Project / model / effort knobs under the prompt. Opens
-  with no chat selected.
+  with no chat selected. What the list holds is the rule below.
 - **Dashboard**: overview (stats strip, projects, missions grouped needs-you →
   queued → running → paused → recent) and a mission drill-down: header + flow strip,
   sessions (one per run) on the left, and Trajectory / Graph (LangGraph-style
-  node view, click a node to focus its run) / Output / Diff / Report / Gates.
+  node view, click a node to focus its run) / Output / Diff / Report / Gates /
+  Chat (the mission's orchestrator transcript, read-only and scrollable).
   A section is derived from the store, never from a remembered label: **needs
   you** means the mission has an OPEN gate (any status), **running** means
   status `running` or `awaiting_gate` with no open gate left (its gate was
@@ -170,6 +219,19 @@ specified in `docs/tui/DESIGN.md`; every view is built from that kit.
   per-project badges count those same sections through one helper, so the
   Dashboard cannot list a mission under "needs you" while the Gates tab is
   empty.
+- **What the Work tab lists.** Chats are conversations; missions are missions.
+  A chat is a row iff it is not an orchestrator transcript (`orch-<mission id>`)
+  AND it holds at least one `user` or `assistant` message. So an empty chat, a
+  chat holding only `note` rows, and a mission's own transcript are never rows.
+  Rows are ordered and aged by their newest MESSAGE (`Chat.last_message_at`,
+  derived by `list_chats`, never stored), with `updated_at` only as a tiebreak,
+  so a rename does not float a chat to the top. Agents never create chats:
+  creating a mission mints none (its `chat_id` points at `orch-<id>`, a row
+  that appears when the orchestrator first runs). A real conversation that
+  launched a mission stays listed and keeps a Transcript button that opens that
+  mission's transcript in Work. A mission's transcript otherwise lives on the
+  Dashboard (its Chat tab). If the store cannot say which chats hold messages,
+  the list is empty for that refresh rather than showing everything.
 - **Gates**: inbox oldest-first with full decision context (mission, the run it
   unblocks, the diff + audit verdict for ship gates, recent steps) and an answer
   box; the typed answer reaches the paused role as `Gate.decision`.

@@ -28,6 +28,19 @@ def run_id(mission_id: str, step: str, role: str, attempt: int) -> str:
     return f"{mission_id}:{step}:{role}:{attempt}"
 
 
+ORCHESTRATOR_CHAT_PREFIX = "orch-"
+
+
+def orchestrator_chat_id(mission_id: str) -> str:
+    """The chat a mission's own orchestrator writes its transcript to.
+
+    Deterministic, so any surface (the Work list, the Dashboard action, session
+    restore) can reach a mission's transcript without a lookup. Defined here
+    rather than in rework.orchestrator.agent because the TUI needs it and the
+    orchestrator package pulls in the whole engine."""
+    return f"{ORCHESTRATOR_CHAT_PREFIX}{mission_id}"
+
+
 class MissionStatus(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
@@ -272,6 +285,11 @@ class Chat(BaseModel):
     mission_id: str | None = None
     created_at: float = Field(default_factory=now)
     updated_at: float = Field(default_factory=now)
+    # ts of the newest message of ANY role in this chat (None: no messages).
+    # Derived, never stored: only `list_chats` fills it, from chat_messages, so
+    # the Work list can order and age a chat by its real latest activity rather
+    # than by `updated_at`, which a rename or an attach also moves.
+    last_message_at: float | None = None
 
 
 class ChatMessage(BaseModel):

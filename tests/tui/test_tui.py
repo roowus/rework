@@ -5427,6 +5427,178 @@ async def test_dashboard_open_mission_sends_a_message_through_the_shared_publish
         await store.aclose()
 
 
+# -- empty chats are hidden, a mission's transcript is one click away ----------
+
+
+def _row_markup(app: ReworkApp) -> list[str]:
+    return [r._markup for r in app.query_one("#chat-list", RowList).query("Row")]
+
+
+def _log_text(app: ReworkApp) -> str:
+    return " ".join(str(w.render()) for w in app.query("#chat-log .step"))
+
+
+async def _seed_orch_chat(env: Path, mission_id: str, line: str) -> str:
+    """A mission's real orchestrator transcript: `orch-<mission-id>` with one
+    message in it, exactly as the orchestrator agent writes it."""
+    from rework.kernel.state.records import Chat, ChatMessage, orchestrator_chat_id
+
+    chat_id = orchestrator_chat_id(mission_id)
+    store = await _store(env)
+    try:
+        await store.create_chat(
+            Chat(id=chat_id, title=f"orchestrator {mission_id}", mission_id=mission_id)
+        )
+        await store.append_chat_message(
+            ChatMessage(
+                chat_id=chat_id,
+                role="assistant",
+                body={"role": "assistant", "content": line},
+                display=line,
+            )
+        )
+    finally:
+        await store.aclose()
+    return chat_id
+
+
+async def test_a_chat_that_never_got_a_message_is_not_listed(
+    ids: dict[str, str], env: Path
+) -> None:
+    """The shell `create_mission` mints for the CLI has no messages, so as a
+    clickable row it looks exactly like a broken chat that opens blank."""
+    from rework.kernel.state.records import Chat
+
+    store = await _store(env)
+    try:
+        await store.create_chat(Chat(title="never used shell", model_id="flash"))
+    finally:
+        await store.aclose()
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        rows = _row_markup(app)
+        assert not any("never used shell" in r for r in rows), rows
+        # the list is not simply empty: a chat that has messages is still there
+        assert any("flaky rolling mean test" in r for r in rows), rows
+        assert not app.swallowed
+
+
+async def test_that_chat_is_listed_once_it_has_a_message(ids: dict[str, str], env: Path) -> None:
+    from rework.kernel.state.records import Chat, ChatMessage
+
+    store = await _store(env)
+    try:
+        shell = await store.create_chat(Chat(title="never used shell", model_id="flash"))
+    finally:
+        await store.aclose()
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        assert not any("never used shell" in r for r in _row_markup(app))
+        store = await _store(env)
+        try:
+            await store.append_chat_message(
+                ChatMessage(chat_id=shell.id, role="user", body={}, display="actually used")
+            )
+        finally:
+            await store.aclose()
+        await _wait_for(
+            pilot, lambda: any("never used shell" in r for r in _row_markup(app)), tries=120
+        )
+        rows = _row_markup(app)
+        assert any("never used shell" in r for r in rows), rows
+        assert not app.swallowed
+
+
+async def test_dashboard_transcript_button_opens_the_mission_transcript(
+    ids: dict[str, str], env: Path
+) -> None:
+    """The orchestrator chat is filtered out of CHATS (one per mission, machine
+    chatter), so the Dashboard mission page carries its own door to it."""
+    line = "the audit found two flaky gates"
+    chat_id = await _seed_orch_chat(env, ids["running"], line)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.open_mission(ids["running"])
+        await _settle(pilot, 0.8)
+        dash = app.view("dashboard")
+        await pilot.click(_btn(app, dash, "transcript"))
+        await _wait_for(pilot, lambda: app.view("work").convo is not None)
+        await _settle(pilot, 0.6)
+        work = app.view("work")
+        assert app.active_tab == "work"
+        assert work.convo is not None and work.convo.id == chat_id
+        assert line in _log_text(app)
+        assert not app.swallowed
+
+
+async def test_work_transcript_button_opens_the_mission_transcript(
+    ids: dict[str, str], env: Path
+) -> None:
+    """The other door: a mission's chat row in the Work list puts the mission in
+    view, and the pane's Transcript button opens `orch-<mission-id>`."""
+    line = "round 1 passed, round 2 is running"
+    chat_id = await _seed_orch_chat(env, ids["running"], line)
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        # ids["chat"] IS the chat that launched ids["running"], so the mission is
+        # in view as soon as it is open
+        app.query_one("#chat-list", RowList).activate(ids["chat"], via_mouse=True)
+        await _settle(pilot, 0.8)
+        work = app.view("work")
+        assert work.mission_in_view() == ids["running"]
+        await pilot.click(_btn(app, work, "transcript"))
+        await _wait_for(pilot, lambda: work.convo is not None and work.convo.id == chat_id)
+        await _settle(pilot, 0.6)
+        assert work.convo is not None and work.convo.id == chat_id
+        assert line in _log_text(app)
+        assert not app.swallowed
+
+
+async def test_a_normal_chat_still_opens_and_paints(ids: dict[str, str]) -> None:
+    """Regression for the owner's report: clicking a real chat shows the chat."""
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        app.query_one("#chat-list", RowList).activate(ids["chat"], via_mouse=True)
+        await _settle(pilot, 1.0)
+        work = app.view("work")
+        assert work.convo is not None and work.convo.id == ids["chat"]
+        log = _log_text(app)
+        assert "the rolling mean test is flaky again" in log, log[:400]
+        assert not app.swallowed
+
+
+async def test_a_restored_session_comes_back_to_a_mission_transcript(
+    ids: dict[str, str], env: Path
+) -> None:
+    """A session saved while looking at `orch-<mission-id>` must reopen that
+    transcript. The orch chat is filtered OUT of the snapshot (one per mission),
+    so the old "is it in snap.chats?" restore guard dropped it and the owner
+    landed on a blank Work tab."""
+    from rework.tui import reload as reload_mod
+    from rework.tui.reload import ReloadState
+
+    line = "restored turn: round 1 passed"
+    chat_id = await _seed_orch_chat(env, ids["running"], line)
+    assert reload_mod.save_state(ReloadState(tab="work", chat_id=chat_id, at=1.0))
+
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot, 1.0)
+        work = app.view("work")
+        await _wait_for(pilot, lambda: work.convo is not None and work.convo.id == chat_id)
+        await _settle(pilot, 0.6)
+        assert app.active_tab == "work"
+        assert work.convo is not None and work.convo.id == chat_id
+        assert line in _log_text(app)
+        assert not app.swallowed
+    assert not reload_mod.state_path().exists(), "the state applies exactly once"
+
+
 # -- rotated credentials: an auth failure re-reads the env file ----------------
 
 

@@ -23,7 +23,7 @@ from typing import Any
 
 from textual.css.query import NoMatches
 
-from rework.kernel.state.records import EventType
+from rework.kernel.state.records import ORCHESTRATOR_CHAT_PREFIX, EventType
 from rework.tui.data import TuiData
 
 log = logging.getLogger("rework.tui")
@@ -32,6 +32,10 @@ log = logging.getLogger("rework.tui")
 # small query of this many newest events
 STAMP_MISSIONS = 24
 EVENT_WINDOW = 40
+# the Work list shows at most CHAT_LIMIT chats; the store is asked for more so the
+# orchestrator transcripts filtered out of the window cannot starve it
+CHAT_LIMIT = 200
+CHAT_FETCH = 600
 
 
 def midnight() -> float:
@@ -50,6 +54,10 @@ class Snapshot:
     online: bool = True
     error: str = ""
     loaded: bool = False  # False until the first successful refresh
+    # True when the chat list could not be read this poll and there is no last
+    # good one to show: the Work panel says so instead of rendering a bare
+    # empty list, and a saved open chat is not dropped for an empty list
+    chats_failed: bool = False
     at: float = 0.0
     # newest event epoch per run. Events are the only live signal a role gives,
     # so this is what tells a working run from a wedged one (spinner.STALL_SECONDS).
@@ -97,6 +105,8 @@ class Hub:
         # 'offline:' and broadcast a stale snapshot into a half-torn-down DOM
         # (a spurious error pair in tui.log on every graceful quit).
         self._closing = False
+        # set by `_chats` when the list could not be read (see Snapshot.chats_failed)
+        self._chats_failed = False
 
     def subscribe(self, fn: Callable[[Snapshot], None]) -> None:
         self._listeners.append(fn)
@@ -122,6 +132,10 @@ class Hub:
             snap.gates,
             snap.projects,
             snap.chats,
+            # a new message must reorder the list at once: id + newest message
+            # time per chat, so it is in the key even if Chat equality changes
+            tuple((str(c.id), getattr(c, "last_message_at", None)) for c in snap.chats),
+            snap.chats_failed,
             snap.spend_today,
             snap.online,
             snap.error,
@@ -154,6 +168,7 @@ class Hub:
                 snap.gates = await self.data.open_gates()
                 snap.projects = await self.data.projects()
                 snap.chats = await self._chats()
+                snap.chats_failed = self._chats_failed
                 snap.spend_today = await self._spend_today()
                 snap.budget_raises = await self._budget_raises()
                 await self._event_stamps(snap)
@@ -195,8 +210,9 @@ class Hub:
         EVENT_WINDOW events, no payload-heavy 200-row reads, no per-run queries)
         for at most STAMP_MISSIONS missions, so at most 24 small queries. Runs
         are read out of that one window in Python. A failed query leaves that
-        mission without a stamp ("unknown"), which animates; it never replays an
-        old stamp. The stamp only decides "animating frame" vs "idle 7m"."""
+        mission without a stamp ("unknown"); it never replays an old stamp. The
+        views never show an offline snapshot as working, whatever the stamps.
+        The stamp only decides "animating frame" vs "idle 7m"."""
         stamps: dict[str, float] = {}
         active = [
             m for m in snap.missions if str(getattr(m.status, "value", m.status)) == "running"
@@ -210,13 +226,63 @@ class Hub:
             stamps["*"] = max(stamps.values())
         snap.last_event = stamps
 
+    @staticmethod
+    def _is_orchestrator_transcript(chat: Any) -> bool:
+        # A mission orchestrator's own conversation is machinery, not a chat:
+        # there is one per mission and the owner never writes in it. It stays
+        # reachable per mission (the Dashboard Chat tab shows it read-only, and
+        # the Transcript buttons open `orchestrator_chat_id(mission.id)`); it
+        # is hidden from the list, not deleted.
+        return str(chat.id).startswith(ORCHESTRATOR_CHAT_PREFIX)
+
     async def _chats(self) -> list[Any]:
+        """The Work list: user conversations only.
+
+        The rule, in one place: a chat is listed iff it is not an orchestrator
+        transcript AND it holds at least one `user` or `assistant` message. So
+        not an orchestrator transcript, not an empty chat, not a note-only chat
+        (a mission shell holds nothing, or only `note` rows from the owner
+        pings). Nothing else is consulted: a real conversation that launched a
+        mission carries `mission_id` too and must stay listed.
+
+        Fails CLOSED: a chat the store cannot vouch for is not listed (a probe
+        that fell back to "list everything" is how shells leaked in). That rule
+        is unchanged; only what a FAILED probe shows has changed. The probe is
+        read like `data.chats()` is (last good on a connection error), and when
+        it still fails the last published list is kept instead of blanking the
+        panel, so a reconnect never looks like deleted conversations. With
+        nothing to keep, the list is empty and `_chats_failed` says why, so the
+        sidebar can show a retrying note."""
+        self._chats_failed = False
         try:
-            chats = await self.data.chats(limit=200)
+            chats = await self.data.chats(limit=CHAT_FETCH)
         except AttributeError:  # store without chat support
             return []
-        # a mission orchestrator's own conversation is machinery, not a chat
-        return [c for c in chats if not str(c.id).startswith("orch-")]
+        # orchestrator transcripts are dropped BEFORE the cap so the busiest
+        # chats in the store cannot crowd real conversations out of the window
+        candidates = [c for c in chats if not self._is_orchestrator_transcript(c)]
+        if not candidates:
+            return []
+        try:
+            filled = await self.data.chat_ids_with_conversation([str(c.id) for c in candidates])
+        except Exception:  # probe failed: keep the last vouched list, never list everything
+            log.debug("chat conversation probe failed, keeping the last list", exc_info=True)
+            asked = {str(c.id) for c in candidates}
+            kept = [c for c in self.snapshot.chats if str(c.id) in asked]
+            self._chats_failed = not kept
+            return kept
+        listed = [c for c in candidates if str(c.id) in filled]
+        # newest MESSAGE first; updated_at is only the tiebreaker and a chat
+        # with no message time sorts last (the store orders the same way, this
+        # keeps the list right for a store or fake that does not)
+        listed.sort(
+            key=lambda c: (
+                getattr(c, "last_message_at", None) is None,
+                -float(getattr(c, "last_message_at", None) or 0),
+                -float(getattr(c, "updated_at", 0) or 0),
+            )
+        )
+        return listed[:CHAT_LIMIT]
 
     async def _budget_raises(self) -> list[Any]:
         try:

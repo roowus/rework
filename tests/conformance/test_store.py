@@ -163,6 +163,27 @@ async def test_gate_lifecycle(store: StateStore) -> None:
     assert again.decision_note == "lgtm"  # first decision stands
 
 
+async def test_set_gate_question_rewords_an_open_gate_only(store: StateStore) -> None:
+    """A final gate is reused across audit rounds, so its question has to be
+    re-wordable while it is open. A decided gate is the record of what the
+    owner answered: its text never changes."""
+    m = await store.create_mission(Mission(id=new_id("m"), objective="o"))
+    gate = Gate(id=new_id("gate"), mission_id=m.id, kind=GateKind.SHIP, question="ship? r1")
+    await store.create_gate(gate)
+
+    refreshed = await store.set_gate_question(gate.id, "ship? r2")
+    assert refreshed is not None and refreshed.question == "ship? r2"
+    assert refreshed.status == GateStatus.OPEN
+    stored = await store.get_gate(gate.id)
+    assert stored is not None and stored.question == "ship? r2"
+
+    await store.decide_gate(gate.id, approved=True, note="lgtm")
+    refused = await store.set_gate_question(gate.id, "ship? r3")
+    assert refused is not None and refused.question == "ship? r2", "a decided gate is frozen"
+    assert refused.status == GateStatus.APPROVED
+    assert await store.set_gate_question("missing", "whatever") is None
+
+
 async def test_events_seq_cursor(store: StateStore) -> None:
     m = await store.create_mission(Mission(id=new_id("m"), objective="o"))
     other = await store.create_mission(Mission(id=new_id("m"), objective="p"))
@@ -559,6 +580,126 @@ async def test_chat_roundtrip(store: StateStore) -> None:
     assert await store.chat_messages(chat.id) == []
 
 
+async def test_chat_ids_with_messages_reports_only_chats_that_hold_a_message(
+    store: StateStore,
+) -> None:
+    """The emptiness probe answers for exactly the chats asked about.
+
+    The Work list hides chats that never got a message (`create_mission` mints
+    one per mission and never writes to it), so a wrong answer here is invisible:
+    returning every id silently restores the blank rows, returning none hides
+    real transcripts. A missing id is simply absent, never an error."""
+    from rework.kernel.state.records import Chat, ChatMessage
+
+    filled = await store.create_chat(Chat(title="has a transcript"))
+    blank = await store.create_chat(Chat(title="never written to"))
+    await store.append_chat_message(
+        ChatMessage(
+            chat_id=filled.id,
+            role="user",
+            body={"role": "user", "content": "hi"},
+            display="hi",
+            ts=100.0,
+        )
+    )
+
+    got = await store.chat_ids_with_messages([filled.id, blank.id])
+    assert got == {filled.id}, got
+
+    # asked for alone, the empty chat still answers empty
+    assert await store.chat_ids_with_messages([blank.id]) == set()
+    # no ids at all: no query, no rows
+    assert await store.chat_ids_with_messages([]) == set()
+    # an id that is not in the db is absent, not an error
+    assert await store.chat_ids_with_messages([filled.id, "chat-does-not-exist"]) == {filled.id}
+    # duplicates are harmless (the probe de-dupes)
+    assert await store.chat_ids_with_messages([filled.id, filled.id]) == {filled.id}
+
+
+async def test_chat_ids_with_conversation_skips_empty_and_note_only_chats(
+    store: StateStore,
+) -> None:
+    """The Work list's conversation probe, held to one contract on every backend
+    (Postgres has no server in CI here, so parity is pinned at this level).
+
+    A chat counts only if it holds a `user` or `assistant` row. A mission shell
+    is empty or holds only `note` rows (owner pings), and counting those is how
+    shells impersonated conversations. Missing ids are absent, never an error."""
+    from rework.kernel.state.records import Chat, ChatMessage
+
+    async def put(chat_id: str, role: str, ts: float) -> None:
+        await store.append_chat_message(
+            ChatMessage(
+                chat_id=chat_id,
+                role=role,
+                body={"role": role, "content": "x"},
+                display="x",
+                ts=ts,
+            )
+        )
+
+    user_only = await store.create_chat(Chat(title="user only"))
+    assistant_only = await store.create_chat(Chat(title="assistant only"))
+    note_only = await store.create_chat(Chat(title="note only"))
+    empty = await store.create_chat(Chat(title="empty"))
+    mixed = await store.create_chat(Chat(title="notes then a reply"))
+    await put(user_only.id, "user", 100.0)
+    await put(assistant_only.id, "assistant", 100.0)
+    await put(note_only.id, "note", 100.0)
+    await put(note_only.id, "note", 101.0)
+    await put(mixed.id, "note", 100.0)
+    await put(mixed.id, "assistant", 101.0)
+
+    ids = [user_only.id, assistant_only.id, note_only.id, empty.id, mixed.id]
+    got = await store.chat_ids_with_conversation(ids)
+    assert got == {user_only.id, assistant_only.id, mixed.id}, got
+    assert await store.chat_ids_with_conversation([note_only.id, empty.id]) == set()
+    assert await store.chat_ids_with_conversation([]) == set()
+    assert await store.chat_ids_with_conversation([user_only.id, "chat-nope"]) == {user_only.id}
+    assert await store.chat_ids_with_conversation([user_only.id, user_only.id]) == {user_only.id}
+
+
+async def test_list_chats_orders_by_newest_message_not_updated_at(store: StateStore) -> None:
+    """`list_chats` sorts by the newest MESSAGE time, `updated_at` only breaks
+    ties, and a chat with no message sorts last: the same on both backends.
+
+    The two timestamps are set to disagree. Appending to `newer_msg` first and
+    to `newer_stamp` second leaves `newer_stamp` with the later `updated_at`
+    (an append bumps it) but the earlier message `ts`, so a sort on `updated_at`
+    would put it first. Each chat also reports its `last_message_at`."""
+    from rework.kernel.state.records import Chat, ChatMessage
+
+    async def put(chat_id: str, ts: float) -> None:
+        await store.append_chat_message(
+            ChatMessage(
+                chat_id=chat_id,
+                role="user",
+                body={"role": "user", "content": "x"},
+                display="x",
+                ts=ts,
+            )
+        )
+
+    newer_stamp = await store.create_chat(Chat(title="newer updated_at, older message"))
+    newer_msg = await store.create_chat(Chat(title="older updated_at, newer message"))
+    empty = await store.create_chat(Chat(title="no messages"))
+    await put(newer_msg.id, 2000.0)
+    await asyncio.sleep(0.01)
+    await put(newer_stamp.id, 1000.0)
+
+    chats = await store.list_chats()
+    assert [c.id for c in chats] == [newer_msg.id, newer_stamp.id, empty.id], [
+        (c.title, c.last_message_at, c.updated_at) for c in chats
+    ]
+    by_id = {c.id: c for c in chats}
+    assert by_id[newer_msg.id].last_message_at == 2000.0
+    assert by_id[newer_stamp.id].last_message_at == 1000.0
+    assert by_id[empty.id].last_message_at is None
+    # the same order under the launched-only filter
+    unlaunched = await store.list_chats(include_missions=False)
+    assert [c.id for c in unlaunched] == [newer_msg.id, newer_stamp.id, empty.id]
+
+
 async def test_gate_typed_decision_roundtrip(store: StateStore) -> None:
     """A gate can carry a typed answer, and it survives a reload.
 
@@ -584,6 +725,21 @@ async def test_gate_typed_decision_roundtrip(store: StateStore) -> None:
     )
     done = await store.decide_gate(plain.id, approved=True)
     assert done is not None and done.decision is None
+
+
+async def test_transient_crash_count_increments_then_resets(store: StateStore) -> None:
+    """The daemon's requeue budget: one atomic bump returning the new value,
+    and a reset that really zeroes the stored one (fresh dispatch / terminal).
+    The counter is NOT on Mission: it is read only through these two methods.
+    """
+    m = await store.create_mission(Mission(id=new_id("m"), objective="flaky runner"))
+    assert await store.increment_transient_crash_count(m.id) == 1
+    assert await store.increment_transient_crash_count(m.id) == 2
+    # a row that does not exist reports 0 instead of raising
+    assert await store.increment_transient_crash_count("missing") == 0
+    await store.reset_transient_crash_count(m.id)
+    # 1, not 3: the reset hit the stored value and the bump read it back
+    assert await store.increment_transient_crash_count(m.id) == 1
 
 
 async def test_a_schema_change_does_not_break_a_live_connection(

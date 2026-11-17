@@ -59,14 +59,14 @@ def proposal_from_args(args: dict[str, Any], *, cost_history: float | None = Non
     it, so a replay without it would show — and then stamp at launch — a
     different cap than the live card. A caller that has no store (a pure
     replay test) may omit it and gets the keyword estimate."""
-    from rework.orchestrator.chat import Proposal, proposal_budget
+    from rework.orchestrator.chat import Proposal, proposal_budget, proposal_plan
 
     objective = str(args.get("objective", "")).strip()
     budget_usd, budget_reason = proposal_budget(args, objective, cost_history=cost_history)
     return Proposal(
         objective=objective,
         title=str(args.get("title", "")).strip(),
-        plan=str(args.get("plan", "fix")).strip() or "fix",
+        plan=proposal_plan(args, objective),
         project=str(args.get("project", "")).strip(),
         repo=str(args.get("repo", "")).strip(),
         model=str(args.get("model", "")).strip(),
@@ -290,9 +290,10 @@ def context_note(snap: Snapshot, project_id: str | None) -> str:
         "Plans: echo (no repo). fix and fix-pr need a repo for a git-transport "
         "project; for an upload-transport project they do NOT need one — the "
         "project's files area supplies the files, and results are fetched, not pushed. "
-        "draft (document work: research with the web tools, write files in the "
-        "project, no PR) follows the same repo rule as fix. audit (read-only survey "
-        "of a codebase, no code change, no PR) also needs a repo."
+        "draft (read-and-report work: the deliverable is the mission's Report "
+        "tab, no files are written into the repository, and there is no PR) still "
+        "resolves a repo to run against; audit (read-only survey of a codebase, no "
+        "code change, no PR) also needs a repo."
     )
     return "\n".join(lines)
 
