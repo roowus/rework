@@ -155,6 +155,11 @@ The Graph draws two levels and they must never be confused:
   than one line.
 - Inside a tab: a **sidebar** (`$surface`, fixed width ~30) and a **main area**
   (`$bg`), divided by one `$line` column. No outer borders.
+- **Mission detail** (Dashboard): the orchestrator prompt sits in a bounded box
+  of `PROMPT_BOX_ROWS` (6) rows at the top of the page, scrollable in place with
+  a reserved one-line `$faint` hint row (`36 more lines below · scroll`) that
+  appears when the brief is taller, so a long brief never displaces the flow
+  strip, the run list or the tabs.
 
 ## 5. Components
 

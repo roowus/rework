@@ -134,6 +134,7 @@ async def test_coder_edits_in_worktree_and_hands_off_diff(coder_ctx: RoleBuildCt
     assert artifact["commit"] is not None
     assert artifact["summary"].startswith("test passed")
     assert "calc.py" in artifact["diff"]
+    assert "calc.py" in artifact["changed_files"]  # taken from the full diff, not the cut copy
     assert "+    return a + b" in artifact["diff"]
     assert "-    return a - b" in artifact["diff"]
 
@@ -205,3 +206,36 @@ async def test_ensure_worktree_reuses_existing_branch(coder_ctx: RoleBuildCtx) -
     wt2, _sha = await ensure_worktree(repo, wt_path, branch)
     assert wt1 == wt2
     assert await current_branch(wt2) == branch
+
+
+async def test_investigators_proposed_tests_reach_the_coder(coder_ctx: RoleBuildCtx) -> None:
+    """Acceptance (c): the investigator's tests are in the coder's first message,
+    ahead of the generic findings dump; and the red-green rule is in its prompt."""
+    investigation = {
+        "summary": "add subtracts",
+        "tests": [
+            {
+                "name": "test_add_sums",
+                "what_it_pins": "add(2, 3) == 5",
+                "where": "test_calc.py",
+                "should_fail_because": "add returns a - b",
+                "command": "python3 -m pytest -q test_calc.py",
+            }
+        ],
+        "no_tests_reason": "",
+    }
+    run = await coder_ctx.store.update_run(
+        coder_ctx.run.id, context={"brief": "fix add()", "investigation": investigation}
+    )
+    ctx = RoleBuildCtx(**{**coder_ctx.__dict__, "run": run or coder_ctx.run})
+    fake = coder_ctx.provider
+    assert isinstance(fake, FakeProvider)
+    fake.push(ChatResult(text="done", usage=Usage(input_tokens=1, output_tokens=1)))
+    graph = autodiscover().get("coder").build_graph(ctx)
+    graph.checkpointer = InMemorySaver()
+    config: dict[str, Any] = {"configurable": {"thread_id": "t-c"}}
+    await graph.ainvoke({"objective": "fix add()"}, config=config)
+    first = str(fake.requests[0].messages[0]["content"])
+    assert "Tests the investigator proposed" in first
+    assert "test_add_sums" in first and "should_fail_because" in first
+    assert "watch it FAIL for the RIGHT reason" in str(fake.requests[0].system)

@@ -17,7 +17,12 @@ from rework.kernel.llm.catalog import ModelCatalog, ModelProvider
 from rework.kernel.llm.types import ChatRequest
 from rework.kernel.state.records import Charge
 from rework.kernel.state.store import StateStore
-from rework.nodes.report_sections import ReportSection, build_report_prompt, build_report_schema
+from rework.nodes.report_sections import (
+    ReportSection,
+    apply_defaults,
+    build_report_prompt,
+    build_report_schema,
+)
 
 log = logging.getLogger("rework.nodes")
 
@@ -124,9 +129,12 @@ def make_report_writer_node(
             return None, f"invalid JSON: {exc}"
         if not isinstance(artifact, dict):
             return None, "artifact is not an object"
-        missing = [k for k in schema["required"] if k not in artifact]
+        defaulted = {k for s in sections for k in s.defaults}
+        missing = [k for k in schema["required"] if k not in artifact and k not in defaulted]
         if missing:
             return None, f"missing required sections: {missing}"
+        if apply_defaults(artifact, sections):
+            log.warning("report-writer defaulted omitted sections")
         return artifact, ""
 
     async def node(state: dict[str, Any]) -> dict[str, Any]:

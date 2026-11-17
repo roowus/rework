@@ -18,7 +18,13 @@ class ReportSection:
     prompt_fragment: str  # instructions for the model producing this section
     schema_slice: dict[str, Any]  # json-schema properties this section requires
     required_fields: tuple[str, ...] = field(default_factory=tuple)
+    # safe values for fields the writer may omit: a forgotten field degrades to
+    # these instead of discarding an otherwise valid report
+    defaults: dict[str, Any] = field(default_factory=dict)
 
+
+# kinds of test-quality finding the auditor files under `coverage`
+COVERAGE_KINDS = ("untested_behavior", "vacuous_test")
 
 FINDINGS = ReportSection(
     key="findings",
@@ -100,24 +106,37 @@ SUGGESTED_FIX = ReportSection(
     required_fields=("suggested_fix",),
 )
 
-PROPOSED_TESTS = ReportSection(
-    key="proposed_tests",
-    title="Proposed tests",
+TESTS = ReportSection(
+    key="tests",
+    title="Tests that would catch the bug",
     prompt_fragment=(
-        "Tests that would prove the fix or answer the open questions: name,"
-        " what it exercises, how (exact command or file to add)."
+        "The SMALLEST test that would CATCH THE BUG, not a suite. For each:"
+        " name, what_it_pins (the behaviour), where (the file to add it to or"
+        " the existing test file), should_fail_because (why it fails on the"
+        " CURRENT code: the behaviour is missing, not a typo or an import"
+        " error), command (the exact command that runs it). An empty list is"
+        " legitimate only with a non-empty no_tests_reason (why no test can"
+        " catch this); otherwise set no_tests_reason to an empty string."
     ),
     schema_slice={
-        "proposed_tests": {
+        "tests": {
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["name", "exercises"],
-                "properties": {"name": {"type": "string"}, "exercises": {"type": "string"}},
+                "required": ["name", "what_it_pins", "where", "should_fail_because", "command"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "what_it_pins": {"type": "string"},
+                    "where": {"type": "string"},
+                    "should_fail_because": {"type": "string"},
+                    "command": {"type": "string"},
+                },
             },
-        }
+        },
+        "no_tests_reason": {"type": "string"},
     },
-    required_fields=("proposed_tests",),
+    required_fields=("tests", "no_tests_reason"),
+    defaults={"tests": [], "no_tests_reason": ""},
 )
 
 RULED_OUT = ReportSection(
@@ -250,6 +269,42 @@ WARNINGS = ReportSection(
 )
 
 
+COVERAGE = ReportSection(
+    key="coverage",
+    title="Test coverage",
+    prompt_fragment=(
+        "Ask of every test the change relies on: can it actually fail? List"
+        " coverage findings, each with kind (untested_behavior = changed"
+        " behaviour no test pins; vacuous_test = a test that passes with the"
+        " fix reverted or cannot fail), title, detail, evidence (command"
+        " output you actually saw), severity (critical|high|medium|low). If"
+        " the handoff claims red_green_verified, verify it yourself for at"
+        " most 3 named tests: revert the fix hunk in your worktree, re-run the"
+        " named command, and if it still passes report vacuous_test with the"
+        " output as evidence; then restore the worktree. Empty list only when"
+        " every changed behaviour is pinned by a test that can fail."
+    ),
+    schema_slice={
+        "coverage": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["kind", "title", "detail", "evidence", "severity"],
+                "properties": {
+                    "kind": {"enum": list(COVERAGE_KINDS)},
+                    "title": {"type": "string"},
+                    "detail": {"type": "string"},
+                    "evidence": {"type": "array", "items": {"type": "string"}},
+                    "severity": {"enum": ["critical", "high", "medium", "low"]},
+                },
+            },
+        }
+    },
+    required_fields=("coverage",),
+    defaults={"coverage": []},
+)
+
+
 # ---- surveyor sections: a cited map of a codebase, read cold --------------
 
 _WHERE = (
@@ -310,15 +365,17 @@ SURVEY_CONFIG = ReportSection(
 )
 
 SURVEY_TESTS = ReportSection(
-    key="tests",
+    # NOT "tests": that key is the REPORT's "tests that would catch the bug"
+    # (#69). The surveyor's key says what it means: how this repo is tested.
+    key="survey_tests",
     title="Tests",
     prompt_fragment=(
         "How the project is tested: an object with framework, command (the"
         " exact command), where (test directories, with paths), and notes"
         " (coverage gaps, slow or networked tests)."
     ),
-    schema_slice={"tests": {"type": "object"}},
-    required_fields=("tests",),
+    schema_slice={"survey_tests": {"type": "object"}},
+    required_fields=("survey_tests",),
 )
 
 SURVEY_CI = ReportSection(
@@ -392,7 +449,6 @@ SURVEY_REPORT = ReportSection(
     required_fields=("report",),
 )
 
-
 SECTION_REGISTRY: dict[str, ReportSection] = {
     s.key: s
     for s in (
@@ -400,10 +456,11 @@ SECTION_REGISTRY: dict[str, ReportSection] = {
         FINDINGS,
         BLOCKERS,
         SUGGESTED_FIX,
-        PROPOSED_TESTS,
+        TESTS,
         RULED_OUT,
         CLASSIFICATION,
         STANDING_ASSESSMENTS,
+        COVERAGE,
         WARNINGS,
         DISPOSITIONS,
         SURVEY_TITLE,
@@ -422,7 +479,6 @@ SECTION_REGISTRY: dict[str, ReportSection] = {
 
 # named assemblies: the default checkbox sets (ADR 0003: truss format is the
 # auditor's default; investigator has its own)
-ASSEMBLY_INVESTIGATOR = ("summary", "findings", "blockers")
 ASSEMBLY_SURVEYOR = (
     "title",
     "summary",
@@ -430,14 +486,23 @@ ASSEMBLY_SURVEYOR = (
     "entry_points",
     "dependencies",
     "config",
-    "tests",
+    "survey_tests",
     "ci",
     "risks",
     "gaps",
     "next_steps",
     "report",
 )
-ASSEMBLY_AUDIT = ("summary", "findings", "standing_assessments", "warnings", "blockers")
+
+ASSEMBLY_INVESTIGATOR = ("summary", "findings", "tests", "blockers")
+ASSEMBLY_AUDIT = (
+    "summary",
+    "findings",
+    "standing_assessments",
+    "coverage",
+    "warnings",
+    "blockers",
+)
 
 
 def resolve_sections(requested: list[str] | None) -> list[ReportSection]:
@@ -485,6 +550,42 @@ def build_report_schema(sections: list[ReportSection]) -> dict[str, Any]:
     }
 
 
+def apply_defaults(artifact: dict[str, Any], sections: list[ReportSection]) -> list[str]:
+    """Fill omitted fields that have a safe default; returns the keys filled.
+    When the artifact has a `warnings` list, each fill is noted there so a
+    reader knows the section was defaulted, not judged empty."""
+    filled: list[str] = []
+    for s in sections:
+        for key, value in s.defaults.items():
+            if key not in artifact:
+                artifact[key] = list(value) if isinstance(value, list) else value
+                filled.append(key)
+    if filled and isinstance(artifact.get("warnings"), list):
+        artifact["warnings"].append(
+            f"the report omitted {', '.join(filled)}; treated as empty, not as a clean result"
+        )
+    if _flag_untested(artifact, sections):
+        filled.append("no_tests_reason")
+    return filled
+
+
+NO_TESTS_NO_REASON = "not provided: the investigator named no test and gave no reason"
+
+
+def _flag_untested(artifact: dict[str, Any], sections: list[ReportSection]) -> bool:
+    """An empty `tests` with a blank `no_tests_reason` is an omission, not a judgement.
+    Make it self-describing (a marker reason plus a warning row when there is a
+    `warnings` list) instead of passing silently; a real reason is left alone."""
+    if not any(s.key == "tests" for s in sections):
+        return False
+    if artifact.get("tests") or str(artifact.get("no_tests_reason") or "").strip():
+        return False
+    artifact["no_tests_reason"] = NO_TESTS_NO_REASON
+    if isinstance(artifact.get("warnings"), list):
+        artifact["warnings"].append(NO_TESTS_NO_REASON)
+    return True
+
+
 def resolve_order(artifact: dict[str, Any], sections: list[ReportSection]) -> list[str]:
     """The artifact's presentation order: the model's sections_order when it
     lists produced sections, else the assembly order. Mechanical sanitizer:
@@ -519,10 +620,16 @@ def open_blockers(audit_artifact: dict[str, Any] | None) -> list[dict[str, Any]]
     return [b for b in blockers if isinstance(b, dict)]
 
 
+def _all_findings(audit_artifact: dict[str, Any] | None) -> list[Any]:
+    """Findings plus coverage findings: a vacuous test blocks like any other."""
+    art = audit_artifact or {}
+    return [*(art.get("findings") or []), *(art.get("coverage") or [])]
+
+
 def blocking_findings(audit_artifact: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Findings at medium severity or above: the ones a ship decision must
     account for (accepted with a reason, or fixed and re-audited)."""
-    findings = (audit_artifact or {}).get("findings") or []
+    findings = _all_findings(audit_artifact)
     return [
         f
         for f in findings
@@ -555,7 +662,7 @@ def mechanical_verdict(audit_artifact: dict[str, Any] | None) -> str:
     answer is unverified work, not a clean audit."""
     if not audit_artifact:
         return NOT_AUDITED
-    findings = [f for f in audit_artifact.get("findings") or [] if isinstance(f, dict)]
+    findings = [f for f in _all_findings(audit_artifact) if isinstance(f, dict)]
     severities = {str(f.get("severity", "")).lower() for f in findings}
     if "critical" in severities or open_blockers(audit_artifact):
         return "request changes"

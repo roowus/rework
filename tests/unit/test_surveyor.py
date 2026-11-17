@@ -59,7 +59,7 @@ ARTIFACT: dict[str, Any] = {
     "entry_points": [{"name": "greet", "where": "app.py:1-2", "purpose": "say hello"}],
     "dependencies": [],
     "config": [],
-    "tests": {"framework": "none", "command": "", "where": "", "notes": "no tests"},
+    "survey_tests": {"framework": "none", "command": "", "where": "", "notes": "no tests"},
     "ci": {"system": "none", "where": "", "checks": []},
     "risks": [
         {
@@ -145,7 +145,7 @@ async def test_surveyor_scripted_run_yields_cited_artifact(sv_ctx: RoleBuildCtx)
     assert artifact is not None, final.get("artifact_error")
     assert {
         "title", "summary", "layout", "entry_points", "dependencies", "config",
-        "tests", "ci", "risks", "gaps", "next_steps", "report",
+        "survey_tests", "ci", "risks", "gaps", "next_steps", "report",
     } <= set(artifact)  # fmt: skip
     assert artifact["risks"][0]["where"] == "app.py:2"
     assert artifact["report"].strip()
@@ -763,7 +763,7 @@ async def test_surveyor_only_mission_end_to_end_renders_the_map_via_report_md(
     assert artifact is not None, final.get("artifact_error")
     required = {
         "title", "summary", "layout", "entry_points", "dependencies", "config",
-        "tests", "ci", "risks", "gaps", "next_steps",
+        "survey_tests", "ci", "risks", "gaps", "next_steps",
     }  # fmt: skip
     assert required <= set(artifact), "all eleven required keys"
     assert len(artifact["risks"]) + len(artifact["gaps"]) == MAX_RISKS_AND_GAPS

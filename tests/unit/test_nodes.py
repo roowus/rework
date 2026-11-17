@@ -14,11 +14,13 @@ from rework.kernel.llm.types import ChatResult, ToolCall, Usage
 from rework.nodes.repo_map import build_repo_map
 from rework.nodes.report_sections import (
     ASSEMBLY_AUDIT,
+    NO_TESTS_NO_REASON,
     build_report_prompt,
     build_report_schema,
     resolve_order,
     resolve_sections,
 )
+from rework.nodes.report_writer import make_report_writer_node
 from rework.nodes.toolloop import make_toolloop_node
 from rework.nodes.tools import LocalExecutor
 
@@ -117,7 +119,7 @@ def test_resolve_sections_unknown_key_loud() -> None:
 
 def test_resolve_sections_none_is_investigator_default() -> None:
     keys = [s.key for s in resolve_sections(None)]
-    assert keys == ["summary", "findings", "blockers"]
+    assert keys == ["summary", "findings", "blockers", "tests"]  # registry order
 
 
 def test_audit_assembly_has_standing_assessments() -> None:
@@ -640,3 +642,130 @@ def test_role_env_no_workdir_does_not_set_scratch_vars(monkeypatch: pytest.Monke
     result = role_env(None)
     # Without workdir, we do not inject any scratch paths
     assert "REWORK_TARGETS" not in result
+
+
+async def test_an_audit_report_missing_coverage_keeps_its_findings(tmp_path: Path) -> None:
+    """A forgotten `coverage` section degrades to empty (and says so in warnings);
+    it must not null an otherwise valid audit, which would block finish(done)."""
+    import json
+
+    store = await _store(tmp_path)
+    finding = {
+        "title": "off by one",
+        "detail": "d",
+        "evidence": ["a.py:1"],
+        "severity": "high",
+        "verdict": "CONFIRMED",
+        "confidence": 0.9,
+    }
+    report = {
+        "summary": "s",
+        "findings": [finding],
+        "standing_assessments": {
+            k: "ok"
+            for k in (
+                "proportionality",
+                "complexity",
+                "priority",
+                "coverage",
+                "business_logic_risk",
+            )
+        },
+        "warnings": [],
+        "blockers": [],
+    }
+    fake = FakeProvider(
+        [ChatResult(text=json.dumps(report), usage=Usage(input_tokens=1, output_tokens=1))]
+    )
+    node = make_report_writer_node(
+        fake,
+        _catalog(),
+        "fake",
+        store,
+        "m1",
+        "m1:step:audit:1",
+        resolve_sections(list(ASSEMBLY_AUDIT)),
+    )
+    result = await node({"messages": []})
+    artifact = result["artifact"]
+    assert artifact is not None and "artifact_error" not in result
+    assert artifact["coverage"] == []
+    assert artifact["findings"] == [finding]
+    assert any("coverage" in w for w in artifact["warnings"])
+    assert len(fake.requests) == 1  # no retry was needed
+
+
+async def _investigator_artifact(
+    tmp_path: Path,
+    report: dict[str, object],
+    n: int,
+    requested: list[str] | None = ["summary", "findings", "tests", "blockers", "warnings"],  # noqa: B006
+) -> dict:
+    """The artifact for `requested` sections; None is the plain spawn_role path
+    (no requested_sections), which resolves to the default investigator assembly."""
+    import json
+
+    fake = FakeProvider(
+        [ChatResult(text=json.dumps(report), usage=Usage(input_tokens=1, output_tokens=1))]
+    )
+    node = make_report_writer_node(
+        fake,
+        _catalog(),
+        "fake",
+        await _store(tmp_path),
+        "m1",
+        f"m1:step:investigate:{n}",
+        resolve_sections(requested),
+    )
+    result = await node({"messages": []})
+    assert result["artifact"] is not None and len(fake.requests) == 1
+    return dict(result["artifact"])
+
+
+async def test_an_investigator_that_names_no_test_and_no_reason_is_not_silent(
+    tmp_path: Path,
+) -> None:
+    base = {"summary": "s", "findings": [], "blockers": [], "warnings": []}
+    omitted = await _investigator_artifact(tmp_path, base, 1)
+    assert omitted["tests"] == []
+    assert omitted["no_tests_reason"] == NO_TESTS_NO_REASON
+    assert "no test" in omitted["no_tests_reason"] and "no reason" in omitted["no_tests_reason"]
+    assert NO_TESTS_NO_REASON in omitted["warnings"]
+
+    reasoned = await _investigator_artifact(
+        tmp_path, {**base, "tests": [], "no_tests_reason": "docs-only change"}, 2
+    )
+    assert reasoned["no_tests_reason"] == "docs-only change"
+    assert reasoned["warnings"] == []
+
+
+async def test_a_plain_spawned_investigator_owes_the_test_or_the_reason(tmp_path: Path) -> None:
+    """The orchestrator's spawn_role passes no requested_sections, so the default
+    assembly itself must carry `tests`; otherwise the marker can never fire there."""
+    assert "tests" in [s.key for s in resolve_sections(None)]
+    report = {"summary": "s", "findings": [], "blockers": []}
+    silent = await _investigator_artifact(tmp_path, report, 1, requested=None)
+    assert silent["tests"] == []
+    assert silent["no_tests_reason"] == NO_TESTS_NO_REASON
+    reasoned = await _investigator_artifact(
+        tmp_path, {**report, "tests": [], "no_tests_reason": "docs-only change"}, 2, requested=None
+    )
+    assert reasoned["no_tests_reason"] == "docs-only change"
+
+
+async def test_a_report_missing_a_section_without_a_default_still_fails(tmp_path: Path) -> None:
+    store = await _store(tmp_path)
+    bad = ChatResult(text='{"summary": "s"}', usage=Usage(input_tokens=1, output_tokens=1))
+    fake = FakeProvider([bad, bad])
+    node = make_report_writer_node(
+        fake,
+        _catalog(),
+        "fake",
+        store,
+        "m1",
+        "m1:step:audit:2",
+        resolve_sections(list(ASSEMBLY_AUDIT)),
+    )
+    result = await node({"messages": []})
+    assert result["artifact"] is None
+    assert "findings" in result["artifact_error"]

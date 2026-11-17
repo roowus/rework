@@ -187,6 +187,27 @@ with a continue/abort gate; approving doubles the cap and resumes, rejecting can
 Steps that FAIL get exactly one in-mission retry (the 429-storm lesson) before the
 plan moves on; synthesis counts only the latest attempt per step.
 
+### Tests are a deliverable
+
+A test that cannot fail is worse than no test, because it looks like safety. The
+defense, from the owner's workflow discipline (github.com/roowus/workflow, "Why the
+test thing is clever"), is red-green: write the test first, run it, watch it fail for
+the right reason (the behaviour is missing, not a typo, an import error or a collection
+error), then fix and watch it pass; the system demands it and records whether it
+happened. What each role owes:
+
+| role | owes on tests |
+|---|---|
+| investigator | `tests`: the smallest test that would catch the bug (name, what it pins, where, why it fails on current code, command), or a `no_tests_reason` |
+| coder | handoff `tests` {added, changed, red_green_verified, commands, result, not_testable_reason}, taken from a fenced json block in its final message; never edits an assertion to get green |
+| auditor | a `coverage` section (`untested_behavior`, `vacuous_test`); a claimed red-green is re-checked mechanically (`nodes/testing.py: verify_red_green` reverts the fix files in a throwaway worktree and re-runs at most 3 named commands; one that still passes is vacuous) |
+| orchestrator | `finish(done)` is refused when the latest coder handoff has no `tests` field, or says `red_green_verified: false` with no `not_testable_reason` (`_enforce_audit_fresh`, coder runs only) |
+
+The mechanical check runs the coder's named commands through `bash -o pipefail` in a disposable worktree, bounded to three commands, and classifies each run by pytest's own vocabulary: exit 0 with pytest's passing summary in the output is `vacuously_passes`, while exit 0 with no pytest evidence (or with a failure summary the shell's exit code hid, as in `pytest ; true`), and exit 1 with no pytest output at all (the command died before pytest started, e.g. a missing directory or `.venv`), are `unverifiable`, which asks a human to verify and accuses nobody; exit 2 to 5 (interrupted, internal error, usage error, nothing collected) is `wrong_red`; at exit 1, an `E ` line naming `ImportError`, `ModuleNotFoundError`, `NameError` or a module-attribute `AttributeError` is treated as a wrong red, and any other exit 1 that shows pytest ran is `fails_for_right_reason`. The wrong-red rule cannot tell a broken import from an exception raised by the code under test, so it errs toward asking a human to verify rather than toward claiming proof. Known limitation: with `--tb=no` or `--tb=line` pytest emits no `E ` lines, so an import failure is then indistinguishable from a real red.
+
+The mission acceptance re-run of pytest lives in the eval grader, not the engine; the
+engine has no verification step and none was added.
+
 ### The TUI (rebuilt 2026-11-06, ADR 0006)
 
 Bare `rework` opens a Textual app: a menu bar (wordmark, File / Edit / View /

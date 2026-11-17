@@ -292,7 +292,23 @@ MarkdownH1, MarkdownH2, MarkdownH3 { background: transparent; color: $fg; }
 #proj-search { height: 1; margin: 0 1 0 1; }
 #proj-list .row { margin-bottom: 0; }
 #run-list .row { margin-bottom: 1; }
-#m-header { height: auto; padding: 1 2 0 2; }
+/* the orchestrator prompt: a bounded box, so a long brief scrolls inside it
+   instead of eating the run list and the tabs. The height mirrors
+   PROMPT_BOX_ROWS in views/dashboard.py and must be changed with it. */
+#m-prompt {
+    height: 6;
+    margin: 1 0 0 0;
+    padding: 0 2;
+    scrollbar-size-vertical: 1;
+}
+#m-header { height: auto; padding: 0; }
+/* one faint line at the bottom of the box, only when the brief is taller than
+   what it shows (`has-more`). It keeps its row either way (hidden by
+   `visibility`, not `display`), so showing the hint never reflows the text
+   above it and the box always shows the same number of brief lines. */
+#m-prompt-more { dock: bottom; height: 1; color: $faint; visibility: hidden; }
+#m-prompt.has-more #m-prompt-more { visibility: visible; }
+#m-prompt:focus { background-tint: $accent 8%; }
 #m-flow { height: auto; padding: 0 2 1 2; border-bottom: solid $line; }
 #m-pages { height: 1fr; }
 .doc { height: 1fr; padding: 0 2 1 2; }

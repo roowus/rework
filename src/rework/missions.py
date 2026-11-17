@@ -37,7 +37,7 @@ PLAN_FIX: dict = {
                     "summary",
                     "findings",
                     "suggested_fix",
-                    "proposed_tests",
+                    "tests",
                     "blockers",
                 ],
             },
@@ -55,6 +55,9 @@ PLAN_FIX: dict = {
             "context_from": {
                 "diff": {"step": "code", "field": "diff"},
                 "worktree_path": {"step": "code", "field": "worktree"},
+                "coder_tests": {"step": "code", "field": "tests"},
+                "base_sha": {"step": "code", "field": "base_sha"},
+                "changed_files": {"step": "code", "field": "changed_files"},
                 "investigation": {"step": "investigate"},
             },
             "on_request_changes": {"revise": "code", "max_rounds": 2},

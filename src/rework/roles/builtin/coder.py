@@ -9,6 +9,7 @@ base it started with. Handoff is fully mechanical: no LLM invents the diff.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, TypedDict
 
@@ -27,6 +28,7 @@ from rework.nodes.git_ops import (
     stage_all,
     unstage_nested_repos,
 )
+from rework.nodes.testing import changed_files, parse_tests_block
 from rework.nodes.toolloop import make_toolloop_node
 from rework.nodes.tools import ComplaintAwareExecutor, LazyExecutor
 from rework.roles.base import RoleBuildCtx, RoleSpec
@@ -111,6 +113,21 @@ class CoderSpec(RoleSpec):
             " throwaway probe scripts or experiments unless the brief asks for a"
             " measurement. Run the relevant tests after your change, and again"
             " only if you changed something.\n\n"
+            "TESTS ARE A DELIVERABLE (red-green; a test that cannot fail is worse"
+            " than no test, because it looks like safety). Write the test FIRST,"
+            " run it, and watch it FAIL for the RIGHT reason: the behaviour is"
+            " missing, not a typo, not an ImportError, not a collection error"
+            " (those are the wrong red: fix the test until it fails because the"
+            " behaviour is absent). Then implement and watch it pass. Never edit"
+            " an assertion to get green: report the disagreement as a finding"
+            " instead. Record the actual commands and their real results. If a"
+            " change truly cannot be tested, say why in not_testable_reason."
+            " End your final message with a fenced json block, exactly:"
+            ' {"tests": {"added": [files], "changed": [files],'
+            ' "red_green_verified": true|false, "commands": [what you ran],'
+            ' "result": "red then green: ...", "not_testable_reason": ""}}.'
+            " A handoff with no tests block and no not_testable_reason is"
+            " incomplete and will be refused.\n\n"
             "Never write under ~/.rework or any path outside your worktree."
             " Use temporary directories for any probes or tests that touch"
             " rework's own config or state."
@@ -159,15 +176,30 @@ class CoderSpec(RoleSpec):
                     " it already summarized unless you must edit them):\n"
                     + str(run_ctx["previous_attempt"])[:6000]
                 )
+            if isinstance(investigation, dict) and (
+                investigation.get("tests") or investigation.get("no_tests_reason")
+            ):
+                parts.append(
+                    "Tests the investigator proposed (start from these: write the"
+                    " smallest one that catches the bug, watch it fail, then fix):\n"
+                    + json.dumps(
+                        {
+                            "tests": investigation.get("tests") or [],
+                            "no_tests_reason": investigation.get("no_tests_reason") or "",
+                        },
+                        indent=1,
+                    )[:3000]
+                )
             if investigation:
                 parts.append(
                     "Investigator's findings (context from the orchestrator):\n"
                     + str(investigation)[:8000]
                 )
             parts.append(
-                "Implement the change, then verify: run the tests and report the"
-                " actual output. Finish with a clear summary of what you changed"
-                " and what passed."
+                "Write the test first and watch it fail for the right reason, then"
+                " implement the change and watch it pass; report the actual output."
+                " Finish with a clear summary of what you changed and what passed,"
+                " ending with the fenced json tests block."
             )
             await ctx.bus.publish(
                 EventRecord(
@@ -204,6 +236,7 @@ class CoderSpec(RoleSpec):
             )
             sha = await git_commit(wt, message, author=ctx.git_author)
             diff = await diff_base(wt, base=state.get("base_sha"))
+            tests_block = parse_tests_block(state.get("final_text") or "")
             artifact = {
                 "kind": "coder_handoff",
                 "branch": branch,
@@ -211,7 +244,11 @@ class CoderSpec(RoleSpec):
                 "base_sha": state.get("base_sha"),
                 "summary": state.get("final_text") or "",
                 "worktree": str(wt),
+                **({"tests": tests_block} if tests_block is not None else {}),
                 **({"excluded_from_commit": excluded} if excluded else {}),
+                # from the FULL diff: the stored copy is cut, and a file listed
+                # only past the cut would escape the auditor's red-green revert
+                "changed_files": changed_files(diff),
                 "diff": diff[:100_000],
             }
             from rework.nodes.run_stats import attach_run_stats
