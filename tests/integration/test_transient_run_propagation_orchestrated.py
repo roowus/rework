@@ -135,7 +135,9 @@ async def test_a_transient_role_error_reaches_the_daemon_from_the_orchestrator(
         )
         result = mission_after.result or {}
         assert "40P01" in result["transient_db_error"]
-        assert "crash 1 of 3" in result["crash"]
+        # the bound is a time budget now: the crash number is a diagnostic
+        assert "crash 1" in result["crash"]
+        assert "into the outage" in result["crash"]
         events = await store.events_since(0, mission_id=mission.id, limit=200)
         assert EventType.MISSION_FAILED not in [e.type for e in events]
         runs = await store.list_runs(mission.id)

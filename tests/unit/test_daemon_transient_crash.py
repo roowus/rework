@@ -20,7 +20,11 @@ from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.state.records import EventType, Mission, MissionStatus
 from rework.kernel.state.retry import TransientDatabaseError
 from rework.kernel.state.sqlite import SqliteStore, open_sqlite
-from rework.orchestrator.daemon import MAX_TRANSIENT_CRASHES, Daemon
+from rework.orchestrator.daemon import (
+    MIN_TRANSIENT_CRASHES,
+    TRANSIENT_OUTAGE_BUDGET_S,
+    Daemon,
+)
 
 
 class Deadlock(Exception):
@@ -85,7 +89,8 @@ async def test_a_deadlock_requeues_the_mission_instead_of_failing_it(tmp_path: P
         result = mission.result or {}
         assert result["summary"] == "half the work is done", "the old result keys must survive"
         assert "40P01" in result["transient_db_error"]
-        assert "crash 1 of 3" in result["crash"] and "resuming" in result["crash"]
+        assert "crash 1" in result["crash"] and "resuming" in result["crash"]
+        assert "into the outage" in result["crash"]
 
         events = await store.events_since(0, mission_id=mission_id, limit=200)
         assert EventType.MISSION_FAILED not in [e.type for e in events]
@@ -124,22 +129,33 @@ async def test_the_real_transient_database_error_requeues_too(tmp_path: Path) ->
         await store.aclose()
 
 
-async def test_the_crash_past_the_bound_fails_the_mission(tmp_path: Path) -> None:
-    """Three requeues, then the budget is spent: an unbounded requeue loop
-    against a database that stays broken would hide the outage forever."""
+async def test_the_crash_past_the_time_budget_fails_the_mission(tmp_path: Path) -> None:
+    """Past the OUTAGE BUDGET the mission is failed: an unbounded requeue loop
+    against a database that stays broken would hide the outage forever. The bound
+    is elapsed time, not a count (a bad minute must not burn a mission's work)."""
+    import time as _time
+
     store = await open_sqlite(str(tmp_path / "s.sqlite3"))
     try:
         bus = InProcessEventBus(store)
         mission_id = await _running_mission(store)
         daemon = _daemon(store, bus, tmp_path)
 
-        for crash in range(1, MAX_TRANSIENT_CRASHES + 1):
+        # inside the budget: many crashes, still alive
+        for crash in range(1, MIN_TRANSIENT_CRASHES + 4):
             await daemon._log_runner_error(mission_id, Deadlock())
             mission = await store.get_mission(mission_id)
             assert mission is not None and mission.status == MissionStatus.PENDING
-            assert f"crash {crash} of {MAX_TRANSIENT_CRASHES}" in (mission.result or {})["crash"]
-            # back to RUNNING, exactly as the requeue's next dispatch would leave it
+            assert f"crash {crash}" in (mission.result or {})["crash"]
+            assert "into the outage" in (mission.result or {})["crash"]
             await store.update_mission(mission_id, status=MissionStatus.RUNNING)
+
+        # spend the budget on the row, then crash again
+        mission = await store.get_mission(mission_id)
+        assert mission is not None
+        old = {**(mission.result or {})}
+        old["first_transient_crash_at"] = _time.time() - TRANSIENT_OUTAGE_BUDGET_S - 1
+        await store.update_mission(mission_id, result=old, status=MissionStatus.RUNNING)
 
         await daemon._log_runner_error(mission_id, Deadlock())
 
@@ -147,10 +163,8 @@ async def test_the_crash_past_the_bound_fails_the_mission(tmp_path: Path) -> Non
         assert mission is not None and mission.status == MissionStatus.FAILED
         error = (mission.result or {})["error"]
         assert "transient database error" in error
-        assert (
-            f"crash {MAX_TRANSIENT_CRASHES + 1} after {MAX_TRANSIENT_CRASHES} requeues"
-        ) in error
-        assert "giving up" in error and "40P01" in error
+        assert "budget" in error and "giving up" in error
+        assert "40P01" in error
         assert EventType.MISSION_FAILED in await _events(store, mission_id)
     finally:
         await store.aclose()
@@ -235,16 +249,30 @@ async def test_a_terminal_failure_gives_a_later_run_a_full_budget(tmp_path: Path
         bus = InProcessEventBus(store)
         mission_id = await _running_mission(store)
         daemon = _daemon(store, bus, tmp_path)
-        for _ in range(MAX_TRANSIENT_CRASHES + 1):
+        import time as _time
+
+        from rework.orchestrator.daemon import TRANSIENT_OUTAGE_BUDGET_S
+
+        for _ in range(MIN_TRANSIENT_CRASHES + 1):
             await daemon._log_runner_error(mission_id, Deadlock())
             await store.update_mission(mission_id, status=MissionStatus.RUNNING)
 
+        # spend the outage budget, then crash: that terminal failure clears the clock
+        mission = await store.get_mission(mission_id)
+        assert mission is not None
+        spent = {**(mission.result or {})}
+        spent["first_transient_crash_at"] = _time.time() - TRANSIENT_OUTAGE_BUDGET_S - 1
+        await store.update_mission(mission_id, result=spent, status=MissionStatus.RUNNING)
+        await daemon._log_runner_error(mission_id, Deadlock())
+        failed = await store.get_mission(mission_id)
+        assert failed is not None and failed.status == MissionStatus.FAILED
+
         assert await _crash_count(store, mission_id) == 0
-        # and the next crash is crash 1 again, not crash 5
+        # and the next run's first crash is crash 1 again, with a fresh clock
         await store.update_mission(mission_id, status=MissionStatus.RUNNING)
         await daemon._log_runner_error(mission_id, Deadlock())
         mission = await store.get_mission(mission_id)
         assert mission is not None and mission.status == MissionStatus.PENDING
-        assert f"crash 1 of {MAX_TRANSIENT_CRASHES}" in (mission.result or {})["crash"]
+        assert "crash 1" in (mission.result or {})["crash"]
     finally:
         await store.aclose()
