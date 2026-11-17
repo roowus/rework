@@ -36,7 +36,21 @@ log = logging.getLogger("rework.daemon")
 # checkpoint instead of failing it. The bound stops an unbounded requeue loop
 # against a database that stays unreachable. 2026-11-14: an unclassified
 # DeadlockDetected failed a nearly finished mission and threw its work away.
-MAX_TRANSIENT_CRASHES = 3
+# How long a mission may keep being requeued for a database outage before it is
+# given up on. A COUNT was the old rule (3 crashes) and it answers the wrong
+# question: one bad minute on the link burns several crashes and ends a mission
+# whose work is already safe on disk, while a mission that hits a crash every ten
+# minutes for an hour is a real problem worth reporting. So the bound is time: as
+# long as the store has been unreachable for less than this, keep requeueing (the
+# mission resumes from its checkpoint, nothing is lost). The count is still
+# recorded and shown, because it is the useful diagnostic.
+#
+# Rewvis measurement (2026-11-17): 0 missions have ever recorded a transient crash,
+# so this has never fired. It is a rule that should not end a mission on its own.
+TRANSIENT_OUTAGE_BUDGET_S = 15 * 60.0
+# A floor on attempts, so a very fast failing loop still gets a few tries even if
+# every crash lands inside the first second.
+MIN_TRANSIENT_CRASHES = 3
 
 # setup() on the postgres saver runs its migrations: DDL that takes ACCESS
 # EXCLUSIVE on the checkpointer tables of the SAME database the store writes to,
@@ -356,14 +370,27 @@ class Daemon:
                     # server side, and the mission resumes from its checkpoint.
                     summary = transient_error_summary(exc)
                     count = await self._store.increment_transient_crash_count(mission_id)
-                    if count <= MAX_TRANSIENT_CRASHES:
+                    # when this mission's first crash in the current run of them was
+                    # seen; a successful run resets the count (engine.py), which
+                    # clears this too
+                    first = (mission.result or {}).get("first_transient_crash_at")
+                    now = time.time()
+                    if not isinstance(first, (int, float)):
+                        first = now
+                    elapsed = now - float(first)
+                    within_budget = count <= MIN_TRANSIENT_CRASHES or (
+                        elapsed < TRANSIENT_OUTAGE_BUDGET_S
+                    )
+                    if within_budget:
                         log.warning(
-                            "%s: transient database error (%s), crash %d of %d,"
+                            "%s: transient database error (%s), crash %d,"
+                            " %.0fs into the outage (budget %.0fs);"
                             " requeueing the mission to resume from its checkpoint",
                             mission_id,
                             summary,
                             count,
-                            MAX_TRANSIENT_CRASHES,
+                            elapsed,
+                            TRANSIENT_OUTAGE_BUDGET_S,
                         )
                         await self._store.update_mission(
                             mission_id,
@@ -371,8 +398,10 @@ class Daemon:
                             result={
                                 **(mission.result or {}),
                                 "transient_db_error": summary,
-                                "crash": f"transient database error, crash {count} of"
-                                f" {MAX_TRANSIENT_CRASHES}, resuming from its checkpoint",
+                                "first_transient_crash_at": first,
+                                "crash": f"transient database error, crash {count},"
+                                f" {elapsed:.0f}s into the outage, resuming from its"
+                                " checkpoint",
                             },
                         )
                         await self._bus.publish(
@@ -381,16 +410,17 @@ class Daemon:
                                 type=EventType.INFO,
                                 payload={
                                     "note": f"transient database error ({summary}), crash"
-                                    f" {count} of {MAX_TRANSIENT_CRASHES}: the mission is"
-                                    " requeued and will resume from its checkpoint"
+                                    f" {count}, {elapsed:.0f}s into the outage: the mission"
+                                    " is requeued and will resume from its checkpoint"
                                 },
                             )
                         )
                         return
                     # bound reached: fail, but keep the reason visible
                     error = (
-                        f"transient database error, crash {count} after"
-                        f" {MAX_TRANSIENT_CRASHES} requeues, giving up: {summary}"
+                        f"transient database error: the store has been unreachable for"
+                        f" {elapsed:.0f}s across {count} crashes, past the"
+                        f" {TRANSIENT_OUTAGE_BUDGET_S:.0f}s budget, giving up: {summary}"
                     )
                 await self._store.update_mission(
                     mission_id,

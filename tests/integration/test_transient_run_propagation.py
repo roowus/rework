@@ -94,7 +94,13 @@ async def test_a_transient_error_in_a_role_run_is_requeued_not_failed(tmp_path: 
         )
         result = mission_after.result or {}
         assert "40P01" in result["transient_db_error"]
-        assert "crash 1 of 3" in result["crash"]
+        # the count is now a diagnostic, not the bound: the message names the
+        # crash number and how far into the outage it happened
+        assert "crash 1" in result["crash"]
+        assert "into the outage" in result["crash"]
+        assert isinstance(result["first_transient_crash_at"], float), (
+            "the outage clock is stamped on the first crash"
+        )
         events = await store.events_since(0, mission_id=mission.id, limit=200)
         assert EventType.MISSION_FAILED not in [e.type for e in events]
         runs = await store.list_runs(mission.id)
@@ -102,5 +108,72 @@ async def test_a_transient_error_in_a_role_run_is_requeued_not_failed(tmp_path: 
             "the transient error must not be recorded as a failed run"
         )
         assert await store.next_pending_missions(limit=10) != [], "the queue claims it again"
+    finally:
+        await store.aclose()
+
+
+class _Deadlock(Exception):
+    sqlstate = "40P01"
+
+
+def _daemon(store: SqliteStore, bus: Any, tmp_path: Path) -> Any:
+    from rework.orchestrator.daemon import Daemon
+
+    return Daemon(
+        store,
+        bus,
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        None,  # type: ignore[arg-type]
+        tmp_path,
+        SimpleNamespace(concurrency=1, max_roles=1, poll_interval_s=0.05, git_author=None),  # type: ignore[arg-type]
+    )
+
+
+async def test_the_outage_budget_is_time_not_a_crash_count(tmp_path: Path) -> None:
+    """A long outage must not end a mission for running out of TRIES.
+
+    The old rule was three crashes. One bad minute on the link can burn several
+    crashes while the mission's work is safe on its checkpoint, and that mission
+    was failed for arithmetic. The bound is now the elapsed outage: many crashes
+    inside the budget keep requeueing.
+    """
+    import time as _time
+
+    from rework.orchestrator import daemon as daemon_mod
+
+    db_path = str(tmp_path / "state.sqlite3")
+    store: SqliteStore = await open_sqlite(db_path)
+    try:
+        bus = InProcessEventBus(store)
+        mission = await store.create_mission(Mission(id=new_id("m"), objective="survive"))
+        d = _daemon(store, bus, tmp_path)
+
+        # ten crashes inside the budget: the mission stays alive
+        for _ in range(10):
+            await d._log_runner_error(mission.id, _Deadlock("deadlock detected"))
+            now = await store.get_mission(mission.id)
+            assert now is not None and now.status == MissionStatus.PENDING, (
+                "a mission inside the outage budget is requeued, never failed"
+            )
+        state = await store.get_mission(mission.id)
+        assert state is not None
+        assert state.result and "first_transient_crash_at" in state.result
+        # the count still increments (it is the useful diagnostic), read it back
+        # through the store API rather than the record, which does not carry it
+        assert await store.increment_transient_crash_count(mission.id) >= 11
+
+        # the SAME mission, now stamp it as an outage that began long ago: the
+        # budget is spent, so the next crash ends it with the reason visible
+        stamp = _time.time() - daemon_mod.TRANSIENT_OUTAGE_BUDGET_S - 60
+        await store.update_mission(
+            mission.id, result={**(state.result or {}), "first_transient_crash_at": stamp}
+        )
+        await d._log_runner_error(mission.id, _Deadlock("deadlock detected"))
+        gone = await store.get_mission(mission.id)
+        assert gone is not None and gone.status == MissionStatus.FAILED
+        assert "budget" in str((gone.result or {}).get("error", "")), (
+            "the failure names the elapsed outage, not a try count"
+        )
     finally:
         await store.aclose()

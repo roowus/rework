@@ -294,7 +294,9 @@ async def test_a_deadlock_past_the_seam_requeues_instead_of_failing(
     assert after.status == MissionStatus.PENDING, "a deadlock is not the mission's fault"
     assert (after.result or {})["summary"] == "in progress"
     assert "40P01" in (after.result or {})["transient_db_error"]
-    assert "crash 1 of 3" in (after.result or {})["crash"]
+    # the bound is a time budget now: the crash number is a diagnostic
+    assert "crash 1" in (after.result or {})["crash"]
+    assert "into the outage" in (after.result or {})["crash"]
     events = await store.events_since(0, mission_id=mission.id, limit=200)
     assert EventType.MISSION_FAILED not in [e.type for e in events]
     assert any(
