@@ -184,15 +184,12 @@ specified in `docs/tui/DESIGN.md`; every view is built from that kit.
   (status, last steps, inline gate answers, pause/cancel). Nothing runs until
   you confirm: typing "yes" launches every pending proposal and "no" scraps
   every one of them. Project / model / effort knobs under the prompt. Opens
-  with no chat selected. A chat that never got a message (the shell mission
-  creation mints for the CLI) is not listed: it would open blank. A mission's
-  own orchestrator transcript is not listed either (there is one per mission,
-  machinery rather than a conversation); it opens from the mission's Work row
-  and from the Dashboard Transcript action.
+  with no chat selected. What the list holds is the rule below.
 - **Dashboard**: overview (stats strip, projects, missions grouped needs-you →
   queued → running → paused → recent) and a mission drill-down: header + flow strip,
   sessions (one per run) on the left, and Trajectory / Graph (LangGraph-style
-  node view, click a node to focus its run) / Output / Diff / Report / Gates.
+  node view, click a node to focus its run) / Output / Diff / Report / Gates /
+  Chat (the mission's orchestrator transcript, read-only and scrollable).
   A section is derived from the store, never from a remembered label: **needs
   you** means the mission has an OPEN gate (any status), **running** means
   status `running` or `awaiting_gate` with no open gate left (its gate was
@@ -202,6 +199,19 @@ specified in `docs/tui/DESIGN.md`; every view is built from that kit.
   per-project badges count those same sections through one helper, so the
   Dashboard cannot list a mission under "needs you" while the Gates tab is
   empty.
+- **What the Work tab lists.** Chats are conversations; missions are missions.
+  A chat is a row iff it is not an orchestrator transcript (`orch-<mission id>`)
+  AND it holds at least one `user` or `assistant` message. So an empty chat, a
+  chat holding only `note` rows, and a mission's own transcript are never rows.
+  Rows are ordered and aged by their newest MESSAGE (`Chat.last_message_at`,
+  derived by `list_chats`, never stored), with `updated_at` only as a tiebreak,
+  so a rename does not float a chat to the top. Agents never create chats:
+  creating a mission mints none (its `chat_id` points at `orch-<id>`, a row
+  that appears when the orchestrator first runs). A real conversation that
+  launched a mission stays listed and keeps a Transcript button that opens that
+  mission's transcript in Work. A mission's transcript otherwise lives on the
+  Dashboard (its Chat tab). If the store cannot say which chats hold messages,
+  the list is empty for that refresh rather than showing everything.
 - **Gates**: inbox oldest-first with full decision context (mission, the run it
   unblocks, the diff + audit verdict for ship gates, recent steps) and an answer
   box; the typed answer reaches the paused role as `Gate.decision`.

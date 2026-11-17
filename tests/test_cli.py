@@ -126,6 +126,17 @@ def _get_chat(db: Path, chat_id: str):
     return asyncio.run(go())
 
 
+def _list_chat_ids(db: Path) -> list[str]:
+    async def go():
+        store = await open_sqlite(str(db))
+        try:
+            return [str(c.id) for c in await store.list_chats(limit=50)]
+        finally:
+            await store.aclose()
+
+    return asyncio.run(go())
+
+
 def test_project_create_defaults_to_the_upload_transport(rework_db: Path) -> None:
     """A project with no --repo has no origin to push to (ADR 0005): creation
     must store transport=upload / results=fetch, never git/push_branch."""
@@ -634,7 +645,12 @@ def test_approve_accepts_a_typed_answer(rework_db: Path) -> None:
 
 def test_new_creates_an_orchestrated_mission_by_default(rework_db: Path) -> None:
     """ADR 0007: missions are run by an LLM orchestrator; the plan is its
-    playbook, the final gate and budget are rails."""
+    playbook, the final gate and budget are rails.
+
+    Adapted: mission creation no longer mints a chat; the mission points at its
+    orchestrator transcript. It used to assert a shell chat titled after the
+    mission, which is exactly the row that polluted the Work list (the Work
+    list holds conversations; a mission's transcript lives on the Dashboard)."""
     url = "https://github.com/example/repo.git"
     result = runner.invoke(
         app, ["new", "fix it", "--repo", url, "--plan", "fix-pr", "--budget", "3"]
@@ -647,13 +663,14 @@ def test_new_creates_an_orchestrated_mission_by_default(rework_db: Path) -> None
     assert plan["gates"] == []
     assert plan["orchestrator"]["model"]
     assert plan["budget"]["max_usd"] == 3.0
-    # a CLI-created mission gets a chat titled from the mission title, so it is
-    # reachable from the Work tab / Dashboard like any chat-backed mission
-    assert mission.chat_id is not None
-    chat = _get_chat(rework_db, mission.chat_id)
-    assert chat is not None
-    assert chat.title == mission.title
-    assert chat.mission_id == mission.id
+    # the mission points at its orchestrator transcript (a pointer only: that
+    # row is created lazily when the orchestrator first runs), and no chat of
+    # any other kind was minted for it
+    from rework.kernel.state.records import orchestrator_chat_id
+
+    assert mission.chat_id == orchestrator_chat_id(mission.id)
+    assert _get_chat(rework_db, mission.chat_id) is None
+    assert _list_chat_ids(rework_db) == []
 
 
 def test_new_mechanical_keeps_the_legacy_pipeline(rework_db: Path) -> None:

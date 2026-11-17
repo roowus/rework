@@ -620,6 +620,19 @@ class TuiData:
             lambda: self._call(lambda s: s.chat_messages_since(chat_id, after_id)),
         )
 
+    async def chat_ids_with_conversation(self, chat_ids: list[str]) -> set[str]:
+        """Which of these chats hold a user or assistant message (one probe).
+
+        Read like `chats()`: on a connection error the last good set is served
+        behind the offline note, so a reconnect does not blank the Work list.
+        The key is the query, not the id list, so a changed candidate list still
+        finds it; the caller only trusts ids it asked about, and a chat missing
+        from an old set is simply not listed (fails closed)."""
+        return await self._resilient(
+            "chat_ids_with_conversation",
+            lambda: self._call(lambda s: s.chat_ids_with_conversation(chat_ids)),
+        )
+
     async def chat_ids_with_messages(self, chat_ids: list[str]) -> set[str]:
         """Which of these chats actually hold a message (one batched probe)."""
         key = "chat_ids_with_messages:" + ",".join(sorted(chat_ids))

@@ -175,6 +175,38 @@ def assistant_step(text: str) -> Step:
     return Step(f"[{FG}]⏺[/] {esc(text)}", kind="assistant")
 
 
+def item_step(item: Any) -> Step | None:
+    """A replayed chat item (`conversation.Item`) -> its Step, for the kinds that
+    are plain text: user, assistant, tool_call, tool_result, note. None for the
+    kinds that need a live widget (a proposal card, a mission card).
+
+    The ONE renderer of a chat transcript: the Work tab and the Dashboard's
+    read-only Chat tab both call it, so the two always look identical."""
+    kind = item.kind
+    if kind == "user":
+        return user_step(item.text, item.attachments)
+    if kind == "assistant":
+        return assistant_step(item.text)
+    if kind == "tool_call":
+        return Step(
+            f"[{ACCENT}]⏺[/] [b]{esc(item.name)}[/b]  [{MUTED}]{esc(clip(item.args, 140))}[/]",
+            kind="call",
+        )
+    if kind == "tool_result":
+        colour = DANGER if item.error else MUTED
+        lines = item.text.strip().splitlines() or ["(empty)"]
+        more = f" [{FAINT}]+{len(lines) - 1} lines[/]" if len(lines) > 1 else ""
+        detail = "\n".join(f"    [{colour}]{esc(line)}[/]" for line in lines[:40])
+        return Step(
+            f"  [{FAINT}]⎿[/] [{colour}]{esc(clip(lines[0], 140))}[/]{more}",
+            detail=detail if len(lines) > 1 else "",
+            kind="result",
+        )
+    if kind == "note":
+        return Step(f"[{FAINT}]{esc(item.text)}[/]", kind="note")
+    return None
+
+
 def note_step(text: str, colour: str = MUTED) -> Step:
     return Step(f"[{colour}]{esc(text)}[/]", kind="note")
 

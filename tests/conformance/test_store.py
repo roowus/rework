@@ -616,6 +616,90 @@ async def test_chat_ids_with_messages_reports_only_chats_that_hold_a_message(
     assert await store.chat_ids_with_messages([filled.id, filled.id]) == {filled.id}
 
 
+async def test_chat_ids_with_conversation_skips_empty_and_note_only_chats(
+    store: StateStore,
+) -> None:
+    """The Work list's conversation probe, held to one contract on every backend
+    (Postgres has no server in CI here, so parity is pinned at this level).
+
+    A chat counts only if it holds a `user` or `assistant` row. A mission shell
+    is empty or holds only `note` rows (owner pings), and counting those is how
+    shells impersonated conversations. Missing ids are absent, never an error."""
+    from rework.kernel.state.records import Chat, ChatMessage
+
+    async def put(chat_id: str, role: str, ts: float) -> None:
+        await store.append_chat_message(
+            ChatMessage(
+                chat_id=chat_id,
+                role=role,
+                body={"role": role, "content": "x"},
+                display="x",
+                ts=ts,
+            )
+        )
+
+    user_only = await store.create_chat(Chat(title="user only"))
+    assistant_only = await store.create_chat(Chat(title="assistant only"))
+    note_only = await store.create_chat(Chat(title="note only"))
+    empty = await store.create_chat(Chat(title="empty"))
+    mixed = await store.create_chat(Chat(title="notes then a reply"))
+    await put(user_only.id, "user", 100.0)
+    await put(assistant_only.id, "assistant", 100.0)
+    await put(note_only.id, "note", 100.0)
+    await put(note_only.id, "note", 101.0)
+    await put(mixed.id, "note", 100.0)
+    await put(mixed.id, "assistant", 101.0)
+
+    ids = [user_only.id, assistant_only.id, note_only.id, empty.id, mixed.id]
+    got = await store.chat_ids_with_conversation(ids)
+    assert got == {user_only.id, assistant_only.id, mixed.id}, got
+    assert await store.chat_ids_with_conversation([note_only.id, empty.id]) == set()
+    assert await store.chat_ids_with_conversation([]) == set()
+    assert await store.chat_ids_with_conversation([user_only.id, "chat-nope"]) == {user_only.id}
+    assert await store.chat_ids_with_conversation([user_only.id, user_only.id]) == {user_only.id}
+
+
+async def test_list_chats_orders_by_newest_message_not_updated_at(store: StateStore) -> None:
+    """`list_chats` sorts by the newest MESSAGE time, `updated_at` only breaks
+    ties, and a chat with no message sorts last: the same on both backends.
+
+    The two timestamps are set to disagree. Appending to `newer_msg` first and
+    to `newer_stamp` second leaves `newer_stamp` with the later `updated_at`
+    (an append bumps it) but the earlier message `ts`, so a sort on `updated_at`
+    would put it first. Each chat also reports its `last_message_at`."""
+    from rework.kernel.state.records import Chat, ChatMessage
+
+    async def put(chat_id: str, ts: float) -> None:
+        await store.append_chat_message(
+            ChatMessage(
+                chat_id=chat_id,
+                role="user",
+                body={"role": "user", "content": "x"},
+                display="x",
+                ts=ts,
+            )
+        )
+
+    newer_stamp = await store.create_chat(Chat(title="newer updated_at, older message"))
+    newer_msg = await store.create_chat(Chat(title="older updated_at, newer message"))
+    empty = await store.create_chat(Chat(title="no messages"))
+    await put(newer_msg.id, 2000.0)
+    await asyncio.sleep(0.01)
+    await put(newer_stamp.id, 1000.0)
+
+    chats = await store.list_chats()
+    assert [c.id for c in chats] == [newer_msg.id, newer_stamp.id, empty.id], [
+        (c.title, c.last_message_at, c.updated_at) for c in chats
+    ]
+    by_id = {c.id: c for c in chats}
+    assert by_id[newer_msg.id].last_message_at == 2000.0
+    assert by_id[newer_stamp.id].last_message_at == 1000.0
+    assert by_id[empty.id].last_message_at is None
+    # the same order under the launched-only filter
+    unlaunched = await store.list_chats(include_missions=False)
+    assert [c.id for c in unlaunched] == [newer_msg.id, newer_stamp.id, empty.id]
+
+
 async def test_gate_typed_decision_roundtrip(store: StateStore) -> None:
     """A gate can carry a typed answer, and it survives a reload.
 

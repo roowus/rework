@@ -9,6 +9,7 @@ starts a new chat."""
 
 from __future__ import annotations
 
+import asyncio
 import time
 from functools import partial
 from typing import Any
@@ -47,7 +48,13 @@ from rework.tui.widgets.base import Btn, Label, RowData, RowList
 from rework.tui.widgets.cards import MissionCard, ProposalCard
 from rework.tui.widgets.modals import Option, Picker
 from rework.tui.widgets.prompt import Prompt
-from rework.tui.widgets.trajectory import Step, Trajectory, assistant_step, user_step
+from rework.tui.widgets.trajectory import (
+    Step,
+    Trajectory,
+    assistant_step,
+    item_step,
+    user_step,
+)
 
 WELCOME = f"""[b]Talk to the orchestrator.[/b]
 
@@ -57,7 +64,22 @@ nothing runs until you press Launch.[/]
 
 [{FAINT}]enter send · shift+enter newline · ctrl+n new chat · f1 keys[/]"""
 
+CHATS_EMPTY = f"[{FAINT}]No chats yet.[/]"
+# the chat list could not be read and nothing is cached: say so, never a bare blank
+CHATS_RETRYING = f"[{FAINT}]could not read chats (retrying)[/]"
 EFFORTS = [("", "default"), ("low", "low"), ("medium", "medium"), ("high", "high")]
+
+
+def _chat_time(chat: Any) -> float:
+    """When the conversation was last alive: its newest message of any role.
+    `updated_at` is only the fallback for a store that does not report it."""
+    return float(getattr(chat, "last_message_at", None) or chat.updated_at or 0)
+
+
+def _chat_order(chat: Any) -> tuple[bool, float, float]:
+    """Newest message first; updated_at only breaks ties; no message sorts last."""
+    last = getattr(chat, "last_message_at", None)
+    return (last is None, -float(last or 0), -float(chat.updated_at or 0))
 
 
 class Knob(Static):
@@ -89,6 +111,14 @@ class WorkView(View):
         self._sending = False
         self._streamed: list[Step] = []
         self._loading_chat: str | None = None
+        # bumped by every load request: a load only paints while its own number
+        # is still current, so a late arrival of an earlier one is dropped
+        self._load_seq = 0
+        # the one explicit "loading" / "no messages" / "could not load" line in
+        # the log, removed as soon as real rows arrive
+        self._state_step: Step | None = None
+        # why the last load failed, shown in the head until the next load
+        self._load_error: str = ""
         # cursor for the open transcript: the highest chat_messages.id already
         # fetched. The table is append-only, so a tick only has to ask for
         # rows newer than this (indexed, O(log n)) and append those.
@@ -120,7 +150,7 @@ class WorkView(View):
                 with Horizontal(classes="side-actions"):
                     yield Btn("+ New chat", "new", variant="primary", tooltip="ctrl+n")
                 yield Label("Chats")
-                yield RowList(id="chat-list", empty=f"[{FAINT}]No chats yet.[/]")
+                yield RowList(id="chat-list", empty=CHATS_EMPTY)
             with Vertical(classes="main"):
                 with Horizontal(classes="pane-head", id="work-head"):
                     yield Static("", id="work-title", classes="pane-head-title")
@@ -228,13 +258,19 @@ class WorkView(View):
         already-open transcript has to re-read them. Cheap max-id probe first,
         then only the new rows are appended (no re-mount, no full replay)."""
         convo = self.convo
-        if convo is None or self._loading_chat == convo.id:
-            return  # nothing open, or a load for it is still in flight
+        if convo is None or self._loading_chat is not None:
+            return  # nothing open, or a load is in flight and owns the log
         self._tick_chat(convo.id)
 
     @work(exclusive=True, group="chat-poll")
     async def _tick_chat(self, chat_id: str) -> None:
         data = self.hub.data
+        if self._sending:
+            # a live turn paints its own rows and owns the log: polling here
+            # would paint the same chat_messages row a second time
+            # (own_chat_ids is only populated after the row is committed), and
+            # a re-read would clear the live turn off the screen
+            return
         if data.store_epoch != self._store_epoch:
             # the connection (possibly the whole store) was swapped under us, so
             # the ids in `_chat_cursor` and `_rendered_max_id` no longer line up
@@ -250,11 +286,6 @@ class WorkView(View):
             # `open_chat` schedules it the same way.
             self._load_chat(chat_id)
             return
-        if self._sending:
-            # a live turn paints its own rows; polling here would paint the
-            # same chat_messages row a second time (own_chat_ids is only
-            # populated after the row is committed)
-            return
         head = await self.hub.guard(partial(data.chat_messages_max_id, chat_id), None)
         if head is None or head <= self._chat_cursor:
             return  # None = the probe failed; <= means nothing new
@@ -262,7 +293,7 @@ class WorkView(View):
             partial(data.chat_messages_since, chat_id, self._chat_cursor), []
         )
         # the open chat may have changed while we were away: drop the result
-        if not messages or self._loading_chat == chat_id:
+        if not messages or self._loading_chat is not None:
             return
         if self.convo is None or self.convo.id != chat_id:
             return
@@ -293,12 +324,14 @@ class WorkView(View):
     def _paint_chat_list(self) -> None:
         mission_status = {m.id: m.status for m in self.snap.missions}
         rows: list[RowData] = []
-        for chat in sorted(self.snap.chats, key=lambda c: -float(c.updated_at or 0)):
+        # newest MESSAGE first: that is when the conversation was last alive.
+        # updated_at only breaks ties (a rename or an attach also moves it).
+        for chat in sorted(self.snap.chats, key=_chat_order):
             title = chat.title or "untitled"
             status = mission_status.get(chat.mission_id) if chat.mission_id else None
             mark = f"{glyph(status)} " if status is not None else ""
             project = self.snap.project_name(chat.project_id)
-            meta = "  ·  ".join(x for x in (project, ago(chat.updated_at)) if x)
+            meta = "  ·  ".join(x for x in (project, ago(_chat_time(chat))) if x)
             rows.append(
                 RowData(
                     chat.id,
@@ -306,8 +339,11 @@ class WorkView(View):
                 )
             )
         lst = self.query_one("#chat-list", RowList)
+        # the placeholder is a Static inside the list, never a Row: it cannot be
+        # clicked or selected, so the note can not pass for a chat
+        lst.set_empty(CHATS_RETRYING if self.snap.chats_failed else CHATS_EMPTY)
         lst.set_rows(rows)
-        lst.select(self.convo.id if self.convo else None)
+        lst.select(self._loading_chat or (self.convo.id if self.convo else None))
         try:
             self.query_one("#work-transcript", Btn).display = self.mission_in_view() is not None
         except Exception:  # a head-only test may not mount the button
@@ -315,6 +351,15 @@ class WorkView(View):
 
     def _paint_head(self) -> None:
         title = self.query_one("#work-title", Static)
+        if self._loading_chat is not None and (
+            self.convo is None or self._loading_chat != self.convo.id
+        ):
+            # never keep painting the previous chat's title over a load
+            title.update(f"[{MUTED}]Loading…[/]")
+            return
+        if self._load_error:
+            title.update(f"[{WARN}]{esc(clip(self._load_error, 80))}[/]")
+            return
         if self.convo is None:
             title.update(f"[{MUTED}]New conversation[/]")
             return
@@ -385,7 +430,8 @@ class WorkView(View):
     def on_row_list_activated(self, event: RowList.Activated) -> None:
         if event.rows.id == "chat-list":
             event.stop()
-            if self.convo is None or self.convo.id != event.key:
+            shown = self._loading_chat or (self.convo.id if self.convo else None)
+            if shown != event.key:
                 self.open_chat(event.key)
 
     def open_chat(self, chat_id: str) -> None:
@@ -410,40 +456,65 @@ class WorkView(View):
         "Chat not found"."""
         self._load_chat(orchestrator_chat_id(mission_id), missing="no transcript yet")
 
-    @work(exclusive=True, group="load-chat")
-    async def _load_chat(self, chat_id: str, missing: str = "Chat not found") -> None:
+    def _load_chat(self, chat_id: str, missing: str = "Chat not found") -> None:
+        """Switch the transcript to `chat_id`: ALWAYS repaints.
+
+        The log is cleared and an explicit "loading" line painted before any
+        data is read, so the previous chat's rows can never survive a click.
+        Every exit of the read below leaves a visible state (rows, "no messages
+        yet", or the failure), and a result whose request number is no longer
+        current (another chat was opened meanwhile) is dropped."""
+        if self._sending:
+            # a live turn owns the log and writes its reply into it: switching
+            # now would paint that reply into the wrong chat
+            self.toast("Still waiting for the orchestrator…", severity="warning")
+            self._paint_chat_list()  # put the selection marker back on the open chat
+            return
+        self._load_seq += 1
         self._loading_chat = chat_id
+        self._load_error = ""
+        self._chat_cursor = 0  # never carry a cursor across chats
+        with self.painting():
+            self._reset_log()
+            self._show_chat(True)
+            self._set_state("loading…")
+            self._paint_head()
+            self._paint_chat_list()
+        self._run_load(chat_id, missing, self._load_seq)
+
+    @work(exclusive=True, group="load-chat")
+    async def _run_load(self, chat_id: str, missing: str, seq: int) -> None:
         try:
-            await self._read_chat(chat_id, missing)
+            await self._read_chat(chat_id, missing, seq)
+        except asyncio.CancelledError:
+            if seq == self._load_seq:  # cancelled and nothing took over: say so
+                self._fail_load("load cancelled", toast=False)
+            raise
+        except Exception as exc:
+            if seq == self._load_seq:
+                self._fail_load(f"could not load: {clip(str(exc), 120)}")
         finally:
             # `_loading_chat` means "a load is in flight"; leaving it set made
             # the transcript poller think a load was still running forever
-            if self._loading_chat == chat_id:
+            if seq == self._load_seq and self._loading_chat == chat_id:
                 self._loading_chat = None
 
-    async def _read_chat(self, chat_id: str, missing: str = "Chat not found") -> None:
-        self._chat_cursor = 0  # never carry a cursor across chats
+    async def _read_chat(self, chat_id: str, missing: str, seq: int) -> None:
         chat = await self.hub.guard(lambda: self.hub.data.chat(chat_id), None)
+        if seq != self._load_seq:
+            return  # another chat was opened meanwhile: it owns the screen
         if chat is None:
-            self.toast(missing, severity="warning")
+            self._fail_load(missing)
             return
         convo = Conversation(self.hub.data, chat)
         # the cursor comes from the rows actually rendered, so a row committed
         # while we read can never fall below it unseen
         messages = await self.hub.guard(partial(self.hub.data.chat_messages, chat_id), [])
         history = await self.hub.guard(convo.cost_history, None)
+        if seq != self._load_seq:
+            return
         items = items_from_messages(messages, cost_history=history)
         cursor = max((int(m.id or 0) for m in messages), default=0)
-        if self._loading_chat != chat_id:
-            return
-        if self._sending:
-            # a live turn owns the log right now and paints its own rows. This
-            # replay read the transcript BEFORE those rows were committed, so
-            # painting it now would place the same proposal twice (one live
-            # card from `_send`, one replayed). Drop it: `_rendered_max_id`
-            # still marks what is on screen and the next tick pages in the
-            # rest, so no row is lost.
-            return
         self.convo = convo
         self._chat_cursor = cursor
         # the replay below clears the log and paints exactly these rows, so the
@@ -454,12 +525,17 @@ class WorkView(View):
         self.project_id = chat.project_id
         self.model_id = chat.model_id or self.model_id
         self.effort = chat.effort or ""
+        # the load is over from here: the polls and the head see the open chat
+        self._loading_chat = None
         # the app can close during the awaits above: guard the paint only
         with self.painting():
             log = self.query_one("#chat-log", Trajectory)
-            log.clear()
+            self._reset_log()
             self._show_chat(True)
-            self._render_items(items, replay=True)
+            if items:
+                self._render_items(items, replay=True)
+            else:
+                self._set_state("No messages in this chat yet.")
             self._paint_head()
             self._paint_knobs()
             self._paint_chat_list()
@@ -467,13 +543,51 @@ class WorkView(View):
             self.call_after_refresh(log.scroll_end, animate=False)
             self.focus_prompt()
 
+    def _reset_log(self) -> None:
+        self.query_one("#chat-log", Trajectory).clear()
+        self._state_step = None
+
+    def _set_state(self, text: str, *, error: bool = False) -> None:
+        """The one explicit state line in an otherwise empty log."""
+        colour = WARN if error else FAINT
+        step = Step(f"[{colour}]{esc(text)}[/]", kind="note")
+        self._state_step = step
+        self.query_one("#chat-log", Trajectory).add(step)
+
+    def _drop_state(self) -> None:
+        step, self._state_step = self._state_step, None
+        if step is not None:
+            step.remove()
+
+    def _fail_load(self, text: str, *, toast: bool = True) -> None:
+        """A load that did not produce a chat: leave the failure on screen, not
+        the previous chat and not a blank panel."""
+        self._loading_chat = None
+        self.convo = None
+        self._chat_cursor = 0
+        self._rendered_max_id = 0
+        self._load_error = text
+        with self.painting():
+            self._reset_log()
+            self._show_chat(True)
+            self.query_one("#work-rename").display = False
+            self.query_one("#work-delete").display = False
+            self._set_state(text, error=True)
+            self._paint_head()
+            self._paint_chat_list()
+        if toast:
+            self.toast(text, severity="warning")
+
     def new_chat(self) -> None:
+        self._load_seq += 1  # a load still in flight must not paint over this
+        self._loading_chat = None
+        self._load_error = ""
         self.convo = None
         self._chat_cursor = 0
         self._rendered_max_id = 0
         self._target_auto = True
         self.target = None
-        self.query_one("#chat-log", Trajectory).clear()
+        self._reset_log()
         self._show_chat(False)
         self._paint_head()
         self._paint_chat_list()
@@ -488,6 +602,8 @@ class WorkView(View):
         (see `_settle_launched`), so the card just carries that flag: several
         proposals from one request each get their own Launch / Scrap."""
         log = self.query_one("#chat-log", Trajectory)
+        if items:
+            self._drop_state()
         widgets: list[Any] = []
         for item in items:
             widget = self._item_widget(item)
@@ -522,31 +638,13 @@ class WorkView(View):
             card.set_launch_all(offer)
 
     def _item_widget(self, item: Item) -> Any:
-        if item.kind == "user":
-            return user_step(item.text, item.attachments)
-        if item.kind == "assistant":
-            return assistant_step(item.text)
-        if item.kind == "tool_call":
-            return Step(
-                f"[{ACCENT}]⏺[/] [b]{esc(item.name)}[/b]  [{MUTED}]{esc(clip(item.args, 140))}[/]",
-                kind="call",
-            )
-        if item.kind == "tool_result":
-            colour = DANGER if item.error else MUTED
-            lines = item.text.strip().splitlines() or ["(empty)"]
-            more = f" [{FAINT}]+{len(lines) - 1} lines[/]" if len(lines) > 1 else ""
-            detail = "\n".join(f"    [{colour}]{esc(line)}[/]" for line in lines[:40])
-            return Step(
-                f"  [{FAINT}]⎿[/] [{colour}]{esc(clip(lines[0], 140))}[/]{more}",
-                detail=detail if len(lines) > 1 else "",
-                kind="result",
-            )
+        step = item_step(item)  # the text kinds: shared with the Dashboard Chat tab
+        if step is not None:
+            return step
         if item.kind == "proposal":
             return ProposalCard(item.proposal)
         if item.kind == "mission":
             return MissionCard(item.mission_id)
-        if item.kind == "note":
-            return Step(f"[{FAINT}]{esc(item.text)}[/]", kind="note")
         return None
 
     def _retire_proposals(self) -> None:
@@ -572,6 +670,9 @@ class WorkView(View):
         if self._sending:
             self.toast("Still waiting for the orchestrator…", severity="warning")
             return
+        if self._loading_chat is not None:
+            self.toast("Still loading this chat…", severity="warning")
+            return
         self._resolve_target()
         if self.target:
             self._message_mission(self.target, event.text)
@@ -588,6 +689,7 @@ class WorkView(View):
             self.toast(f"Could not reach the mission: {clip(str(exc), 200)}", severity="error")
             return
         prompt.accept()
+        self._drop_state()
         log.add(user_step(text))
         log.add(Step(f"  [{FAINT}]→ sent to {esc(mission_id)}'s orchestrator[/]", kind="meta"))
         if self.convo is not None:
@@ -610,7 +712,7 @@ class WorkView(View):
                     effort=self.effort or None,
                 )
                 self.convo = Conversation(self.hub.data, chat)
-                log.clear()
+                self._reset_log()
                 # a brand new chat has no transcript: nothing is placed yet, so
                 # neither mark may carry over from the chat we just left
                 self._chat_cursor = 0
@@ -628,6 +730,7 @@ class WorkView(View):
                 )
                 return
             prompt.accept()
+            self._drop_state()
             log.add(user_step(text, attachments))
             self._thinking = Step(f"[{ACCENT}]●[/] [{MUTED}]thinking…[/]", kind="note")
             self._streamed = []
@@ -683,6 +786,16 @@ class WorkView(View):
             await self.hub.refresh()
         except Exception as exc:
             self._clear_thinking()
+            # visible in the transcript too, not only in a toast that fades:
+            # a new chat whose engine could not start must not look empty
+            with self.painting():
+                self._drop_state()
+                log.add(
+                    Step(
+                        f"[{DANGER}]✗ {esc(type(exc).__name__)}: {esc(clip(str(exc), 400))}[/]",
+                        kind="error",
+                    )
+                )
             self.toast(f"Send failed: {clip(str(exc), 200)}", severity="error")
         finally:
             self._sending = False

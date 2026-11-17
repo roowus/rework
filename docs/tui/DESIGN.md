@@ -179,6 +179,27 @@ Each lives in `src/rework/tui/widgets/` and is the only way that thing is drawn.
 | `Stat` | big number + label (cost tab, dashboard header) |
 | `Heatmap` | calendar grid, 5 shades from `$raised` to `$accent` |
 
+### Dashboard Chat tab
+
+The mission drill-down has a seventh tab after Gates, **Chat**: the mission's
+`orch-<mission id>` transcript, read-only (no composer). It is the same
+`Trajectory` widget as the first tab and renders rows through the same
+`item_step` helper the Work transcript uses, so a message looks identical in
+both places. Proposal and mission cards, which need a live widget, are not
+drawn here.
+
+- **States.** `loading…` while the first read is in flight; "No orchestrator
+  transcript yet" until the orchestrator first runs (the row is created
+  lazily); "No messages in this transcript yet"; "could not load the
+  transcript (retrying)". Never a blank body.
+- **Scroll.** Opening the tab moves focus to the transcript, so the arrow keys,
+  PageUp / PageDown and Home / End scroll it (the body is a focusable scroll
+  view, like Trajectory). The first fill lands on the newest line; later rows
+  are appended and follow the bottom only while you are at the bottom.
+- **Cost.** Only while the tab is open does the poll run one max-id
+  probe per chat; rows are read and mounted only when
+  something newer than what is painted exists, and only the new rows.
+
 ## 6. Interaction rules
 
 1. **Mouse first, keys as accelerators.** Every action has a visible clickable

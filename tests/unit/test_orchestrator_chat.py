@@ -341,6 +341,32 @@ async def test_provider_error_is_visible_and_logged(caplog: pytest.LogCaptureFix
 
 
 @pytest.mark.asyncio
+async def test_a_failed_turn_persists_the_user_message_and_an_error_row(store: Any) -> None:
+    """When the model call fails, the chat is not left empty: the owner's message
+    was written BEFORE the call (so it survives the crash), and the failure is
+    its own visible assistant row, so a reopened chat shows both."""
+    from rework.kernel.state.records import Chat
+
+    row = await store.create_chat(Chat(title="x"))
+    chat = OrchestratorChat(
+        RaisingProvider(RuntimeError("boom")),
+        _catalog(),
+        "flash",
+        tools_enabled=False,
+        store=store,
+        chat_id=row.id,
+    )
+    result = await chat.send("please fix the flaky test")
+    assert "not saved" not in result.reply
+    rows = await store.chat_messages(row.id)
+    assert [m.role for m in rows] == ["user", "assistant"], [(m.role, m.display) for m in rows]
+    assert rows[0].display == "please fix the flaky test"
+    assert rows[1].display.startswith("⚠ RuntimeError: boom")
+    # and the probe the Work list uses counts it as a real conversation
+    assert await store.chat_ids_with_conversation([row.id]) == {row.id}
+
+
+@pytest.mark.asyncio
 async def test_tool_failure_reaches_the_model_plainly_and_the_turn_continues(
     store: Any,
 ) -> None:

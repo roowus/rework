@@ -284,6 +284,12 @@ class StateStore(Protocol):
         a message, and asking per chat would be an N+1 over the whole list."""
         ...
 
+    async def chat_ids_with_conversation(self, chat_ids: list[str]) -> set[str]:
+        """The subset of `chat_ids` holding at least one `user` or `assistant`
+        message. `note` (launch/owner notes) and `tool` rows do not count: a chat
+        with only those is not a conversation. Batched like the probe above."""
+        ...
+
     # -- leader lock (one daemon per database; atomic-upsert hardened in M3) --
     async def acquire_lock(self, owner: str, stale_after_s: float = 60.0) -> bool: ...
 
