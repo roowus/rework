@@ -70,6 +70,9 @@ Plans you can choose:
             and no PR. Choose draft when the objective only reads and reports (an
             audit, a review, an analysis): put draft in propose_mission's plan
             yourself. A plan the owner names explicitly stays authoritative.
+- audit   - read-only understanding work: map, survey or assess a codebase. A
+            surveyor reads it and returns a cited map. It changes nothing: no
+            coder, no branch push and no PR.
 
 A project may also be repo-less: its transport is "upload", which means rework
 keeps that project's files itself. For an upload project, fix and fix-pr do NOT
@@ -119,7 +122,7 @@ PROPOSE_TOOL = ToolSpec(
                 "type": "string",
                 "description": "A short name for lists, 3 to 6 words.",
             },
-            "plan": {"type": "string", "enum": ["echo", "fix", "fix-pr", "draft"]},
+            "plan": {"type": "string", "enum": ["echo", "fix", "fix-pr", "draft", "audit"]},
             "project": {"type": "string", "description": "Project name, or empty for none."},
             "repo": {
                 "type": "string",

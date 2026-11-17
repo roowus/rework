@@ -104,7 +104,8 @@ def new(
     unless the project's `pr_gate` setting or the orchestrator asks for one);
     `draft` is read-and-report work (research with the web tools, audit the
     claims): its deliverable is the mission's Report tab, not files written into
-    the repository, and it has no gate: no branch push and no PR."""
+    the repository, and it has no gate: no branch push and no PR; `audit` is a
+    read-only survey of the codebase (no coder, no gate, no PR)."""
 
     async def go() -> str:
         from rework.config import Config, open_store_from_config
@@ -664,6 +665,46 @@ def _md_findings(findings: list[dict[str, Any]]) -> list[str]:
     return lines
 
 
+# surveyor list sections: (fields shown per object entry, joined in this order)
+_SURVEY_LIST_FIELDS: dict[str, tuple[str, ...]] = {
+    "layout": ("path", "purpose"),
+    "entry_points": ("name", "where", "purpose"),
+    "dependencies": ("name", "kind", "purpose", "where"),
+    "config": ("name", "where", "purpose"),
+    "risks": ("severity", "area", "detail", "where"),
+    "gaps": (),
+    "next_steps": (),
+}
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _md_survey_list(key: str, artifact: dict[str, Any]) -> list[str]:
+    """A surveyor list section; tolerant of any shape (artifacts are only
+    checked for key presence). Risks show their `where` (file:line) in code
+    ticks, and the cut note follows when risks/gaps were capped."""
+    out: list[str] = []
+    items = artifact.get(key)
+    for item in items if isinstance(items, list) else [items] if items else []:
+        if not isinstance(item, dict):
+            out.append(f"- {item}")
+        elif key == "risks":
+            where = f" (`{item['where']}`)" if item.get("where") else ""
+            out.append(
+                f"- **{item.get('severity', '?')}** {item.get('area', '')}:"
+                f" {item.get('detail', '')}{where}"
+            )
+        else:
+            fields = _SURVEY_LIST_FIELDS[key] or tuple(item)
+            out.append("- " + " · ".join(f"{item[f]}" for f in fields if item.get(f)))
+    if key == "gaps" and artifact.get("cut_note"):
+        out.append(f"- _{artifact['cut_note']}_")
+    out.append("")
+    return out
+
+
 def _md_section(key: str, artifact: dict[str, Any]) -> list[str]:
     """One report section rendered to md. Keys mirror SECTION_REGISTRY; the
     caller decides WHICH sections and in what order (the artifact's
@@ -721,6 +762,22 @@ def _md_section(key: str, artifact: dict[str, Any]) -> list[str]:
             out.append(f"- `{d.get('finding_id')}` **{d.get('action')}** — {d.get('reason')}")
         out.append("")
         return out
+    if key in _SURVEY_LIST_FIELDS:
+        out.extend(_md_survey_list(key, artifact))
+        return out
+    if key == "title":
+        out.append(str(artifact.get("title", "")))
+        out.append("")
+        return out
+    if key in ("tests", "ci"):
+        for k, v in (_as_dict(artifact.get(key))).items():
+            out.append(f"- **{k}:** {v}")
+        out.append("")
+        return out
+    if key == "report":
+        out.append(str(artifact.get("report", "")))
+        out.append("")
+        return out
     if key == "blockers":
         for i, b in enumerate(artifact.get("blockers", []), 1):
             out.append(f"**Blocker {i}: {b.get('question')}**")
@@ -751,8 +808,34 @@ _ROLE_DEFAULT_ORDER: dict[str, tuple[str, ...]] = {
         "warnings",
         "blockers",
     ),
+    # `report` is the same map as trimmed markdown: the Report tab renders the
+    # structured fields (with their file:line) instead of the body twice
+    "surveyor": (
+        "title",
+        "summary",
+        "layout",
+        "entry_points",
+        "dependencies",
+        "config",
+        "survey_tests",
+        "ci",
+        "risks",
+        "gaps",
+        "next_steps",
+        "report",
+    ),
 }
 _SECTION_TITLES = {
+    "title": "Survey",
+    "layout": "Layout",
+    "entry_points": "Entry points",
+    "dependencies": "Dependencies",
+    "config": "Configuration",
+    "survey_tests": "Tests",
+    "ci": "CI",
+    "risks": "Risks",
+    "gaps": "Gaps (not established)",
+    "next_steps": "Next steps",
     "summary": "Summary",
     "findings": "Findings",
     "suggested_fix": "Suggested fix",

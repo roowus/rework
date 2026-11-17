@@ -292,7 +292,8 @@ def context_note(snap: Snapshot, project_id: str | None) -> str:
         "project's files area supplies the files, and results are fetched, not pushed. "
         "draft (read-and-report work: the deliverable is the mission's Report "
         "tab, no files are written into the repository, and there is no PR) still "
-        "resolves a repo to run against."
+        "resolves a repo to run against; audit (read-only survey of a codebase, no "
+        "code change, no PR) also needs a repo."
     )
     return "\n".join(lines)
 

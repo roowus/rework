@@ -135,6 +135,12 @@ def render_tool(tool: ToolSpec) -> ToolSpec:
 
 
 PLAYBOOKS: dict[str, str] = {
+    "audit": (
+        "Understanding work, no code changes: optionally spawn an investigator to scope "
+        "the question, then spawn a `surveyor` (read-only) with the objective as its "
+        "brief and read its map. Do NOT spawn a coder: there is no branch push and no "
+        "PR. Finish with the survey's bottom line and the gaps and risks it cites."
+    ),
     "echo": (
         "Plumbing check: spawn the `echo` role once with the objective as its brief, "
         "wait for it, then finish."
@@ -227,6 +233,9 @@ How you work:
   speculative side concerns into extra work items unless they block the goal: a
   one-line change deserves a one-line-sized mission.
 - Read handoffs (`read_artifact`) before deciding what comes next.
+- Spawn `surveyor` for understanding work (audit, map, survey or assess a codebase):
+  it is read-only and returns a cited map. Spawn `auditor` only to check work
+  another role just did (a coder's diff).
 - Keep the owner informed with `message_owner` at meaningful moments only.
 - Roles may ask you questions (`ask_orchestrator`); answer with `answer_escalation`
   when you can, or forward to the owner with `ask_owner(run_id=...)` when only they
@@ -297,7 +306,7 @@ _TOOLS: list[ToolSpec] = [
                 "max_turns": {
                     "type": "integer",
                     "description": "Tool-round budget for this role (cost control). "
-                    "Defaults: investigator 20 (deep 45), coder 40, auditor 25.",
+                    "Defaults: investigator 20 (deep 45), surveyor 25, coder 40, auditor 25.",
                 },
                 "fresh": {
                     "type": "boolean",
@@ -655,6 +664,20 @@ def artifact_summary(artifact: dict[str, Any] | None) -> str:
     if artifact.get("blockers"):
         bits.append(f"{len(artifact['blockers'])} blockers")
     return "; ".join(bits) or _short(artifact, 200)
+
+
+def _plan_allows_unaudited_done(plan: dict[str, Any]) -> bool:
+    """True only for the `audit` playbook (`orchestrated_plan` stamps
+    plan["playbook"]) and only while it can never change or ship anything: no
+    coder step, no gates and no publish. `draft` also has none of those but
+    writes files into the project, so the shape alone is not enough. The
+    audit-rail exemption for a survey-only mission is keyed on this, not on
+    which runs happened to be spawned."""
+    if plan.get("playbook") != "audit":
+        return False
+    steps = plan.get("steps") or []
+    has_coder = any(isinstance(s, dict) and s.get("role") == "coder" for s in steps)
+    return not has_coder and not plan.get("gates") and not plan.get("publish")
 
 
 class MissionOrchestrator:
@@ -1241,26 +1264,39 @@ class MissionOrchestrator:
 
     async def _enforce_audit_fresh(self) -> None:
         """The ONE mechanical rail on finish(done), not bypassable by anything
-        the orchestrator can call: what ships must have been audited. Refuses
-        when no auditor ever completed, or when a coder completed after the
-        last completed audit (unaudited changes). The only way through is to
-        spawn a fresh audit and wait for it."""
-        audits = await self._completed_runs("auditor")
+        the orchestrator can call: what ships must have been audited.
+
+        Rule: when ANY coder run exists in the mission (whatever its status:
+        completed, failed, aborted, still running), finish(done) needs a
+        completed auditor, and no coder run may have finished after that
+        audit STARTED. The only exemption needs ALL of: the mission's PLAN
+        allows an unaudited done (the audit playbook, with no coder step, no gates
+        and no publish: see `_plan_allows_unaudited_done`), no coder run exists,
+        and a surveyor completed. A survey changes nothing, so there is no diff to audit; a
+        surveyor never excuses a coder, and never a gated or publishing plan."""
+        runs = await self.store.list_runs(self.mid)
+        audits = [r for r in runs if r.role == "auditor" and r.status == RunStatus.COMPLETED]
+        coders = [r for r in runs if r.role == "coder"]
+        if not coders and not audits:
+            surveyed = any(r.role == "surveyor" and r.status == RunStatus.COMPLETED for r in runs)
+            if surveyed and _plan_allows_unaudited_done(await self._fresh_plan()):
+                return
         if not audits:
             raise ToolError(
                 "no auditor has completed in this mission: spawn an auditor on the coder's "
                 "branch and wait for it before finishing with outcome='done'"
             )
         last_audit = audits[-1]
-        coders = await self._completed_runs("coder")
-        # a coder that FINISHED after the audit STARTED changed the branch after
-        # the auditor looked (they can run in parallel): compare finish to start
+        # a coder run that ended (or is still running) after the audit STARTED
+        # changed or may change the branch after the auditor looked (they can
+        # run in parallel): compare its last update to the audit's start. A
+        # coder that failed or timed out may still have left edits behind.
         after = [r for r in coders if (r.updated_at or r.created_at) > last_audit.created_at]
         if after:
             raise ToolError(
-                f"coder {after[-1].id} ran after the last completed audit {last_audit.id}: "
-                "those changes are unaudited. Spawn an auditor on the current branch and "
-                "wait for it, then finish."
+                f"coder {after[-1].id} ({after[-1].status}) ran after the last completed "
+                f"audit {last_audit.id}: those changes are unaudited. Spawn an auditor on "
+                "the current branch and wait for it, then finish."
             )
         # tests are a deliverable: the coder whose branch ships must have
         # reported its red-green tests block (or a not_testable_reason). Scoped
@@ -2000,7 +2036,7 @@ class MissionOrchestrator:
         return "\n".join(lines)
 
 
-DEFAULT_TURNS = {"investigator": 20, "coder": 40, "auditor": 25}
+DEFAULT_TURNS = {"investigator": 20, "surveyor": 25, "coder": 40, "auditor": 25}
 
 
 def _accepted_findings(raw: Any) -> list[dict[str, str]]:

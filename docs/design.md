@@ -158,6 +158,26 @@ the orchestrator is a typed envelope `{kind: blocked|needs_model|needs_tool|
 needs_context|question, detail}`: runtime policies act on the kind mechanically; the
 orchestrator LLM reads the detail.
 
+| Role | Does | Changes code? |
+|---|---|---|
+| investigator | Investigates a brief and reports structured findings with evidence | no |
+| surveyor | Reads a codebase cold and reports a cited map: layout, entry points, tests, CI, risks, gaps | no: read-only, cannot publish |
+| coder | Implements the change in its own worktree and hands off a branch | yes |
+| auditor | Verifies another role's diff and informs the ship decision | no |
+
+Surveyor maps, auditor verifies, coder changes. The surveyor's read-only guarantee is
+structural and enforced in code (`nodes/readonly.py`): it has no shell at all. Its
+executor wrapper is outermost and offers only `read_file`, `list_dir`, `search_code`,
+`repo_tree` and `git_read`; every other tool name, `run_command` included, is refused.
+The three search tools build their own argv from a fixed template (user values only
+land after `-e` or `--`, git is pinned with no pager, fsmonitor, textconv or external
+diff), every path passes the same jail as `read_file` (relative, no `~`, no `..`,
+resolved inside the workspace), and the argv is handed to the inner executor as its
+`run_command`, so cwd, env, timeout and truncation are unchanged. The `audit` plan
+(investigator, then surveyor) has no coder step, no gate and no `publish`, so it can
+never open a PR. `finish(done)` on such a mission needs no auditor only when NO coder
+run exists in it; a coder run of any status still requires a fresh completed audit.
+
 Escalation policies (engine, M3): `needs_model` promotes within the provider (catalog
 tier order) and resumes the role with no human; when the catalog is exhausted the run
 falls through to a gate tracked by id (decisions are read from gate ROWS, and a resume

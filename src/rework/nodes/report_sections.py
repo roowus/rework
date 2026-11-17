@@ -305,6 +305,150 @@ COVERAGE = ReportSection(
 )
 
 
+# ---- surveyor sections: a cited map of a codebase, read cold --------------
+
+_WHERE = (
+    " Every `where` / path value carries the file path AND line numbers"
+    " (path/to/file.py:12-40) of code you actually read; never invent them."
+)
+_ITEMS = {"type": "array", "items": {"type": "object"}}
+
+SURVEY_TITLE = ReportSection(
+    key="title",
+    title="Title",
+    prompt_fragment="A short title for the survey (the project name and what it is).",
+    schema_slice={"title": {"type": "string"}},
+    required_fields=("title",),
+)
+
+SURVEY_LAYOUT = ReportSection(
+    key="layout",
+    title="Layout",
+    prompt_fragment=(
+        "The directory and module layout: one entry per meaningful top-level"
+        " directory or module with {path, purpose}." + _WHERE
+    ),
+    schema_slice={"layout": _ITEMS},
+    required_fields=("layout",),
+)
+
+SURVEY_ENTRY_POINTS = ReportSection(
+    key="entry_points",
+    title="Entry points",
+    prompt_fragment=(
+        "How the program starts or is used: CLIs, servers, workers, public"
+        " APIs, as {name, where, purpose}." + _WHERE
+    ),
+    schema_slice={"entry_points": _ITEMS},
+    required_fields=("entry_points",),
+)
+
+SURVEY_DEPENDENCIES = ReportSection(
+    key="dependencies",
+    title="Dependencies",
+    prompt_fragment=(
+        "Runtime and development dependencies that shape the design, as"
+        " {name, kind (runtime|dev|service|tool), purpose, where}." + _WHERE
+    ),
+    schema_slice={"dependencies": _ITEMS},
+    required_fields=("dependencies",),
+)
+
+SURVEY_CONFIG = ReportSection(
+    key="config",
+    title="Configuration",
+    prompt_fragment=(
+        "Configuration surfaces: env vars, config files, flags, as {name, where, purpose}." + _WHERE
+    ),
+    schema_slice={"config": _ITEMS},
+    required_fields=("config",),
+)
+
+SURVEY_TESTS = ReportSection(
+    # NOT "tests": that key is the REPORT's "tests that would catch the bug"
+    # (#69). The surveyor's key says what it means: how this repo is tested.
+    key="survey_tests",
+    title="Tests",
+    prompt_fragment=(
+        "How the project is tested: an object with framework, command (the"
+        " exact command), where (test directories, with paths), and notes"
+        " (coverage gaps, slow or networked tests)."
+    ),
+    schema_slice={"survey_tests": {"type": "object"}},
+    required_fields=("survey_tests",),
+)
+
+SURVEY_CI = ReportSection(
+    key="ci",
+    title="CI",
+    prompt_fragment=(
+        "What CI runs: an object with system, where (workflow file paths with"
+        " line numbers) and checks (list of what is run: tests, lint, types)."
+        " Say plainly when there is no CI."
+    ),
+    schema_slice={"ci": {"type": "object"}},
+    required_fields=("ci",),
+)
+
+SURVEY_RISKS = ReportSection(
+    key="risks",
+    title="Risks",
+    prompt_fragment=(
+        "Concrete risks you saw, as {severity (critical|high|medium|low), area,"
+        " detail, where}." + _WHERE + " Evidence over suspicion; no nitpicks."
+        " Risks and gaps together are capped at 40: lead with the worst."
+    ),
+    schema_slice={
+        "risks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["severity", "area", "detail", "where"],
+                "properties": {
+                    "severity": {"enum": ["critical", "high", "medium", "low"]},
+                    "area": {"type": "string"},
+                    "detail": {"type": "string"},
+                    "where": {"type": "string"},
+                },
+            },
+        }
+    },
+    required_fields=("risks",),
+)
+
+SURVEY_GAPS = ReportSection(
+    key="gaps",
+    title="Gaps",
+    prompt_fragment=(
+        "What you could NOT establish or did not cover (unread areas, missing"
+        " docs or tests, things only runtime would show), as short strings."
+    ),
+    schema_slice={"gaps": {"type": "array", "items": {"type": "string"}}},
+    required_fields=("gaps",),
+)
+
+SURVEY_NEXT_STEPS = ReportSection(
+    key="next_steps",
+    title="Next steps",
+    prompt_fragment=(
+        "What a reader should do or look at next, as short strings, most"
+        " valuable first. Describe; never implement."
+    ),
+    schema_slice={"next_steps": {"type": "array", "items": {"type": "string"}}},
+    required_fields=("next_steps",),
+)
+
+SURVEY_REPORT = ReportSection(
+    key="report",
+    title="Report",
+    prompt_fragment=(
+        "The survey as a trimmed markdown body (under 120 lines) rendered from"
+        " the fields above: headings, short bullets, file:line citations kept."
+    ),
+    schema_slice={"report": {"type": "string"}},
+    required_fields=("report",),
+)
+
 SECTION_REGISTRY: dict[str, ReportSection] = {
     s.key: s
     for s in (
@@ -319,11 +463,37 @@ SECTION_REGISTRY: dict[str, ReportSection] = {
         COVERAGE,
         WARNINGS,
         DISPOSITIONS,
+        SURVEY_TITLE,
+        SURVEY_LAYOUT,
+        SURVEY_ENTRY_POINTS,
+        SURVEY_DEPENDENCIES,
+        SURVEY_CONFIG,
+        SURVEY_TESTS,
+        SURVEY_CI,
+        SURVEY_RISKS,
+        SURVEY_GAPS,
+        SURVEY_NEXT_STEPS,
+        SURVEY_REPORT,
     )
 }
 
 # named assemblies: the default checkbox sets (ADR 0003: truss format is the
 # auditor's default; investigator has its own)
+ASSEMBLY_SURVEYOR = (
+    "title",
+    "summary",
+    "layout",
+    "entry_points",
+    "dependencies",
+    "config",
+    "survey_tests",
+    "ci",
+    "risks",
+    "gaps",
+    "next_steps",
+    "report",
+)
+
 ASSEMBLY_INVESTIGATOR = ("summary", "findings", "tests", "blockers")
 ASSEMBLY_AUDIT = (
     "summary",

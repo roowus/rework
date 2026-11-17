@@ -1744,6 +1744,174 @@ async def test_a_complete_red_green_claim_is_accepted(world: dict[str, Any]) -> 
     await orch._enforce_audit_fresh()
 
 
+async def _seed_runs(store: SqliteStore, *rows: tuple[str, str, RunStatus, float, float]) -> None:
+    from rework.kernel.state.records import Run
+
+    for role, n, status, created, updated in rows:
+        await store.create_run(
+            Run(
+                id=f"mo:{role}:{role}:{n}",
+                mission_id="mo",
+                role=role,
+                step=role,
+                status=status,
+                created_at=created,
+                updated_at=updated,
+            )
+        )
+
+
+async def test_audit_rail_still_refuses_a_completed_coder_with_no_audit(
+    world: dict[str, Any],
+) -> None:
+    """(a) a completed coder and no completed audit is refused, and a surveyor
+    in the same mission does not excuse it."""
+    from rework.orchestrator.agent import MissionOrchestrator, ToolError
+
+    store: SqliteStore = world["store"]
+    t0 = 1_000_000.0
+    await _seed_runs(
+        store,
+        ("coder", "1", RunStatus.COMPLETED, t0, t0 + 10),
+        ("surveyor", "1", RunStatus.COMPLETED, t0 + 20, t0 + 30),
+    )
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    with pytest.raises(ToolError, match="no auditor has completed"):
+        await orch._enforce_audit_fresh()
+
+
+@pytest.mark.parametrize("status", [RunStatus.FAILED, RunStatus.ABORTED, RunStatus.RUNNING])
+async def test_audit_rail_refuses_a_coder_that_did_not_complete_plus_a_surveyor(
+    world: dict[str, Any], status: RunStatus
+) -> None:
+    """(b) a coder that ran but failed, timed out or is still running, plus a
+    surveyor, in a PUBLISHING mission (the world plan is `fix`): still refused.
+    The surveyor exemption exists only when no coder run exists at all."""
+    from rework.orchestrator.agent import MissionOrchestrator, ToolError
+
+    store: SqliteStore = world["store"]
+    assert world["mission"].plan["gates"] == ["ship"], "this mission is a gated, shipping plan"
+    t0 = 1_000_000.0
+    await _seed_runs(
+        store,
+        ("coder", "1", status, t0, t0 + 10),
+        ("surveyor", "1", RunStatus.COMPLETED, t0 + 20, t0 + 30),
+    )
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    with pytest.raises(ToolError, match="no auditor has completed"):
+        await orch._enforce_audit_fresh()
+
+
+async def test_audit_rail_refuses_a_failed_coder_that_ran_after_the_last_audit(
+    world: dict[str, Any],
+) -> None:
+    """A coder that failed AFTER the last completed audit began may still have
+    left edits behind: completion status does not matter."""
+    from rework.orchestrator.agent import MissionOrchestrator, ToolError
+
+    store: SqliteStore = world["store"]
+    t0 = 1_000_000.0
+    await _seed_runs(
+        store,
+        ("auditor", "1", RunStatus.COMPLETED, t0, t0 + 10),
+        ("coder", "1", RunStatus.FAILED, t0 + 5, t0 + 50),
+    )
+    orch = MissionOrchestrator(runner(world), world["mission"])
+    with pytest.raises(ToolError, match="after the last completed audit"):
+        await orch._enforce_audit_fresh()
+
+
+async def _use_plan(world: dict[str, Any], playbook: str) -> Any:
+    """Re-plan the `mo` mission as `playbook` (what the rail reads from the store)."""
+    from rework.missions import orchestrated_plan
+
+    plan = orchestrated_plan(playbook, "pro")
+    await world["store"].update_mission("mo", plan=plan)
+    return await world["store"].get_mission("mo")
+
+
+def test_plan_allows_unaudited_done_predicate() -> None:
+    from rework.missions import PLAN_FIX, PLAN_FIX_PR, orchestrated_plan
+    from rework.orchestrator.agent import _plan_allows_unaudited_done as ok
+
+    assert ok(orchestrated_plan("audit", "pro"))
+    # draft has no gates, no publish and no coder step but writes files: never exempt
+    assert not ok(orchestrated_plan("draft", "pro"))
+    assert not ok(orchestrated_plan("echo", "pro"))
+    assert not ok({"steps": [], "gates": [], "publish": ""})  # no playbook stamp
+    # the audit playbook is exempt only while it stays pure
+    assert not ok({**orchestrated_plan("audit", "pro"), "gates": ["ship"]})
+    assert not ok({**orchestrated_plan("audit", "pro"), "publish": "pr"})
+    assert not ok({**orchestrated_plan("audit", "pro"), "steps": [{"role": "coder"}]})
+    assert not ok(orchestrated_plan("fix", "pro"))  # gated
+    assert not ok(orchestrated_plan("fix-pr", "pro"))  # publishes
+    assert not ok(dict(PLAN_FIX)) and not ok(dict(PLAN_FIX_PR))  # coder step
+    assert not ok({"steps": [{"role": "coder"}], "gates": [], "publish": ""})
+    assert not ok({"gates": ["ship"]}) and not ok({"publish": "pr"})
+
+
+async def test_audit_rail_allows_a_pure_audit_mission(world: dict[str, Any]) -> None:
+    """(c) investigator + surveyor, no coder run at all, in a plan that cannot
+    change or ship anything (the `audit` playbook): nothing to audit."""
+    from rework.orchestrator.agent import MissionOrchestrator
+
+    mission = await _use_plan(world, "audit")
+    assert mission.plan["playbook"] == "audit"  # what the exemption keys on
+    assert mission.plan["gates"] == [] and not mission.plan["publish"], (
+        "the plan shape it relies on"
+    )
+    t0 = 1_000_000.0
+    await _seed_runs(
+        world["store"],
+        ("investigator", "1", RunStatus.COMPLETED, t0, t0 + 10),
+        ("surveyor", "1", RunStatus.COMPLETED, t0 + 20, t0 + 30),
+    )
+    orch = MissionOrchestrator(runner(world), mission)
+    await orch._enforce_audit_fresh()  # allowed
+
+
+@pytest.mark.parametrize("playbook", ["fix", "fix-pr", "draft"])
+async def test_audit_rail_refuses_a_surveyor_only_run_on_a_gated_or_publishing_plan(
+    world: dict[str, Any], playbook: str
+) -> None:
+    """A surveyor spawned instead of a coder must not let a `fix` (gated) or
+    `fix-pr` (publishing) mission finish(done) with nothing audited, nor a
+    `draft` one (no gates, no publish, but it writes files into the project)."""
+    from rework.orchestrator.agent import MissionOrchestrator, ToolError
+
+    mission = await _use_plan(world, playbook)
+    assert mission.plan["playbook"] == playbook
+    t0 = 1_000_000.0
+    await _seed_runs(
+        world["store"],
+        ("investigator", "1", RunStatus.COMPLETED, t0, t0 + 10),
+        ("surveyor", "1", RunStatus.COMPLETED, t0 + 20, t0 + 30),
+    )
+    orch = MissionOrchestrator(runner(world), mission)
+    with pytest.raises(ToolError, match="no auditor has completed"):
+        await orch._enforce_audit_fresh()
+
+
+async def test_audit_rail_refuses_a_mission_with_neither_coder_nor_completed_survey(
+    world: dict[str, Any],
+) -> None:
+    """The exemption needs a COMPLETED surveyor: an investigator alone, or a
+    failed survey, does not let finish(done) through."""
+    from rework.orchestrator.agent import MissionOrchestrator, ToolError
+
+    mission = await _use_plan(world, "audit")  # the plan allows it: only the runs refuse
+    store: SqliteStore = world["store"]
+    t0 = 1_000_000.0
+    await _seed_runs(
+        store,
+        ("investigator", "1", RunStatus.COMPLETED, t0, t0 + 10),
+        ("surveyor", "1", RunStatus.FAILED, t0 + 20, t0 + 30),
+    )
+    orch = MissionOrchestrator(runner(world), mission)
+    with pytest.raises(ToolError, match="no auditor has completed"):
+        await orch._enforce_audit_fresh()
+
+
 # -- a reply cut off at the output limit is not idleness ----------------------
 
 
