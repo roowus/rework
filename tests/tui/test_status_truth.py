@@ -18,10 +18,11 @@ import re
 import time
 from typing import Any
 
+import pytest
 from textual.app import App, ComposeResult
 from textual.widgets import Static
 
-from rework.kernel.state.records import Mission, MissionStatus
+from rework.kernel.state.records import Mission, MissionStatus, Run, RunStatus
 from rework.tui import actions, theme
 from rework.tui.hub import Snapshot
 from rework.tui.spinner import FRAMES
@@ -163,9 +164,10 @@ async def test_a_cancelled_mission_paints_the_cross_and_the_word_everywhere() ->
     view.snap = _snap([mission])
     assert glyph("cancelled") == f"[{FAINT}]⊘[/]", "theme owns the glyph"
     assert status_text("cancelled") == f"[{FAINT}]⊘ cancelled[/]", "and the word"
-    # the label is spelled out in STATUS_LABEL instead of falling back to the
-    # value with underscores replaced: same text either way, so this pins the
-    # explicit entry (a future status value cannot inherit the wrong word)
+    # the label is now stated in STATUS_LABEL rather than derived by
+    # `status_text`'s fallback (`value.replace("_", " ")`). Both entries re-state
+    # a word the fallback already produced, so the rendered bytes are unchanged:
+    # what these two lines pin is that the word is stated, not inherited
     assert theme.STATUS_LABEL["cancelled"] == "cancelled"
     assert theme.STATUS_LABEL["aborted"] == "aborted"
 
@@ -292,3 +294,96 @@ def test_the_orchestrator_row_does_not_animate_while_paused() -> None:
     view.mission_id = live.id
     rows = {r.key: r for r in view._run_rows(frame=FRAMES[2], now=live.created_at + 120.0)}
     assert FRAMES[2] in rows[orch].markup, rows[orch].markup
+
+
+# -- (g) a stopped mission's RUN rows are stopped too -------------------------
+
+RUN_CREATED = 1_000_000.0
+
+
+def _run(mid: str, status: RunStatus = RunStatus.RUNNING, role: str = "coder") -> Run:
+    return Run(
+        id=f"{mid}:code:{role}:1",
+        mission_id=mid,
+        role=role,
+        step="code",
+        status=status,
+        created_at=RUN_CREATED,
+        updated_at=RUN_CREATED,
+    )
+
+
+def _detail(status: MissionStatus, run_status: RunStatus = RunStatus.RUNNING) -> Any:
+    """The drill-down of a mission whose RUN ROW is stored RUNNING, which is
+    exactly what the engine leaves behind on an owner pause or cancel: it
+    cancels the live role tasks and never rewrites the rows (engine.py:1495)."""
+    mission = _mission(f"m-{status.value}", status)
+    run = _run(mission.id, run_status)
+    view = DashboardView()
+    view.snap = _snap([mission])
+    # both the mission and the run have a brand new event: nothing here is
+    # stalled, so any marker that is not a frame is a deliberate choice
+    view.snap.last_event = {mission.id: mission.updated_at, run.id: run.updated_at}
+    view.mission_id = mission.id
+    view.runs = [run]
+    return view, mission, run
+
+
+@pytest.mark.parametrize("status", [MissionStatus.ON_HOLD, MissionStatus.CANCELLED])
+def test_a_stopped_mission_does_not_animate_its_run_rows(status: MissionStatus) -> None:
+    """(g) A pause or cancel stops the ROLE TASKS but leaves their rows stored
+    RUNNING, so a row built from that run's own status kept spinning and its
+    clock kept counting the still time as work. Under a mission that is not
+    WORKING the row takes the MISSION's marker (‖ paused, ⊘ cancelled) and its
+    elapsed text is frozen at the mission's last update."""
+    view, mission, run = _detail(status)
+
+    def rows(now: float) -> dict[str, str]:
+        return {r.key: r.markup for r in view._run_rows(frame=FRAMES[2], now=now)}
+
+    first = rows(mission.updated_at + 60.0)
+    assert run.id in first, list(first)
+    assert not any(f in first[run.id] for f in FRAMES), (
+        f"a {status.value} mission animated a run row: {first[run.id]}"
+    )
+    assert glyph(status.value) in first[run.id], first[run.id]
+    # the clock is frozen at the mission's own stamp, not the wall clock: the
+    # run was created one minute before it, where the wall clock would say days
+    assert "1m 00s" in first[run.id], first[run.id]
+    later = rows(mission.updated_at + LATER)[run.id]
+    assert first[run.id] == later, f"the run clock advanced: {first[run.id]} -> {later}"
+
+
+@pytest.mark.parametrize("status", [MissionStatus.ON_HOLD, MissionStatus.CANCELLED])
+def test_a_finished_run_under_a_stopped_mission_keeps_its_own_marker(
+    status: MissionStatus,
+) -> None:
+    """The other half of (g): a run that genuinely finished is not a lie, so it
+    keeps its own terminal marker (✓ done) instead of the mission's ‖ or ⊘."""
+    view, _mission_row, run = _detail(status, RunStatus.COMPLETED)
+    markup = {r.key: r.markup for r in view._run_rows(frame=FRAMES[2], now=RUN_CREATED + 60.0)}
+    assert glyph("completed") in markup[run.id], markup[run.id]
+
+
+def test_a_mission_at_a_gate_still_animates_its_run_rows() -> None:
+    """... and the fix must not over-reach: `awaiting_gate` is WORKING, so a run
+    that is stored RUNNING under it still animates."""
+    view, _mission_row, run = _detail(MissionStatus.AWAITING_GATE)
+    markup = {r.key: r.markup for r in view._run_rows(frame=FRAMES[2], now=RUN_CREATED + 60.0)}
+    assert FRAMES[2] in markup[run.id], markup[run.id]
+
+
+# -- (h) the label fallback is still the fallback -----------------------------
+
+
+def test_a_status_with_no_label_falls_back_to_its_value() -> None:
+    """The two STATUS_LABEL entries "cancelled" and "aborted" spell out what
+    `status_text` would have derived anyway, so the rendered bytes are the same;
+    this pins that derivation for a status that has no entry at all (a test that
+    only checked cancelled/aborted could not tell the table from the fallback)."""
+    assert status_text("needs_review") == f"[{FAINT}]· needs review[/]"
+    assert status_text("under-review") == f"[{FAINT}]· under-review[/]", "no underscores to swap"
+    # ... and the two explicit entries render exactly those bytes: proof that
+    # stating them changed the table and not the screen
+    assert status_text("cancelled") == f"[{FAINT}]⊘ cancelled[/]"
+    assert status_text("aborted") == f"[{FAINT}]⊘ aborted[/]"

@@ -81,8 +81,10 @@ hook waiting for a decision.
 
 A running mission or run shows the spinner only while it is producing events.
 With no event for 5 minutes (`spinner.STALL_SECONDS`, 300s) the spinner stops
-and the row shows the static idle marker `◌` plus `idle 7m`. Pending, on hold
-and awaiting-gate states never animate. The frame set and the 5 minute rule
+and the row shows the static idle marker `◌` plus `idle 7m`. Pending and on hold
+never animate. An `awaiting_gate` mission is still waiting on work, so its header
+carries the `live` tag and its orchestrator row animates, while its mission row
+paints the `◆` of the gate it is waiting on. The frame set and the 5 minute rule
 live in `tui/spinner.py`.
 
 What "idle" means depends on the surface, because every run event also counts
