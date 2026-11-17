@@ -94,7 +94,7 @@ open questions) carry the same numbering in the later sections.
 | Workspace | one clone per run on the daemon | one clone per job on the host, SHA plus tree proven |
 | Credentials | one `REWORK_TOKEN`, one git author | per-host enrolment token, per-host push token, per-host git identity |
 | State | missions, runs, events | plus `hosts` and a `host` on each run |
-| TUI | reads the database | unchanged: remote output lands as ordinary events |
+| TUI | reads the database | no new streaming channel: remote output lands as ordinary trajectory events; phase 1 changes nothing in the TUI |
 
 ### R1: one control plane in the daemon, and the seam is `ToolExecutor`
 
@@ -105,20 +105,38 @@ never installed on the host. The code seam is a new `RemoteExecutor` implementin
 `ToolExecutor` Protocol (`src/rework/nodes/tools.py:82`), selected at the point where the engine
 builds or attaches the executor: `LazyExecutor.attach` (`src/rework/nodes/tools.py:105`) for the
 coder, the direct `LocalExecutor(...)` construction in `src/rework/roles/builtin/auditor.py:120` and
-`src/rework/roles/builtin/investigator.py:116`, and `worktree_executor`
-(`src/rework/nodes/git_ops.py:626`). Roles call `executor.execute(name, args)` and never learn where
-the process ran.
+`src/rework/roles/builtin/investigator.py:116`. The fourth construction site, `worktree_executor`
+(`src/rework/nodes/git_ops.py:626`), is defined but currently uncalled: a repo-wide grep finds only
+its definition, so this ADR leaves it alone and does not present it as a construction site.
+`RemoteExecutor` lives in `src/rework/nodes/remote.py`, and `src/rework/nodes/tools.py` is the
+binding point, not a second home: `LazyExecutor.attach` (`:105`-`:106`) hard-codes
+`self._inner = LocalExecutor(...)` today and has to take an executor factory (or a resolved
+executor) instead (R11). Roles call `executor.execute(name, args)` and never learn where the
+process ran.
 
-**Reasoning.** A role's graph, its tools, its prompts and its artifacts all stay exactly as they are,
-because the only thing that changes is which object answers `execute`. That keeps the diff reviewable
-(a new module plus a factory) and keeps every existing role test valid. Putting the decision above
+**What the seam covers, and what it does not.** `execute("run_command", ...)` becomes remote. Nothing
+else does. Every other tool in a role's toolset is still pure Python running on the daemon against
+`self._workdir`: `read_file`, `list_dir` and `file_complaint` are branches and wrappers of the same
+`LocalExecutor` (`execute` at `src/rework/nodes/tools.py:191`, `BUILTIN_TOOLS` at `:22`), and
+`ask_orchestrator`, the web tools and the library tools are wrapper layers built on top of it. The
+coder's handoff is daemon-side too: `stage_all` (`src/rework/nodes/git_ops.py:182`),
+`unstage_nested_repos` (`:202`), `commit` (`:237`) and `diff_base` (`:262`) all take a local path,
+and the coder stores `"worktree": str(wt)` (`src/rework/roles/builtin/coder.py:213`) in its
+artifact. The auditor's and the investigator's read root is `ctx.read_root`, a daemon path
+(`src/rework/roles/builtin/investigator.py:116`). Enclosing only the subprocess spawn is therefore
+**not** sufficient for a remote coder run, and R2.1 turns that into a hard placement gate instead
+of a footnote. What the seam does buy is that the decision is one object, so the diff stays
+reviewable (a new module plus a factory) and every existing role test stays valid. Putting the decision above
 the executor level, for example in the plan or in `command_prefix`, would either duplicate the tool
 loop on the host or require a second copy of `rework`'s jail semantics in a shell string.
 
 **Consequences to state plainly.** A remote host runs its own `command_prefix`, never the daemon's:
 the memory cap it applies is the host's own `MemoryMax`/`ulimit` policy, and `LocalExecutor`'s own
 docstring already concedes that the `run_command` memory cap is advisory. A remote host inherits
-that weakness, and this ADR does not fix it.
+that weakness, and this ADR does not fix it. One further consequence, stated once here and relied on
+by R2.1 and R4: an artifact carrying a daemon-local `"worktree"` path must not be produced by a
+remote run in phase 1, and RESULT must never carry a path the daemon will later use as if it were
+local.
 
 **Rejected.** Replicating `rework` or the state database to hosts (two writers, split brain, and the
 daemon's schema discipline would have to ship as a second deployable). A second full daemon per host
@@ -154,6 +172,51 @@ mission to the big box. The precedence rule is the part that keeps (iii) from be
 
 **Rejected.** (i) alone, (ii) alone, and (iv) the worker pulling from a shared global queue with no
 daemon-side decision at all.
+
+#### R2.1: the toolset gate
+
+**Recommendation.** A host may be chosen for a run only if every tool the role can call is in the
+remote-capable set, and in phase 1 that set is exactly `{run_command}`. A role whose toolset includes
+anything else is not placeable on a host: the policy refuses, with a reason string naming the first
+non-remote-capable tool, for example
+`role coder is not placeable on a host: ask_orchestrator is not remote-capable`.
+
+**What the non-remote set is, read from the code.** Every tool that exists today is answered either
+by a branch of `LocalExecutor.execute` (`src/rework/nodes/tools.py:191`) or by one of the wrappers
+that compose around it: `read_file`, `list_dir`, `run_command` in `BUILTIN_TOOLS`
+(`src/rework/nodes/tools.py:22`), `file_complaint` (`COMPLAINT_SPEC`, `:57`), `ask_orchestrator`
+(`src/rework/nodes/escalate.py:27`), `web_search` and `fetch_url` (`src/rework/web/tools.py:19`), and
+`library_search`, `library_read`, `library_contribute` (`src/rework/library/tools.py:123`). There is
+no file-writing or patch tool at all: the coder edits files through `run_command` (heredocs,
+`git apply`), not through a write tool.
+
+**Where the toolset is actually declared.** Not in `RoleSpec.tools`: the declarative `ToolPack.allowed`
+field (`src/rework/roles/base.py:54`, used at `:108`) is dead code that nothing reads, exactly as the
+`src/rework/web/tools.py:5` comment says, so a tool registered there would never appear. A role's real
+toolset is the wrapper chain it builds at its own `make_toolloop_node` call
+(`src/rework/roles/builtin/coder.py:236`-`:244`, `auditor.py:192`-`:199`,
+`investigator.py:107`-`:115`). All three builtin roles wrap `ComplaintAwareExecutor`,
+`EscalationAwareExecutor`, `library_executor` and (for two of them) `web_executor`, so all three carry
+non-remote tools today and none of them is placeable on a host in phase 1. The gate therefore reads
+the composed executor's `specs()`, not a declarative field.
+
+**`prefer_host` cannot override the gate.** R2 already makes the policy the sole arbiter of an
+explicit request, and this is that rule applied to one of its inputs: a pin narrows the candidate set,
+and an empty candidate set stays empty. An explicit request that fails the gate is refused with the
+tool name, never silently downgraded to a remote run that cannot finish.
+
+**What phase 1 still delivers.** Test suites, lint matrices, soak and fuzz runs, doc builds, and any
+role that shells out without editing files: in one line, a role whose whole toolset is
+`run_command`.
+
+**What it does not deliver yet.** A coder role that edits files, an auditor or investigator that reads
+them, and any run whose result depends on a commit or a diff. Those need R10 phase 2.
+
+**Rejected.** A warning instead of a refusal (produces a remote coder run with no commit and no diff,
+which is the defect this gate exists to prevent). Proxying `read_file` back to the daemon per call
+while leaving the handoff local (the half-remote state R1 describes, and it would make a remote run
+depend on a daemon path that does not exist on the host). Inferring capability from what the model
+says it needs instead of from the toolset (the toolset is a fact about the code; the intent is not).
 
 ### R3: one fresh clone per job, on the host, proven by SHA and tree
 
@@ -300,8 +363,8 @@ revoked per host, and a compromised host would inherit everything the daemon exp
 **Streaming to the TUI.** Each LOG chunk is appended by the daemon as an ordinary trajectory/chat
 event for that run, using the existing event path (`EventRecord` with the run id, the `events` table
 at `src/rework/kernel/state/sqlite.py:97`). The worker's `seq` is used only for ordering and gap
-detection inside the daemon; the events table is the single source of truth. The TUI needs no
-change and shows remote output exactly like local output, because it already reads only the database
+detection inside the daemon; the events table is the single source of truth. Phase 1 needs no TUI
+change: remote output shows exactly like local output, because the TUI already reads only the database
 (`MissionCard` in `src/rework/tui/widgets/cards.py:178`, `#chat-log` in
 `src/rework/tui/views/work.py`). A gap is filled with an explicit
 `[N bytes of output lost, host stream gap]` event, never silently.
@@ -363,6 +426,12 @@ project-scoped form the project owns the local part and the host owns the domain
    that ran steps and how many.
 3. The PR body: one line per host, for example
    `Remote: rewver (100.101.74.108) ran 2 of 5 steps; commits authored as rework+rewver <rework@rework+rewver.rewis>`.
+
+`100.101.74.108` is rewver's tailnet address, supplied by the owner; no host address is hardcoded in
+the repository, it lives in the host record written at enrolment (R7). `src/rework/targets.py:12`
+already carries the same kind of tailnet address for rewvis
+(`daemon_url = "http://100.107.125.118:8941"`), which is the style precedent for this line, not a
+substitute for the rewver record.
 
 **Why not a trailer as the primary signal.** A `Co-authored-by:` line or a bespoke
 `Rework-Host:` trailer is invisible in `git log --format=%ae`, has to be remembered by whoever writes
@@ -514,6 +583,8 @@ Not in scope, deliberately and completely:
 - No automatic host discovery: enrolment is explicit and out of band.
 - No Windows.
 - No shared or network-mounted workspace.
+- No remote file editing, no remote commit and no remote diff in phase 1 (R2.1): the file tools,
+  `stage_all`, `commit` and `diff_base` all stay daemon-side until R10 phase 2.
 - No orchestrator or scheduling logic inside the worker: it claims, executes, reports.
 - No protocol feature whose absence a single box cannot reveal (multi-daemon consensus, cross-host
   ordering, distributed locks).
@@ -536,8 +607,8 @@ Not in scope, deliberately and completely:
 - Playwright and browser work becomes possible at all: rewvis has no display and no browsers.
 - A mission's cheap work stays local while its heavy or browser-bound work uses a host with 4 cores
   and 645 GB of disk.
-- Output from a remote job reaches the owner with zero TUI work, because it arrives as ordinary
-  trajectory events for the run.
+- Remote output reaches the owner with no new streaming channel: it arrives as ordinary trajectory
+  events for the run, and phase 1 requires zero TUI changes for it.
 - Every commit says which machine produced it, in the one field that cannot be forgotten.
 - Per-host revocation becomes a row delete instead of a mesh-wide secret rotation.
 
@@ -595,7 +666,9 @@ does not do yet.
 
 **Lands.** R4's protocol and endpoints, the stdlib-only worker, `RemoteExecutor` implementing
 `ToolExecutor` (R1), per-host enrolment token issuance and verification (R6a), and one host
-configured by explicit name in config (no registry, no capability filtering yet). R5's identity
+configured by explicit name in config (no registry, no capability filtering yet). The R2.1 toolset
+gate lands here as well, because it is the only placement rule phase 1 has: the placeable set is a
+role whose whole toolset is `run_command`. R5's identity
 derivation lands here too, because the commits a remote job makes need it from day one.
 
 **Proves it works.** One role's `run_command` executes on rewver, and the trajectory rows appear in
@@ -605,13 +678,24 @@ mission whose single step is a `run_command` that prints a marker; the marker ap
 `rework+rewver <rework@rework+rewver.rewis>`; the run row carries `host = "rewver"`.
 
 **Does not do yet.** No capability filtering, no `requires`, no per-host slot pools, no lease expiry
-and re-queue, no artifacts, no revocation tooling.
+and re-queue, no artifacts, no revocation tooling. And, by R2.1: no remote file editing, no remote
+commit, no remote diff.
 
 ### Phase 2: the registry, capabilities, requirements, leases
 
 **Lands.** `HostRegistry` and the capability vocabulary (R7), `requires` on steps and roles, the
 placement policy with the R2 precedence rule, per-host slot pools in `limits.py`, lease expiry and
-re-queue (R8's first three rows), and the retry budget.
+re-queue (R8's first three rows), and the retry budget. Two more things land in phase 2 and are the
+reason it is bigger than phase 1: the **remote file API** (the file-touching tools become messages
+to the worker, so `read_file`, `list_dir` and any later write or patch tool answer from the host's
+own workspace) and the **on-host git path** (stage, commit and diff are produced on the host and
+shipped back in RESULT, so no daemon-local path is ever handed to a remote run).
+
+**Recommendation on the file tools.** Reimplement them as protocol messages handled by the worker,
+for the same reason `run_command` is a message: one jail implementation, one place a path is
+resolved, one place to bound size. The obvious shortcut, rejected: `rsync` or a shared mount of the
+worktree back to the daemon, which breaks R3's one-fresh-clone-per-job rule and reinstates every
+failure the R3 table removes.
 
 **Proves it works.** A suite tagged `cpus>=4` lands on rewver while an untagged role stays local; a
 `kill -9` on the worker mid-job re-queues the run and it completes on the next attempt.
@@ -660,11 +744,13 @@ means it touches a file whose existing behaviour other features depend on.
 | `src/rework/remote/leases.py` | new | claim, renew, expire, idempotency keyed on run id plus job id plus attempt | additive |
 | `src/rework/remote/identity.py` | new | the R5 derivation (`sanitise`, `author_for(host, project)`) and nothing else | additive |
 | `src/rework/remote/worker/worker.py` | new | the single stdlib-only file that is copied to the host by scp; it imports nothing from `rework` | additive |
+| `src/rework/nodes/tools.py` | changed | `LazyExecutor.attach` takes an executor factory (or a resolved executor) instead of hard-coding `LocalExecutor` (`:105`-`:106`); the `ToolExecutor` Protocol (`:82`) is unchanged. This file is the binding point, `nodes/remote.py` is `RemoteExecutor`'s only home | risky |
+| `src/rework/remote/registry.py` | new | the R2.1 toolset gate: the remote-capable set and the refusal reason, keyed on the composed executor's `specs()`; phase 2 grows the same file into `HostRegistry` | additive |
 | `src/rework/config.py` | changed | host settings and the identity hook next to the existing `git_author` property (`:157`-`:162`); `git_author` itself is untouched | additive |
 | `src/rework/roles/builtin/coder.py` | changed | choose `RemoteExecutor` instead of `LazyExecutor`/`LocalExecutor` at the `LazyExecutor(...)` construction (`:91`) and its `attach` call (`:128`), per the placement decision | risky |
 | `src/rework/roles/builtin/auditor.py` | changed | same choice at the direct `LocalExecutor(...)` (`:120`) | risky |
 | `src/rework/roles/builtin/investigator.py` | changed | same choice at `LocalExecutor(ctx.read_root, ...)` (`:116`) | risky |
-| `src/rework/nodes/git_ops.py` | changed | `worktree_executor` (`:626`) learns the remote case, and `commit` (`:237`) takes the R5 author | risky |
+| `src/rework/nodes/git_ops.py` | changed | `commit` (`:237`) takes the R5 author; `worktree_executor` (`:626`) is dead code and this ADR neither wires nor edits it | risky |
 | `src/rework/kernel/state/sqlite.py` | changed | `CREATE TABLE IF NOT EXISTS hosts` plus `host` and attempt columns, added to the inline check-then-alter list (`:1175`-`:1188`) | risky |
 | `src/rework/kernel/state/postgres.py` | changed | the same three additions in its own list (`:1307`-`:1334`), with the 5 s `lock_timeout` lesson from `:258` respected | risky |
 | `src/rework/kernel/state/records.py` | changed | `host` on `Run` and on `Mission.result`; a new `Host` model | additive |
@@ -677,13 +763,16 @@ means it touches a file whose existing behaviour other features depend on.
 
 | Path | New or changed | Content and why this file | Risk |
 |---|---|---|---|
-| `src/rework/remote/registry.py` | new | `HostRegistry`, the R7 vocabulary, eligibility, guardrails, the deterministic choice | additive |
+| `src/rework/remote/registry.py` | changed | `HostRegistry`, the R7 vocabulary, eligibility, guardrails, the deterministic choice, beside the R2.1 gate the file already holds | additive |
 | `src/rework/remote/placement.py` | new | the R2 precedence rule as one pure function, so it is testable without a host | additive |
 | `src/rework/orchestrator/limits.py` | changed | per-host `PrioritySlots` pools beside `MissionSlot` (`:198`); `RoleLimiter` (`:22`) stays global | risky |
 | `src/rework/orchestrator/capacity.py` | changed | feed per-host measurements into the existing plan/retune path (`measure` `:165`, `DynamicCapacity` `:467`); no new scheduling logic here | risky |
 | `src/rework/orchestrator/engine.py` | changed | apply placement at step dispatch (`_run_steps_once`, `:686`) and record the chosen host on the run | risky |
 | `src/rework/remote/leases.py` | changed | expiry, re-queue and the retry budget from R8 | additive |
-| `src/rework/tui/views/work.py` | changed | render the waiting reason and the requeue note (R7, R8) from existing events | additive |
+| `src/rework/tui/views/work.py` | changed | render the R7 waiting reason and the R8 requeue note from existing events; both are recommendations this ADR makes, so showing them is part of the design, not cosmetics | additive |
+| `src/rework/nodes/remote.py` | changed | the file-touching tool names become worker messages (R10 phase 2); `run_command` is untouched | risky |
+| `src/rework/remote/worker/worker.py` | changed | serve the file tool messages and run the git steps on the host | additive |
+| `src/rework/nodes/git_ops.py` | changed | `stage_all` (`:182`), `commit` (`:237`) and `diff_base` (`:262`) produce their result on the host and ship it back in RESULT | risky |
 | `tests/test_remote_placement.py` | new | the 2x3 cross product of `requires`/`prefer_host` against eligible, busy and incompatible hosts | additive |
 | `tests/test_remote_leases.py` | new | missed heartbeat, duplicate result, clock skew, exhausted budget | additive |
 
@@ -694,7 +783,7 @@ means it touches a file whose existing behaviour other features depend on.
 | `src/rework/remote/artifacts.py` | new | artifact listing and transfer, reusing the ADR 0005 files route shape rather than inventing one; the browser image itself is set up per R12 | additive |
 | `src/rework/remote/server.py` | changed | the artifact routes on the same app | additive |
 | `src/rework/orchestrator/delivery.py` | changed | the PR-body host line from R5, next to the body it already renders (`:382`) | risky |
-| `src/rework/tui/widgets/cards.py` | changed | the host chip on `MissionCard` (`:178`) and `ProposalCard` (`:50`) | additive |
+| `src/rework/tui/widgets/cards.py` | changed | the host chip on `MissionCard` (`:178`) and `ProposalCard` (`:50`), the at-a-glance channel R5 names | additive |
 | `tests/test_remote_artifacts.py` | new | retrieve a screenshot produced by a remote job | additive |
 
 ### Phase 4
@@ -712,8 +801,9 @@ means it touches a file whose existing behaviour other features depend on.
 ## Migration and setup on rewver
 
 **R12.** The host: Ubuntu 24.04, 4 cores, 7.8 GB RAM, 645 GB free, lid-close ignored. A reboot or a sleep can
-happen, so the worker must come back by itself. Tailnet address 100.101.74.108 is already up and is
-already the `daemon_url`-style address the owner uses for rewvis targets (`src/rework/targets.py`).
+happen, so the worker must come back by itself. Rewver's tailnet address is `100.101.74.108`, supplied
+by the owner and recorded in the host row at enrolment; `src/rework/targets.py:12` carries rewvis's
+own `daemon_url`, which is the style precedent for this and not this literal.
 
 Steps, in order, each with the command that verifies it:
 
@@ -724,7 +814,10 @@ Steps, in order, each with the command that verifies it:
    `ssh rewver 'python3 /usr/local/bin/rework-worker --version'`. No pip, no uv, no rework checkout on
    the host.
 3. **Env file.** `sudo install -o rework -g rework -m 0600 /dev/null /etc/rework/worker.env`, then
-   fill `REWORK_HOST_NAME=rewver`, `REWORK_DAEMON_URL=http://<daemon tailnet ip>:8941`,
+   fill `REWORK_HOST_NAME=rewver`,
+   `REWORK_DAEMON_URL=http://100.107.125.118:8941` (rewvis, the daemon's tailnet address, as
+   `src/rework/targets.py:12` records it; rewver's own address, `100.101.74.108`, belongs in the host
+   row at enrolment, not in this file),
    `REWORK_HOST_TOKEN=<enrolment token>`, `REWORK_GIT_PUSH_TOKEN=<fine-grained PAT>`. Verify:
    `sudo stat -c '%U %a' /etc/rework/worker.env` prints `rework 600`.
 4. **Workspace root.** `sudo install -d -o rework -g rework -m 0700 /var/lib/rework/workspaces`
