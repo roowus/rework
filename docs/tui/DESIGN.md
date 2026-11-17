@@ -72,6 +72,13 @@ badges). Defined once in `theme.py::STATUS`.
 | failed / rejected | `✗` | `$danger` |
 | cancelled / aborted | `⊘` | `$faint` |
 
+`actions.ACTIVE` (`pending`, `running`, `awaiting_gate`, `on_hold`) means the
+mission is not finished; `actions.WORKING` (`running`, `awaiting_gate`) means
+work is happening now, so only those statuses get a role chip, a live elapsed
+clock, an animation or the `live` tag: `pending` has not started and `on_hold`
+has been stopped on purpose, while an `awaiting_gate` mission is still on the
+hook waiting for a decision.
+
 A running mission or run shows the spinner only while it is producing events.
 With no event for 5 minutes (`spinner.STALL_SECONDS`, 300s) the spinner stops
 and the row shows the static idle marker `◌` plus `idle 7m`. Pending, on hold

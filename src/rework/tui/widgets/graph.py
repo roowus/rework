@@ -27,6 +27,7 @@ from textual.message import Message
 from textual.widgets import Static
 
 from rework.nodes.report_sections import NOT_AUDITED, mechanical_verdict
+from rework.tui import actions
 from rework.tui.theme import ACCENT, FAINT, MUTED, esc, glyph, status_value
 from rework.tui.widgets.trajectory import role_of
 
@@ -296,7 +297,7 @@ def _mission_nodes_step_grouped(
     nodes: list[GNode] = []
     orch = plan.get("orchestrator") or {}
     if orch:
-        live = status_value(mission.status) in {"pending", "running", "awaiting_gate", "on_hold"}
+        live = status_value(mission.status) in actions.WORKING
         st = "running" if live else status_value(mission.status)
         nodes.append(
             GNode(
@@ -365,7 +366,7 @@ def _mission_nodes_per_run(
 
     # Add orchestrator node
     orch = plan.get("orchestrator") or {}
-    live = status_value(mission.status) in {"pending", "running", "awaiting_gate", "on_hold"}
+    live = status_value(mission.status) in actions.WORKING
     st = "running" if live else status_value(mission.status)
     nodes.append(
         GNode(
@@ -633,7 +634,7 @@ def mission_layers(
 
     # Orchestrator layer
     orch = plan.get("orchestrator") or {}
-    live = status_value(mission.status) in {"pending", "running", "awaiting_gate", "on_hold"}
+    live = status_value(mission.status) in actions.WORKING
     st = "running" if live else status_value(mission.status)
     orch_node = GNode(
         key="orchestrator",

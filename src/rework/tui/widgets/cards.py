@@ -12,7 +12,7 @@ from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.widgets import Input, Static
 
-from rework.tui import spinner
+from rework.tui import actions, spinner
 from rework.tui.actions import can
 from rework.tui.theme import (
     ACCENT,
@@ -305,7 +305,7 @@ class MissionCard(Vertical):
             elif mark:
                 mark += f" [{FAINT}]working[/]"
             bits = [esc(self.mission_id), esc(plan_label(m.plan))]
-            if self.active_role and status in {"running", "awaiting_gate"}:
+            if self.active_role and status in actions.WORKING:
                 bits.append(f"[b]{esc(self.active_role)}[/b]")
             if self.spend:
                 bits.append(money(self.spend))

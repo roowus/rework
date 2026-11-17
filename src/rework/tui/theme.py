@@ -128,6 +128,10 @@ STATUS_LABEL: dict[str, str] = {
     "on_hold": "paused",
     "intent": "queued",
     "sent_back": "sent back",
+    # explicit, not the raw-string fallback: a finished-and-stopped mission is
+    # named on every surface (card header, drill-down header) from here
+    "cancelled": "cancelled",
+    "aborted": "aborted",
 }
 
 

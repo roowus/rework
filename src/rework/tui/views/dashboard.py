@@ -844,7 +844,7 @@ class DashboardView(View):
         if self.project == ALL and m.project_id:
             bits.append(self.snap.project_name(m.project_id))
         role = self.mission_role.get(m.id)
-        if role and st in actions.ACTIVE:
+        if role and st in actions.WORKING:
             bits.append(role)
         if m.id in self.mission_cost:
             bits.append(money(self.mission_cost[m.id]))
@@ -1523,7 +1523,7 @@ class DashboardView(View):
             # the full row could not be fetched: show the light facts we hold
             # and say what is missing, instead of a permanent "loading"
             st = status_value(mission.status)
-            end = time.time() if st in actions.ACTIVE else mission.updated_at
+            end = time.time() if st in actions.WORKING else mission.updated_at
             prompt.set_prompt(
                 f"[b]{esc(mission.objective)}[/b]\n{status_text(st)}  [{MUTED}]"
                 + esc(
@@ -1550,7 +1550,7 @@ class DashboardView(View):
                 f"{money(self.budget.spent_usd)} · {tokens(self.budget.input_tokens)} in / "
                 f"{tokens(self.budget.output_tokens)} out"
             )
-        end = time.time() if st in actions.ACTIVE else mission.updated_at
+        end = time.time() if st in actions.WORKING else mission.updated_at
         bits.append(f"started {ago(mission.created_at)} · {duration(end - mission.created_at)}")
         if self.full_failed:
             # a refetch failed after this row was fetched: it is stale, say so
@@ -1607,7 +1607,7 @@ class DashboardView(View):
             cost = self.run_cost.get(orch_id, 0.0)
             sub = " · ".join(x for x in (str(model or ""), money(cost) if cost else "") if x)
             mark = self._mark(
-                "running" if st in actions.ACTIVE else st,
+                "running" if st in actions.WORKING else st,
                 self._stamp(orch_id),
                 frame,
                 now,
@@ -1784,7 +1784,7 @@ class DashboardView(View):
         elif tab == "gates":
             self._paint_gates()
         follow = self.query_one("#m-follow", Static)
-        live = status_value(mission.status) in actions.ACTIVE
+        live = status_value(mission.status) in actions.WORKING
         follow.update(f"[{ACCENT}]● live[/]" if live else "")
 
     # -- chat tab (read-only orchestrator transcript) ------------------------------------------
