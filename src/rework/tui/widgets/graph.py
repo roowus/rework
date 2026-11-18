@@ -255,7 +255,7 @@ def _run_status(mission: Any, run: Any) -> str:
 
     A run's own stored status can be a ghost: an owner pause or cancel cancels
     the live role tasks and writes nothing back to the run rows, so they stay
-    RUNNING (engine.py:1455-1462, Supervisor.aclose at engine.py:437-440).
+    RUNNING (engine.py:1455-1462, RunSupervisor.aclose at engine.py:437-440).
     Same rule as the dashboard's `_run_mark`: under a mission that is not
     WORKING a RUNNING run takes the MISSION's status (on_hold, cancelled, ...)
     so a grounded node does not paint a live marker or a moving clock, while a
@@ -542,8 +542,17 @@ def _outcome_edge_label(audits: list[Any]) -> str:
 
 
 def _derive_collapsed_status(mission: Any, runs: list[Any]) -> str:
-    """Derive a summary status for collapsed runs (a grounded run reads as the
-    mission's status, so a folded round under a paused mission is not live)."""
+    """Derive a summary status for collapsed runs.
+
+    A grounded run reads as the mission's status, so a folded round under a
+    paused mission is not live. And a folded head is a mission-status surface:
+    when no run in it carries a terminal status of its OWN (every run is still
+    intent/pending, or the ghost `running` row an owner pause leaves behind) and
+    the mission is not WORKING, the round reads the MISSION's status - a folded
+    head painting "completed" (or the "mix" marker) for a paused mission is a
+    worse lie than the live marker it replaced. A genuine terminal run still
+    wins, failed first, then cancelled, and a round that really completed still
+    reads completed."""
     if not runs:
         return "completed"
     statuses = {_run_status(mission, r) for r in runs}
@@ -551,6 +560,10 @@ def _derive_collapsed_status(mission: Any, runs: list[Any]) -> str:
         return "failed"
     if "cancelled" in statuses:
         return "cancelled"
+    mission_st = status_value(mission.status)
+    if mission_st not in actions.WORKING:
+        if {status_value(r.status) for r in runs} <= {"running", "pending", "intent"}:
+            return mission_st  # on_hold -> ‖, cancelled -> ⊘
     if statuses - {"completed", "running", "pending", "intent"}:
         return "mixed"
     return "completed"

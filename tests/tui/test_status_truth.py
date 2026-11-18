@@ -327,7 +327,7 @@ def _detail(status: MissionStatus, run_status: RunStatus = RunStatus.RUNNING) ->
     """The drill-down of a mission whose RUN ROW is stored RUNNING, which is
     exactly what the engine leaves behind on an owner pause or cancel: it
     cancels the live role tasks and never rewrites the rows (engine.py:1455-1462,
-    Supervisor.aclose at engine.py:437-440)."""
+    RunSupervisor.aclose at engine.py:437-440)."""
     mission = _mission(f"m-{status.value}", status)
     run = _run(mission.id, run_status)
     view = DashboardView()
@@ -498,6 +498,87 @@ def test_graph_run_node_still_animates_at_a_gate() -> None:
     for node in coder:
         assert node.status == "running", node
         assert node.inner_at == "loop", f"a live run lost its current inner step: {node}"
+
+
+# -- (g3) the FOLDED round head is a mission-status surface too --------------
+
+
+def _folded_head_status(mission: Mission, head: list[RunStatus]) -> str:
+    """The status `mission_layers` gives the folded-rounds summary node.
+
+    Seven review rounds (a coder, then the audit that closes it) are more than
+    COLLAPSE_ROUND_THRESHOLD, so rounds 1-5 fold into one head node and rounds
+    6-7 stay visible. `head` supplies the statuses of the runs INSIDE the folded
+    head (cycled over the ten of them); the two visible rounds are completed.
+    """
+    mission = mission.model_copy(update={"plan": {"orchestrator": {"model": "m"}}})
+    base = 2_000_000.0
+    runs: list[Run] = []
+    for i in range(1, 8):
+        for pos, (role, step, offset) in enumerate(
+            (("coder", "code", 0.0), ("auditor", "audit", 50.0))
+        ):
+            if i <= 5:  # inside the folded head
+                status = head[((i - 1) * 2 + pos) % len(head)]
+            else:  # the two latest rounds stay expanded and are simply done
+                status = RunStatus.COMPLETED
+            ts = base + i * 100.0 + offset
+            runs.append(
+                Run(
+                    id=f"{mission.id}:{step}:{role}:{i}",
+                    mission_id=mission.id,
+                    role=role,
+                    step=step,
+                    attempt=i,
+                    status=status,
+                    created_at=ts,
+                    updated_at=ts,
+                )
+            )
+    layers = mission_layers(mission, runs, [], {}, {}, None)
+    summary = [n for layer in layers for n in layer.nodes if n.key == "rounds-collapsed"]
+    assert len(summary) == 1, [(n.key, n.status) for layer in layers for n in layer.nodes]
+    return summary[0].status
+
+
+@pytest.mark.parametrize(
+    ("mission_status", "head", "expected"),
+    [
+        # the ghost RUNNING rows an owner pause or cancel leaves behind: the
+        # folded head takes the MISSION's status, never "running", and the
+        # "completed"/"mixed" it painted before was a worse lie than the live
+        # marker it replaced
+        (MissionStatus.ON_HOLD, [RunStatus.RUNNING], "on_hold"),
+        (MissionStatus.CANCELLED, [RunStatus.RUNNING], "cancelled"),
+        # ... also when the runs never even started
+        (MissionStatus.ON_HOLD, [RunStatus.INTENT], "on_hold"),
+        (MissionStatus.CANCELLED, [RunStatus.INTENT], "cancelled"),
+        # controls: a genuine terminal run inside the round still wins, failed
+        # first ...
+        (MissionStatus.ON_HOLD, [RunStatus.FAILED], "failed"),
+        (MissionStatus.CANCELLED, [RunStatus.RUNNING, RunStatus.FAILED], "failed"),
+        # ... and a round that really did complete still reads completed, even
+        # under a mission that is now paused
+        (MissionStatus.ON_HOLD, [RunStatus.COMPLETED], "completed"),
+    ],
+)
+def test_a_folded_round_head_reflects_the_mission_not_a_false_completion(
+    mission_status: MissionStatus, head: list[RunStatus], expected: str
+) -> None:
+    """(g3) The folded-round summary node is a mission-status surface too, and
+    it disagreed with the mission row right above it: a pause or cancel leaves
+    the run rows stored RUNNING (the engine cancels the tasks and writes
+    nothing back), so a folded round of such ghosts painted "mixed", and one of
+    pending/intent runs painted "completed", under a mission painting the
+    pause/cancel marker. A round with no terminal run of its own now takes the
+    MISSION's status; a genuine terminal run still wins (failed first, then
+    cancelled) and a round that truly completed still says completed."""
+    mission = _mission(f"m-{mission_status.value}-folded", mission_status)
+    got = _folded_head_status(mission, head)
+    assert got == expected, (
+        f"folded head under a {mission_status.value} mission whose head runs are "
+        f"{[r.value for r in head]}: {got} (expected {expected})"
+    )
 
 
 # -- (h) the label fallback is still the fallback -----------------------------
