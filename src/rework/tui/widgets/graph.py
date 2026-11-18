@@ -250,6 +250,25 @@ def _findings_summary(run: Any) -> str:
     return " · ".join(parts)
 
 
+def _run_status(mission: Any, run: Any) -> str:
+    """A run's status as the graph may paint it, given the mission above it.
+
+    A run's own stored status can be a ghost: an owner pause or cancel cancels
+    the live role tasks and writes nothing back to the run rows, so they stay
+    RUNNING (engine.py:1455-1462, Supervisor.aclose at engine.py:437-440).
+    Same rule as the dashboard's `_run_mark`: under a mission that is not
+    WORKING a RUNNING run takes the MISSION's status (on_hold, cancelled, ...)
+    so a grounded node does not paint a live marker or a moving clock, while a
+    run that is genuinely over keeps its own terminal status. Under a working
+    mission (running, awaiting_gate) every run is judged by its own status, so
+    a still-live run keeps animating and a wedged one does not lie."""
+    st = status_value(run.status)
+    mission_st = status_value(mission.status)
+    if st == "running" and mission_st not in actions.WORKING:
+        return mission_st
+    return st
+
+
 def mission_nodes(
     mission: Any,
     runs: list[Any],
@@ -312,7 +331,7 @@ def _mission_nodes_step_grouped(
         name = str(step.get("step") or step.get("role"))
         attempts = sorted(by_step.get(name, []), key=lambda r: r.attempt)
         latest = attempts[-1] if attempts else None
-        status = status_value(latest.status) if latest else "pending"
+        status = _run_status(mission, latest) if latest else "pending"
         role = str(step.get("role") or name)
         sub = role
         if latest is not None:
@@ -381,7 +400,7 @@ def _mission_nodes_per_run(
     # Add one node per run, in chronological order (runs are already sorted by created_at)
     prev_audit_run: Any = None
     for run in runs:
-        status = status_value(run.status)
+        status = _run_status(mission, run)
         title = role_of(run.id) or str(run.role)
         if run.role == "coder" and prev_audit_run is not None:
             title = f"{title} (revision)"
@@ -522,11 +541,12 @@ def _outcome_edge_label(audits: list[Any]) -> str:
     return " / ".join(sorted(verdicts))
 
 
-def _derive_collapsed_status(runs: list[Any]) -> str:
-    """Derive a summary status for collapsed runs."""
+def _derive_collapsed_status(mission: Any, runs: list[Any]) -> str:
+    """Derive a summary status for collapsed runs (a grounded run reads as the
+    mission's status, so a folded round under a paused mission is not live)."""
     if not runs:
         return "completed"
-    statuses = {status_value(r.status) for r in runs}
+    statuses = {_run_status(mission, r) for r in runs}
     if "failed" in statuses:
         return "failed"
     if "cancelled" in statuses:
@@ -536,9 +556,11 @@ def _derive_collapsed_status(runs: list[Any]) -> str:
     return "completed"
 
 
-def _node_for(run: Any, run_meta: dict[str, str], inner: dict[str, tuple[list[str], str]]) -> GNode:
+def _node_for(
+    mission: Any, run: Any, run_meta: dict[str, str], inner: dict[str, tuple[list[str], str]]
+) -> GNode:
     """One run, one node - titled from its run id ('coder #2'), never 'coder 4'."""
-    st = status_value(run.status)
+    st = _run_status(mission, run)
     inner_nodes, inner_at = inner.get(run.id, ([], ""))
     return GNode(
         key=run.id,
@@ -554,6 +576,7 @@ def _node_for(run: Any, run_meta: dict[str, str], inner: dict[str, tuple[list[st
 
 
 def _round_layers(
+    mission: Any,
     round_: ReviewRound,
     index: int,
     run_meta: dict[str, str],
@@ -569,11 +592,11 @@ def _round_layers(
     """
     layers: list[GLayer] = []
     if round_.others:
-        layers.append(GLayer(nodes=[_node_for(r, run_meta, inner) for r in round_.others]))
+        layers.append(GLayer(nodes=[_node_for(mission, r, run_meta, inner) for r in round_.others]))
     coder_nodes: list[GNode] = []
     chain: list[Any] = []  # the continuation chain inside this round, if any
     for pos, run in enumerate(round_.coders):
-        node = _node_for(run, run_meta, inner)
+        node = _node_for(mission, run, run_meta, inner)
         title = role_of(run.id) or str(run.role)
         sub = node.sub
         if is_revision and pos == 0:
@@ -591,7 +614,7 @@ def _round_layers(
         coder_nodes.append(node)
     if coder_nodes:
         layers.append(GLayer(nodes=coder_nodes))
-    audit_nodes = [_node_for(r, run_meta, inner) for r in round_.audits]
+    audit_nodes = [_node_for(mission, r, run_meta, inner) for r in round_.audits]
     if audit_nodes:
         layers.append(GLayer(nodes=audit_nodes))
     return layers
@@ -665,7 +688,7 @@ def mission_layers(
                             if not expanded_rounds
                             else f"rounds 1-{split} (expanded)"
                         ),
-                        status=_derive_collapsed_status(head_runs),
+                        status=_derive_collapsed_status(mission, head_runs),
                         sub=(
                             f"{len(head_runs)} runs · click to expand"
                             if not expanded_rounds
@@ -683,7 +706,7 @@ def mission_layers(
     seen_review = False
     for i, round_ in enumerate(rounds):
         index = (len(head) + i) if (many_rounds and expanded_rounds) else i
-        round_layers = _round_layers(round_, index, run_meta, inner, seen_review)
+        round_layers = _round_layers(mission, round_, index, run_meta, inner, seen_review)
         # label the edge into the audits with the round's review outcome
         if round_.audits and round_.coders and len(round_layers) >= 2:
             round_layers[-2].edge_to_next = GEdge(label=_review_edge_label(round_.audits))

@@ -30,6 +30,7 @@ from rework.tui.theme import FAINT, glyph, status_text
 from rework.tui.views.dashboard import DashboardView
 from rework.tui.widgets.cards import MissionCard
 from rework.tui.widgets.graph import GLayer, mission_layers, mission_nodes
+from rework.tui.widgets.graph import _Node as _GraphNode
 
 #: a whole day past `created_at`: if a paused mission's clock ran, the header
 #: would say "1d 0h" instead of its own (frozen) duration
@@ -74,6 +75,15 @@ class DashApp(App[None]):
 
     def compose(self) -> ComposeResult:
         yield self._view
+
+
+class _GraphNodeApp(App[None]):
+    def __init__(self, node: Any) -> None:
+        super().__init__()
+        self._node = node
+
+    def compose(self) -> ComposeResult:
+        yield self._node
 
 
 class CardApp(App[None]):
@@ -316,7 +326,8 @@ def _run(mid: str, status: RunStatus = RunStatus.RUNNING, role: str = "coder") -
 def _detail(status: MissionStatus, run_status: RunStatus = RunStatus.RUNNING) -> Any:
     """The drill-down of a mission whose RUN ROW is stored RUNNING, which is
     exactly what the engine leaves behind on an owner pause or cancel: it
-    cancels the live role tasks and never rewrites the rows (engine.py:1495)."""
+    cancels the live role tasks and never rewrites the rows (engine.py:1455-1462,
+    Supervisor.aclose at engine.py:437-440)."""
     mission = _mission(f"m-{status.value}", status)
     run = _run(mission.id, run_status)
     view = DashboardView()
@@ -371,6 +382,122 @@ def test_a_mission_at_a_gate_still_animates_its_run_rows() -> None:
     view, _mission_row, run = _detail(MissionStatus.AWAITING_GATE)
     markup = {r.key: r.markup for r in view._run_rows(frame=FRAMES[2], now=RUN_CREATED + 60.0)}
     assert FRAMES[2] in markup[run.id], markup[run.id]
+
+
+# -- (g2) the graph's per-run nodes obey the same rule as the run rows -------
+
+
+def _graph_run(mid: str, status: RunStatus = RunStatus.RUNNING, role: str = "coder") -> Run:
+    return Run(
+        id=f"{mid}:code:{role}:1",
+        mission_id=mid,
+        role=role,
+        step="code",
+        status=status,
+        created_at=RUN_CREATED,
+        updated_at=RUN_CREATED,
+    )
+
+
+def _graph_views(mission: Mission, runs: list[Run]) -> list[list[Any]]:
+    """Every graph builder, fed the SAME real run data (the drill-down passes
+    what it has: one run stored RUNNING under a mission that is not), including
+    the role's own inner steps so a live node would highlight one."""
+    mission = mission.model_copy(update={"plan": {"orchestrator": {"model": "m"}}})
+    inner = {r.id: (["prepare", "loop", "handoff"], "loop") for r in runs}
+    return [
+        mission_nodes(mission, runs, [], {}, inner),  # per-run nodes
+        mission_nodes(mission, runs, [], {}, inner, compact=True),  # step-grouped
+        mission_layers(mission, runs, [], {}, inner, None),
+    ]
+
+
+def _graph_nodes(views: list[list[Any]]) -> list[Any]:
+    """Every GNode across the three builders (layers unnested)."""
+    return [
+        n
+        for view in views
+        for item in view
+        for n in (item.nodes if isinstance(item, GLayer) else [item])
+    ]
+
+
+@pytest.mark.parametrize("status", [MissionStatus.ON_HOLD, MissionStatus.CANCELLED])
+def test_graph_run_nodes_do_not_run_while_the_mission_is_stopped(status: MissionStatus) -> None:
+    """(g2) the Graph tab's PER-RUN nodes judged each run by its own stored
+    status only, so the ghost row an owner pause or cancel leaves behind (the
+    role tasks are cancelled, no run status is written) painted a live accent
+    marker under a mission whose row above paints it as stopped. Every graph
+    builder now applies the dashboard's `_run_mark` rule: under a mission that
+    is not WORKING a RUNNING run takes the mission's status, while a genuinely
+    terminal run keeps its own."""
+    mission = _mission(f"m-g-{status.value}", status)
+    run = _graph_run(mission.id)
+    views = _graph_views(mission, [run])
+    nodes = _graph_nodes(views)
+    # all three builders: per-run, step-grouped and layered (keyed by run id)
+    coder = [n for n in nodes if n.run_id == run.id]
+    assert len(coder) == 3, [(n.key, n.status) for n in nodes]
+    for node in coder:
+        assert node.status != "running", node
+        assert node.status == status.value, node
+        # the role's own "inside this run" strip is live only while it runs
+        assert node.inner_at == "", f"a grounded run kept a live inner step: {node}"
+        assert node.inner, node  # ... but the strip itself is still drawn
+    assert "running" not in _node_statuses([n for v in views for n in v]), (
+        "a stopped mission's graph still paints a running node"
+    )
+
+
+@pytest.mark.parametrize("status", [MissionStatus.ON_HOLD, MissionStatus.CANCELLED])
+def test_graph_run_nodes_of_a_finished_run_keep_their_own_status(status: MissionStatus) -> None:
+    """... and the rule is not a blanket repaint: a run that really finished
+    keeps its own terminal status under a stopped mission."""
+    mission = _mission(f"m-gf-{status.value}", status)
+    run = _graph_run(mission.id, RunStatus.COMPLETED)
+    nodes = _graph_nodes(_graph_views(mission, [run]))
+    coder = [n for n in nodes if n.run_id == run.id]
+    assert len(coder) == 3, [(n.key, n.status) for n in nodes]
+    for node in coder:
+        assert node.status == "completed", node
+
+
+async def test_a_grounded_graph_node_paints_the_stopped_class_not_a_live_one() -> None:
+    """The node's own class follows its status (`-s-<status>`), which is what
+    colours the box: a grounded node must paint the mission's class, never
+    `-s-running`, and must not carry a spinner frame."""
+    mission = _mission("m-g-class0000", MissionStatus.ON_HOLD)
+    run = _graph_run(mission.id)
+    node = next(
+        n
+        for n in mission_nodes(mission.model_copy(update={"plan": {}}), [run], [], {}, {})
+        if n.run_id == run.id
+    )
+    widget = _GraphNode(node)
+    app = _GraphNodeApp(widget)
+    async with app.run_test() as pilot:
+        widget.paint(node, False)
+        await pilot.pause()
+        text = str(widget.render())
+        classes = " ".join(widget.classes)
+    assert "-s-on_hold" in classes and "-s-running" not in classes, classes
+    assert not any(f in text for f in FRAMES), text
+    # the painted marker is the mission's ‖, not a live frame (`render()` is
+    # markup-stripped, so compare the plain glyph)
+    assert text.startswith(_plain(glyph("on_hold"))), text
+
+
+def test_graph_run_node_still_animates_at_a_gate() -> None:
+    """The control: `awaiting_gate` is WORKING and the run is stored RUNNING,
+    so it must still read running - the fix cannot over-reach."""
+    mission = _mission("m-g-atgate000", MissionStatus.AWAITING_GATE)
+    run = _graph_run(mission.id)
+    nodes = _graph_nodes(_graph_views(mission, [run]))
+    coder = [n for n in nodes if n.run_id == run.id]
+    assert len(coder) == 3, [(n.key, n.status) for n in nodes]
+    for node in coder:
+        assert node.status == "running", node
+        assert node.inner_at == "loop", f"a live run lost its current inner step: {node}"
 
 
 # -- (h) the label fallback is still the fallback -----------------------------

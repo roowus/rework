@@ -714,7 +714,8 @@ class DashboardView(View):
 
         A run is judged by the MISSION above it first, because its own stored
         status can be a ghost: an owner pause or cancel cancels the live role
-        tasks and writes nothing back, so those rows stay RUNNING (engine.py:1495)
+        tasks and writes nothing back, so those rows stay RUNNING (engine.py:1455-1462,
+        Supervisor.aclose at engine.py:437-440)
         and the row must not keep spinning under a mission that is stopped. So:
         under a mission that is not WORKING, a RUNNING run takes the mission's
         marker (‖ paused, ⊘ cancelled) and a run that is genuinely over keeps its
@@ -1618,8 +1619,9 @@ class DashboardView(View):
 
         A run still stored RUNNING is timed by the mission's clock, not by the
         wall clock: an owner pause or cancel stops the role tasks and leaves
-        their rows RUNNING (engine.py:1495), so `time.time()` here counted the
-        mission's own still time as work. A run that really did finish
+        their rows RUNNING (engine.py:1455-1462, Supervisor.aclose at
+        engine.py:437-440), so `time.time()` here counted the mission's own
+        still time as work. A run that really did finish
         (done/failed/aborted/cancelled) is timed to its own last update."""
         bits = [str((run.model_ref or {}).get("id") or "default")]
         st = status_value(run.status)
