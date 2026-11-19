@@ -32,7 +32,15 @@ def delivery_pending(result: dict[str, Any] | None) -> bool:
     return bool((result or {}).get(PENDING_KEY))
 
 
+# Two questions, two sets. ACTIVE = "the mission is UN-FINISHED": a cancel,
+# pause or resume verb is legal for it, and the store poll keeps enriching and
+# costing it (a paused mission must still offer resume and cancel). WORKING =
+# "work is happening RIGHT NOW": the role chip, the live elapsed clock, the
+# spinner, the "live" tag. `pending` has not started yet and `on_hold` has been
+# stopped on purpose, so neither is working; `awaiting_gate` IS working, because
+# the mission is still on the hook waiting for a decision.
 ACTIVE = {"pending", "running", "awaiting_gate", "on_hold"}
+WORKING = {"running", "awaiting_gate"}
 
 
 def can(verb: str, status: str, result: dict[str, Any] | None = None) -> bool:

@@ -72,10 +72,20 @@ badges). Defined once in `theme.py::STATUS`.
 | failed / rejected | `✗` | `$danger` |
 | cancelled / aborted | `⊘` | `$faint` |
 
+`actions.ACTIVE` (`pending`, `running`, `awaiting_gate`, `on_hold`) means the
+mission is not finished; `actions.WORKING` (`running`, `awaiting_gate`) means
+work is happening now, so only those statuses get a role chip, a live elapsed
+clock, an animation or the `live` tag: `pending` has not started and `on_hold`
+has been stopped on purpose, while an `awaiting_gate` mission is still on the
+hook waiting for a decision.
+
 A running mission or run shows the spinner only while it is producing events.
 With no event for 5 minutes (`spinner.STALL_SECONDS`, 300s) the spinner stops
-and the row shows the static idle marker `◌` plus `idle 7m`. Pending, on hold
-and awaiting-gate states never animate. The frame set and the 5 minute rule
+and the row shows the static idle marker `◌` plus `idle 7m`. Pending and on hold
+never animate. An `awaiting_gate` mission is still waiting on work, so its header
+carries the `live` tag and its orchestrator row animates, while its mission row
+shows the `◆` gate marker only while that gate is actually open (a decided gate
+leaves the row painting `●`). The frame set and the 5 minute rule
 live in `tui/spinner.py`.
 
 What "idle" means depends on the surface, because every run event also counts

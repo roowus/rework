@@ -128,6 +128,12 @@ STATUS_LABEL: dict[str, str] = {
     "on_hold": "paused",
     "intent": "queued",
     "sent_back": "sent back",
+    # stated, not inherited: for these two the label equals what the fallback
+    # below (`value.replace("_", " ")`) would derive anyway, so the bytes on
+    # every surface (card header, drill-down header) are identical either way.
+    # They are here so the word is explicit rather than an accident of the value
+    "cancelled": "cancelled",
+    "aborted": "aborted",
 }
 
 

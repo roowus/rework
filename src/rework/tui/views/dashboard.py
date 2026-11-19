@@ -707,6 +707,25 @@ class DashboardView(View):
         clock = time.time() if now is None else now
         return run_mark(spinner.is_stalled(clock, last, self.snap.online), frame)
 
+    def _run_mark(
+        self, run: Any, mission_st: str, frame: str | None = None, now: float | None = None
+    ) -> str:
+        """A run row's leading icon.
+
+        A run is judged by the MISSION above it first, because its own stored
+        status can be a ghost: an owner pause or cancel cancels the live role
+        tasks and writes nothing back, so those rows stay RUNNING (engine.py:1455-1462,
+        RunSupervisor.aclose at engine.py:437-440)
+        and the row must not keep spinning under a mission that is stopped. So:
+        under a mission that is not WORKING, a RUNNING run takes the mission's
+        marker (‖ paused, ⊘ cancelled) and a run that is genuinely over keeps its
+        own terminal marker (a finished run is not a lie). Under a working
+        mission (running, awaiting_gate) every row is judged by its own status,
+        so a wedged run still shows ◌ idle and a live sibling still animates."""
+        if mission_st not in actions.WORKING and status_value(run.status) == "running":
+            return glyph(mission_st)
+        return self._mark(run.status, self._stamp(run.id), frame, now)
+
     def _row_mark(
         self, mission: Any, section: str, frame: str | None = None, now: float | None = None
     ) -> str:
@@ -844,7 +863,7 @@ class DashboardView(View):
         if self.project == ALL and m.project_id:
             bits.append(self.snap.project_name(m.project_id))
         role = self.mission_role.get(m.id)
-        if role and st in actions.ACTIVE:
+        if role and st in actions.WORKING:
             bits.append(role)
         if m.id in self.mission_cost:
             bits.append(money(self.mission_cost[m.id]))
@@ -1513,6 +1532,19 @@ class DashboardView(View):
             return full
         return self.snap.mission(self.mission_id)
 
+    def _mission_clock(self, mission: Any) -> float:
+        """When this mission's elapsed time stops.
+
+        While the mission is WORKING that is the wall clock. The moment it is
+        not (a pause, a cancel), it is the mission's own last update: the pause
+        is not work, so the clock must not count it. Every clock painted under
+        a mission uses this one rule (see `_run_sub`), so a header and the run
+        rows below it cannot disagree about how long the mission has run."""
+        # no mission row at all (a run list still loading, a vanished mission):
+        # there is no pause to honour, so the old wall-clock reading stands
+        st = status_value(mission.status) if mission is not None else "running"
+        return time.time() if st in actions.WORKING else mission.updated_at
+
     def _paint_mission_static(self, *, frame: str | None = None, now: float | None = None) -> None:
         mission = self._detail_mission()
         prompt = self.query_one("#m-prompt", PromptBox)
@@ -1523,7 +1555,7 @@ class DashboardView(View):
             # the full row could not be fetched: show the light facts we hold
             # and say what is missing, instead of a permanent "loading"
             st = status_value(mission.status)
-            end = time.time() if st in actions.ACTIVE else mission.updated_at
+            end = self._mission_clock(mission)
             prompt.set_prompt(
                 f"[b]{esc(mission.objective)}[/b]\n{status_text(st)}  [{MUTED}]"
                 + esc(
@@ -1550,7 +1582,7 @@ class DashboardView(View):
                 f"{money(self.budget.spent_usd)} · {tokens(self.budget.input_tokens)} in / "
                 f"{tokens(self.budget.output_tokens)} out"
             )
-        end = time.time() if st in actions.ACTIVE else mission.updated_at
+        end = self._mission_clock(mission)
         bits.append(f"started {ago(mission.created_at)} · {duration(end - mission.created_at)}")
         if self.full_failed:
             # a refetch failed after this row was fetched: it is stale, say so
@@ -1582,14 +1614,22 @@ class DashboardView(View):
         strip = f" [{FAINT}]──[/] ".join(f"{esc(p)} {glyph(st)}" for p in phases)
         self.query_one("#m-flow", Static).update(strip)
 
-    def _run_sub(self, run: Any) -> str:
+    def _run_sub(self, run: Any, mission: Any) -> str:
+        """One run row's facts: model, elapsed, cost.
+
+        A run still stored RUNNING is timed by the mission's clock, not by the
+        wall clock: an owner pause or cancel stops the role tasks and leaves
+        their rows RUNNING (engine.py:1455-1462, RunSupervisor.aclose at
+        engine.py:437-440), so `time.time()` here counted the mission's own
+        still time as work. A run that really did finish
+        (done/failed/aborted/cancelled) is timed to its own last update."""
         bits = [str((run.model_ref or {}).get("id") or "default")]
         st = status_value(run.status)
         stats = (run.artifact or {}).get("run_stats") or {}
         if stats.get("wall_s"):
             bits.append(duration(stats["wall_s"]))
         else:
-            end = time.time() if st == "running" else run.updated_at
+            end = self._mission_clock(mission) if st == "running" else run.updated_at
             bits.append(duration(max(0.0, end - run.created_at)))
         if self.run_cost.get(run.id):
             bits.append(money(self.run_cost[run.id]))
@@ -1599,15 +1639,16 @@ class DashboardView(View):
         """The sessions list. Split out so the spinner tick and the poll build
         the same rows (same keys, in-place update)."""
         rows = [RowData(ALL, f"[b]All activity[/b]\n[{FAINT}]{len(self.events)} events[/]")]
+        mission = self._detail_mission()
+        mission_st = status_value(mission.status) if mission else "running"
         orch_id = self._orchestrator_id()
         if orch_id:
-            mission = self._detail_mission()
-            st = status_value(mission.status) if mission else "running"
+            st = mission_st
             model = ((mission.plan or {}).get("orchestrator") or {}).get("model") if mission else ""
             cost = self.run_cost.get(orch_id, 0.0)
             sub = " · ".join(x for x in (str(model or ""), money(cost) if cost else "") if x)
             mark = self._mark(
-                "running" if st in actions.ACTIVE else st,
+                "running" if st in actions.WORKING else st,
                 self._stamp(orch_id),
                 frame,
                 now,
@@ -1619,13 +1660,13 @@ class DashboardView(View):
                 )
             )
         for run in self.runs:
-            mark = self._mark(run.status, self._stamp(run.id), frame, now)
             rows.append(
                 RowData(
                     run.id,
-                    f"{mark} [b]{esc(role_of(run.id))}[/b]  "
+                    f"{self._run_mark(run, mission_st, frame, now)} "
+                    f"[b]{esc(role_of(run.id))}[/b]  "
                     f"[{FAINT}]{esc(run.step)}[/]\n"
-                    f"  [{FAINT}]{esc(self._run_sub(run))}[/]",
+                    f"  [{FAINT}]{esc(self._run_sub(run, mission))}[/]",
                 )
             )
         return rows
@@ -1726,7 +1767,7 @@ class DashboardView(View):
             return
         tab = self.mtab
         if tab == "graph":
-            meta = {r.id: f"{role_of(r.id)} · {self._run_sub(r)}" for r in self.runs}
+            meta = {r.id: f"{role_of(r.id)} · {self._run_sub(r, mission)}" for r in self.runs}
             inner = self._inner_graphs()
             # Use layered graph for orchestrated missions
             plan = mission.plan or {}
@@ -1754,9 +1795,10 @@ class DashboardView(View):
                 runs = [r for r in self.runs if self.run_id in (None, r.id)]
                 parts = []
                 for run in runs:
+                    mark = self._run_mark(run, status_value(mission.status))
                     parts.append(
-                        f"{glyph(run.status)} [b]{esc(role_of(run.id))}[/b]  "
-                        f"[{FAINT}]{esc(run.step)} · {esc(self._run_sub(run))}[/]\n"
+                        f"{mark} [b]{esc(role_of(run.id))}[/b]  "
+                        f"[{FAINT}]{esc(run.step)} · {esc(self._run_sub(run, mission))}[/]\n"
                         + artifact_markup(run.role, run.artifact)
                     )
                 body = "\n\n".join(parts) or f"[{FAINT}]no sessions yet[/]"
@@ -1784,7 +1826,7 @@ class DashboardView(View):
         elif tab == "gates":
             self._paint_gates()
         follow = self.query_one("#m-follow", Static)
-        live = status_value(mission.status) in actions.ACTIVE
+        live = status_value(mission.status) in actions.WORKING
         follow.update(f"[{ACCENT}]● live[/]" if live else "")
 
     # -- chat tab (read-only orchestrator transcript) ------------------------------------------
