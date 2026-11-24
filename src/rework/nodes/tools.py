@@ -490,16 +490,24 @@ def role_env(workdir: Path | None = None, mission_id: str | None = None) -> dict
         env["REWORK_LOG_DIR"] = str(scratch / "logs")
         env["REWORK_RUN_DIR"] = str(scratch / "run")
 
-    venvs = {v for v in (os.environ.get("VIRTUAL_ENV"),) if v}
-    if sys.prefix != sys.base_prefix:
-        venvs.add(sys.prefix)
-    roots = [os.path.realpath(v) for v in venvs]
-    keep = [
-        p
-        for p in env.get("PATH", "").split(os.pathsep)
-        if p and not any(os.path.realpath(p).startswith(r + os.sep) for r in roots)
-    ]
-    env["PATH"] = os.pathsep.join(keep)
+    # The daemon's venv must not be importable from a worktree that has its own
+    # Python project: found live, `pytest` in a rework worktree imported the
+    # main checkout's source and audits tested the wrong code. That pruning is
+    # scoped to a repo with its own pyproject.toml, exactly as before ADR 0009;
+    # a toy repo (no pyproject) keeps the daemon's tools through PATH, and the
+    # allowlist already guarantees VIRTUAL_ENV itself never arrives.
+    own_python = workdir is None or (workdir / "pyproject.toml").exists()
+    if own_python:
+        venvs = {v for v in (os.environ.get("VIRTUAL_ENV"),) if v}
+        if sys.prefix != sys.base_prefix:
+            venvs.add(sys.prefix)
+        roots = [os.path.realpath(v) for v in venvs]
+        keep = [
+            p
+            for p in env.get("PATH", "").split(os.pathsep)
+            if p and not any(os.path.realpath(p).startswith(r + os.sep) for r in roots)
+        ]
+        env["PATH"] = os.pathsep.join(keep)
 
     # The daemon's git identity is an owner setting (Config.git_author, from
     # REWORK_GIT_AUTHOR_*), not a stray variable, and a role command that runs

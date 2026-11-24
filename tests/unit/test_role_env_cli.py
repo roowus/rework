@@ -62,7 +62,7 @@ def test_allow_is_idempotent(isolated):
 
 
 def test_allow_refuses_to_append_to_an_unreadable_file(isolated):
-    """"Append blindly to a file I cannot parse" would silently drop the owner's
+    """ "Append blindly to a file I cannot parse" would silently drop the owner's
     other grants, so the command refuses and says which file and why."""
     isolated.write_text("this is not toml\n")
 
