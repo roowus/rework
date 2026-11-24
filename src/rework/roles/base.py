@@ -81,6 +81,36 @@ class RoleBuildCtx(BaseModel):
     # that order. None = no limiter (tests, evals), so parking costs nothing and
     # the context manager is a no-op.
     park: Callable[[], AbstractAsyncContextManager[None]] | None = None
+    # How this run builds its ToolExecutor. One place decides local vs
+    # container (ADR 0014); None = LocalExecutor, which is what tests and evals
+    # get without saying anything.
+    executor_factory: Callable[[Path], Any] | None = None
+    # Teardown for things the run owns outside the graph (a container, a temp
+    # dir). The SUPERVISOR calls these when the run ends, on every path
+    # including cancellation; nothing else owns "end of run" (ADR 0014).
+    closers: list[Callable[[], Any]] = Field(default_factory=list)
+
+    def make_executor(self, workdir: Path) -> Any:
+        """Build a run's executor through the injected factory, defaulting to
+        the local jail. Imported here so roles/base stays free of node imports
+        at module time."""
+        if self.executor_factory is None:
+            from rework.nodes.tools import LocalExecutor
+
+            return LocalExecutor(workdir, mission_id=self.mission.id)
+        return self.executor_factory(workdir)
+
+    async def aclose(self) -> None:
+        """Run every closer, ignoring failures: a broken teardown must never
+        turn a finished run into a failed one."""
+        closers, self.closers = self.closers, []
+        for close in closers:
+            try:
+                result = close()
+                if hasattr(result, "__await__"):
+                    await result
+            except Exception:
+                pass
 
     def parked(self) -> AbstractAsyncContextManager[None]:
         """The context a role waits inside. Always usable: a ctx with no park

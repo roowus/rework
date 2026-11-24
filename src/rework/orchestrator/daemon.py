@@ -158,6 +158,12 @@ class Daemon:
         self._auto_update = auto_update
         self._repo_root: Path | None = None
         self._last_update_check = 0.0
+        # how a role builds its executor: the local jail, or a per-run
+        # container when REWORK_EXECUTOR asks for one (ADR 0014). Decided once
+        # per process, here, so no role reads the environment.
+        from rework.nodes.docker import make_executor_factory
+
+        self._executor_factory = make_executor_factory()
         self._sem = PrioritySlots(config.concurrency)
         # daemon-wide cap on concurrently RUNNING roles, shared by every
         # mission's RunSupervisor (REWORK_MAX_ROLES, orchestrator/limits.py)
@@ -346,6 +352,7 @@ class Daemon:
                     library=self._library,
                     slot=slot,
                     limiter=self._limiter,
+                    executor_factory=self._executor_factory,
                 )
                 await runner.run()
             finally:

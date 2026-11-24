@@ -22,7 +22,6 @@ from rework.nodes.repo_map import build_repo_map
 from rework.nodes.report_sections import ASSEMBLY_SURVEYOR, resolve_sections
 from rework.nodes.report_writer import make_report_writer_node
 from rework.nodes.toolloop import make_toolloop_node
-from rework.nodes.tools import LocalExecutor
 from rework.roles.base import RoleBuildCtx, RoleSpec
 
 if TYPE_CHECKING:
@@ -188,9 +187,7 @@ class SurveyorSpec(RoleSpec):
             catalog=ctx.catalog,
             catalog_id=catalog_id,
             # outermost: the read-only filter must wrap every other wrapper
-            executor=ReadOnlyExecutor(
-                LocalExecutor(ctx.read_root, mission_id=ctx.mission.id), ctx.read_root
-            ),
+            executor=ReadOnlyExecutor(ctx.make_executor(ctx.read_root), ctx.read_root),
             system_prompt=system_prompt,
             store=ctx.store,
             mission_id=ctx.mission.id,

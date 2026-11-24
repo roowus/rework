@@ -20,7 +20,7 @@ from rework.nodes.repo_map import build_repo_map
 from rework.nodes.report_sections import resolve_sections
 from rework.nodes.report_writer import make_report_writer_node
 from rework.nodes.toolloop import make_toolloop_node
-from rework.nodes.tools import ComplaintAwareExecutor, LocalExecutor
+from rework.nodes.tools import ComplaintAwareExecutor
 from rework.roles.base import RoleBuildCtx, RoleSpec
 from rework.web.tools import web_executor
 
@@ -112,9 +112,7 @@ class InvestigatorSpec(RoleSpec):
                 library_executor(
                     ctx,
                     ComplaintAwareExecutor(
-                        EscalationAwareExecutor(
-                            LocalExecutor(ctx.read_root, mission_id=ctx.mission.id), ctx
-                        ),
+                        EscalationAwareExecutor(ctx.make_executor(ctx.read_root), ctx),
                         ctx.store,
                         ctx.mission.id,
                         ctx.run.id,

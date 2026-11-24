@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import re
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -88,22 +89,38 @@ class ToolExecutor(Protocol):
     def specs(self, allowed: set[str] | None = None) -> list[ToolSpec]: ...
 
 
+# An executor factory takes the workdir a run will use and returns the executor
+# for it. It is the one place a deployment chooses local vs container (ADR 0014,
+# and ADR 0010 R1's requirement), and roles never see the choice.
+ExecutorFactory = Callable[[Path], "ToolExecutor"]
+
+
+def local_executor_factory(mission_id: str | None = None) -> ExecutorFactory:
+    def make(workdir: Path) -> ToolExecutor:
+        return LocalExecutor(workdir, mission_id=mission_id)
+
+    return make
+
+
 class LazyExecutor:
-    """Executor that binds its jail target at prepare time. The coder's
+    """Executor whose jail target is known only at prepare time. The coder's
     worktree is created by its prepare node, but the loop node is wired at
-    build_graph time; this wrapper forwards to a LocalExecutor once attached."""
+    build_graph time; this wrapper builds the real executor once attached,
+    through the injected factory (so a container swap needs no role change)."""
 
     def __init__(
         self,
         fallback_specs: list[ToolSpec] | None = None,
         mission_id: str | None = None,
+        factory: ExecutorFactory | None = None,
     ) -> None:
-        self._inner: LocalExecutor | None = None
+        self._inner: ToolExecutor | None = None
         self._fallback = fallback_specs or list(BUILTIN_TOOLS)
         self._mission_id = mission_id
+        self._factory = factory or local_executor_factory(mission_id)
 
     def attach(self, workdir: Path) -> None:
-        self._inner = LocalExecutor(workdir, mission_id=self._mission_id)
+        self._inner = self._factory(workdir)
 
     @property
     def attached(self) -> bool:
@@ -127,6 +144,38 @@ class LazyExecutor:
 # exits 2 on the failed cd, every later command in the chain silently skips,
 # and the model reads a truncated transcript as if the work happened.
 _LEADING_CD = re.compile(r"^\s*cd\s+(?P<path>'[^']*'|\"[^\"]*\"|[^\s;&|]+)")
+
+# The tools that only READ. They run on the host for every executor, including
+# the container one: they cannot change anything, they work before a container
+# has started, and the read is the same bytes either way. One jail, defined
+# once, so a bug in it is fixed once (ADR 0014).
+FILE_TOOLS = frozenset({"read_file", "list_dir"})
+
+
+def jail_path(workdir: Path, path_str: str) -> Path:
+    candidate = (workdir / path_str).resolve()
+    if candidate != workdir and workdir not in candidate.parents:
+        raise ValueError(f"path escapes workspace: {path_str}")
+    return candidate
+
+
+async def read_side(name: str, workdir: Path, args: dict[str, Any]) -> str:
+    """`read_file` and `list_dir`, jailed to `workdir`."""
+    if name == "read_file":
+        path = jail_path(workdir, str(args["path"]))
+        text = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="replace")
+        lines = text.splitlines()
+        head = lines[:2000]
+        note = f"\n... ({len(lines) - 2000} more lines)" if len(lines) > 2000 else ""
+        return "\n".join(head) + note
+    path = jail_path(workdir, str(args.get("path", ".")))
+    entries = await asyncio.to_thread(sorted, path.iterdir())
+    rendered = []
+    for entry in entries[:500]:
+        kind = "d" if entry.is_dir() else "f"
+        size = entry.stat().st_size if entry.is_file() else ""
+        rendered.append(f"{kind} {entry.name} {size}".rstrip())
+    return "\n".join(rendered) or "(empty)"
 
 
 class LocalExecutor:
@@ -158,10 +207,7 @@ class LocalExecutor:
         reap_orphaned_commands()
 
     def _jail(self, path_str: str) -> Path:
-        candidate = (self._workdir / path_str).resolve()
-        if candidate != self._workdir and self._workdir not in candidate.parents:
-            raise ValueError(f"path escapes workspace: {path_str}")
-        return candidate
+        return jail_path(self._workdir, path_str)
 
     def _check_leading_cd(self, command: str) -> str | None:
         """Return an error message if the command starts with an absolute `cd`
@@ -190,22 +236,8 @@ class LocalExecutor:
 
     async def execute(self, name: str, args: dict[str, Any]) -> str:
         try:
-            if name == "read_file":
-                path = self._jail(str(args["path"]))
-                text = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="replace")
-                lines = text.splitlines()
-                head = lines[:2000]
-                note = f"\n... ({len(lines) - 2000} more lines)" if len(lines) > 2000 else ""
-                return "\n".join(head) + note
-            if name == "list_dir":
-                path = self._jail(str(args.get("path", ".")))
-                entries = await asyncio.to_thread(sorted, path.iterdir())
-                rendered = []
-                for entry in entries[:500]:
-                    kind = "d" if entry.is_dir() else "f"
-                    size = entry.stat().st_size if entry.is_file() else ""
-                    rendered.append(f"{kind} {entry.name} {size}".rstrip())
-                return "\n".join(rendered) or "(empty)"
+            if name in FILE_TOOLS:
+                return await read_side(name, self._workdir, args)
             if name == "run_command":
                 command = str(args["command"])
                 refusal = self._check_leading_cd(command)

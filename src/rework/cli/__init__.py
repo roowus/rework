@@ -1755,10 +1755,58 @@ def gc(
         )
         return
     freed = gc_mod.remove(found, workroot) + gc_mod.remove_scratch(scratch)
+    # sandbox containers whose run ended (or whose daemon died before the run's
+    # closer ran) are labels, not files: sweep them here too (ADR 0014)
+    containers = _sweep_sandbox_containers(finished, dry_run=dry_run)
     typer.echo(
         f"removed {len(found)} run dirs and {len(scratch)} scratch dirs,"
         f" freed {gc_mod.human(freed)}"
+        + (f"; {containers} sandbox container(s)" if containers else "")
     )
+
+
+def _sweep_sandbox_containers(finished: set[str], *, dry_run: bool) -> int:
+    """Remove `rework.managed` containers whose mission is finished or gone.
+
+    A container is ephemeral (`--rm`) except when the daemon is killed: then it
+    keeps running `sleep infinity` with nothing to stop it. The run's closer
+    handles the normal path; this is the crash sweep."""
+    from rework.nodes.docker import SANDBOX_LABEL, docker_bin
+
+    docker = docker_bin()
+    if not docker:
+        return 0
+    import subprocess
+
+    try:
+        listing = subprocess.run(
+            [
+                docker,
+                "ps",
+                "-a",
+                "--filter",
+                f"label={SANDBOX_LABEL}",
+                "--format",
+                '{{.ID}} {{.Label "rework.mission"}}',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    removed = 0
+    for line in listing.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        cid, mission = parts[0], parts[1]
+        if mission and mission not in finished:
+            continue
+        if not dry_run:
+            subprocess.run([docker, "rm", "-f", cid], capture_output=True, timeout=30)
+        removed += 1
+    return removed
 
 
 @app.command()
