@@ -187,6 +187,7 @@ class Daemon:
             # BEFORE the first dispatch: a fresh daemon starts at the caps the
             # box can take right now, not at the value resolved at import time
             self._capacity.start()
+            self._log_dropped_env()
             await self._recover()
             self._code = CodeChangeWatcher()
             # resolved once: the checkout this daemon runs from (may be None
@@ -206,6 +207,26 @@ class Daemon:
             # and `raise SystemExit(0)` from auto-update all come through here
             await self._capacity.stop()
             await self._store.release_lock(self._owner)
+
+    def _log_dropped_env(self) -> None:
+        """Say ONCE, by name and never by value, which variables the role
+        environment drops (ADR 0009). The daemon's own systemd unit can carry
+        variables the owner's shell cannot see, so this is the only way to know
+        whether a role lost something it needs: the fix is
+        `rework role-env allow NAME`, and the log entry names it."""
+        import os
+
+        from rework.nodes.tools import allowed_names
+
+        kept = allowed_names(dict(os.environ))
+        dropped = sorted(set(os.environ) - kept)
+        if dropped:
+            log.info(
+                "role commands drop %d variable(s) (ADR 0009; grant one with "
+                "`rework role-env allow NAME`): %s",
+                len(dropped),
+                ", ".join(dropped),
+            )
 
     def _check_code(self) -> None:
         """The checkout this daemon was started from changed (a merge landed in

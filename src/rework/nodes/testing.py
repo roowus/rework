@@ -157,15 +157,21 @@ def classify_red(exit_code: int, output: str) -> tuple[str, str | None]:
     return "fails_for_right_reason", None
 
 
-async def _spawn(command: str, cwd: Path) -> asyncio.subprocess.Process:
+async def _spawn(
+    command: str, cwd: Path, env: dict[str, str] | None = None
+) -> asyncio.subprocess.Process:
     """Start the coder's command in `cwd`. Through `bash -o pipefail` so a pipeline
     (`| tail`, `2>&1 | tee`) cannot mask a failing pytest behind the last stage's exit
-    code; plain sh when bash is absent."""
+    code; plain sh when bash is absent. `env` is the role allowlist when the caller
+    has one: this spawn is role-shaped (it runs the coder's own commands), so it must
+    not inherit the daemon's provider keys any more than LocalExecutor does."""
     kwargs: dict[str, Any] = {
         "cwd": str(cwd),
         "stdout": asyncio.subprocess.PIPE,
         "stderr": asyncio.subprocess.STDOUT,
     }
+    if env is not None:
+        kwargs["env"] = env
     bash = shutil.which("bash")
     if bash:
         return await asyncio.create_subprocess_exec(bash, "-o", "pipefail", "-c", command, **kwargs)
@@ -179,6 +185,7 @@ async def verify_red_green(
     base: str,
     *,
     timeout_s: float = 120.0,
+    env: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Check a claimed red-green: with the fix reverted the named tests must FAIL.
 
@@ -203,7 +210,7 @@ async def verify_red_green(
             if code != 0:  # absent at base: the fix added it, so reverting removes it
                 (probe / path).unlink(missing_ok=True)
         for command in commands[:MAX_VERIFIED_TESTS]:
-            proc = await _spawn(command.replace(str(worktree), str(probe)), probe)
+            proc = await _spawn(command.replace(str(worktree), str(probe)), probe, env)
             try:
                 raw, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
                 exit_code = proc.returncode if proc.returncode is not None else -1

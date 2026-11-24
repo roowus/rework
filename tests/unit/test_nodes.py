@@ -359,13 +359,17 @@ async def test_role_commands_do_not_inherit_the_daemons_venv(tmp_path, monkeypat
 
 
 async def test_a_plain_repo_keeps_the_daemons_tools(tmp_path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """No pyproject: nothing of its own to import, so the daemon's python (with
-    pytest) stays available, as toy repos expect."""
+    """A toy repo (no pyproject) keeps the daemon's TOOLS through PATH, as toy
+    repos expect, but not the daemon's VIRTUAL_ENV: ADR 0009 replaced the
+    inheritance branch with an allowlist, so the venv variable names nothing."""
     from rework.nodes.tools import LocalExecutor
 
     monkeypatch.setenv("VIRTUAL_ENV", "/daemon/venv")
-    out = await LocalExecutor(tmp_path).execute("run_command", {"command": 'echo "[$VIRTUAL_ENV]"'})
-    assert "[/daemon/venv]" in out
+    out = await LocalExecutor(tmp_path).execute(
+        "run_command", {"command": 'echo "venv=[$VIRTUAL_ENV] tools=$(command -v sh)"'}
+    )
+    assert "venv=[]" in out
+    assert "/bin/sh" in out
 
 
 @pytest.mark.parametrize("edited", [False, True])

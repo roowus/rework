@@ -1305,6 +1305,94 @@ def gates(mission_id: str | None = None) -> None:
         typer.echo(f"{gid}  [{kind}]  {question}")
 
 
+role_env_app = typer.Typer(
+    no_args_is_help=True, add_completion=False, help="The role command environment (ADR 0009)."
+)
+app.add_typer(role_env_app, name="role-env")
+
+
+@role_env_app.command("show")
+def role_env_show() -> None:
+    """Print the effective allowlist, and the names this shell would lose.
+
+    Cannot see the daemon's real environment (a systemd unit's Environment= is
+    not in this shell), so the daemon also logs the dropped names once at start.
+    Values are never printed, here or there."""
+    import os
+
+    from rework.nodes.tools import (
+        BASELINE_EXACT,
+        BASELINE_PREFIXES,
+        allowed_names,
+        load_allowlist,
+    )
+
+    extra_exact, extra_prefixes = load_allowlist()
+    typer.echo("baseline (exact):")
+    for name in sorted(BASELINE_EXACT):
+        typer.echo(f"  {name}")
+    typer.echo("baseline (prefixes): " + ", ".join(BASELINE_PREFIXES))
+    if extra_exact or extra_prefixes:
+        typer.echo("owner additions:")
+        for name in sorted(extra_exact):
+            typer.echo(f"  {name}")
+        typer.echo("  " + ", ".join(f"{p}*" for p in extra_prefixes))
+    else:
+        typer.echo("owner additions: none (~/.rework/role_env.toml)")
+
+    kept = allowed_names(dict(os.environ))
+    dropped = sorted(set(os.environ) - kept)
+    typer.echo(f"\nthis shell has {len(kept)} kept and {len(dropped)} dropped name(s):")
+    typer.echo("dropped: " + (", ".join(dropped) if dropped else "none"))
+
+
+@role_env_app.command("allow")
+def role_env_allow(name: str) -> None:
+    """Add NAME to ~/.rework/role_env.toml (a trailing * makes it a prefix).
+
+    The daemon re-reads the file when its mtime changes, so the next role
+    command sees the grant with no restart."""
+    from rework.nodes.tools import role_env_file
+
+    path = role_env_file()
+    existing: list[str] = []
+    if path.exists():
+        import tomllib
+
+        try:
+            data = tomllib.loads(path.read_text())
+            raw = data.get("allow") or []
+            existing = [str(x) for x in raw] if isinstance(raw, list) else []
+        except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
+            # a BadParameter would print a usage block and drop the reason; the
+            # owner needs to know WHICH file and WHICH error to fix by hand
+            typer.secho(
+                f"error: {path} cannot be read ({exc}); fix it by hand rather than "
+                "appending blindly",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(1) from exc
+    if name in existing:
+        typer.echo(f"{name} is already allowed")
+        return
+    existing.append(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    quoted = ", ".join(
+        '"' + item.replace("\\", "\\\\").replace('"', '\\"') + '"' for item in existing
+    )
+    path.write_text(
+        "# exact names; a trailing * makes a prefix. Everything not listed here or in the\n"
+        "# built-in baseline is dropped from role commands. `rework role-env show` lists both.\n"
+        f"allow = [{quoted}]\n",
+        encoding="utf-8",
+    )
+    import rework.nodes.tools as _tools
+
+    _tools._allow_cache.clear()
+    typer.echo(f"allowed {name} in {path}")
+
+
 @app.command()
 def cancel(mission_id: str) -> None:
     """Cancel a mission. Works from any machine: the daemon notices the status
