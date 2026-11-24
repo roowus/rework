@@ -135,6 +135,13 @@ _DDL = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS delivery_lock (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        owner TEXT NOT NULL,
+        heartbeat_at DOUBLE PRECISION NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS complaints (
         id TEXT PRIMARY KEY,
         kind TEXT NOT NULL,
@@ -188,6 +195,7 @@ _TABLES = [
     "projects",
     "missions",
     "daemon_lock",
+    "delivery_lock",
     "complaints",
 ]
 
@@ -1219,6 +1227,35 @@ class PostgresStore:
     @_serialized
     async def release_lock(self, owner: str) -> None:
         await self._conn.execute("DELETE FROM daemon_lock WHERE id = 1 AND owner = %s", (owner,))
+        await self._conn.commit()
+
+    # -- delivery lock (ADR 0013): see sqlite.py for the contract -------------
+    @_serialized
+    async def acquire_delivery_lock(self, owner: str, stale_after_s: float = 120.0) -> bool:
+        now = time.time()
+        cur = await self._conn.execute(
+            "INSERT INTO delivery_lock (id, owner, heartbeat_at) VALUES (1, %s, %s)"
+            " ON CONFLICT (id) DO UPDATE SET"
+            " owner = EXCLUDED.owner, heartbeat_at = EXCLUDED.heartbeat_at"
+            " WHERE delivery_lock.owner = EXCLUDED.owner"
+            "    OR delivery_lock.heartbeat_at <= %s",
+            (owner, now, now - stale_after_s),
+        )
+        await self._conn.commit()
+        return cur.rowcount > 0
+
+    @_serialized
+    async def heartbeat_delivery_lock(self, owner: str) -> bool:
+        cur = await self._conn.execute(
+            "UPDATE delivery_lock SET heartbeat_at = %s WHERE id = 1 AND owner = %s",
+            (time.time(), owner),
+        )
+        await self._conn.commit()
+        return cur.rowcount > 0
+
+    @_serialized
+    async def release_delivery_lock(self, owner: str) -> None:
+        await self._conn.execute("DELETE FROM delivery_lock WHERE id = 1 AND owner = %s", (owner,))
         await self._conn.commit()
 
     # -- complaints inbox (ADR 0004) ------------------------------------------------

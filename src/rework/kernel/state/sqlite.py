@@ -120,6 +120,11 @@ CREATE TABLE IF NOT EXISTS daemon_lock (
     owner TEXT NOT NULL,
     heartbeat_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS delivery_lock (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    owner TEXT NOT NULL,
+    heartbeat_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS complaints (
     id TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
@@ -1084,6 +1089,31 @@ class SqliteStore:
 
     async def release_lock(self, owner: str) -> None:
         await self._db.execute("DELETE FROM daemon_lock WHERE id = 1 AND owner = ?", (owner,))
+
+    # -- delivery lock (ADR 0013): one merge+push+PR at a time, across PROCESSES
+    # (the daemon ships, and `rework retry-pr` may run from a laptop). Same
+    # atomic-upsert contract as the leader lock above.
+    async def acquire_delivery_lock(self, owner: str, stale_after_s: float = 120.0) -> bool:
+        now = time.time()
+        cur = await self._db.execute(
+            "INSERT INTO delivery_lock (id, owner, heartbeat_at) VALUES (1, ?, ?)"
+            " ON CONFLICT(id) DO UPDATE SET"
+            " owner = EXCLUDED.owner, heartbeat_at = EXCLUDED.heartbeat_at"
+            " WHERE delivery_lock.owner = EXCLUDED.owner"
+            "    OR delivery_lock.heartbeat_at <= ?",
+            (owner, now, now - stale_after_s),
+        )
+        return cur.rowcount > 0
+
+    async def heartbeat_delivery_lock(self, owner: str) -> bool:
+        cur = await self._db.execute(
+            "UPDATE delivery_lock SET heartbeat_at = ? WHERE id = 1 AND owner = ?",
+            (time.time(), owner),
+        )
+        return cur.rowcount > 0
+
+    async def release_delivery_lock(self, owner: str) -> None:
+        await self._db.execute("DELETE FROM delivery_lock WHERE id = 1 AND owner = ?", (owner,))
 
     # -- complaints inbox (ADR 0004) ------------------------------------------------
     async def file_complaint(self, complaint: Complaint) -> Complaint:

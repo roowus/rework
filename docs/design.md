@@ -190,6 +190,10 @@ with a continue/abort gate; approving doubles the cap and resumes, rejecting can
 Steps that FAIL get exactly one in-mission retry (the 429-storm lesson) before the
 plan moves on; synthesis counts only the latest attempt per step.
 
+Delivery is one serialized step (ADR 0013): merge, push and PR create happen under a
+`delivery_lock` row in the store, so two missions finishing together cannot both push
+against the main each one saw, and the ship path merges main like the PR path does.
+
 An escalation has NO deadline (ADR 0011). A role that asks waits until an answer lands on
 its row, its run is aborted, or the mission is cancelled; there is no timeout that tells it
 to proceed on its own judgment. While it waits it gives both its role-concurrency slot and
