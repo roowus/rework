@@ -1301,6 +1301,11 @@ class MissionRunner:
         # needs) is written by _create_pr BEFORE this rebuild: carry it over, or
         # "finished but PR pending" would be forgotten the moment we go DONE.
         current_mission = await self._store.get_mission(mission_id)
+        # the issue-tracker pointer (ADR 0016): carried like the delivery keys,
+        # because _synthesize rebuilds the dict and the write-back needs it
+        source = ((current_mission.result if current_mission else None) or {}).get("source")
+        if source:
+            result["source"] = source
         for key in DELIVERY_RESULT_KEYS:
             value = ((current_mission.result if current_mission else None) or {}).get(key)
             if value is not None:
@@ -1362,6 +1367,37 @@ class MissionRunner:
         await self._bus.publish(
             EventRecord(mission_id=mission_id, type=event, payload={"runs": len(runs)})
         )
+        await self._write_back_to_source(mission_id, status)
+
+    async def _write_back_to_source(self, mission_id: str, status: MissionStatus) -> None:
+        """One comment on the work item this mission came from (ADR 0016).
+
+        Only for a mission a source created (it carries `result["source"]`) and
+        only for a terminal status. Never raises and never blocks: a tracker
+        outage is a log line, and the mission is already finished."""
+        mission = await self._store.get_mission(mission_id)
+        source = ((mission.result if mission else None) or {}).get("source")
+        if not source or status not in (
+            MissionStatus.DONE,
+            MissionStatus.FAILED,
+            MissionStatus.CANCELLED,
+        ):
+            return
+        try:
+            from rework.sources import poller
+
+            config = poller.plane_config()
+            if not poller.enabled(config):
+                return
+            client = poller.build_client(config)
+            try:
+                await asyncio.wait_for(
+                    poller.write_back(client, self._store, mission_id), timeout=20
+                )
+            finally:
+                await client.close()
+        except Exception as exc:  # a tracker outage must not touch a finished mission
+            log.warning("write-back for %s failed: %s", mission_id, exc)
 
     @staticmethod
     def _resume_value(gate: Any) -> Any:
