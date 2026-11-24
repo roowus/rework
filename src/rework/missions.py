@@ -98,6 +98,12 @@ PLAN_AUDIT: dict = {
 
 PLANS = ("echo", "fix", "fix-pr", "draft", "audit")
 
+# The plan kinds the FROZEN template runner drives (ADR 0012). A mission runs
+# the LLM orchestrator when plan["orchestrator"] is set; otherwise it must name
+# one of these, or it has no driver at all (a caller bug the old silent
+# fallthrough to the echo plan used to hide).
+TEMPLATE_KINDS = frozenset({"echo", "fix", "fix-pr", "draft", "audit", "mechanical"})
+
 # a derived mission title is a few words for lists (PR titles, `rework ls`,
 # commit subjects): the whole objective is not one (found live: PR #24 was
 # titled "rework: Follow-up to #22 (just merged, NOT deployed to rewvis...")
@@ -732,6 +738,11 @@ async def create_mission(
             plan_spec["model"] = model
         if effort:
             plan_spec["effort"] = effort
+    elif plan == "echo":
+        # the echo plan runs the frozen template runner too: stamp the kind so
+        # the engine's driver guard (ADR 0012) accepts it instead of treating
+        # "no orchestrator, no kind" as a caller bug
+        plan_spec = {"kind": "echo", "steps": [{"step": "echo", "role": "echo"}]}
 
     # Agents never create chats. A mission launched without a user chat (the
     # CLI's `rework new`) points at its own orchestrator transcript, which the

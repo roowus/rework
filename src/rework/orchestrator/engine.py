@@ -55,6 +55,7 @@ from rework.nodes.git_ops import DEFAULT_GIT_AUTHOR
 from rework.nodes.report_sections import accepted_findings_section, mechanical_verdict
 from rework.orchestrator.delivery import DELIVERY_RESULT_KEYS
 from rework.orchestrator.limits import MissionSlot, RoleLimiter
+from rework.orchestrator.rails import audit_problem
 from rework.roles.base import EscalationKind, RoleBuildCtx
 from rework.roles.registry import RoleRegistry
 
@@ -538,7 +539,28 @@ class MissionRunner:
 
                 await MissionOrchestrator(self, mission).run()
             else:
-                await self._run_steps(mission)
+                from rework.missions import TEMPLATE_KINDS
+
+                plan = mission.plan
+                # A plan with steps is a template by construction (it is the
+                # runner's only input), so a caller-built one needs no `kind`.
+                # A plan that exists but names no driver at all (no
+                # orchestrator, no steps, no template kind) is a caller bug the
+                # old silent fallthrough to the echo plan used to hide. A
+                # mission with NO plan at all keeps the documented echo default
+                # (DEFAULT_PLAN), which is what `rework new` and the engine's
+                # own tests rely on.
+                if (
+                    plan is not None
+                    and not plan.get("steps")
+                    and plan.get("kind") not in TEMPLATE_KINDS
+                ):
+                    raise ValueError(
+                        f"mission {mission.id} has no driver: no plan['orchestrator'], "
+                        f"no plan['steps'], and plan['kind'] is not a template kind "
+                        f"(plan={plan!r})"
+                    )
+                await self._run_template(mission)
         finally:
             await self._supervisor.aclose()
 
@@ -679,8 +701,11 @@ class MissionRunner:
         )
         return f"Project files updated: {', '.join(changed)}", ""
 
-    async def _run_steps(self, mission: Mission) -> None:
-        """The plan's steps then the final gates, looped: an owner SEND-BACK at a
+    async def _run_template(self, mission: Mission) -> None:
+        """FROZEN FIXTURE PATH (ADR 0012): the canned plan, for evals and
+        `--mechanical` only. The product driver is MissionOrchestrator.
+
+        The plan's steps then the final gates, looped: an owner SEND-BACK at a
         final gate re-runs the plan with the owner's feedback in every step's
         context and reaches the final gates again, where a FRESH gate opens.
         Bounded by MAX_SEND_BACKS so a never-satisfied owner cannot spin it."""
@@ -700,7 +725,7 @@ class MissionRunner:
                     }
                     for s in base_steps
                 ]
-            if await self._run_steps_once(mission, list(steps)) != "sent_back":
+            if await self._run_template_once(mission, list(steps)) != "sent_back":
                 return
         await self._synthesize(
             mission.id,
@@ -709,7 +734,7 @@ class MissionRunner:
             summary=f"owner sent the mission back more than {MAX_SEND_BACKS} times; giving up",
         )
 
-    async def _run_steps_once(self, mission: Mission, steps: list[dict[str, Any]]) -> str:
+    async def _run_template_once(self, mission: Mission, steps: list[dict[str, Any]]) -> str:
         """One pass: all steps, then the final gates. Returns "sent_back" when
         the owner sent the work back (mission is RUNNING again, not
         synthesized), else "done" (synthesized)."""
@@ -807,6 +832,25 @@ class MissionRunner:
                             },
                         ]
             index += 1
+
+        # The SAME finish rails the orchestrator applies, from rails.py: the
+        # template runner used to skip them, so a `--mechanical` fix-pr mission
+        # could ship without an audit taken after the last change. A rail that
+        # fires here fails the mission rather than refusing a tool call,
+        # because there is no model to explain it to.
+        problem = audit_problem(await self._store.list_runs(mission.id), mission.plan)
+        if problem:
+            await self._bus.publish(
+                EventRecord(
+                    mission_id=mission.id,
+                    type=EventType.INFO,
+                    payload={"error": f"refused to finish: {problem}"},
+                )
+            )
+            await self._synthesize(
+                mission.id, None, outcome="failed", summary=f"finish rail refused: {problem}"
+            )
+            return "done"
 
         # the mechanical path has no orchestrator to ask for the gate, so it
         # uses _final_gates' defaults (the plan and the project setting decide)

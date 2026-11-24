@@ -1832,7 +1832,7 @@ async def _use_plan(world: dict[str, Any], playbook: str) -> Any:
 
 def test_plan_allows_unaudited_done_predicate() -> None:
     from rework.missions import PLAN_FIX, PLAN_FIX_PR, orchestrated_plan
-    from rework.orchestrator.agent import _plan_allows_unaudited_done as ok
+    from rework.orchestrator.rails import plan_allows_unaudited_done as ok
 
     assert ok(orchestrated_plan("audit", "pro"))
     # draft has no gates, no publish and no coder step but writes files: never exempt
