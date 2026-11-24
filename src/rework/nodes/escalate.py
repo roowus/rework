@@ -12,13 +12,21 @@ blocking tool call keeps the loop's state in memory and needs no replay.
 
 The row is the source of truth (CLAUDE.md rule 3): any process can answer by
 writing `escalation.answer`, and the asking role polls for it.
+
+The wait has NO deadline (ADR 0011). A blocked role used to be told, after 45
+minutes, to "proceed with your best judgment", which turned silence into an
+unverified guess. Now it parks until an answer lands, an abort/cancel arrives,
+or the daemon stops it, and it hands both its concurrency slots back while it
+waits (`RoleBuildCtx.parked`) so a parked role costs nothing. The ask id is
+derived from the run and the question, so a restart that replays the tool
+consumes an answer written while the daemon was down instead of asking again.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
-import uuid
 from typing import Any
 
 from rework.kernel.llm.types import ToolSpec
@@ -44,23 +52,46 @@ ASK_SPEC = ToolSpec(
     },
 )
 
-ANSWER_TIMEOUT_S = 45 * 60
 POLL_S = 1.0
 
 
-class EscalationAwareExecutor:
-    """Wraps a ToolExecutor; answers `ask_orchestrator`, delegates the rest."""
+def _ask_id(run_id: str, question: str, seq: int = 0) -> str:
+    """A stable id for one ask on one run.
 
-    def __init__(self, inner: Any, ctx: Any, poll_s: float = POLL_S) -> None:
+    Deterministic so a daemon restart can recognise a question it already wrote.
+    `seq` distinguishes a later ask of the same text from the first (a role may
+    legitimately ask again once it has had an answer); `0` is the first ask.
+    """
+    digest = hashlib.sha256(f"{run_id}\n{question}\n{seq}".encode()).hexdigest()
+    return f"ask-{digest[:12]}"
+
+
+class EscalationAwareExecutor:
+    """Wraps a ToolExecutor; answers `ask_orchestrator`, delegates the rest.
+
+    `expose_ask` is the role saying it can be blocked: the wrapping is a
+    deliberate choice at build time, not a side effect of the toolloop passing
+    `allowed=None`. A wrapper that should only answer (never advertise) sets it
+    False."""
+
+    def __init__(
+        self, inner: Any, ctx: Any, poll_s: float = POLL_S, *, expose_ask: bool = True
+    ) -> None:
         self._inner = inner
         self._ctx = ctx
         self._poll = poll_s
+        self._expose_ask = expose_ask
+        # Ask ids this executor has already returned an answer for. Distinguishes
+        # a legitimate repeat ask from a restart replay (see _ask_orchestrator).
+        self._served: set[str] = set()
 
     def __getattr__(self, item: str) -> Any:
         return getattr(self._inner, item)
 
     def specs(self, allowed: set[str] | None = None) -> list[ToolSpec]:
         base = self._inner.specs(allowed)
+        if not self._expose_ask:
+            return base
         if allowed is not None and ASK_SPEC.name not in allowed:
             return base
         return [*base, ASK_SPEC]
@@ -80,33 +111,64 @@ class EscalationAwareExecutor:
     async def _ask_orchestrator(self, question: str, kind: str) -> str:
         store = self._ctx.store
         run_id = self._ctx.run.id
-        ask_id = uuid.uuid4().hex[:10]
-        payload = {
-            "id": ask_id,
-            "kind": kind,
-            "question": question[:2000],
-            "asked_at": time.time(),
-            "answer": None,
-        }
-        await store.update_run(run_id, escalation=payload)
-        await self._ctx.bus.publish(
-            EventRecord(
-                mission_id=self._ctx.mission.id,
-                run_id=run_id,
-                type=EventType.ESCALATED,
-                payload={"kind": kind, "question": question[:500]},
-            )
+        run = await store.get_run(run_id)
+        if run is None or run.status in (RunStatus.ABORTED, RunStatus.FAILED):
+            return "the orchestrator stopped this run"
+        current = run.escalation or {}
+
+        # Two cases look identical on the row and must behave differently:
+        #
+        # 1. A REPLAY. The daemon restarted while the role was blocked, so the
+        #    tool call runs again. An answer may have been written while the
+        #    daemon was down, and the role never received it: consume it.
+        # 2. A REPEAT ASK. The role got its answer, continued, and asked the
+        #    same thing again. The row still holds the old answered ask; it
+        #    must NOT be handed back a second time.
+        #
+        # `_served` is what separates them: it remembers the asks this executor
+        # returned, so a repeat is recognised in-process. A replay is by
+        # definition an ask this instance never served (a fresh process has an
+        # empty set), which is exactly the case that must consume the answer.
+        open_ask = bool(current.get("id")) and current.get("answer") is None
+        answered_replay = (
+            bool(current.get("id"))
+            and current.get("answer") is not None
+            and str(current["id"]) not in self._served
         )
-        deadline = time.monotonic() + ANSWER_TIMEOUT_S
-        while time.monotonic() < deadline:
-            await asyncio.sleep(self._poll)
-            run = await store.get_run(run_id)
-            if run is None or run.status in (RunStatus.ABORTED, RunStatus.FAILED):
-                return "the orchestrator stopped this run"
-            esc = run.escalation or {}
-            if esc.get("id") == ask_id and esc.get("answer") is not None:
-                return f"orchestrator: {esc['answer']}"
-        return "no answer within the time limit; proceed with your best judgment and say so"
+        if open_ask:
+            ask_id = str(current["id"])
+        elif answered_replay and current.get("question") == question[:2000]:
+            ask_id = str(current["id"])
+        else:
+            # a new question (or a genuine repeat): a fresh id, never colliding
+            # with the one already on the row
+            ask_id = _ask_id(run_id, question, len(self._served))
+            payload = {
+                "id": ask_id,
+                "kind": kind,
+                "question": question[:2000],
+                "asked_at": time.time(),
+                "answer": None,
+            }
+            await store.update_run(run_id, escalation=payload)
+            await self._ctx.bus.publish(
+                EventRecord(
+                    mission_id=self._ctx.mission.id,
+                    run_id=run_id,
+                    type=EventType.ESCALATED,
+                    payload={"kind": kind, "question": question[:500]},
+                )
+            )
+        async with self._ctx.parked():
+            while True:
+                await asyncio.sleep(self._poll)
+                run = await store.get_run(run_id)
+                if run is None or run.status in (RunStatus.ABORTED, RunStatus.FAILED):
+                    return "the orchestrator stopped this run"
+                esc = run.escalation or {}
+                if esc.get("id") == ask_id and esc.get("answer") is not None:
+                    self._served.add(ask_id)
+                    return f"orchestrator: {esc['answer']}"
 
     async def _ask_owner(self, question: str) -> str:
         """Legacy (non-orchestrated) missions: the owner answers via a gate."""
@@ -117,13 +179,15 @@ class EscalationAwareExecutor:
             for_run=self._ctx.run.id,
             spec={"placeholder": "your answer"},
         )
-        deadline = time.monotonic() + ANSWER_TIMEOUT_S
-        while time.monotonic() < deadline:
-            await asyncio.sleep(self._poll)
-            row = await self._ctx.store.get_gate(gate.id)
-            if row is not None and row.status != GateStatus.OPEN:
-                return f"owner: {answer_text(row)}"
-        return "no answer within the time limit; proceed with your best judgment and say so"
+        async with self._ctx.parked():
+            while True:
+                await asyncio.sleep(self._poll)
+                row = await self._ctx.store.get_gate(gate.id)
+                if row is not None and row.status != GateStatus.OPEN:
+                    return f"owner: {answer_text(row)}"
+                run = await self._ctx.store.get_run(self._ctx.run.id)
+                if run is None or run.status in (RunStatus.ABORTED, RunStatus.FAILED):
+                    return "the orchestrator stopped this run"
 
 
 def answer_text(gate: Any) -> str:

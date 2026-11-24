@@ -208,6 +208,54 @@ async def test_waiting_without_the_slot_never_touches_the_semaphore() -> None:
     assert slot.held is False
 
 
+async def test_releasing_a_slot_the_run_no_longer_holds_is_a_no_op() -> None:
+    """A parked run hands its slot back; the `finally` in `_execute` then runs
+    `release` on a slot it no longer holds. It must not free somebody else's."""
+    from rework.orchestrator.limits import RoleLimiter
+
+    limiter = RoleLimiter(cap=2)
+    await limiter.acquire("parked")
+    await limiter.acquire("busy")
+    assert limiter.running == 2
+
+    async with limiter.while_waiting("parked"):
+        assert limiter.running == 1, "the parked run gave its slot back"
+        assert limiter._held == {"busy"}
+
+    limiter.release("parked")  # the run finishes normally
+    assert limiter.running == 1, "the second release must not free the busy run"
+    limiter.release("busy")
+    assert limiter.running == 0
+
+
+async def test_a_park_resumes_only_when_a_slot_is_free() -> None:
+    """Leaving a park waits for a free slot, exactly like starting a run does.
+
+    A run that took the freed slot keeps it until it finishes, the resumed run
+    then takes it, and nothing leaks. This is the honest behaviour: a park hands
+    capacity back, it does not reserve capacity."""
+    from rework.orchestrator.limits import RoleLimiter
+
+    limiter = RoleLimiter(cap=1)
+    await limiter.acquire("parked")
+
+    async def release_fresh_later() -> None:
+        await asyncio.sleep(0.05)
+        limiter.release("fresh")
+
+    releaser = asyncio.create_task(release_fresh_later())
+    async with limiter.while_waiting("parked"):
+        fresh = asyncio.create_task(limiter.acquire("fresh"))
+        await asyncio.sleep(0)
+        assert await fresh is False, "the freed slot went to the fresh run at once"
+        assert limiter._held == {"fresh"}
+    # leaving the park waited for `fresh` to finish, then took the slot back
+    assert limiter._held == {"parked"}
+    await releaser
+    limiter.release("parked")
+    assert limiter.running == 0
+
+
 async def test_release_is_idempotent() -> None:
     sem = CountingSem(1)
     slot = MissionSlot(sem, "m-a")  # type: ignore[arg-type]

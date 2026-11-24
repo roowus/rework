@@ -20,8 +20,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
-from collections.abc import Awaitable, Callable
-from contextlib import AbstractAsyncContextManager, nullcontext
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -157,6 +157,7 @@ class RunSupervisor:
         provider: ModelProvider | None = None,
         library: Any | None = None,
         limiter: RoleLimiter | None = None,
+        mission_park: Callable[[], AbstractAsyncContextManager[None]] | None = None,
     ) -> None:
         self._mission = mission
         self._store = store
@@ -171,6 +172,9 @@ class RunSupervisor:
         # daemon-wide cap on concurrently RUNNING roles (REWORK_MAX_ROLES): a
         # supervisor of its own gets its own limiter, the daemon shares one
         self.limiter = limiter if limiter is not None else RoleLimiter(1)
+        # the MISSION slot, given back while a role parks. Supplied by the
+        # runner (which owns it); None = no slot to give back (tests, evals).
+        self.mission_park = mission_park if mission_park is not None else nullcontext
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self._closers: list[Callable[[], Awaitable[None]]] = []
         self._ctxs: dict[str, RoleBuildCtx] = {}
@@ -179,6 +183,26 @@ class RunSupervisor:
     #: re-raises it so it reaches Daemon._log_runner_error, which requeues the
     #: mission; recording it as a FAILED run instead made it terminal.
     _fatal: BaseException | None = None
+
+    def _park_context(self, run: Run) -> Any:
+        """The slots a role gives back while it waits for an answer.
+
+        Both are handed back, and in this order: the role slot first (so a
+        waiting role stops counting against REWORK_MAX_ROLES), then the mission
+        slot (so a parked mission stops counting against REWORK_CONCURRENCY).
+        They are taken again in the reverse order. A resumed run queues for its
+        role slot like any other run: a park hands capacity back, it does not
+        reserve it. Everything is a no-op when the runner owns no slot (tests,
+        evals) and `while_waiting` is idempotent per run, so nesting cannot
+        double-release."""
+
+        @asynccontextmanager
+        async def park() -> AsyncIterator[None]:
+            async with self.limiter.while_waiting(run.id):
+                async with self.mission_park():
+                    yield
+
+        return park
 
     async def _build_graph(self, run: Run) -> Any:
         spec = self._registry.get(run.role)
@@ -257,6 +281,7 @@ class RunSupervisor:
             git_author=self._git_author,
             library=self._library,
             library_menu=library_menu,
+            park=self._park_context(run),
         )
         graph = spec.build_graph(ctx)
         checkpointer, close = await self._make_checkpointer(run.id)
@@ -505,6 +530,7 @@ class MissionRunner:
             self._provider,
             self._library,
             self._limiter,
+            mission_park=self._mission_park,
         )
         try:
             if (mission.plan or {}).get("orchestrator"):
@@ -1286,6 +1312,11 @@ class MissionRunner:
         ahead of never-started missions before work resumes
         (MissionSlot.while_waiting).
         """
+        return self._mission_park()
+
+    def _mission_park(self) -> AbstractAsyncContextManager[None]:
+        """The bare mission-slot park, usable from inside a role's ctx where
+        there is no runner to call `_waiting()` on."""
         if self._slot is None:
             return nullcontext()
         return self._slot.while_waiting()
@@ -1663,6 +1694,10 @@ class MissionRunner:
                     kind=self._gate_kind(payload),
                     question=str(payload.get("question") or payload.get("detail") or "proceed?"),
                     for_run=run.id,
+                    # the raw kind ("blocked", "needs_context") is not a
+                    # GateKind, so it collapsed to GENERIC and the gates tab
+                    # could not tell "I am stuck" from a generic question
+                    spec={"escalation_kind": str(payload.get("kind") or "generic")},
                 )
                 gated.append((run, gate.id))
             else:
@@ -1675,11 +1710,17 @@ class MissionRunner:
             # shows `awaiting_gate` with no gate row, which the daemon repair
             # pass and the wait loop below both assume away.
             await self._store.update_mission(self.mission_id, status=MissionStatus.AWAITING_GATE)
-        while True:
-            open_gates = await self._store.list_open_gates(self.mission_id)
-            if not open_gates:
-                break
-            await asyncio.sleep(self._poll)
+        # The wait happens INSIDE the mission-slot park. This loop used to sleep
+        # bare, so a mission parked on an escalation held a REWORK_CONCURRENCY
+        # slot for the whole (formerly 45 minute) wait; every other gate wait
+        # already gives the slot back (see _gate_decision, _pause_until_resumed,
+        # _burn_gate_hit).
+        async with self._waiting():
+            while True:
+                open_gates = await self._store.list_open_gates(self.mission_id)
+                if not open_gates:
+                    break
+                await asyncio.sleep(self._poll)
         if gated:
             await self._store.update_mission(self.mission_id, status=MissionStatus.RUNNING)
         # apply decisions, straight from each run's gate row
@@ -1869,8 +1910,15 @@ class MissionRunner:
 
     @staticmethod
     def _gate_kind(payload: dict[str, Any]) -> GateKind:
+        """The gate kind for an escalation. `blocked` and `needs_context` are
+        questions the owner must answer, not generic holds, so they map to
+        QUESTION rather than falling back to GENERIC; the exact kind is kept on
+        `Gate.spec["escalation_kind"]` for anything that wants to display it."""
+        raw = str(payload.get("kind") or "generic")
+        if raw in ("blocked", "needs_context", "needs_tool"):
+            return GateKind.QUESTION
         try:
-            return GateKind(str(payload.get("kind") or "generic"))
+            return GateKind(raw)
         except ValueError:
             return GateKind.GENERIC
 
