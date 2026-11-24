@@ -27,6 +27,18 @@ from rework.kernel.state.records import Run, RunStatus
 from rework.nodes.report_sections import blocking_findings, open_blockers
 from rework.nodes.testing import handoff_tests_gap
 
+# -- which roles write code ---------------------------------------------------
+#
+# The harness (ADR 0015) leaves the same `coder_handoff` as the coder, so every
+# place that used to look for role == "coder" must look for this instead: the
+# audit rail, the auto-wiring, the continue-branch scan and the ship picker.
+WRITING_ROLES = frozenset({"coder", "harness"})
+
+
+def writes_code(run_role: str) -> bool:
+    return run_role in WRITING_ROLES
+
+
 # -- which runs count ---------------------------------------------------------
 
 
