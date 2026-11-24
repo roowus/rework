@@ -1,9 +1,9 @@
 """Role integration: web_search + fetch_url as ordinary role tools.
 
 Registered compositionally, exactly like the library tools: an executor
-wrapper that answers its own tool names and appends its own specs. (The
-declarative ToolPack.allowed field is dead code -- nothing reads it -- so a
-tool registered there would silently never appear.)
+wrapper that answers its own tool names and appends its own specs. Exposure is
+the WRAPPER's job and the only mechanism: there is no declarative list to
+register a tool in (ADR 0017 removed the one that existed unread).
 """
 
 from __future__ import annotations
