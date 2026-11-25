@@ -64,10 +64,18 @@ def harness_argv(name: str, prompt: str, workdir: Path) -> list[str]:
             f"REWORK_HARNESS_BIN_{name.upper()} or pick another harness"
         )
     if name == "claude":
-        # non-interactive, streaming JSON so the trajectory can show progress,
-        # and dontAsk so an unattended run DENIES a permission it cannot get
-        # rather than waiting for a human who is not there (ADR 0011's rule:
-        # never proceed on silence)
+        # non-interactive, streaming JSON so the trajectory can show progress.
+        #
+        # Permissions, found the hard way on a real run:
+        #   - `dontAsk` denies Edit, Write AND Bash: the worker cannot change a
+        #     single file, so the role is useless;
+        #   - `acceptEdits` allows the edits but NOT Bash, so it can change the
+        #     code and then never run the test: red-green is impossible and it
+        #     honestly reports red_green_verified=false.
+        # A coding worker needs BOTH. `--allowedTools` grants exactly the tools
+        # the job needs (edit, write, run a command) and leaves the rest denied,
+        # which is narrower than `bypassPermissions` and is the containment the
+        # worktree already provides (plus the ADR 0014 container when enabled).
         return [
             binary,
             "-p",
@@ -76,7 +84,12 @@ def harness_argv(name: str, prompt: str, workdir: Path) -> list[str]:
             "stream-json",
             "--verbose",
             "--permission-mode",
-            "dontAsk",
+            "acceptEdits",
+            "--allowedTools",
+            "Edit",
+            "Write",
+            "Read",
+            "Bash",
         ]
     if name == "codex":
         return [binary, "exec", "--json", "--cd", str(workdir), prompt]
@@ -113,6 +126,20 @@ class HarnessSpec(RoleSpec):
             prompt = "\n\n".join(
                 m["content"] for m in state.get("messages") or [] if m.get("role") == "user"
             )
+            # The SAME contract the coder is held to, in the harness's own
+            # prompt: the tests block is what the red-green rail reads, so a
+            # worker that never emits it fails the rail for a reason it could
+            # have avoided. The harness does not know rework's conventions; say
+            # them.
+            prompt += (
+                "\n\nIMPORTANT (rework): when you are done, end your final message with a "
+                "fenced json block recording the tests you ran, exactly:\n"
+                '```json\n{"tests": {"added": [], "changed": [], '
+                '"red_green_verified": true, "commands": ["the command you ran"], '
+                '"result": "red then green: ...", "not_testable_reason": ""}}\n```\n'
+                "Work only inside this directory. Do not leave scratch scripts or probe "
+                "files behind: this directory is committed as-is."
+            )
             argv = harness_argv(harness_name, prompt, worktree)
             timeout = float((ctx.run.context or {}).get("max_seconds") or HARNESS_TIMEOUT_S)
             # a fresh session per run, under the run's own dir: two runs must
@@ -133,9 +160,15 @@ class HarnessSpec(RoleSpec):
             final_text = ""
             turns = 0
             events: list[dict[str, Any]] = []
+            # the CLI's own verdict on the run. `claude -p` exits 1 when it stops
+            # short of its end (a tool it could not use, a turn limit), and 0 when
+            # it reached `end_turn`: its `result` event carries `is_error`.
+            self_ok = False
+
+            result_text: str = ""  # the CLI's own final `result` field wins
 
             async def read_stream() -> None:
-                nonlocal final_text, turns
+                nonlocal final_text, turns, result_text, self_ok
                 assert proc.stdout is not None
                 async for raw in proc.stdout:
                     line = raw.decode("utf-8", "replace").strip()
@@ -147,7 +180,17 @@ class HarnessSpec(RoleSpec):
                     except ValueError:
                         data = None
                     if isinstance(data, dict):
-                        turns += 1
+                        # a TURN is one assistant message, not one stream line:
+                        # thinking-token deltas alone run into the thousands
+                        if data.get("type") == "assistant":
+                            turns += 1
+                        if isinstance(data.get("result"), str) and data.get("type") in (
+                            "result",
+                            "turn.completed",
+                        ):
+                            result_text = str(data["result"])
+                            if not data.get("is_error"):
+                                self_ok = True
                         text = _final_text_of(data)
                         if text:
                             final_text = text
@@ -171,12 +214,19 @@ class HarnessSpec(RoleSpec):
                 raise RuntimeError(
                     f"the {harness_name} harness ran past {timeout:.0f}s and was killed"
                 ) from None
-            if proc.returncode not in (0, None) and not final_text:
+            # What "the harness succeeded" means: it reached its own end
+            # (self_ok), not that the process exited 0. A harness can exit
+            # non-zero after a perfectly good edit (found live: it used a
+            # shell probe that a sandbox refused, then finished the work anyway
+            # and reported success in its result event). It FAILED only when
+            # neither its own verdict nor any text survived.
+            if not self_ok and not final_text:
                 raise RuntimeError(
-                    f"the {harness_name} harness exited {proc.returncode} with no output"
+                    f"the {harness_name} harness exited {proc.returncode} without reaching "
+                    "its end and produced no output"
                 )
             return {
-                "final_text": final_text or (state.get("final_text") or ""),
+                "final_text": result_text or final_text or (state.get("final_text") or ""),
                 "harness": {
                     "name": harness_name,
                     "turns": turns,
