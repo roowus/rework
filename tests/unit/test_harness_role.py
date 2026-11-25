@@ -103,10 +103,19 @@ async def test_the_harness_role_is_registered() -> None:
     assert "harness" in autodiscover().names()
 
 
-async def test_harness_argv_uses_dontask_and_streaming(monkeypatch, tmp_path) -> None:
+async def test_harness_argv_uses_accept_edits_plus_bash_and_streaming(
+    monkeypatch, tmp_path
+) -> None:
+    """`dontAsk` denies Edit/Write/Bash (the worker cannot change anything);
+    `acceptEdits` alone leaves Bash denied (it cannot run the test). The role
+    needs both, granted narrowly via --allowedTools (found live)."""
     monkeypatch.setenv("REWORK_HARNESS_BIN_CLAUDE", "/usr/bin/claude")
     argv = harness_argv("claude", "do the thing", tmp_path)
-    assert "--permission-mode" in argv and "dontAsk" in argv
+    assert "--permission-mode" in argv
+    assert argv[argv.index("--permission-mode") + 1] == "acceptEdits"
+    assert "--allowedTools" in argv
+    for tool in ("Edit", "Write", "Bash"):
+        assert tool in argv, f"{tool} must be granted or the worker cannot work"
     assert "--output-format" in argv and "stream-json" in argv
 
 
