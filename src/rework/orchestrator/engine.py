@@ -1079,10 +1079,24 @@ class MissionRunner:
         if coder is None:
             return
         art = coder.artifact or {}
-        from rework.nodes.git_ops import push_branch
+        from rework.orchestrator.delivery import (
+            merge_main_before_push,
+            serialized_delivery,
+        )
 
+        worktree = Path(str(art.get("worktree") or mission.repo_path))
         try:
-            await push_branch(Path(str(art.get("worktree") or mission.repo_path)), art["branch"])
+            # This is the SHIP path, and it used to push without merging main,
+            # so a ship-approved branch could arrive conflicting with everything
+            # merged while it worked. Same lock and same merge as `deliver_pr`
+            # (ADR 0013), so the two delivery paths cannot drift apart again.
+            async with serialized_delivery(self._store):
+                await merge_main_before_push(
+                    self._bus, mission.id, art["branch"], worktree, self._git_author
+                )
+                from rework.nodes.git_ops import push_branch
+
+                await push_branch(worktree, art["branch"])
         except Exception as exc:
             log.warning("ship: pushing %s failed: %s", art.get("branch"), exc)
             await self._bus.publish(

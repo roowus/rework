@@ -15,7 +15,12 @@ and the TUI's "Retry PR" button come through here — one code path, one record.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
+import time
+import uuid
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +39,69 @@ from rework.nodes.git_ops import (
 )
 
 log = logging.getLogger("rework.delivery")
+
+# How long a process may hold the delivery lock without a heartbeat before
+# another (or the same, after a crash) may take it. A push + PR create is
+# seconds; this is generous so a slow remote is not mistaken for a dead one.
+DELIVERY_LOCK_TTL_S = 120.0
+DELIVERY_HEARTBEAT_S = 20.0
+
+
+@contextlib.asynccontextmanager
+async def serialized_delivery(store: StateStore) -> AsyncIterator[None]:
+    """Hold the ONE delivery lock while merging, pushing and opening a PR.
+
+    Two missions finishing together both merged main and both pushed, so both
+    PRs were "clean" against the main each one saw and the owner rebased one by
+    hand. A process-local asyncio.Lock cannot fix that: `rework retry-pr` runs
+    from a laptop against the same database, so the lock has to live in the
+    store (ADR 0013).
+
+    Waiting is bounded and never raises: if the lock cannot be taken in about
+    two TTLs, the caller proceeds WITHOUT it rather than deadlocking a mission.
+    Ordered-but-occasionally-unserialized is a better failure than a mission
+    that hangs on a lock row.
+    """
+    owner = f"deliver-{uuid.uuid4().hex[:12]}"
+    # A holder that is ALIVE heartbeats every DELIVERY_HEARTBEAT_S, so a row
+    # untouched for a few heartbeats is dead and can be taken over at once.
+    # Without the short stale window a crashed delivery blocks the next one for
+    # the full TTL, which is four minutes of a mission doing nothing.
+    takeover_after = DELIVERY_HEARTBEAT_S * 3
+    deadline = time.monotonic() + DELIVERY_LOCK_TTL_S * 2
+    acquired = False
+    while time.monotonic() < deadline:
+        if await store.acquire_delivery_lock(owner, stale_after_s=takeover_after):
+            acquired = True
+            break
+        await asyncio.sleep(1.0)
+    if not acquired:
+        log.warning(
+            "delivery lock busy for %.0fs; delivering unserialized", DELIVERY_LOCK_TTL_S * 2
+        )
+        yield
+        return
+
+    async def beat() -> None:
+        while True:
+            await asyncio.sleep(DELIVERY_HEARTBEAT_S)
+            try:
+                await store.heartbeat_delivery_lock(owner)
+            except Exception:  # a lost heartbeat must never kill a delivery
+                return
+
+    task = asyncio.create_task(beat())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await task
+        try:
+            await store.release_delivery_lock(owner)
+        except Exception as exc:  # pragma: no cover - release is best effort
+            log.warning("release of the delivery lock failed: %s", exc)
+
 
 # The keys `_create_pr`/retry write into mission.result. `_synthesize` rebuilds
 # the result dict from the runs, so it must carry these over explicitly.
@@ -384,12 +452,19 @@ async def deliver_pr(
     # merge main INTO the branch first, so the PR arrives mergeable instead of
     # conflicting with everything other missions merged while this one worked.
     # A real conflict leaves the branch untouched and is reported in the body.
-    note = await merge_main_before_push(bus, mission_id, branch, worktree, author)
-    if note:
-        body = _body_with_merge_note(body, note)
+    #
+    # The WHOLE sequence (merge, push, PR) is under one delivery lock (ADR
+    # 0012): two missions finishing together used to merge and push
+    # independently, so both PRs were clean against the main each one saw and
+    # the owner rebased one by hand. One lock, not one per step, because a gap
+    # between the merge and the push is exactly the window that caused it.
     try:
-        await push_branch(Path(worktree), branch)
-        url = await pr_create(Path(worktree), head=branch, title=title, body=body)
+        async with serialized_delivery(store):
+            note = await merge_main_before_push(bus, mission_id, branch, worktree, author)
+            if note:
+                body = _body_with_merge_note(body, note)
+            await push_branch(Path(worktree), branch)
+            url = await pr_create(Path(worktree), head=branch, title=title, body=body)
     except Exception as exc:
         error = _error_text(exc)
         attempts = int(getattr(exc, "attempts", 1) or 1)

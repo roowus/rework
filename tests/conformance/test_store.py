@@ -297,6 +297,34 @@ async def test_leader_lock_concurrent_acquire(store: StateStore) -> None:
     assert await store.acquire_lock("latecomer", stale_after_s=60.0) is False
 
 
+async def test_delivery_lock(store: StateStore) -> None:
+    """ADR 0013: one merge+push+PR at a time, across processes."""
+    assert await store.acquire_delivery_lock("deliver-1") is True
+    assert await store.acquire_delivery_lock("deliver-2") is False  # live foreign lock
+    assert await store.heartbeat_delivery_lock("deliver-2") is False
+    assert await store.heartbeat_delivery_lock("deliver-1") is True
+    # re-acquiring as the OWNER is idempotent (a retry loop must not deadlock)
+    assert await store.acquire_delivery_lock("deliver-1") is True
+    await store.release_delivery_lock("deliver-1")
+    assert await store.acquire_delivery_lock("deliver-2") is True
+    await store.release_delivery_lock("deliver-2")
+
+
+async def test_delivery_lock_stale_takeover(store: StateStore) -> None:
+    """A machine that dies mid-push must not block every future delivery."""
+    assert await store.acquire_delivery_lock("dead", stale_after_s=0.05) is True
+    await asyncio.sleep(0.15)
+    assert await store.acquire_delivery_lock("fresh", stale_after_s=0.05) is True
+    assert await store.heartbeat_delivery_lock("dead") is False
+
+
+async def test_delivery_lock_concurrent_acquire(store: StateStore) -> None:
+    results = await asyncio.gather(
+        *[store.acquire_delivery_lock(f"d-{i}", stale_after_s=60.0) for i in range(8)]
+    )
+    assert sum(results) == 1, "exactly one delivery may win"
+
+
 async def test_complaints_roundtrip(store: StateStore) -> None:
     """ADR 0004: complaints are typed, fire-and-forget feedback in the store."""
     c = Complaint(
