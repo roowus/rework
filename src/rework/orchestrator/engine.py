@@ -159,6 +159,7 @@ class RunSupervisor:
         library: Any | None = None,
         limiter: RoleLimiter | None = None,
         mission_park: Callable[[], AbstractAsyncContextManager[None]] | None = None,
+        executor_factory: Any | None = None,
     ) -> None:
         self._mission = mission
         self._store = store
@@ -176,6 +177,9 @@ class RunSupervisor:
         # the MISSION slot, given back while a role parks. Supplied by the
         # runner (which owns it); None = no slot to give back (tests, evals).
         self.mission_park = mission_park if mission_park is not None else nullcontext
+        # how a run builds its executor (local jail vs container, ADR 0014).
+        # None = LocalExecutor, which is what tests and evals get.
+        self.executor_factory = executor_factory
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self._closers: list[Callable[[], Awaitable[None]]] = []
         self._ctxs: dict[str, RoleBuildCtx] = {}
@@ -283,6 +287,7 @@ class RunSupervisor:
             library=self._library,
             library_menu=library_menu,
             park=self._park_context(run),
+            executor_factory=self.executor_factory,
         )
         graph = spec.build_graph(ctx)
         checkpointer, close = await self._make_checkpointer(run.id)
@@ -349,6 +354,15 @@ class RunSupervisor:
             )
         finally:
             self.limiter.release(run.id)
+            await self._close_ctx(run.id)
+
+    async def _close_ctx(self, run_id: str) -> None:
+        """Let a finished run tear down what it owns outside the graph (a
+        container, a temp dir). Cancellation and failure both arrive here, so
+        teardown never depends on a clean completion (ADR 0014)."""
+        ctx = self._ctxs.pop(run_id, None)
+        if ctx is not None:
+            await ctx.aclose()
 
     def _run_config(self, run: Run) -> dict[str, Any]:
         """Checkpoint thread + a callback that publishes each node start, so a
@@ -438,6 +452,7 @@ class RunSupervisor:
             )
         finally:
             self.limiter.release(run.id)
+            await self._close_ctx(run.id)
 
     async def check_fatal(self) -> None:
         """Re-raise a transient database error that escaped a role run.
@@ -463,6 +478,8 @@ class RunSupervisor:
         for task in self.tasks.values():
             if not task.done():
                 task.cancel()
+        for run_id in list(self._ctxs):
+            await self._close_ctx(run_id)
         for close in self._closers:
             try:
                 await close()
@@ -488,6 +505,7 @@ class MissionRunner:
         library: Any | None = None,
         slot: MissionSlot | None = None,
         limiter: RoleLimiter | None = None,
+        executor_factory: Any | None = None,
     ) -> None:
         self._store = store
         self._bus = bus
@@ -508,6 +526,9 @@ class MissionRunner:
         # semaphore that a waiting mission gives back.
         self._slot = slot
         self._limiter = limiter
+        # the process-wide executor choice (local jail vs container, ADR 0014);
+        # None = local, which is what tests and evals get
+        self._executor_factory = executor_factory
 
     async def run(self) -> None:
         bind(mission=self.mission_id)
@@ -532,6 +553,7 @@ class MissionRunner:
             self._library,
             self._limiter,
             mission_park=self._mission_park,
+            executor_factory=self._executor_factory,
         )
         try:
             if (mission.plan or {}).get("orchestrator"):

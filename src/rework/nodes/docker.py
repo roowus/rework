@@ -1,0 +1,363 @@
+"""Sandboxed role commands: a container per run, behind the same executor seam.
+
+`LocalExecutor` runs a role's `run_command` as the daemon's own user through a
+shell that can `cd` anywhere (its own docstring says so). This module closes
+that without teaching the roles anything: it satisfies the same two-method
+`ToolExecutor` protocol, so a role's graph is unchanged (ADR 0014).
+
+What runs where:
+
+- `read_file` and `list_dir` stay on the HOST. They read the bind-mounted
+  worktree, they cannot change anything, they work before a container exists,
+  and the jail is exactly the one `LocalExecutor` uses (`tools.read_side`), so
+  there is one implementation of it.
+- `run_command` runs in the container.
+
+The container is created lazily on the first command, named from the run id so a
+restart recognizes its own, and removed by the run's closer (`RoleBuildCtx`
+closers, called by `RunSupervisor`), or swept by `rework gc` if the daemon died
+without running one. Docker is never required: `REWORK_EXECUTOR=docker` refuses
+to start rather than silently degrading, and `auto` falls back to local.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import shutil
+import uuid
+from pathlib import Path
+from typing import Any
+
+from rework.kernel.llm.types import ToolSpec
+from rework.nodes.tools import (
+    BUILTIN_TOOLS,
+    FILE_TOOLS,
+    ToolExecutor,
+    _kill_tree,
+    read_side,
+    role_env,
+)
+
+DEFAULT_IMAGE = "python:3.12-slim"
+# Where the run's worktree appears INSIDE the container. A fixed path, not the
+# host's: the first real run set --workdir to the host's absolute worktree and
+# `docker exec` refused ("current working directory is outside of container
+# mount namespace root"), because the exec process's cwd was not a mounted path.
+CONTAINER_WORKDIR = "/work"
+SANDBOX_LABEL = "rework.managed"
+CONTAINER_PREFIX = "rework-"
+
+
+class SandboxUnavailable(RuntimeError):
+    """REWORK_EXECUTOR=docker but there is no usable docker.
+
+    Deliberately fatal: an owner who asked for a sandbox must not silently get
+    the unsandboxed path instead. `auto` is the mode that falls back.
+    """
+
+
+def docker_bin() -> str | None:
+    return os.environ.get("REWORK_DOCKER_BIN") or shutil.which("docker")
+
+
+def executor_mode() -> str:
+    """`local` (default), `docker`, or `auto` (docker when it is installed)."""
+    mode = (os.environ.get("REWORK_EXECUTOR") or "local").strip().lower()
+    return mode if mode in ("local", "docker", "auto") else "local"
+
+
+class DockerExecutor:
+    """`run_command` in a per-run container; the rest on the host."""
+
+    def __init__(
+        self,
+        workdir: Path,
+        *,
+        mission_id: str | None = None,
+        run_id: str | None = None,
+        image: str | None = None,
+        docker: str | None = None,
+        network: str = "none",
+        memory: str | None = None,
+        cpus: str | None = None,
+    ) -> None:
+        self._workdir = Path(workdir).resolve()
+        self._mission_id = mission_id
+        self._run_id = run_id or uuid.uuid4().hex[:12]
+        self._image = image or os.environ.get("REWORK_SANDBOX_IMAGE") or DEFAULT_IMAGE
+        self._docker = docker or docker_bin()
+        self._network = network
+        self._memory = memory or _memory_cap()
+        self._cpus = cpus or os.environ.get("REWORK_SANDBOX_CPUS") or ""
+        self._container: str | None = None
+
+    # -- protocol ----------------------------------------------------------
+    def specs(self, allowed: set[str] | None = None) -> list[ToolSpec]:
+        return [s for s in BUILTIN_TOOLS if allowed is None or s.name in allowed]
+
+    async def execute(self, name: str, args: dict[str, Any]) -> str:
+        try:
+            if name in FILE_TOOLS:
+                return await read_side(name, self._workdir, args)
+            if name == "run_command":
+                return await self._run_in_container(
+                    str(args["command"]), float(args.get("timeout_seconds", 120))
+                )
+            raise KeyError(f"unknown tool {name!r}")
+        except KeyError as exc:
+            return f"error: missing argument {exc}"
+        except (ValueError, OSError) as exc:
+            return f"error: {exc}"
+
+    async def aclose(self) -> None:
+        """Remove this run's container, if one was started. Never raises: a
+        failed teardown must not fail a finished run."""
+        name, self._container = self._container, None
+        if not name or not self._docker:
+            return
+        try:
+            await self._docker_exec("rm", "-f", name, limit_s=30)
+        except Exception:
+            pass
+
+    # -- container lifecycle -----------------------------------------------
+    @property
+    def container_name(self) -> str:
+        """Deterministic, so a restarted daemon recognizes its own container
+        rather than starting a second one."""
+        tag = self._run_id.replace(":", "-").replace("/", "-")[:60]
+        return f"{CONTAINER_PREFIX}{tag}"
+
+    async def _ensure_container(self) -> str:
+        if self._container is not None:
+            return self._container
+        if not self._docker:
+            raise SandboxUnavailable(
+                "REWORK_EXECUTOR=docker but no docker binary was found; "
+                "install docker, set REWORK_DOCKER_BIN, or use REWORK_EXECUTOR=local"
+            )
+        name = self.container_name
+        # reuse a container left by an earlier attempt of this same run
+        code, _ = await self._docker_exec(
+            "inspect", "--format", "{{.State.Running}}", name, limit_s=30
+        )
+        if code == 0:
+            self._container = name
+            return name
+
+        argv = [
+            "run",
+            "-d",
+            "--name",
+            name,
+            "--label",
+            SANDBOX_LABEL,
+            "--label",
+            f"rework.mission={self._mission_id or ''}",
+            "--label",
+            f"rework.run={self._run_id}",
+            "--init",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--pids-limit=512",
+            "--network",
+            self._network,
+            "--workdir",
+            CONTAINER_WORKDIR,
+            "--volume",
+            f"{self._workdir}:{CONTAINER_WORKDIR}",
+            "--user",
+            f"{os.getuid()}:{os.getgid()}",
+        ]
+        if self._memory:
+            argv += ["--memory", self._memory]
+        if self._cpus:
+            argv += ["--cpus", self._cpus]
+        # The container's environment is EXPLICIT, not forwarded. `-e NAME`
+        # alone would copy the value from the DAEMON's environment, which is how
+        # the first real run leaked the host's HOME, its venv PATH and its
+        # locale into a sandbox. A sandbox starts with a clean, predictable
+        # environment; the allowlist decides which of the host's vars MAY be
+        # forwarded, and even then only by the values the daemon holds for it.
+        allowed = role_env(self._workdir, self._mission_id)
+        container_env: dict[str, str] = {
+            # a writable home the image's `user` can actually use
+            "HOME": "/tmp",
+            "PATH": _CONTAINER_PATH,
+            "LANG": allowed.get("LANG", "C.UTF-8"),
+            "TERM": allowed.get("TERM", "dumb"),
+        }
+        if allowed.get("TZ"):
+            container_env["TZ"] = allowed["TZ"]
+        # an owner-granted variable (the allowlist's additions, beyond the
+        # baseline) IS forwarded, because that is what the owner asked for
+        for name in _owner_granted(allowed):
+            if name in os.environ:
+                container_env[name] = os.environ[name]
+        # NOTE: the loop variable is NOT `name`: that holds the container name,
+        # which this function returns. Shadowing it here sent "TERM" (the last
+        # env key) to docker as the container name (found live).
+        for env_name, env_value in sorted(container_env.items()):
+            argv += ["-e", f"{env_name}={env_value}"]
+        argv += [self._image, "sleep", "infinity"]
+
+        code, out = await self._docker_exec(*argv, limit_s=120)
+        if code != 0:
+            raise SandboxUnavailable(f"could not start the sandbox container: {out.strip()[:400]}")
+        self._container = name
+        return name
+
+    async def _run_in_container(self, command: str, limit_s: float) -> str:
+        name = await self._ensure_container()
+        # the container's own shell: no host command_prefix (that wrapper is a
+        # HOST resource nanny; the container's cgroup limits replace it)
+        proc = await asyncio.create_subprocess_exec(
+            self._docker or "docker",
+            "exec",
+            "--workdir",
+            CONTAINER_WORKDIR,
+            name,
+            "/bin/sh",
+            "-c",
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=limit_s)
+        except TimeoutError:
+            await _kill_tree(proc)
+            # the exec client is dead, but the command may still be running in
+            # the container: kill the container's processes too, and forget the
+            # handle so the next call recreates it (the worktree is on the host,
+            # so only container-layer state is lost)
+            await self._docker_exec("kill", name, limit_s=30)
+            self._container = None
+            return f"(timeout after {limit_s:.0f}s; the sandboxed command was killed)"
+        text = out.decode(errors="replace")
+        if len(text) > 8000:
+            text = text[:4000] + "\n... (truncated) ...\n" + text[-4000:]
+        return f"(exit {proc.returncode})\n{text or '(no output)'}"
+
+    async def _docker_exec(self, *args: str, limit_s: float = 60) -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_exec(
+            self._docker or "docker",
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=_docker_client_env(),
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=limit_s)
+        except TimeoutError:
+            proc.kill()
+            return -1, "docker command timed out"
+        return proc.returncode or 0, out.decode(errors="replace")
+
+
+# What a command inside the sandbox sees on PATH. NOT the daemon's PATH: that
+# is how a venv and a host toolchain leaked into a container on the first real
+# run. The image's own layout is the honest answer.
+_CONTAINER_PATH = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+
+
+def _owner_granted(allowed: dict[str, str]) -> set[str]:
+    """The names the owner explicitly added to the allowlist, and nothing else.
+
+    Two things must NOT be forwarded, and both bit the first real container:
+
+    - the five `REWORK_*` scratch redirects that `role_env` sets ITSELF (they
+      point at host paths under the scratch dir, which do not exist in the
+      container), so every `REWORK_*` is excluded here regardless;
+    - a name whose value carries whitespace, because `-e NAME=VALUE` on one argv
+      element with a space is how docker ended up reading `TERM` as a container
+      name. An owner grant is a plain value (a token, a proxy URL); anything else
+      is refused with a warning rather than corrupted."""
+    from rework.nodes.tools import BASELINE_EXACT, BASELINE_PREFIXES
+
+    out: set[str] = set()
+    for name in allowed:
+        if name.startswith("REWORK_"):
+            continue
+        if name in BASELINE_EXACT:
+            continue
+        if any(name.startswith(prefix) for prefix in BASELINE_PREFIXES):
+            continue
+        value = os.environ.get(name, "")
+        if " " in value or "\n" in value:
+            import logging
+
+            logging.getLogger("rework.docker").warning(
+                "not forwarding %s into the sandbox: its value contains whitespace", name
+            )
+            continue
+        out.add(name)
+    return out
+
+
+def _docker_client_env() -> dict[str, str]:
+    """What the docker CLIENT needs to reach its daemon. Deliberately NOT
+    role_env: that is the environment INSIDE the container, and the client
+    needs DOCKER_HOST, or it cannot find the socket."""
+    keep = {
+        "PATH",
+        "HOME",
+        "DOCKER_HOST",
+        "DOCKER_CONFIG",
+        "DOCKER_TLS_VERIFY",
+        "DOCKER_CERT_PATH",
+        "XDG_RUNTIME_DIR",
+    }
+    return {k: v for k, v in os.environ.items() if k in keep}
+
+
+def _memory_cap() -> str:
+    from rework.nodes.hostlimits import configured_memory_max
+
+    return configured_memory_max()
+
+
+# -- selection ---------------------------------------------------------------
+
+
+class AutoExecutor:
+    """`REWORK_EXECUTOR=auto`: docker when it is usable, local otherwise."""
+
+    def __init__(self, executor: ToolExecutor) -> None:
+        self._inner = executor
+
+    def __getattr__(self, item: str) -> Any:
+        return getattr(self._inner, item)
+
+    async def execute(self, name: str, args: dict[str, Any]) -> str:
+        return await self._inner.execute(name, args)
+
+    def specs(self, allowed: set[str] | None = None) -> list[ToolSpec]:
+        return self._inner.specs(allowed)
+
+
+def make_executor_factory(mode: str | None = None) -> Any:
+    """The daemon's one executor choice, made once per process.
+
+    `local` (default) and `auto`-without-docker return the local jail. `docker`
+    and `auto`-with-docker return a per-run container executor, which the run's
+    closer removes.
+    """
+    from rework.nodes.tools import local_executor_factory
+
+    chosen = (mode or executor_mode()).strip().lower()
+    has_docker = docker_bin() is not None
+    if chosen == "docker" and not has_docker:
+        raise SandboxUnavailable(
+            "REWORK_EXECUTOR=docker but no docker binary was found; install docker, "
+            "set REWORK_DOCKER_BIN, or use REWORK_EXECUTOR=local"
+        )
+    if chosen == "docker" or (chosen == "auto" and has_docker):
+
+        def make(workdir: Path) -> ToolExecutor:
+            return DockerExecutor(workdir)
+
+        return make
+    return local_executor_factory()

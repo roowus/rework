@@ -547,11 +547,21 @@ rework therefore bounds itself. Five knobs, all optional, all in
 | `REWORK_CAPACITY` | `auto` | whether the two caps above follow the host at runtime, or stay fixed |
 | `REWORK_CAPACITY_INTERVAL_S` | `60` | how often (`auto`) the host is re-measured |
 | `REWORK_CAPACITY_PINS` | `floor` | what a hand-set `REWORK_CONCURRENCY` / `REWORK_MAX_ROLES` means: a minimum the planner may go above, or that exact cap |
+| `REWORK_EXECUTOR` | `local` | where a role's `run_command` runs: `local` (the daemon's user, jailed by path only), `docker` (a per-run container; refuses to start without docker), or `auto` (docker when installed, else local) |
+| `REWORK_SANDBOX_IMAGE` | `python:3.12-slim` | the image a sandboxed run uses; it must carry the repo's toolchain (git, the runtime) |
+| `REWORK_SANDBOX_CPUS` | unset | an extra `--cpus` cap on the sandbox container (memory comes from `REWORK_ROLE_MEMORY_MAX`) |
+| `REWORK_DOCKER_BIN` | `docker` on PATH | which docker client to use (tests set a fake) |
 
 `REWORK_MAX_ROLES` is daemon-wide: every `spawn_role` counts, whichever mission
 it belongs to. Runs beyond the cap are not refused, they queue — the run row
 stays `intent` and the orchestrator sees `queued (waiting for a free role
 slot, cap N)` in `wait` / `check_in`, so a queue never looks like a hung role.
+
+**If you enable `REWORK_EXECUTOR=docker`, remove the daemon's user from the `docker`
+group.** A role that somehow escaped its container could otherwise reach
+`/var/run/docker.sock` and start a privileged one, which makes the sandbox theatre
+(ADR 0014). The daemon itself talks to docker through the socket proxy or the root-owned
+group of your choice; nothing a ROLE runs needs socket access.
 
 `REWORK_ROLE_MEMORY_MAX` accepts `4G`, `512M`, `60%` or raw bytes (a percentage
 is that share of total RAM, resolved once at startup). rework applies it through

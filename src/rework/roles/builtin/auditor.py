@@ -31,7 +31,7 @@ from rework.nodes.testing import (
     verify_red_green,
 )
 from rework.nodes.toolloop import make_toolloop_node
-from rework.nodes.tools import ComplaintAwareExecutor, LocalExecutor
+from rework.nodes.tools import ComplaintAwareExecutor
 from rework.roles.base import RoleBuildCtx, RoleSpec
 
 if TYPE_CHECKING:
@@ -126,9 +126,7 @@ class AuditorSpec(RoleSpec):
         # worktree_path (the coder's branch checkout) wins; else the mission's
         # staged repo; else the empty per-run dir (degenerate: no repo access)
         workspace = run_ctx.get("worktree_path")
-        executor = LocalExecutor(
-            Path(workspace) if workspace else ctx.read_root, mission_id=ctx.mission.id
-        )
+        executor = ctx.make_executor(Path(workspace) if workspace else ctx.read_root)
 
         strictness = str(run_ctx.get("strictness") or "standard").strip().lower()
         mode = STRICTNESS_PROMPTS.get(strictness, STRICTNESS_PROMPTS["standard"])
