@@ -912,8 +912,24 @@ async def test_double_launch_creates_one_mission(
         # which would let the first launch finish and hide the race)
         launch.post_message(Btn.Pressed(launch))
         launch.post_message(Btn.Pressed(launch))
-        await _settle(pilot, 2.0)
         chat_id = app.view("work").convo.id
+        # The launch worker runs IN THIS app's event loop: give it time HERE, by
+        # pausing the pilot (which keeps the loop spinning), until the mission
+        # exists. A fixed 2 s settle lost the race on a loaded 3.13 runner (the
+        # worker had not reached create_mission; the block then exited and closed
+        # the loop, leaving []). Pausing in a loop keeps it alive until the work
+        # lands. The assertion after still requires EXACTLY one, so a real
+        # double-launch (two, a beat later) still fails.
+        for _ in range(600):
+            store0 = await _store(env)
+            try:
+                got = await store0.list_missions(limit=100, chat_id=chat_id)
+            finally:
+                await store0.aclose()
+            if got:
+                break
+            await pilot.pause(0.05)
+        await pilot.pause(0.3)  # let a genuine second launch surface as "two"
         assert not app.swallowed
     store = await _store(env)
     try:

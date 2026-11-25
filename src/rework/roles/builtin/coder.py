@@ -140,7 +140,7 @@ class CoderSpec(RoleSpec):
 
         graph = StateGraph(CoderState)
         graph.add_node("prepare", prepare)
-        graph.add_node("loop", loop)  # type: ignore[call-overload]
+        graph.add_node("loop", loop)  # type: ignore  # plain-callable node factory
         graph.add_node("handoff", handoff)
         graph.add_edge(START, "prepare")
         graph.add_edge("prepare", "loop")

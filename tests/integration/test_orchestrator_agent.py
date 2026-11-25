@@ -1908,7 +1908,7 @@ async def test_audit_rail_refuses_a_mission_with_neither_coder_nor_completed_sur
         ("surveyor", "1", RunStatus.FAILED, t0 + 20, t0 + 30),
     )
     orch = MissionOrchestrator(runner(world), mission)
-    with pytest.raises(ToolError, match="no auditor has completed"):
+    with pytest.raises(ToolError, match="needs a COMPLETED surveyor"):
         await orch._enforce_audit_fresh()
 
 
