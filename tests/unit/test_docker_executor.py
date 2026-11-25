@@ -220,6 +220,21 @@ async def test_the_run_closer_removes_the_container(tmp_path: Path, fake_docker:
     assert any(c.startswith("rm -f ") for c in _calls(fake_docker))
 
 
+async def test_ensure_container_returns_the_name_not_an_env_key(
+    tmp_path: Path, fake_docker: Path
+) -> None:
+    """Found live: the env loop reused the variable `name`, so `_ensure_container`
+    returned "TERM" (the last env key) instead of the container name and every
+    exec failed with "No such container: TERM". A container name is returned; an
+    env key is never a name."""
+    ex = DockerExecutor(tmp_path, run_id="m:code:coder:1")
+    name = await ex._ensure_container()
+
+    assert name == ex.container_name
+    assert name.startswith("rework-")
+    assert name not in {"TERM", "HOME", "PATH", "LANG"}
+
+
 def test_env_for_the_docker_client_is_not_the_role_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """The client needs DOCKER_HOST; the container needs neither it nor the
     daemon's keys."""

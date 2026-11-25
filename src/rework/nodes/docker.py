@@ -195,8 +195,11 @@ class DockerExecutor:
         for name in _owner_granted(allowed):
             if name in os.environ:
                 container_env[name] = os.environ[name]
-        for name, value in sorted(container_env.items()):
-            argv += ["-e", f"{name}={value}"]
+        # NOTE: the loop variable is NOT `name`: that holds the container name,
+        # which this function returns. Shadowing it here sent "TERM" (the last
+        # env key) to docker as the container name (found live).
+        for env_name, env_value in sorted(container_env.items()):
+            argv += ["-e", f"{env_name}={env_value}"]
         argv += [self._image, "sleep", "infinity"]
 
         code, out = await self._docker_exec(*argv, limit_s=120)
