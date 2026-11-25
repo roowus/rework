@@ -412,6 +412,14 @@ typed artifacts mechanically stripped (auditor gets the diff only); the orchestr
 mechanically verifies claims (runs the tests itself). v2 (Docker milestone) sandboxes tool
 execution per role behind the `ToolExecutor` protocol.
 
+The environment a role command runs with is an allowlist, not an inheritance (ADR 0009):
+`role_env` builds from `{}` plus a fixed baseline, so no `REWORK_*_KEY`, `REWORK_DB`,
+`SSH_AUTH_SOCK` or proxy credential reaches a role shell. `~/.rework/role_env.toml` grants
+additions; `rework role-env show` prints the effective list and `rework role-env allow NAME`
+appends an entry. The same allowlist covers the second role-shaped spawn, `verify_red_green`
+in `nodes/testing.py`. Until the container lands, `run_command` is still a real shell on the
+host: the allowlist narrows what it can read, not what it can reach.
+
 ## Roadmap
 
 | Milestone | Scope | Status |

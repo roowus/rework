@@ -228,7 +228,11 @@ class LocalExecutor:
                 from rework.nodes.hostlimits import report_once as _report_wrapper
 
                 memory_max = configured_memory_max()
-                prefix = command_prefix(command, memory_max=memory_max)
+                # the command's OWN environment: computed once and used both for
+                # the prefix choice and the spawn, so the user-scope probe sees
+                # exactly what the command will (ADR 0009 + CI's missing bus)
+                proc_env = role_env(self._workdir, self._mission_id)
+                prefix = command_prefix(command, memory_max=memory_max, env=proc_env)
                 _report_wrapper(prefix, memory_max)
                 proc = await asyncio.create_subprocess_exec(
                     *prefix,
@@ -236,7 +240,7 @@ class LocalExecutor:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     start_new_session=True,
-                    env=role_env(self._workdir, self._mission_id),
+                    env=proc_env,
                 )
                 mark = _register_command(proc.pid, command)
                 try:
@@ -320,54 +324,213 @@ def scratch_dir(workdir: Path, mission_id: str | None = None) -> Path:
     return scratch
 
 
-def role_env(workdir: Path | None = None, mission_id: str | None = None) -> dict[str, str]:
-    """The daemon's environment, minus its own Python environment when the
-    worktree is a Python project of its own (pyproject.toml). Found live: the
-    daemon runs from the main checkout's venv (`uv run rework serve`), every role
-    command inherited VIRTUAL_ENV and that venv's bin first on PATH, so a bare
-    `python`/`pytest` in a rework worktree imported the MAIN checkout's source
-    and audits tested the wrong code. A plain repo (no pyproject, e.g. a toy
-    repo whose tests run with `python3 -m pytest`) keeps the daemon's tools.
+# -- the role environment allowlist (ADR 0009) -------------------------------
+#
+# A role command gets a BUILT environment, never the daemon's. Everything not
+# named here or in ~/.rework/role_env.toml is dropped, including every
+# REWORK_*_KEY and REWORK_DB. Deliberately absent: GIT_SSH_COMMAND (it picks
+# which key git pushes as), GIT_CONFIG_* (can inject an auth header),
+# SSH_AUTH_SOCK, proxy variables, PYTHONPATH/PYTHONHOME/VIRTUAL_ENV (the
+# daemon's venv must not leak into a role, for every repo shape, not just ones
+# with a pyproject.toml).
 
-    Also redirects any rework-state paths that rework reads/writes under
-    ~/.rework (targets, env file, TUI settings, logs) to a per-run scratch
-    directory OUTSIDE the role's git worktree (see scratch_dir), so a role
-    command cannot silently touch or redirect from the real ~/.rework on a dev
-    machine, and nothing it writes there can be staged by the handoff."""
+BASELINE_EXACT: frozenset[str] = frozenset(
+    {
+        # process basics
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TMPDIR",
+        "TZ",
+        # locale and terminal
+        "LANG",
+        "LANGUAGE",
+        "TERM",
+        # XDG directories (paths only)
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        # the session bus: `hostlimits.command_prefix` may run a role command
+        # under `systemd-run --user`, which needs a reachable user bus. Without
+        # these two it fails with "Failed to connect to user scope bus", which
+        # on CI (no XDG_RUNTIME_DIR/DBUS in the job env) broke EVERY role
+        # command. They are runtime paths, not secrets.
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+        # uv and python behaviour (paths and switches, never URLs)
+        "UV_CACHE_DIR",
+        "UV_PYTHON",
+        "UV_PYTHON_INSTALL_DIR",
+        "PYTHONUNBUFFERED",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONUTF8",
+        "PYTHONIOENCODING",
+    }
+)
+
+BASELINE_PREFIXES: tuple[str, ...] = ("LC_", "GIT_AUTHOR_", "GIT_COMMITTER_")
+
+# The owner's additions. REWORK_ROLE_ENV_FILE is a test seam; the real path is
+# ~/.rework/role_env.toml, the same directory targets.toml and rework.env live
+# in.
+MIN_PREFIX = 3  # a shorter prefix ("*", "A") would widen the list arbitrarily
+
+_allow_cache: dict[tuple[str, float], tuple[frozenset[str], tuple[str, ...]]] = {}
+
+
+def role_env_file() -> Path:
+    import os
+
+    from rework.config import DEFAULT_STATE_DIR
+
+    return Path(
+        os.environ.get("REWORK_ROLE_ENV_FILE", str(DEFAULT_STATE_DIR / "role_env.toml"))
+    ).expanduser()
+
+
+def _parse_allow(data: Any) -> tuple[frozenset[str], tuple[str, ...]]:
+    """Exact names and `prefix*` entries from the file's `allow` list.
+
+    Anything suspect rejects the WHOLE file (baseline only): a bad TOML, a
+    non-list, a non-string entry, a bare `*`, an empty name, or a prefix
+    shorter than MIN_PREFIX. Every failure moves toward fewer variables, never
+    more, and there is deliberately no `inherit_all` switch."""
+    exact: set[str] = set()
+    prefixes: list[str] = []
+    raw = data.get("allow", []) if isinstance(data, dict) else []
+    if not isinstance(raw, list):
+        raise ValueError("allow must be a list of strings")
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ValueError("allow entries must be non-empty strings")
+        name = entry.strip()
+        if name == "*":
+            raise ValueError("a bare * would widen the allowlist to everything")
+        if name.endswith("*"):
+            prefix = name[:-1]
+            if len(prefix) < MIN_PREFIX:
+                raise ValueError(f"prefix {name!r} is shorter than {MIN_PREFIX} characters")
+            prefixes.append(prefix)
+        else:
+            exact.add(name)
+    return frozenset(exact), tuple(sorted(prefixes))
+
+
+def load_allowlist(path: Path | None = None) -> tuple[frozenset[str], tuple[str, ...]]:
+    """(extra exact names, extra prefixes) from the owner's file, cached on the
+    file's mtime so an edit applies to the next command with no restart. A
+    missing file is baseline only and is not an error."""
+    import logging
+    import tomllib
+
+    target = Path(path) if path is not None else role_env_file()
+    try:
+        mtime = target.stat().st_mtime
+    except OSError:
+        return frozenset(), ()
+    key = (str(target), mtime)
+    cached = _allow_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        parsed = _parse_allow(tomllib.loads(target.read_text()))
+    except (OSError, UnicodeDecodeError, ValueError, tomllib.TOMLDecodeError) as exc:
+        # the whole file, not the bad entry: fewer variables, never more
+        logging.getLogger("rework.roelenv").error(
+            "ignoring %s as a whole (baseline only): %s", target, exc
+        )
+        parsed = (frozenset(), ())
+    _allow_cache[key] = parsed
+    return parsed
+
+
+def allowed_names(env: dict[str, str] | None = None) -> set[str]:
+    """The effective allowlist, plus which of `env`'s names it would keep. Used
+    by `rework role-env show` and by the daemon's once-per-start log."""
+    import os
+
+    extra_exact, extra_prefixes = load_allowlist()
+    exact = BASELINE_EXACT | extra_exact
+    prefixes = BASELINE_PREFIXES + extra_prefixes
+    source = os.environ if env is None else env
+    return {
+        name
+        for name in source
+        if name in exact or any(name.startswith(prefix) for prefix in prefixes)
+    }
+
+
+def role_env(workdir: Path | None = None, mission_id: str | None = None) -> dict[str, str]:
+    """The environment a role command runs with: an allowlist, built from {}.
+
+    ADR 0009. The daemon's environment is never inherited, so a role cannot read
+    `REWORK_*_KEY`, `REWORK_DB`, `SSH_AUTH_SOCK`, or a proxy credential by
+    running `env`. The owner adds names in ~/.rework/role_env.toml.
+
+    The venv stripping stays (found live: the daemon runs from the main
+    checkout's venv, so `pytest` in a worktree imported the main source and
+    audits tested the wrong code). It now reads VIRTUAL_ENV and sys.prefix from
+    the daemon to know which PATH entries to remove, but never copies
+    VIRTUAL_ENV itself, and applies to every repo shape.
+
+    Also redirects rework's own state paths (~/.rework targets, env file, TUI
+    settings, logs, run registry) into a per-run scratch dir OUTSIDE the role's
+    git worktree (see scratch_dir), so a role cannot touch or redirect the real
+    state and nothing it writes can be staged by the handoff. These are plain
+    assignments: with nothing inherited there is nothing to defer to."""
     import os
     import sys
 
-    env = dict(os.environ)
+    extra_exact, extra_prefixes = load_allowlist()
+    exact = BASELINE_EXACT | extra_exact
+    prefixes = BASELINE_PREFIXES + extra_prefixes
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if name in exact or any(name.startswith(prefix) for prefix in prefixes)
+    }
 
-    # Always redirect rework-state paths to the run's scratch dir (if a workdir
-    # was given), regardless of whether the worktree has a pyproject.toml.  This
-    # prevents role commands from reading/writing the real ~/.rework
-    # (targets.toml, rework.env, tui.json, logs) and accidentally redirecting
-    # which target/db rework talks to.  The dir lives outside the git checkout,
-    # so the coder handoff's `git add -A` never sees it.
     if workdir is not None:
         scratch = scratch_dir(workdir, mission_id)
-        # Only set if not already overridden by the caller's environment.
-        env.setdefault("REWORK_TARGETS", str(scratch / "targets.toml"))
-        env.setdefault("REWORK_ENV_FILE", str(scratch / "rework.env"))
-        env.setdefault("REWORK_TUI_SETTINGS", str(scratch / "tui.json"))
-        env.setdefault("REWORK_LOG_DIR", str(scratch / "logs"))
-        env.setdefault("REWORK_RUN_DIR", str(scratch / "run"))
+        env["REWORK_TARGETS"] = str(scratch / "targets.toml")
+        env["REWORK_ENV_FILE"] = str(scratch / "rework.env")
+        env["REWORK_TUI_SETTINGS"] = str(scratch / "tui.json")
+        env["REWORK_LOG_DIR"] = str(scratch / "logs")
+        env["REWORK_RUN_DIR"] = str(scratch / "run")
 
-    if workdir is not None and not (workdir / "pyproject.toml").exists():
-        return env
-    venvs = {v for v in (env.pop("VIRTUAL_ENV", None),) if v}
-    if sys.prefix != sys.base_prefix:
-        venvs.add(sys.prefix)
-    for key in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV_PROMPT"):
-        env.pop(key, None)
-    roots = [os.path.realpath(v) for v in venvs]
-    keep = [
-        p
-        for p in env.get("PATH", "").split(os.pathsep)
-        if p and not any(os.path.realpath(p).startswith(r + os.sep) for r in roots)
-    ]
-    env["PATH"] = os.pathsep.join(keep)
+    # The daemon's venv must not be importable from a worktree that has its own
+    # Python project: found live, `pytest` in a rework worktree imported the
+    # main checkout's source and audits tested the wrong code. That pruning is
+    # scoped to a repo with its own pyproject.toml, exactly as before ADR 0009;
+    # a toy repo (no pyproject) keeps the daemon's tools through PATH, and the
+    # allowlist already guarantees VIRTUAL_ENV itself never arrives.
+    own_python = workdir is None or (workdir / "pyproject.toml").exists()
+    if own_python:
+        venvs = {v for v in (os.environ.get("VIRTUAL_ENV"),) if v}
+        if sys.prefix != sys.base_prefix:
+            venvs.add(sys.prefix)
+        roots = [os.path.realpath(v) for v in venvs]
+        keep = [
+            p
+            for p in env.get("PATH", "").split(os.pathsep)
+            if p and not any(os.path.realpath(p).startswith(r + os.sep) for r in roots)
+        ]
+        env["PATH"] = os.pathsep.join(keep)
+
+    # The daemon's git identity is an owner setting (Config.git_author, from
+    # REWORK_GIT_AUTHOR_*), not a stray variable, and a role command that runs
+    # `git commit` without it fails on a machine with no global user config.
+    # Copy it, and only it, from the daemon's own settings.
+    from rework.config import Config
+
+    author = Config.from_env().git_author
+    env.setdefault("GIT_AUTHOR_NAME", author[0])
+    env.setdefault("GIT_AUTHOR_EMAIL", author[1])
+    env.setdefault("GIT_COMMITTER_NAME", author[0])
+    env.setdefault("GIT_COMMITTER_EMAIL", author[1])
     return env
 
 

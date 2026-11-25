@@ -814,7 +814,11 @@ async def test_launch_all_creates_one_mission_per_proposal(
         cards = list(app.query(ProposalCard))
         assert len(cards) == 2
         await pilot.click(_btn(app, cards[0], "launch-all"))
-        await _settle(pilot, 1.5)
+        # POLL, do not sleep a fixed 1.5 s: on a loaded CI runner both launches
+        # can still be in flight when the sleep elapses, so a card is still
+        # `live` and the assertion fails (the same class of race `_wait_for` was
+        # added for). The assertion is unchanged; only the wait becomes robust.
+        await _wait_for(pilot, lambda: not any(card.live for card in cards))
         assert not any(card.live for card in cards), "a launched batch settles every card"
         chat_id = app.view("work").convo.id
         assert not app.swallowed
@@ -1334,7 +1338,11 @@ async def test_a_saved_chat_with_two_unlaunched_proposals_shows_and_launches_bot
         assert all(card.live for card in cards), "nothing launched, so both are pending"
         assert all(card.query_one(".pc-allbtn", Btn).display for card in cards)
         await pilot.click(_btn(app, cards[0], "launch-all"))
-        await _settle(pilot, 1.5)
+        # POLL, do not sleep a fixed 1.5 s: on a loaded CI runner both launches
+        # can still be in flight when the sleep elapses, so a card is still
+        # `live` and the assertion fails (the same class of race `_wait_for` was
+        # added for). The assertion is unchanged; only the wait becomes robust.
+        await _wait_for(pilot, lambda: not any(card.live for card in cards))
         assert not any(card.live for card in cards)
         assert not app.swallowed
     store = await _store(env)

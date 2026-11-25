@@ -193,7 +193,7 @@ class AuditorSpec(RoleSpec):
                     "Prior dispositions (do not re-raise without new evidence):\n"
                     + str(run_ctx["prior_dispositions"])[:6000]
                 )
-            parts.extend(await red_green_notes(run_ctx))
+            parts.extend(await red_green_notes(run_ctx, ctx.mission.id))
             parts.append(
                 "Audit the change: read the touched files in the workspace for"
                 " full context, run the tests if useful, then report."
@@ -254,7 +254,7 @@ class AuditorSpec(RoleSpec):
         return graph.compile()
 
 
-async def red_green_notes(run_ctx: dict[str, Any]) -> list[str]:
+async def red_green_notes(run_ctx: dict[str, Any], mission_id: str | None = None) -> list[str]:
     """Mechanical red-green check of the coder's claim, as prompt context: with
     the fix files reverted, each named test command must fail. Empty when the
     handoff claims no red-green. When it does but the check cannot be performed
@@ -270,8 +270,18 @@ async def red_green_notes(run_ctx: dict[str, Any]) -> list[str]:
     if not (commands and files and base):
         why = "no base_sha" if not base else "no commands" if not commands else "test-only change"
         return [f"Mechanical red-green check NOT performed ({why}). Verify the claim yourself."]
+    # the coder's own commands, run with the role allowlist: this spawn is
+    # role-shaped and must not inherit the daemon's provider keys (ADR 0009)
+    from rework.nodes.tools import role_env
+
     try:
-        results = await verify_red_green(Path(str(worktree)), commands, files, str(base))
+        results = await verify_red_green(
+            Path(str(worktree)),
+            commands,
+            files,
+            str(base),
+            env=role_env(Path(str(worktree)), mission_id),
+        )
     except Exception as exc:
         return [f"Mechanical red-green check could not run: {exc}. Verify it yourself."]
     lines = ["Mechanical red-green check (fix files reverted in a throwaway worktree):"]

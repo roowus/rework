@@ -2,12 +2,48 @@
 
 ## Status
 
-Proposed (design only; no code in this ADR's commit). ADR 0000 says an ADR is normally
-written in the same commit as the code that enacts it; this one is deliberately written
-first because the change is large, touches both stores, the executor and the TUI, and the
-owner's decisions below are settled. The three phases in section 13 each land under this
-ADR, and the Status moves to Accepted (with an `## Amendments` section for anything that
-changed on contact with the code) when phase 3 lands.
+Proposed, phase 1 landed (2026-11-23). ADR 0000 says an ADR is normally written in the
+same commit as the code that enacts it; this one was deliberately written first because the
+change is large, touches both stores, the executor and the TUI, and the owner's decisions
+below are settled. The three phases in section 13 each land under this ADR, and the Status
+moves to Accepted (with the `## Amendments` section below recording what changed on
+contact with the code) when phase 3 lands.
+
+## Amendments
+
+**Phase 1 (the role environment allowlist) landed 2026-11-23.** What changed against the
+design above:
+
+- `role_env` (`nodes/tools.py`) now builds from `{}` plus `BASELINE_EXACT` and
+  `BASELINE_PREFIXES`, and the `dict(os.environ)` line and the `pyproject.toml` early
+  return are both deleted. The venv `PATH` pruning stays, reading `VIRTUAL_ENV` and
+  `sys.prefix` from the daemon without copying either.
+- The owner's file is read by `load_allowlist()`, cached on `(path, mtime)` so an edit
+  applies to the next command. `rework role-env show` and `rework role-env allow NAME`
+  exist as specified. The daemon logs the dropped names once at start.
+- **One addition to the baseline, not in the design above.** `role_env` now sets
+  `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL` / `GIT_COMMITTER_NAME` /
+  `GIT_COMMITTER_EMAIL` from `Config.git_author` (the `REWORK_GIT_AUTHOR_*` setting). A
+  role command that commits without them fails on a machine with no global git identity,
+  and the value is an owner setting rather than a stray variable. The `GIT_AUTHOR_*` and
+  `GIT_COMMITTER_*` prefixes stay on the baseline for the same reason.
+- The second role-shaped spawn was closed too: `nodes/testing.py::_spawn` (used by
+  `verify_red_green`, which runs the coder's own commands) takes an `env` and the auditor
+  passes `role_env(worktree, mission_id)`. Before this it inherited the daemon environment
+  because it passed no `env=` at all.
+- **`test_injected_credential_visible_only_in_the_granted_call` was not written**, because
+  there is no injection path yet (point (b), the credential vault, is a later phase).
+  Writing it against a mechanism that does not exist would have meant inventing the
+  mechanism in the test. It lands with phase 2.
+- The regression test is `tests/unit/test_role_env.py::test_role_command_cannot_see_provider_keys_or_db`,
+  and it enumerates the real names from the deployment (`REWORK_FIREWORKS_KEY`,
+  `REWORK_DEEPSEEK_KEY`, `REWORK_DEEPINFRA_KEY`, `REWORK_ZAI_KEY`, `REWORK_DB`,
+  `REWORK_TOKEN`, plus the provider env names and `SSH_AUTH_SOCK`) rather than a pattern,
+  so a new secret has to be added to the test deliberately.
+- Possible owner-visible regressions, as predicted: a role that relied on an inherited
+  `GH_TOKEN`, `REWORK_TEST_POSTGRES`, or a proxy variable now loses it until granted with
+  `rework role-env allow`. The daemon's startup log names every dropped variable, so this
+  is discoverable rather than silent.
 
 ## Context
 
