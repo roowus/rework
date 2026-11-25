@@ -891,7 +891,17 @@ class WorkView(View):
         if not cards:
             self._sending = False
             return
-        self._launch_all_worker([card.proposal for card in cards], cards)
+        proposals = [card.proposal for card in cards]
+        # A REPLAYED chat (cards rebuilt from stored rows) has an empty
+        # `engine.proposals`: the live cards are the source of truth for what is
+        # pending, but `convo.launch` still gates on the engine list and would
+        # refuse every launch (found live: launch-all on a reopened chat created
+        # nothing). Repopulate it from the cards, exactly as the typed-yes path
+        # does, so the gate sees the same proposals the owner is looking at.
+        engine = self.convo.engine if self.convo is not None else None
+        if engine is not None and not engine.proposals:
+            engine.proposals = list(proposals)
+        self._launch_all_worker(proposals, cards)
 
     @work(group="send", exclusive=True)
     async def _launch_all_worker(self, proposals: list[Any], cards: list[Any]) -> None:
