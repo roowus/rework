@@ -8,6 +8,8 @@ build_graph entirely; standard roles use roles/assembly.py (M2).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager, nullcontext
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -74,6 +76,18 @@ class RoleBuildCtx(BaseModel):
     # menu is the prebuilt ACTIVE-skills list for the system prompt
     library: Any | None = None
     library_menu: str = ""
+    # Given back while a run is only WAITING (a parked escalation), and taken
+    # again before it resumes: the role slot and the daemon mission slot, in
+    # that order. None = no limiter (tests, evals), so parking costs nothing and
+    # the context manager is a no-op.
+    park: Callable[[], AbstractAsyncContextManager[None]] | None = None
+
+    def parked(self) -> AbstractAsyncContextManager[None]:
+        """The context a role waits inside. Always usable: a ctx with no park
+        hook (tests, evals) yields immediately."""
+        if self.park is None:
+            return nullcontext()
+        return self.park()
 
     @property
     def model_ref(self) -> dict[str, Any]:

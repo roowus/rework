@@ -34,6 +34,11 @@ class RoleLimiter:
         self._queue: list[str] = []
         self._waiters: dict[str, asyncio.Future[None]] = {}
         self._poll = poll_interval_s
+        # Run ids currently holding a slot. Exists so a park can hand the slot
+        # back and a `finally` that runs afterwards cannot release it twice:
+        # `release` becomes idempotent per run, which is what makes
+        # `while_waiting` safe to nest inside `_execute`'s own finally.
+        self._held: set[str] = set()
 
     # -- introspection (check_in, wait, tests) -----------------------------
     @property
@@ -61,6 +66,7 @@ class RoleLimiter:
         if self.running < self.cap and not self._queue:
             self.running += 1
             self.max_seen = max(self.max_seen, self.running)
+            self._held.add(run_id)
             return False
         fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._queue.append(run_id)
@@ -80,13 +86,39 @@ class RoleLimiter:
             raise
         finally:
             self._waiters.pop(run_id, None)
+        self._held.add(run_id)
         log.info("run %s admitted: %d/%d roles running", run_id, self.running, self.cap)
         return True
 
     def release(self, run_id: str) -> None:
-        """Free the slot a run held and hand it to the next queued run."""
+        """Free the slot a run held and hand it to the next queued run.
+
+        Idempotent per run: releasing a slot this run no longer holds (because
+        :meth:`while_waiting` handed it back for a park) is a no-op, so the
+        `finally` in `_execute` cannot release a second run's slot."""
+        if run_id not in self._held:
+            return
+        self._held.discard(run_id)
         self.running = max(0, self.running - 1)
         self._admit()
+
+    @asynccontextmanager
+    async def while_waiting(self, run_id: str) -> AsyncIterator[None]:
+        """Hold no role slot while a run is only waiting (a parked escalation).
+
+        A role that parks used to keep its slot for the whole 45 minute poll, so
+        a daemon with three parked missions could refuse to start any work. The
+        slot is handed back for the duration and taken again before the role
+        resumes, ahead of anything never admitted, because the parked run is
+        live work rather than new work. Nested parks release once."""
+        if run_id not in self._held:
+            yield  # not holding anything (tests, evals, an outer park)
+            return
+        self.release(run_id)
+        try:
+            yield
+        finally:
+            await self.acquire(run_id)
 
     def set_cap(self, cap: int) -> None:
         """Move the cap at RUNTIME (orchestrator/capacity.py, REWORK_CAPACITY).

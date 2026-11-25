@@ -187,6 +187,12 @@ with a continue/abort gate; approving doubles the cap and resumes, rejecting can
 Steps that FAIL get exactly one in-mission retry (the 429-storm lesson) before the
 plan moves on; synthesis counts only the latest attempt per step.
 
+An escalation has NO deadline (ADR 0011). A role that asks waits until an answer lands on
+its row, its run is aborted, or the mission is cancelled; there is no timeout that tells it
+to proceed on its own judgment. While it waits it gives both its role-concurrency slot and
+the daemon's mission slot back, so a parked mission costs no capacity, and the ask id is
+derived from `(run, question)` so a restart consumes an answer instead of re-asking.
+
 ### Tests are a deliverable
 
 A test that cannot fail is worse than no test, because it looks like safety. The
