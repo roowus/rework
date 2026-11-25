@@ -55,7 +55,7 @@ from rework.nodes.git_ops import DEFAULT_GIT_AUTHOR
 from rework.nodes.report_sections import accepted_findings_section, mechanical_verdict
 from rework.orchestrator.delivery import DELIVERY_RESULT_KEYS
 from rework.orchestrator.limits import MissionSlot, RoleLimiter
-from rework.orchestrator.rails import audit_problem
+from rework.orchestrator.rails import audit_problem, writes_code
 from rework.roles.base import EscalationKind, RoleBuildCtx
 from rework.roles.registry import RoleRegistry
 
@@ -1093,7 +1093,7 @@ class MissionRunner:
             coders = [
                 r
                 for r in await self._store.list_runs(mission.id)
-                if r.role == "coder"
+                if writes_code(r.role)
                 and r.status == RunStatus.COMPLETED
                 and (r.artifact or {}).get("branch")
             ]

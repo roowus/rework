@@ -59,6 +59,7 @@ from rework.orchestrator.rails import (
 from rework.orchestrator.rails import (
     reads_like_status_note,
     summary_is_substantive,
+    writes_code,
 )
 
 log = logging.getLogger("rework.orchestrator")
@@ -1257,8 +1258,8 @@ class MissionOrchestrator:
         live = [r for r in prior if r.status not in TERMINAL]
         if live:
             raise ToolError(f"step {step!r} already has a live run {live[-1].id}")
-        if role == "coder" and not self.mission.repo_path:
-            raise ToolError("this mission has no repo; a coder cannot run")
+        if writes_code(role) and not self.mission.repo_path:
+            raise ToolError(f"this mission has no repo; a {role} cannot run")
         model = str(args.get("model") or "").strip() or None
         if model:
             try:
@@ -1295,13 +1296,13 @@ class MissionOrchestrator:
                     f"strictness must be one of {', '.join(STRICTNESS_LEVELS)}; got {level!r}"
                 )
             context["strictness"] = level
-        if role == "coder" and not args.get("fresh"):
+        if writes_code(role) and not args.get("fresh"):
             # a revision continues the last finished coder's branch; the diff
             # base stays the original, so the auditor still sees the whole change
             done = [
                 r
                 for r in runs
-                if r.role == "coder"
+                if writes_code(r.role)
                 and r.status == RunStatus.COMPLETED
                 and (r.artifact or {}).get("branch")
             ]
@@ -1846,7 +1847,7 @@ class MissionOrchestrator:
         for run in await self.store.list_runs(self.mid):
             if run.status != RunStatus.COMPLETED:
                 continue
-            if run.role == "coder":
+            if writes_code(run.role):
                 out["code"] = run
             elif run.role == "auditor":
                 out["audit"] = run

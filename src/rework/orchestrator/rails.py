@@ -27,6 +27,18 @@ from rework.kernel.state.records import Run, RunStatus
 from rework.nodes.report_sections import blocking_findings, open_blockers
 from rework.nodes.testing import handoff_tests_gap
 
+# -- which roles write code ---------------------------------------------------
+#
+# The harness (ADR 0015) leaves the same `coder_handoff` as the coder, so every
+# place that used to look for role == "coder" must look for this instead: the
+# audit rail, the auto-wiring, the continue-branch scan and the ship picker.
+WRITING_ROLES = frozenset({"coder", "harness"})
+
+
+def writes_code(run_role: str) -> bool:
+    return run_role in WRITING_ROLES
+
+
 # -- which runs count ---------------------------------------------------------
 
 
@@ -66,7 +78,7 @@ def _cannot_write_code(plan: dict[str, Any] | None) -> bool:
     steps = plan.get("steps")
     if steps is None:
         return True  # no plan at all: DEFAULT_PLAN (echo)
-    return not any(isinstance(s, dict) and s.get("role") == "coder" for s in steps)
+    return not any(isinstance(s, dict) and writes_code(str(s.get("role"))) for s in steps)
 
 
 # -- what ships must have been audited ---------------------------------------
@@ -89,7 +101,7 @@ def audit_problem(runs: list[Run], plan: dict[str, Any] | None) -> str | None:
       mission cannot dodge the rail by spawning nothing.
     """
     audits = completed(runs, "auditor")
-    coders = [r for r in runs if r.role == "coder"]
+    coders = [r for r in runs if writes_code(r.role)]
     if not coders and not audits:
         surveyed = any(r.role == "surveyor" and r.status == RunStatus.COMPLETED for r in runs)
         if surveyed and plan_allows_unaudited_done(plan):
