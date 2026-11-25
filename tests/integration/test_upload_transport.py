@@ -18,7 +18,13 @@ from typing import Any
 
 import pytest
 
-from conftest import ScriptedProvider, role_catalog
+from conftest import (
+    AUDIT_CLEAN,
+    CODER_TESTS_BLOCK,
+    ScriptedProvider,
+    _auditor_script,
+    role_catalog,
+)
 from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.gates import GateManager
 from rework.kernel.llm.types import ChatResult, ToolCall, Usage
@@ -30,12 +36,32 @@ from rework.orchestrator.workspace import ensure_files_area, git_init_commit
 from rework.roles.registry import autodiscover
 
 OBJECTIVE = "add a notes file next to the seeded one"
-# no gates: the mission must reach synthesis without a human in the loop
+# no gates: the mission must reach synthesis without a human in the loop. The
+# audit step is not optional any more: the finish rails (ADR 0012) refuse to
+# ship a coder's work that no auditor has seen, on this path too.
 PLAN_CODE_ONLY: dict[str, Any] = {
     "steps": [
         {"step": "code", "role": "coder", "model": "flash", "context": {"brief": "$OBJECTIVE"}},
+        {
+            "step": "audit",
+            "role": "auditor",
+            "model": "flash",
+            "context": {"brief": "$OBJECTIVE"},
+            "context_from": {
+                "diff": {"step": "code", "field": "diff"},
+                "worktree_path": {"step": "code", "field": "worktree"},
+                "coder_tests": {"step": "code", "field": "tests"},
+                "base_sha": {"step": "code", "field": "base_sha"},
+                "changed_files": {"step": "code", "field": "changed_files"},
+            },
+        },
     ],
 }
+
+
+def _script_auditor(provider: ScriptedProvider) -> None:
+    """The auditor's prompt starts with its GOAL line, not a step name."""
+    provider.route("Find issues", _auditor_script(AUDIT_CLEAN))
 
 
 def _coder_writes_and_edits() -> list[ChatResult]:
@@ -57,7 +83,10 @@ def _coder_writes_and_edits() -> list[ChatResult]:
             usage=Usage(input_tokens=10, output_tokens=5),
             stop_reason="tool_calls",
         ),
-        ChatResult(text="all done", usage=Usage(input_tokens=10, output_tokens=8)),
+        ChatResult(
+            text="all done: wrote b.md and edited a.md in the workspace." + CODER_TESTS_BLOCK,
+            usage=Usage(input_tokens=10, output_tokens=8),
+        ),
     ]
 
 
@@ -107,6 +136,7 @@ async def test_upload_project_seeds_the_mission_and_saves_back(
     workroot: Path = upload_world["workroot"]
     area: Path = upload_world["area"]
     provider.route("Fulfill the task", _coder_writes_and_edits())
+    _script_auditor(provider)
 
     runner = MissionRunner(
         upload_world["mission"].id,
@@ -122,7 +152,9 @@ async def test_upload_project_seeds_the_mission_and_saves_back(
     await asyncio.wait_for(runner.run(), timeout=60)
 
     mission = await store.get_mission(upload_world["mission"].id)
-    assert mission is not None and mission.status == MissionStatus.DONE
+    assert mission is not None and mission.status == MissionStatus.DONE, (
+        mission.result if mission else None
+    )
 
     # the seeded files area became the mission's workspace, inside the workroot
     assert mission.repo_path, "upload transport must adopt a seeded repo_path"
@@ -178,9 +210,13 @@ async def test_save_back_keeps_non_ascii_filenames(upload_world: dict[str, Any])
                 usage=Usage(input_tokens=10, output_tokens=5),
                 stop_reason="tool_calls",
             ),
-            ChatResult(text="done", usage=Usage(input_tokens=10, output_tokens=3)),
+            ChatResult(
+                text="done: wrote the files above." + CODER_TESTS_BLOCK,
+                usage=Usage(input_tokens=10, output_tokens=3),
+            ),
         ],
     )
+    _script_auditor(provider)
 
     await asyncio.wait_for(_runner_for(upload_world).run(), timeout=60)
 
@@ -193,9 +229,7 @@ async def test_save_back_keeps_non_ascii_filenames(upload_world: dict[str, Any])
 
 # a ship gate the owner declines: the mission is a CANCELLED rejection
 PLAN_SHIP_GATE: dict[str, Any] = {
-    "steps": [
-        {"step": "code", "role": "coder", "model": "flash", "context": {"brief": "$OBJECTIVE"}},
-    ],
+    "steps": list(PLAN_CODE_ONLY["steps"]),  # coder, then auditor (ADR 0012)
     "gates": ["ship"],
 }
 
@@ -214,6 +248,7 @@ async def test_rejected_ship_gate_does_not_save_files(
     await store.update_mission(mission.id, plan=mission.plan)
     upload_world["mission"] = mission
     provider.route("Fulfill the task", _coder_writes_and_edits())
+    _script_auditor(provider)
     before = (area / "a.md").read_text()
 
     task = asyncio.create_task(_runner_for(upload_world).run())
@@ -242,8 +277,19 @@ async def test_mission_that_writes_nothing_saves_nothing(upload_world: dict[str,
     area: Path = upload_world["area"]
     provider.route(
         "Fulfill the task",
-        [ChatResult(text="nothing to do here", usage=Usage(input_tokens=10, output_tokens=3))],
+        [
+            ChatResult(
+                # a coder that changes nothing still owes the rail its tests
+                # block (or a reason): the finish rails are the same on every
+                # driver now (ADR 0012)
+                text="nothing to do here" + '\n\n```json\n{"tests": {"added": [], "changed": [], '
+                '"red_green_verified": false, "commands": [], "result": "", '
+                '"not_testable_reason": "no change was needed"}}\n```',
+                usage=Usage(input_tokens=10, output_tokens=3),
+            )
+        ],
     )
+    _script_auditor(provider)
 
     def commits() -> list[str]:
         return subprocess.run(
@@ -337,6 +383,7 @@ async def test_failed_save_back_is_reported_not_swallowed(
     provider: ScriptedProvider = upload_world["provider"]
     area: Path = upload_world["area"]
     provider.route("Fulfill the task", _coder_writes_and_edits())
+    _script_auditor(provider)
 
     def boom(*_args: Any, **_kwargs: Any) -> list[str]:
         raise OSError("disk on fire")

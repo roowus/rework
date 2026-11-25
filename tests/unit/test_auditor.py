@@ -185,7 +185,7 @@ async def test_auditor_reads_context_and_reports(audit_ctx: RoleBuildCtx) -> Non
 
 
 def test_covers_needs_a_real_title_not_a_fragment() -> None:
-    from rework.orchestrator.agent import _covers
+    from rework.orchestrator.rails import covers as _covers
 
     open_item = "No test for the zero-results path"
     # an exact title, or a long enough excerpt of it, covers

@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -47,9 +46,20 @@ from rework.kernel.state.records import (
 )
 from rework.kernel.state.records import run_id as make_run_id
 from rework.logs import bind
-from rework.nodes.report_sections import blocking_findings, open_blockers
-from rework.nodes.testing import handoff_tests_gap
 from rework.orchestrator.engine import MAX_SEND_BACKS
+from rework.orchestrator.rails import (
+    accepted_findings as _accepted_findings,
+)
+from rework.orchestrator.rails import (
+    audit_problem as _audit_problem,
+)
+from rework.orchestrator.rails import (
+    findings_problem as _findings_problem,
+)
+from rework.orchestrator.rails import (
+    reads_like_status_note,
+    summary_is_substantive,
+)
 
 log = logging.getLogger("rework.orchestrator")
 
@@ -580,50 +590,10 @@ def _short(value: Any, limit: int) -> str:
 
 
 # a finish summary leads the PR body ("## What changed"), so a status note like
-# "FINISHED ALREADY." (PR #34) is refused: it says nothing to a reviewer.
-_MIN_SUMMARY_CHARS = 20
-_STATUS_WORDS = frozenset(
-    {"done", "finished", "complete", "completed", "merged", "ok", "okay", "lgtm", "good", "shipped"}
-)
-_STATUS_FILLER = frozenset(
-    {
-        "a",
-        "all",
-        "already",
-        "and",
-        "been",
-        "everything",
-        "for",
-        "has",
-        "have",
-        "here",
-        "i",
-        "is",
-        "it",
-        "its",
-        "just",
-        "now",
-        "s",
-        "the",
-        "to",
-        "up",
-        "we",
-    }
-)
-
-
-def _reads_like_status_note(summary: str) -> bool:
-    """`done!`, `FINISHED ALREADY.`, `all good`, `LGTM`: a state, not a change."""
-    words = re.sub(r"[^a-z0-9 ]+", " ", summary.lower()).split()
-    rest = [w for w in words if w not in _STATUS_FILLER]
-    return bool(rest) and all(w in _STATUS_WORDS for w in rest)
-
-
-def _substantive_summary(summary: str) -> bool:
-    """Usable as a PR body: not blank, not very short, not a status note."""
-    text = " ".join(summary.split())
-    return len(text) >= _MIN_SUMMARY_CHARS and not _reads_like_status_note(text)
-
+# "FINISHED ALREADY." (PR #34) is refused. The rule itself lives in rails.py so
+# both drivers share one implementation.
+_substantive_summary = summary_is_substantive
+_reads_like_status_note = reads_like_status_note
 
 # where an entry's calls go when it leaves base_url unset (the adapters'
 # defaults; see kernel/llm/adapters)
@@ -664,20 +634,6 @@ def artifact_summary(artifact: dict[str, Any] | None) -> str:
     if artifact.get("blockers"):
         bits.append(f"{len(artifact['blockers'])} blockers")
     return "; ".join(bits) or _short(artifact, 200)
-
-
-def _plan_allows_unaudited_done(plan: dict[str, Any]) -> bool:
-    """True only for the `audit` playbook (`orchestrated_plan` stamps
-    plan["playbook"]) and only while it can never change or ship anything: no
-    coder step, no gates and no publish. `draft` also has none of those but
-    writes files into the project, so the shape alone is not enough. The
-    audit-rail exemption for a survey-only mission is keyed on this, not on
-    which runs happened to be spawned."""
-    if plan.get("playbook") != "audit":
-        return False
-    steps = plan.get("steps") or []
-    has_coder = any(isinstance(s, dict) and s.get("role") == "coder" for s in steps)
-    return not has_coder and not plan.get("gates") and not plan.get("publish")
 
 
 class MissionOrchestrator:
@@ -1263,82 +1219,25 @@ class MissionOrchestrator:
         ]
 
     async def _enforce_audit_fresh(self) -> None:
-        """The ONE mechanical rail on finish(done), not bypassable by anything
-        the orchestrator can call: what ships must have been audited.
-
-        Rule: when ANY coder run exists in the mission (whatever its status:
-        completed, failed, aborted, still running), finish(done) needs a
-        completed auditor, and no coder run may have finished after that
-        audit STARTED. The only exemption needs ALL of: the mission's PLAN
-        allows an unaudited done (the audit playbook, with no coder step, no gates
-        and no publish: see `_plan_allows_unaudited_done`), no coder run exists,
-        and a surveyor completed. A survey changes nothing, so there is no diff to audit; a
-        surveyor never excuses a coder, and never a gated or publishing plan."""
-        runs = await self.store.list_runs(self.mid)
-        audits = [r for r in runs if r.role == "auditor" and r.status == RunStatus.COMPLETED]
-        coders = [r for r in runs if r.role == "coder"]
-        if not coders and not audits:
-            surveyed = any(r.role == "surveyor" and r.status == RunStatus.COMPLETED for r in runs)
-            if surveyed and _plan_allows_unaudited_done(await self._fresh_plan()):
-                return
-        if not audits:
+        """finish(done) needs a fresh audit. The rule is `rails.audit_problem`,
+        shared with the template runner so neither driver can ship unchecked."""
+        problem = _audit_problem(await self.store.list_runs(self.mid), await self._fresh_plan())
+        if problem:
             raise ToolError(
-                "no auditor has completed in this mission: spawn an auditor on the coder's "
-                "branch and wait for it before finishing with outcome='done'"
+                problem + ". Spawn an auditor on the current branch and wait for it, "
+                "then finish (a coder whose handoff is missing its tests block needs "
+                "the coder spawned again with that named in its brief)."
             )
-        last_audit = audits[-1]
-        # a coder run that ended (or is still running) after the audit STARTED
-        # changed or may change the branch after the auditor looked (they can
-        # run in parallel): compare its last update to the audit's start. A
-        # coder that failed or timed out may still have left edits behind.
-        after = [r for r in coders if (r.updated_at or r.created_at) > last_audit.created_at]
-        if after:
-            raise ToolError(
-                f"coder {after[-1].id} ({after[-1].status}) ran after the last completed "
-                f"audit {last_audit.id}: those changes are unaudited. Spawn an auditor on "
-                "the current branch and wait for it, then finish."
-            )
-        # tests are a deliverable: the coder whose branch ships must have
-        # reported its red-green tests block (or a not_testable_reason). Scoped
-        # to coder runs, so echo/investigate-only/draft missions are untouched.
-        if coders:
-            problem = handoff_tests_gap(coders[-1].artifact)
-            if problem:
-                raise ToolError(
-                    f"coder {coders[-1].id} handoff is incomplete on tests: {problem}. "
-                    "Spawn the coder again (name the missing tests field in its brief) and "
-                    "re-audit, then finish."
-                )
 
     async def _enforce_findings_accepted(self, accepted: list[dict[str, str]]) -> None:
-        """finish(done) with open medium-or-higher findings or blockers is the
-        orchestrator's JUDGMENT, not a mechanical block: it is allowed only when
-        every such open item is named in accepted_findings with a reason. This
-        replaces the old fixed 'medium-or-higher always blocks' rule."""
-        audits = await self._completed_runs("auditor")
-        if not audits:
-            return  # _enforce_audit_fresh already refused this
-        artifact = audits[-1].artifact or {}
-        open_items = [str(f.get("title") or "") for f in blocking_findings(artifact)]
-        open_items += [str(b.get("question") or "") for b in open_blockers(artifact)]
-        open_items = [item for item in open_items if item]
-        if not open_items:
-            return
-        covered = {str(a.get("finding") or "").strip().lower() for a in accepted}
-        covered.discard("")
-        missing = [
-            item
-            for item in open_items
-            if not any(_covers(covered_key, item) for covered_key in covered)
-        ]
-        if missing:
+        """Shipping with open medium-or-higher findings is the orchestrator's
+        JUDGMENT, allowed only when every one is named with a reason."""
+        problem = _findings_problem(await self.store.list_runs(self.mid), accepted)
+        if problem:
             raise ToolError(
-                "the latest audit still has open medium-or-higher findings/blockers that "
-                "accepted_findings does not cover: "
-                + "; ".join(missing)
-                + ". Either spawn the coder again with these in its brief and re-audit, or "
-                "call finish again with accepted_findings listing each one and why you are "
-                "shipping with it open."
+                problem + ". Either spawn the coder again with these in its brief and re-audit, "
+                "or call finish again with accepted_findings listing each one and why "
+                "you are shipping with it open."
             )
 
     async def _spawn(self, call_id: str, args: dict[str, Any]) -> str:
@@ -2037,46 +1936,6 @@ class MissionOrchestrator:
 
 
 DEFAULT_TURNS = {"investigator": 20, "surveyor": 25, "coder": 40, "auditor": 25}
-
-
-def _accepted_findings(raw: Any) -> list[dict[str, str]]:
-    """Sanitize the finish tool's accepted_findings: entries without both a
-    finding reference and a reason are the model filling the field in to get
-    past the rail, so they are dropped (and then refused as uncovered)."""
-    if not isinstance(raw, list):
-        return []
-    out: list[dict[str, str]] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        finding = str(item.get("finding") or item.get("title") or item.get("id") or "").strip()
-        reason = str(item.get("reason") or "").strip()
-        if finding and reason:
-            out.append({"finding": finding, "reason": reason})
-    return out
-
-
-_COVER_MIN_CHARS = 20  # a containment match needs real title, not a fragment
-
-
-def _covers(accepted_key: str, open_item: str) -> bool:
-    """Does an accepted_findings entry name this open finding/blocker? Exact
-    match first, then a containment match either way so a long title quoted
-    slightly differently still counts (the model quotes titles imperfectly).
-
-    Containment is deliberately strict: the excerpt must be at least
-    _COVER_MIN_CHARS long, so one vague entry ("tests", "the caller may
-    crash") cannot silently cover several unrelated findings. This is a soft
-    matching heuristic for the judgment-call path, never a bypass of the
-    audit-fresh rail (_enforce_audit_fresh), which is mechanical and exact."""
-    if not accepted_key:
-        return False
-    item = open_item.strip().lower()
-    if accepted_key == item:
-        return True
-    if len(accepted_key) < _COVER_MIN_CHARS:
-        return False
-    return accepted_key in item or item in accepted_key
 
 
 def _turn_budget(role: str, args: dict[str, Any]) -> int:

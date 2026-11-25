@@ -189,7 +189,13 @@ async def test_kill_mid_role_resumes_from_checkpoint(world: dict[str, Any]) -> N
     runner1 = _runner(world, mission.id)
     task1 = asyncio.create_task(runner1.run())
     await _wait_for(lambda: _run_status_is(store, mission.id, "running"), what="run started")
-    await asyncio.sleep(0.2)  # work done (checkpointed), mid-grind now
+    # Wait for the `grind` NODE to start, not a fixed 0.2 s: by then `work` has
+    # checkpointed and grind's 0.6 s sleep is in flight, which is exactly the
+    # "mid-grind" the kill must land inside. A fixed sleep lost this race under
+    # the full suite's load (work had not checkpointed, so resume had nothing).
+    await _wait_for(
+        lambda: _node_entered(store, mission.id, "grind"), what="the grind node to start"
+    )
     task1.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(task1, timeout=5)
@@ -556,6 +562,17 @@ async def _run_status_is(store: SqliteStore, mission_id: str, status: str) -> bo
     return any(r.status.value == status for r in runs)
 
 
+async def _node_entered(store: SqliteStore, mission_id: str, node: str) -> bool:
+    """Has `node` started in this mission? `_NodeEvents` publishes a PROGRESS
+    event with `{node, phase: enter}` per node start, so this is a real signal
+    rather than a guess at a sleep duration."""
+    for event in await store.events_since(0, mission_id=mission_id):
+        payload = event.payload or {}
+        if payload.get("node") == node and payload.get("phase") == "enter":
+            return True
+    return False
+
+
 async def _lock_held(store: SqliteStore, owner: str) -> bool:
     row = await store._fetch_one("SELECT owner FROM daemon_lock WHERE id = 1", ())
     return row is not None and row["owner"] == owner
@@ -741,7 +758,10 @@ async def test_crashed_runner_marks_the_mission_failed(world: dict[str, Any]) ->
             await asyncio.sleep(0.1)
         mission = await store.get_mission("m-broken")
         assert mission is not None and mission.status == MissionStatus.FAILED
-        assert "empty plan" in str((mission.result or {}).get("error"))
+        # ADR 0012: an empty plan has no driver and is refused at the driver
+        # guard, before the plan-steps check. The failure is what matters.
+        error = str((mission.result or {}).get("error"))
+        assert "empty plan" in error or "has no driver" in error, error
     finally:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):

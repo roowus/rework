@@ -694,10 +694,15 @@ def test_new_mechanical_never_reroutes_an_audit_to_draft(rework_db: Path) -> Non
     assert result.exit_code == 0, result.output
     mission = _get_mission(rework_db, result.stdout.strip())
     assert mission is not None
-    # a template mission is built from no playbook spec at all (the engine's
-    # DEFAULT_PLAN template routes it), which is exactly what base did here: a
-    # draft plan would instead carry PLAN_FIX's steps under kind "draft"
-    assert mission.plan is None, "a template mission keeps the caller's plan"
+    # a template mission never gets a draft plan: a draft would carry PLAN_FIX's
+    # steps under kind "draft" and silently deny the coder's branch and PR. The
+    # plan may be the engine's echo default, stamped by create_mission since
+    # ADR 0012 so a mission always names its driver; what matters is that it is
+    # not a draft.
+    plan = mission.plan or {}
+    assert plan.get("kind") != "draft"
+    assert plan.get("playbook") != "draft"
+    assert not plan.get("publish"), "a mechanical audit mission must not publish"
     assert "read-and-report objective" not in result.stderr
 
 

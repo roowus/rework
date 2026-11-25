@@ -52,12 +52,15 @@ Everything else is written against these protocols:
 
 ### Orchestrator
 
-**Today:** `MissionRunner._run_steps` is a mechanical runner over a canned plan
+**`MissionRunner._run_template`** is a FROZEN mechanical runner over a canned plan
 (`missions.PLAN_FIX`: investigate, code, audit, revise on request-changes at most
 twice, one retry per failed step, then the ship or open_pr gate). Steps run one
-at a time. Escalations are handled by mechanical policy or become human gates,
-and synthesis is mechanical. The only LLM that talks to the owner is the
-pre-mission chat (`orchestrator/chat.py`), which proposes missions.
+at a time. It exists for the eval harness, which needs the same plan every run,
+and for `rework new --mechanical`; it is not the product driver (ADR 0012), and
+it gains bug fixes only, never new behaviour. It applies the same finish rails
+as the orchestrator (`orchestrator/rails.py`), so a template mission cannot ship
+unaudited. The only LLM that talks to the owner on this path is the pre-mission
+chat (`orchestrator/chat.py`), which proposes missions.
 
 **Orchestrated missions (ADR 0007, M7; core landed):** `plan.kind == "auto"`
 missions are run by `orchestrator/agent.py::MissionOrchestrator`, a
