@@ -44,17 +44,11 @@ class Escalation(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
-class EscalationPolicy(BaseModel):
-    kinds: set[EscalationKind] = Field(default_factory=lambda: set(EscalationKind))
-    max_escalations: int = 3
-
-
-class ToolPack(BaseModel):
-    """Tools/skills the role may use. Executed by the ToolExecutor the engine hands
-    the graph (LocalExecutor now, DockerExecutor at the sandboxing milestone)."""
-
-    allowed: set[str] = Field(default_factory=set)
-    mcp_servers: list[str] = Field(default_factory=list)
+# Escalation and tool exposure are not declared here. Both used to be
+# (`EscalationPolicy`, `ToolPack`) and nothing read either: exposure is decided by
+# the executor WRAPPER a role builds (the escalate/read-only/library/web
+# wrappers), and an escalation's kind travels on the run row. Two mechanisms for
+# one job is how the declarative one drifted into a lie (ADR 0017).
 
 
 class RoleBuildCtx(BaseModel):
@@ -149,8 +143,6 @@ class RoleSpec(ABC):
     description: str = ""
     goal: str = ""  # the line that anchors every prompt for this role (ADR 0003)
     default_model: str = ""  # catalog id
-    tools: ToolPack = ToolPack()
-    escalation: EscalationPolicy = EscalationPolicy()
     budget: Budget = Budget()
     # what this role can consume in its task context; the orchestrator picks
     # per mission which keys to actually hand over (ADR 0003 decision 5)

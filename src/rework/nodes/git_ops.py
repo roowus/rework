@@ -13,7 +13,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from rework.nodes.failure_text import HTTP_5XX, RATE_LIMIT, marker_regex, scrub
-from rework.nodes.tools import ToolExecutor
 
 # The fallback commit identity: a deployment that configures nothing
 # (REWORK_GIT_AUTHOR_NAME/EMAIL) gets this, exactly as `commit()` always has.
@@ -621,11 +620,3 @@ async def head_branch_name(worktree: Path) -> str:
     if code != 0 or name == "HEAD":
         return ""
     return name
-
-
-def worktree_executor(worktree: Path) -> ToolExecutor:
-    """A LocalExecutor jailed to the worktree: the coder's tools only see its
-    own checkout (CLAUDE.md rule 6, the v1 isolation line)."""
-    from rework.nodes.tools import LocalExecutor
-
-    return LocalExecutor(worktree)

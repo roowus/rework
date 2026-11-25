@@ -198,11 +198,9 @@ class LocalExecutor:
     def __init__(
         self,
         workdir: Path,
-        extra_specs: list[ToolSpec] | None = None,
         mission_id: str | None = None,
     ) -> None:
         self._workdir = workdir.resolve()
-        self._extra = extra_specs or []
         self._mission_id = mission_id  # names the scratch dir; gc reclaims it
         reap_orphaned_commands()
 
@@ -300,10 +298,9 @@ class LocalExecutor:
             return f"error: {exc}"
 
     def specs(self, allowed: set[str] | None = None) -> list[ToolSpec]:
-        all_specs = BUILTIN_TOOLS + self._extra
         if allowed is None:
-            return list(all_specs)
-        return [s for s in all_specs if s.name in allowed]
+            return list(BUILTIN_TOOLS)
+        return [s for s in BUILTIN_TOOLS if s.name in allowed]
 
 
 # Per-workdir scratch dirs, keyed by the resolved workdir. role_env runs once

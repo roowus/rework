@@ -9,6 +9,7 @@ then PENDING missions start normally.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
@@ -179,6 +180,7 @@ class Daemon:
         self._bg: set[asyncio.Task[None]] = set()
         self._owner = f"daemon-{uuid.uuid4().hex[:8]}"
         self._code: CodeChangeWatcher | None = None
+        self._source_task: asyncio.Task[None] | None = None
 
     async def run_forever(self) -> None:
         # staleness must be a small multiple of the heartbeat period, or a
@@ -200,6 +202,9 @@ class Daemon:
             # for a pip install with no git tree, which disables auto-update)
             self._repo_root = find_repo_root()
             self._last_update_check = time.monotonic()
+            # the issue-tracker poller runs on ITS OWN cadence, not the hot
+            # dispatch loop: a slow tracker must never delay a mission (ADR 0016)
+            self._source_task = asyncio.create_task(self._poll_sources())
             while True:
                 await self._store.heartbeat_lock(self._owner)
                 await self._pickup_pending()
@@ -211,6 +216,10 @@ class Daemon:
         finally:
             # no leaked task on any exit path: CancelledError, a normal return
             # and `raise SystemExit(0)` from auto-update all come through here
+            if self._source_task is not None:
+                self._source_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._source_task
             await self._capacity.stop()
             await self._store.release_lock(self._owner)
 
@@ -233,6 +242,59 @@ class Daemon:
                 len(dropped),
                 ", ".join(dropped),
             )
+
+    async def _poll_sources(self) -> None:
+        """Turn ready work items from the tracker into missions, forever.
+
+        Disabled unless configured (REWORK_PLANE_TOKEN and friends, ADR 0016).
+        Each tick is bounded, so a hung tracker costs one tick, and a failure is
+        a log line rather than a dead daemon."""
+        from rework.sources import poller
+
+        config = poller.plane_config()
+        if not poller.enabled(config):
+            log.info("no issue source configured (REWORK_PLANE_*): poller idle")
+            return
+        client = poller.build_client(config)
+        log.info("polling %s every %.0fs for work items", config["url"], config["interval_s"])
+        try:
+            while True:
+                try:
+                    created = await asyncio.wait_for(
+                        poller.poll_once(
+                            self._store,
+                            client,
+                            state=config["state"],
+                            label=config["label"],
+                        ),
+                        timeout=min(config["interval_s"], 60),
+                    )
+                    for mission_id in created:
+                        await self._source_mission(mission_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # a tracker outage is a log line
+                    log.warning("source poll failed: %s", exc)
+                await asyncio.sleep(config["interval_s"])
+        finally:
+            await client.close()
+
+    async def _source_mission(self, mission_id: str) -> None:
+        """A source-created mission carries no plan (the bridge does not know
+        which playbook fits), so give it the same default a bare `rework new`
+        would get: an orchestrated fix. The normal pickup path then dispatches
+        it."""
+        mission = await self._store.get_mission(mission_id)
+        if mission is None or mission.plan is not None:
+            return
+        from rework.cli import default_orchestrator_model
+        from rework.missions import orchestrated_plan
+
+        await self._store.update_mission(
+            mission_id,
+            plan=orchestrated_plan("fix", default_orchestrator_model(self._catalog)),
+        )
+        log.info("source mission %s queued for dispatch", mission_id)
 
     def _check_code(self) -> None:
         """The checkout this daemon was started from changed (a merge landed in

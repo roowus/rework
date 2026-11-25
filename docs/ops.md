@@ -551,6 +551,13 @@ rework therefore bounds itself. Five knobs, all optional, all in
 | `REWORK_SANDBOX_IMAGE` | `python:3.12-slim` | the image a sandboxed run uses; it must carry the repo's toolchain (git, the runtime) |
 | `REWORK_SANDBOX_CPUS` | unset | an extra `--cpus` cap on the sandbox container (memory comes from `REWORK_ROLE_MEMORY_MAX`) |
 | `REWORK_DOCKER_BIN` | `docker` on PATH | which docker client to use (tests set a fake) |
+| `REWORK_PLANE_URL` | unset | base URL of a Plane instance; the poller is OFF unless set with a token and a workspace/project |
+| `REWORK_PLANE_TOKEN` | unset | Plane personal access token (`X-API-Key`) |
+| `REWORK_PLANE_WORKSPACE` | unset | workspace slug |
+| `REWORK_PLANE_PROJECT` | unset | project id the bridge reads and comments on |
+| `REWORK_PLANE_STATE` | unset | only work items in this state become missions |
+| `REWORK_PLANE_LABEL` | unset | only work items carrying this label (id or name) become missions |
+| `REWORK_PLANE_POLL_S` | `60` | how often the bridge polls; it runs as its own task, never on the dispatch loop |
 
 `REWORK_MAX_ROLES` is daemon-wide: every `spawn_role` counts, whichever mission
 it belongs to. Runs beyond the cap are not refused, they queue — the run row
