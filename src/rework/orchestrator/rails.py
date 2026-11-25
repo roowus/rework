@@ -50,16 +50,23 @@ def plan_allows_unaudited_done(plan: dict[str, Any] | None) -> bool:
     return not has_coder and not plan.get("gates") and not plan.get("publish")
 
 
-def _is_echo_plan(plan: dict[str, Any] | None) -> bool:
-    """The engine's no-op default: every step is the echo role, nothing ships.
-    `mission.plan is None` is that same default (see DEFAULT_PLAN)."""
+def _cannot_write_code(plan: dict[str, Any] | None) -> bool:
+    """True when nothing in this plan can change a repository, so there is no
+    diff to audit.
+
+    No coder/harness step, no publish, and not a coding playbook. `draft` writes
+    files into the project, so it is excluded even though it has no coder step;
+    `audit` is handled by its own surveyor rule before this is reached. A plan
+    with no `steps` at all is the engine's echo default (DEFAULT_PLAN)."""
     plan = plan or {}
-    if plan.get("playbook") or plan.get("publish"):
+    if plan.get("publish"):
+        return False
+    if str(plan.get("playbook") or "") in ("draft", "fix", "fix-pr"):
         return False
     steps = plan.get("steps")
     if steps is None:
         return True  # no plan at all: DEFAULT_PLAN (echo)
-    return bool(steps) and all(isinstance(s, dict) and s.get("role") == "echo" for s in steps)
+    return not any(isinstance(s, dict) and s.get("role") == "coder" for s in steps)
 
 
 # -- what ships must have been audited ---------------------------------------
@@ -68,12 +75,18 @@ def _is_echo_plan(plan: dict[str, Any] | None) -> bool:
 def audit_problem(runs: list[Run], plan: dict[str, Any] | None) -> str | None:
     """Why `done` is not allowed yet, or None when the audit rail is satisfied.
 
-    Rule: when ANY coder run exists in the mission (whatever its status:
-    completed, failed, aborted, still running), finishing needs a completed
-    auditor, and no coder run may have finished after that audit STARTED. The
-    only exemption needs ALL of: the plan allows an unaudited done (the audit
-    playbook, no coder step, no gates, no publish), no coder run exists, and a
-    surveyor completed. A survey changes nothing, so there is no diff to audit.
+    Rule: when ANY code-writing run exists in the mission (coder or harness,
+    whatever its status: completed, failed, aborted, still running), finishing
+    needs a completed auditor, and no code-writing run may have finished after
+    that audit STARTED.
+
+    Exemptions, in order:
+    - the survey-only audit playbook: a COMPLETED surveyor stands in (a survey
+      changes nothing, so there is no diff);
+    - a plan that cannot write code at all (echo, a read-only plan, a test-only
+      role like the chaos suite's `crashy`): nothing ships, nothing to audit.
+      A CODING playbook is never exempt even before its coder runs, so a
+      mission cannot dodge the rail by spawning nothing.
     """
     audits = completed(runs, "auditor")
     coders = [r for r in runs if r.role == "coder"]
@@ -81,14 +94,14 @@ def audit_problem(runs: list[Run], plan: dict[str, Any] | None) -> str | None:
         surveyed = any(r.role == "surveyor" and r.status == RunStatus.COMPLETED for r in runs)
         if surveyed and plan_allows_unaudited_done(plan):
             return None
-        # The echo plan is the engine's documented no-op default (DEFAULT_PLAN)
-        # and ships nothing, so it has no diff to audit. This is deliberately
-        # narrow: every other read-only playbook still needs its evidence
-        # (the audit playbook needs a COMPLETED surveyor, above; draft writes
-        # files into the project), and a coding playbook needs an auditor even
-        # before its coder step has run, so a mission cannot dodge the rail by
-        # spawning nothing.
-        if _is_echo_plan(plan):
+        if str((plan or {}).get("playbook") or "") == "audit":
+            # the audit playbook's evidence IS a completed surveyor: an audit
+            # that produced no survey has produced nothing
+            return (
+                "the audit playbook needs a COMPLETED surveyor: a survey that failed "
+                "or never ran leaves the mission with no evidence to report"
+            )
+        if _cannot_write_code(plan):
             return None
     if not audits:
         return (
