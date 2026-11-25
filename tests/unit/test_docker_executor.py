@@ -29,7 +29,9 @@ printf '%s\\n' "$*" >> {log}
 case "$1" in
   inspect) exit 1 ;;
   exec)
-    shift 2   # exec <name>
+    shift 2   # exec [--workdir /work] ... -> drop args until the container name
+    while [ "$1" = "--workdir" ] || [ "$1" = "/work" ]; do shift; done
+    shift 1   # <name>
     shift 2   # sh -c   (the rest is the command string)
     exec /bin/sh -c "$*"
     ;;
@@ -92,9 +94,8 @@ async def test_the_container_mounts_only_the_worktree(tmp_path: Path, fake_docke
     ex = DockerExecutor(tmp_path, run_id="r1")
     await ex.execute("run_command", {"command": "true"})
     run_line = next(c for c in _calls(fake_docker) if c.startswith("run "))
-    mounts = [part for part in run_line.split() if part == "--volume"]
-    assert mounts, "the worktree must be mounted"
-    assert str(tmp_path) in run_line
+    assert "--volume" in run_line, "the worktree must be mounted"
+    assert f"{tmp_path}:/work" in run_line, "mounted at a fixed in-container path"
     for forbidden in ("/var/run/docker.sock", str(Path.home() / ".rework")):
         assert forbidden not in run_line, f"{forbidden} must never be mounted"
 

@@ -40,6 +40,11 @@ from rework.nodes.tools import (
 )
 
 DEFAULT_IMAGE = "python:3.12-slim"
+# Where the run's worktree appears INSIDE the container. A fixed path, not the
+# host's: the first real run set --workdir to the host's absolute worktree and
+# `docker exec` refused ("current working directory is outside of container
+# mount namespace root"), because the exec process's cwd was not a mounted path.
+CONTAINER_WORKDIR = "/work"
 SANDBOX_LABEL = "rework.managed"
 CONTAINER_PREFIX = "rework-"
 
@@ -159,9 +164,9 @@ class DockerExecutor:
             "--network",
             self._network,
             "--workdir",
-            str(self._workdir),
+            CONTAINER_WORKDIR,
             "--volume",
-            f"{self._workdir}:{self._workdir}",
+            f"{self._workdir}:{CONTAINER_WORKDIR}",
             "--user",
             f"{os.getuid()}:{os.getgid()}",
         ]
@@ -207,6 +212,8 @@ class DockerExecutor:
         proc = await asyncio.create_subprocess_exec(
             self._docker or "docker",
             "exec",
+            "--workdir",
+            CONTAINER_WORKDIR,
             name,
             "/bin/sh",
             "-c",
