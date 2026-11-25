@@ -102,18 +102,45 @@ async def test_the_container_mounts_only_the_worktree(tmp_path: Path, fake_docke
 async def test_the_container_gets_allowlisted_names_not_values(
     tmp_path: Path, fake_docker: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`-e NAME` forwards the variable by name; a value on our argv would put
-    the secret in the daemon's process list."""
+    """The container's environment is EXPLICIT and minimal.
+
+    Found live on the first real container: `-e NAME` alone forwards the
+    DAEMON's value, so the sandbox inherited the host's HOME, its venv PATH and
+    its locale. A sandbox must start clean; only an owner-granted variable is
+    forwarded, and only by the value the daemon holds."""
     monkeypatch.setenv("REWORK_FIREWORKS_KEY", "fw-SECRET")
     monkeypatch.setenv("HOME", "/home/tester")
+    monkeypatch.setenv("PATH", "/host/venv/bin:/usr/bin")
     ex = DockerExecutor(tmp_path, run_id="r1")
     await ex.execute("run_command", {"command": "true"})
 
     run_line = next(c for c in _calls(fake_docker) if c.startswith("run "))
     assert "fw-SECRET" not in run_line, "no secret value may appear in argv"
+    assert "HOME=/home/tester" not in run_line, "the host HOME must not leak in"
+    assert "/host/venv/bin" not in run_line, "the daemon venv must not leak in"
+    assert "HOME=/tmp" in run_line, "the container gets its own writable HOME"
     assert "--network none" in run_line
     assert "--cap-drop=ALL" in run_line
     assert "no-new-privileges" in run_line
+
+
+async def test_an_owner_granted_variable_is_forwarded(
+    tmp_path: Path, fake_docker: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit `role-env allow` IS honoured: that is the owner asking for it."""
+    allow = tmp_path / "role_env.toml"
+    allow.write_text('allow = ["MY_TOOL_TOKEN"]\n')
+    monkeypatch.setenv("REWORK_ROLE_ENV_FILE", str(allow))
+    monkeypatch.setenv("MY_TOOL_TOKEN", "t-123")
+    import rework.nodes.tools as tools
+
+    tools._allow_cache.clear()
+
+    ex = DockerExecutor(tmp_path, run_id="r1")
+    await ex.execute("run_command", {"command": "true"})
+
+    run_line = next(c for c in _calls(fake_docker) if c.startswith("run "))
+    assert "MY_TOOL_TOKEN=t-123" in run_line
 
 
 async def test_a_timeout_kills_the_container_and_forgets_it(

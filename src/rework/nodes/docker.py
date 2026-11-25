@@ -169,11 +169,29 @@ class DockerExecutor:
             argv += ["--memory", self._memory]
         if self._cpus:
             argv += ["--cpus", self._cpus]
-        # only the allowlisted names, and names not values: the container reads
-        # them from its own docker env, never from our argv or the daemon's env
+        # The container's environment is EXPLICIT, not forwarded. `-e NAME`
+        # alone would copy the value from the DAEMON's environment, which is how
+        # the first real run leaked the host's HOME, its venv PATH and its
+        # locale into a sandbox. A sandbox starts with a clean, predictable
+        # environment; the allowlist decides which of the host's vars MAY be
+        # forwarded, and even then only by the values the daemon holds for it.
         allowed = role_env(self._workdir, self._mission_id)
-        for var in sorted(allowed):
-            argv += ["-e", var]
+        container_env: dict[str, str] = {
+            # a writable home the image's `user` can actually use
+            "HOME": "/tmp",
+            "PATH": _CONTAINER_PATH,
+            "LANG": allowed.get("LANG", "C.UTF-8"),
+            "TERM": allowed.get("TERM", "dumb"),
+        }
+        if allowed.get("TZ"):
+            container_env["TZ"] = allowed["TZ"]
+        # an owner-granted variable (the allowlist's additions, beyond the
+        # baseline) IS forwarded, because that is what the owner asked for
+        for name in _owner_granted(allowed):
+            if name in os.environ:
+                container_env[name] = os.environ[name]
+        for name, value in sorted(container_env.items()):
+            argv += ["-e", f"{name}={value}"]
         argv += [self._image, "sleep", "infinity"]
 
         code, out = await self._docker_exec(*argv, limit_s=120)
@@ -227,6 +245,26 @@ class DockerExecutor:
             proc.kill()
             return -1, "docker command timed out"
         return proc.returncode or 0, out.decode(errors="replace")
+
+
+# What a command inside the sandbox sees on PATH. NOT the daemon's PATH: that
+# is how a venv and a host toolchain leaked into a container on the first real
+# run. The image's own layout is the honest answer.
+_CONTAINER_PATH = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
+
+
+def _owner_granted(allowed: dict[str, str]) -> set[str]:
+    """The names on the OWNER's list (not the built-in baseline): an explicit
+    grant is the one thing a sandbox may forward from the host, because the
+    owner asked for it by name."""
+    from rework.nodes.tools import BASELINE_EXACT, BASELINE_PREFIXES
+
+    return {
+        name
+        for name in allowed
+        if name not in BASELINE_EXACT
+        and not any(name.startswith(prefix) for prefix in BASELINE_PREFIXES)
+    }
 
 
 def _docker_client_env() -> dict[str, str]:
