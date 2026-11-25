@@ -254,17 +254,37 @@ _CONTAINER_PATH = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 
 
 def _owner_granted(allowed: dict[str, str]) -> set[str]:
-    """The names on the OWNER's list (not the built-in baseline): an explicit
-    grant is the one thing a sandbox may forward from the host, because the
-    owner asked for it by name."""
+    """The names the owner explicitly added to the allowlist, and nothing else.
+
+    Two things must NOT be forwarded, and both bit the first real container:
+
+    - the five `REWORK_*` scratch redirects that `role_env` sets ITSELF (they
+      point at host paths under the scratch dir, which do not exist in the
+      container), so every `REWORK_*` is excluded here regardless;
+    - a name whose value carries whitespace, because `-e NAME=VALUE` on one argv
+      element with a space is how docker ended up reading `TERM` as a container
+      name. An owner grant is a plain value (a token, a proxy URL); anything else
+      is refused with a warning rather than corrupted."""
     from rework.nodes.tools import BASELINE_EXACT, BASELINE_PREFIXES
 
-    return {
-        name
-        for name in allowed
-        if name not in BASELINE_EXACT
-        and not any(name.startswith(prefix) for prefix in BASELINE_PREFIXES)
-    }
+    out: set[str] = set()
+    for name in allowed:
+        if name.startswith("REWORK_"):
+            continue
+        if name in BASELINE_EXACT:
+            continue
+        if any(name.startswith(prefix) for prefix in BASELINE_PREFIXES):
+            continue
+        value = os.environ.get(name, "")
+        if " " in value or "\n" in value:
+            import logging
+
+            logging.getLogger("rework.docker").warning(
+                "not forwarding %s into the sandbox: its value contains whitespace", name
+            )
+            continue
+        out.add(name)
+    return out
 
 
 def _docker_client_env() -> dict[str, str]:
