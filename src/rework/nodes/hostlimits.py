@@ -269,6 +269,19 @@ def reset_report_flag() -> None:
     _reported = False
 
 
+def _bus_reachable(env: dict[str, str] | None) -> bool:
+    """Whether a systemd USER scope can reach the user bus from `env`.
+
+    `systemd-run --user` needs XDG_RUNTIME_DIR or DBUS_SESSION_BUS_ADDRESS. The
+    DAEMON has them, but a role command runs with the ALLOWLISTED env (ADR 0009)
+    which may not; CI's job env has neither, so the probe passed against the
+    daemon and every role command then failed with "Failed to connect to user
+    scope bus". When `env` is given we trust IT, not the daemon's process env."""
+    if env is None:
+        return True  # caller has no stricter view; behave as before
+    return bool(env.get("XDG_RUNTIME_DIR") or env.get("DBUS_SESSION_BUS_ADDRESS"))
+
+
 def command_prefix(
     command: str,
     *,
@@ -276,6 +289,7 @@ def command_prefix(
     which: Callable[[str], str | None] = shutil.which,
     scope_available: Callable[[], bool] = systemd_scope_available,
     system_scope: Callable[[], bool] = system_scope_available,
+    env: dict[str, str] | None = None,
 ) -> list[str]:
     """argv prefix that runs `command` (a shell string) under a resource chain:
 
@@ -307,7 +321,7 @@ def command_prefix(
             # exit 1 for every command; found on the first GitHub CI run), so
             # ionice runs INSIDE the scope instead.
             shell = [str(ionice), "-c3", "-n7", *shell]
-        if scope_available():
+        if scope_available() and _bus_reachable(env):
             return [str(srun), "--user", "--scope", "--quiet", *props, *shell]
         if system_scope():
             return [

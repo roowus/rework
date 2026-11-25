@@ -228,7 +228,11 @@ class LocalExecutor:
                 from rework.nodes.hostlimits import report_once as _report_wrapper
 
                 memory_max = configured_memory_max()
-                prefix = command_prefix(command, memory_max=memory_max)
+                # the command's OWN environment: computed once and used both for
+                # the prefix choice and the spawn, so the user-scope probe sees
+                # exactly what the command will (ADR 0009 + CI's missing bus)
+                proc_env = role_env(self._workdir, self._mission_id)
+                prefix = command_prefix(command, memory_max=memory_max, env=proc_env)
                 _report_wrapper(prefix, memory_max)
                 proc = await asyncio.create_subprocess_exec(
                     *prefix,
@@ -236,7 +240,7 @@ class LocalExecutor:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     start_new_session=True,
-                    env=role_env(self._workdir, self._mission_id),
+                    env=proc_env,
                 )
                 mark = _register_command(proc.pid, command)
                 try:
@@ -349,6 +353,13 @@ BASELINE_EXACT: frozenset[str] = frozenset(
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
         "XDG_STATE_HOME",
+        # the session bus: `hostlimits.command_prefix` may run a role command
+        # under `systemd-run --user`, which needs a reachable user bus. Without
+        # these two it fails with "Failed to connect to user scope bus", which
+        # on CI (no XDG_RUNTIME_DIR/DBUS in the job env) broke EVERY role
+        # command. They are runtime paths, not secrets.
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
         # uv and python behaviour (paths and switches, never URLs)
         "UV_CACHE_DIR",
         "UV_PYTHON",

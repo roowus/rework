@@ -509,6 +509,46 @@ def test_max_roles_on_the_config_object(monkeypatch: pytest.MonkeyPatch) -> None
 # -- wiring: run_command really executes the wrapper -----------------------
 
 
+async def test_a_role_command_runs_with_no_session_bus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Found on CI (Python 3.13): the daemon had XDG_RUNTIME_DIR / a DBUS address
+    so `systemd-run --user --scope` probed as available, but the role command
+    runs with the ALLOWLISTED env, which does not, so every command died with
+    "Failed to connect to user scope bus". `command_prefix` now takes the env the
+    command will actually run in and only picks a user scope when that env can
+    reach the bus. This simulates CI: NO bus vars anywhere."""
+    from rework.nodes.tools import LocalExecutor
+
+    for var in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"):
+        monkeypatch.delenv(var, raising=False)
+
+    out = await LocalExecutor(tmp_path).execute(
+        "run_command", {"command": "echo BUSLESS_OK; python3 -c 'print(6*7)'"}
+    )
+
+    assert out.startswith("(exit 0)"), out
+    assert "BUSLESS_OK" in out
+    assert "42" in out
+    assert "Failed to connect to user scope bus" not in out
+
+
+def test_command_prefix_avoids_a_user_scope_without_a_bus() -> None:
+    """The unit-level rule: an env with no bus var means no `--user` scope, even
+    when the probe (which sees the daemon's env) says the user manager exists."""
+    prefix = hostlimits.command_prefix(
+        "true",
+        memory_max="256M",
+        which=lambda name: f"/usr/bin/{name}",
+        scope_available=lambda: True,  # the probe lies on CI's behalf
+        system_scope=lambda: False,
+        env={"PATH": "/usr/bin"},
+    )
+    assert "--user" not in prefix, prefix
+    # it fell through to the ulimit/nice path, which always runs
+    assert prefix[-3] == "/bin/sh" and prefix[-2] == "-c"
+
+
 @pytest.mark.skipif(
     sys.platform != "linux", reason="reads /proc/self/limits, which only exists on Linux"
 )
