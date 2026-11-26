@@ -129,6 +129,8 @@ class GateManager:
     def __init__(self, store: StateStore, bus: EventBus) -> None:
         self._store = store
         self._bus = bus
+        # whether the most recent decide() is the call that decided its gate
+        self.last_decided = False
 
     async def request(
         self,
@@ -188,6 +190,7 @@ class GateManager:
         verdict (final gates only): the gate is marked `sent_back` and the
         owner's note rides along as typed feedback — the engine then returns
         the mission to `running` instead of terminating it (GAP 2)."""
+        self.last_decided = False
         before = await self._store.get_gate(gate_id)
         if before is None or before.status != GateStatus.OPEN:
             return before
@@ -208,7 +211,10 @@ class GateManager:
         gate = await self._store.decide_gate(
             gate_id, approved, note, decision, send_back, event=decided
         )
-        if decided.seq is not None:
+        # the store wrote the event only if THIS call decided the gate: that,
+        # not a status read before the write, says who won a race
+        self.last_decided = decided.seq is not None
+        if self.last_decided:
             self._fan_out(decided)
         return gate
 

@@ -2111,7 +2111,9 @@ def serve(
         host, port = default_bind()
         server = None
         try:
-            server = await start_workspace_server(store, workroot, host, port)
+            server = await start_workspace_server(
+                store, workroot, host, port, bus=bus, git_author=config.git_author
+            )
             typer.secho(
                 f"workspace API on http://{host}:{port} "
                 "(tailnet-only when the host is a tailnet IP)",

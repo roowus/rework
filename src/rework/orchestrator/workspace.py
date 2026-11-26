@@ -35,6 +35,7 @@ import time
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 from aiohttp import web
 
@@ -528,7 +529,13 @@ def _authorized(request: web.Request, token: str | None) -> bool:
     return header == f"Bearer {token}"
 
 
-def build_workspace_app(store: StateStore, workroot: Path) -> web.Application:
+def build_workspace_app(
+    store: StateStore,
+    workroot: Path,
+    *,
+    bus: Any | None = None,
+    git_author: tuple[str, str] | None = None,
+) -> web.Application:
     """The daemon's workspace API:
 
     POST /workspaces/<name>              body: tar.gz -> staged dir (returns path)
@@ -653,14 +660,31 @@ def build_workspace_app(store: StateStore, workroot: Path) -> web.Application:
     app.router.add_get("/workspaces/results/{mission_id}", result)
     app.router.add_post("/projects/{project_id}/files", project_files_upload)
     app.router.add_get("/projects/{project_id}/files/archive", project_files_archive)
+    # the command API (ADR 0021): owner actions executed BY the daemon
+    from rework.api.server import add_routes
+    from rework.kernel.events.bus import InProcessEventBus
+
+    add_routes(
+        app,
+        store,
+        bus if bus is not None else InProcessEventBus(store),
+        authorized=lambda request: _authorized(request, token),
+        git_author=git_author,
+    )
     return app
 
 
 async def start_workspace_server(
-    store: StateStore, workroot: Path, host: str, port: int
+    store: StateStore,
+    workroot: Path,
+    host: str,
+    port: int,
+    *,
+    bus: Any | None = None,
+    git_author: tuple[str, str] | None = None,
 ) -> web.AppRunner:
     """Run the workspace API inside the daemon's existing event loop."""
-    runner = web.AppRunner(build_workspace_app(store, workroot))
+    runner = web.AppRunner(build_workspace_app(store, workroot, bus=bus, git_author=git_author))
     await runner.setup()
     site = web.TCPSite(runner, host, port)
     try:
