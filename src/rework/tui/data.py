@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +81,12 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
+# How many last-good query results the offline fallback keeps (LRU). Enough for
+# every view's live queries; small enough that cursor-keyed tails cannot grow
+# without bound.
+LAST_GOOD_MAX = 256
+
+
 class TuiData:
     """Lazy single connections + thin query methods. All async; the Textual
     loop is the only caller (single-connection stores are safe here)."""
@@ -116,7 +123,11 @@ class TuiData:
         self._git: GitLibrary | None = None
         # the last successful result per query, used while the daemon is
         # unreachable (see `_resilient`)
-        self._last_good: dict[str, Any] = {}
+        # Bounded, oldest out: several keys carry a moving cursor
+        # (`events:{mission}:{since}`, `events_after:{seq}`, a spend_history
+        # `since=now-7d`), so a long-running TUI minted a new entry every tick
+        # and kept every event batch it ever read (audit 2026-11-25, 4.3).
+        self._last_good: OrderedDict[str, Any] = OrderedDict()
         # set when a reconnect failed; the shell shows it as an offline note
         self._reconnecting_hint: str = ""
 
@@ -279,6 +290,9 @@ class TuiData:
         self._reconnecting_hint = ""
         if stale_ok:
             self._last_good[key] = result
+            self._last_good.move_to_end(key)
+            while len(self._last_good) > LAST_GOOD_MAX:
+                self._last_good.popitem(last=False)
         return result
 
     async def library(self) -> tuple[LibraryStore, GitLibrary]:
