@@ -699,3 +699,37 @@ async def test_proposal_is_a_compatibility_view_of_the_first_pending() -> None:
     assert [p.objective for p in chat.proposals] == ["replacement"]
     chat.proposal = None
     assert chat.proposals == [] and chat.proposal is None
+
+
+async def test_two_engines_on_one_chat_share_the_history(store) -> None:  # type: ignore[no-untyped-def]
+    """Found by the live TUI e2e (same_chat_two_tuis): two TUIs on ONE chat
+    each kept their own in-memory history, so A's next turn reached the model
+    without B's message. Before a turn the engine adopts rows another writer
+    added."""
+    from rework.kernel.llm.catalog import ModelCatalog, ModelEntry
+    from rework.kernel.state.records import Chat
+
+    class _P:
+        def __init__(self) -> None:
+            self.seen: list[list[str]] = []
+
+        async def complete(self, request):  # type: ignore[no-untyped-def]
+            self.seen.append(
+                [str(m.get("content")) for m in request.messages if m["role"] == "user"]
+            )
+            return ChatResult(text="ok")
+
+    catalog = ModelCatalog([ModelEntry(id="flash", provider="fake", model="f")])
+    row = await store.create_chat(Chat(title=""))
+    provider = _P()
+    a = OrchestratorChat(provider, catalog, "flash", store=store, chat_id=row.id)
+    b = OrchestratorChat(provider, catalog, "flash", store=store, chat_id=row.id)
+    await a.load()
+    await b.load()
+    await a.send("first from A")
+    await b.send("second from B")
+    await a.send("third from A")
+    assert provider.seen[1] == ["first from A", "second from B"]
+    assert provider.seen[2] == ["first from A", "second from B", "third from A"]
+    stored = [m.display for m in await store.chat_messages(row.id) if m.role == "user"]
+    assert stored == ["first from A", "second from B", "third from A"], "nothing doubled"

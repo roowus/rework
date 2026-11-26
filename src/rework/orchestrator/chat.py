@@ -460,6 +460,9 @@ class OrchestratorChat:
         self._max_tool_rounds = max_tool_rounds
         self._toolbox = ChatTools(store, library) if self._tools_enabled else None
         self._history: list[dict[str, Any]] = []
+        # the highest chat_messages id this engine has seen (loaded or written):
+        # a larger one in the store means another writer added a turn
+        self._seen_max_id = 0
         self._display: list[tuple[str, str]] = []  # (who, text) replay for the UI
         # PENDING proposals, in the order the model made them. One owner request
         # can span several separate pieces of work, so this is a list; the turn
@@ -489,13 +492,33 @@ class OrchestratorChat:
         from rework.kernel.state.records import ChatMessage
 
         try:
-            await self._store.append_chat_message(
+            saved = await self._store.append_chat_message(
                 ChatMessage(chat_id=self.chat_id, role=role, body=body, display=display)
             )
         except Exception:
             logger.exception("could not persist chat turn (role=%s)", role)
             return False
+        if saved is not None and saved.id is not None:
+            self._seen_max_id = max(self._seen_max_id, int(saved.id))
         return True
+
+    async def _resync(self) -> None:
+        """Adopt rows another writer added since this engine last looked.
+
+        Found by the live TUI e2e: with ONE chat open in two TUIs, each kept its
+        own in-memory history. A's next turn went to the model without B's
+        message, though both screens showed it. The store is the transcript:
+        before a turn, if it holds a row this engine has not seen, the history
+        is reloaded from it. One indexed MAX(id) per turn when nothing changed."""
+        if self._store is None or self.chat_id is None:
+            return
+        try:
+            latest = await self._store.chat_messages_max_id(self.chat_id)
+        except Exception:  # a resync must never stop a turn
+            logger.warning("chat resync skipped", exc_info=True)
+            return
+        if latest != self._seen_max_id:
+            await self.load()
 
     async def _note(self, user_text: str, reply: str) -> None:
         """Record a turn that never reached the model (a bare yes/no)."""
@@ -511,6 +534,7 @@ class OrchestratorChat:
             return []
         messages = await self._store.chat_messages(self.chat_id)
         self._history = [m.body for m in messages if m.body]
+        self._seen_max_id = max((int(m.id or 0) for m in messages), default=0)
         # stored roles are provider-neutral ("user"/"assistant"); the display
         # vocabulary used throughout the UI is "you"/"orchestrator"
         who = {"user": "you", "assistant": "orchestrator"}
@@ -615,6 +639,7 @@ class OrchestratorChat:
             await self._note(text, reply)
             return ChatResult(reply=reply, scrapped_all=True, transcript=[Turn("you", text)])
 
+        await self._resync()
         user_msg: dict[str, Any] = {"role": "user", "content": text}
         if images:
             user_msg["images"] = images
