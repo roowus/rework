@@ -3295,6 +3295,9 @@ async def test_a_replayed_chat_does_not_duplicate_its_proposal_cards(
         chat_id = work.convo.id
         messages = await app.hub.data.chat_messages(chat_id)
         row_ids = [int(m.id or 0) for m in messages]
+        # the high-water mark is set once the turn's rows are painted, a beat
+        # after the cards appear: wait for it (flaked on a loaded CI runner)
+        await _wait_for(pilot, lambda: work._rendered_max_id == max(row_ids))
         assert work._rendered_max_id == max(row_ids), (work._rendered_max_id, row_ids)
 
         # the reopen path: this process no longer knows which rows it wrote, and
