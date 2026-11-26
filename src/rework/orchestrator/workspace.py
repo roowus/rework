@@ -535,6 +535,7 @@ def build_workspace_app(
     *,
     bus: Any | None = None,
     git_author: tuple[str, str] | None = None,
+    library: Any | None = None,
 ) -> web.Application:
     """The daemon's workspace API:
 
@@ -670,6 +671,7 @@ def build_workspace_app(
         bus if bus is not None else InProcessEventBus(store),
         authorized=lambda request: _authorized(request, token),
         git_author=git_author,
+        library=library,
     )
     return app
 
@@ -682,9 +684,12 @@ async def start_workspace_server(
     *,
     bus: Any | None = None,
     git_author: tuple[str, str] | None = None,
+    library: Any | None = None,
 ) -> web.AppRunner:
     """Run the workspace API inside the daemon's existing event loop."""
-    runner = web.AppRunner(build_workspace_app(store, workroot, bus=bus, git_author=git_author))
+    runner = web.AppRunner(
+        build_workspace_app(store, workroot, bus=bus, git_author=git_author, library=library)
+    )
     await runner.setup()
     site = web.TCPSite(runner, host, port)
     try:

@@ -150,3 +150,45 @@ async def test_an_old_daemon_without_the_api_falls_back_in_process(
 async def await_in_thread(fn: Any) -> Any:
     """CliRunner calls asyncio.run inside; keep it off this test's loop."""
     return await asyncio.to_thread(fn)
+
+
+async def test_chat_turns_run_on_the_daemon_one_at_a_time(
+    api: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR 0021 phase 2b: two clients sending to ONE chat at the same moment
+    get two serialized turns on one engine, and the second turn's model call
+    sees the first (no lost or interleaved history)."""
+    import rework.kernel.llm.adapters as adapters
+    from rework.kernel.llm.types import ChatResult as LlmResult
+    from rework.kernel.llm.types import Usage
+    from rework.kernel.state.records import Chat
+    from rework.services import chat as chat_service
+
+    seen: list[list[str]] = []
+    in_flight = {"n": 0, "max": 0}
+
+    class Slow:
+        name = "slow"
+
+        async def complete(self, request: Any) -> LlmResult:
+            in_flight["n"] += 1
+            in_flight["max"] = max(in_flight["max"], in_flight["n"])
+            seen.append([str(m["content"]) for m in request.messages if m["role"] == "user"])
+            await asyncio.sleep(0.2)
+            in_flight["n"] -= 1
+            return LlmResult(text="ok", usage=Usage(input_tokens=1, output_tokens=1))
+
+    monkeypatch.setattr(adapters, "build_provider", lambda entry, extra=None: Slow())
+    monkeypatch.setenv("REWORK_MODELS", '[{"id":"flash","provider":"fake","model":"f","tier":1}]')
+    chat_service._engines.clear()
+    store = api["store"]
+    chat = await store.create_chat(Chat(title="shared"))
+    async with _client(api) as a, _client(api) as b:
+        await asyncio.gather(a.chat_send(chat.id, "from A"), b.chat_send(chat.id, "from B"))
+        with pytest.raises(ApiError) as missing:
+            await a.chat_send("chat-nope", "hello")
+        assert missing.value.status == 404
+    assert in_flight["max"] == 1, "two turns on one chat ran at the same time"
+    assert len(seen) == 2 and len(seen[1]) == 2, seen
+    users = [m.display for m in await store.chat_messages(chat.id) if m.role == "user"]
+    assert sorted(users) == ["from A", "from B"]

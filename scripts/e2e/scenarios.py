@@ -630,3 +630,84 @@ async def tour_every_tab_and_modal(world: World) -> None:
                 world.finding("modal", f"escape did not close {name}", stack=len(a.screen_stack))
         if a.swallowed:
             world.finding("errors", "swallowed", errors=[repr(e) for e in a.swallowed])
+
+
+@scenario
+async def same_chat_turns_on_the_daemon(world: World) -> None:
+    """ADR 0021 phase 2b: both TUIs talk to ONE chat and the DAEMON runs every
+    turn (the TUIs' own model factory is booby-trapped). Each turn shows once
+    in both TUIs, and each model turn sees the whole conversation."""
+    from rework.tui.app import ReworkApp
+    from rework.tui.widgets.base import RowList
+
+    world.script(
+        {
+            "You are rework's orchestrator": [
+                {"text": "Hello from turn one."},
+                {"text": "Reply to B."},
+                {"text": "Reply to A again."},
+            ]
+        }
+    )
+    world.start_daemon()
+    import rework.kernel.llm.adapters as adapters
+
+    def trap(entry: Any, extra: Any = None) -> Any:
+        raise AssertionError("the TUI ran a chat turn itself instead of the daemon")
+
+    adapters.build_provider = trap  # type: ignore[assignment]
+    a = ReworkApp(poll_seconds=0.5)
+    b = ReworkApp(poll_seconds=0.5)
+
+    def log_text(app: Any) -> str:
+        from rework.tui.widgets.trajectory import Trajectory
+
+        return " ".join(
+            str(getattr(s, "renderable", "") or getattr(s, "content", ""))
+            for s in app.query_one("#chat-log", Trajectory).query("*")
+        )
+
+    async with a.run_test(size=(140, 40)) as pa, b.run_test(size=(140, 40)) as pb:
+        await pa.pause(0.8)
+        await type_text(pa, "first from A")
+        await pa.press("enter")
+        if not await until(pa, lambda: "Hello from turn one" in log_text(a), 15):
+            world.finding(
+                "chat/daemon",
+                "A's turn never got a reply",
+                swallowed=[repr(e) for e in a.swallowed],
+            )
+            await shot(a, world.out, "daemon-chat-a-fail")
+            return
+        chat_id = a.view("work").convo.id
+        await until(pb, lambda: chat_id in {c.id for c in b.hub.snapshot.chats}, 15)
+        b.query_one("#chat-list", RowList).activate(chat_id, via_mouse=True)
+        await pb.pause(1.5)
+        await type_text(pb, "second from B")
+        await pb.press("enter")
+        await until(pb, lambda: "Reply to B" in log_text(b), 15)
+        await type_text(pa, "third from A")
+        await pa.press("enter")
+        await until(pa, lambda: "Reply to A again" in log_text(a), 15)
+        for label, app, pilot, needles in (
+            ("A", a, pa, ("second from B", "Reply to B", "Reply to A again")),
+            ("B", b, pb, ("third from A", "Reply to A again")),
+        ):
+            for needle in needles:
+                if not await until(
+                    pilot, lambda app=app, needle=needle: needle in log_text(app), 10
+                ):
+                    world.finding("chat/sync", f"{label} never shows {needle!r}")
+        for label, app in (("A", a), ("B", b)):
+            text = log_text(app)
+            for needle in ("first from A", "Reply to B", "Reply to A again"):
+                if text.count(needle) > 1:
+                    world.finding(
+                        "chat/sync", f"{label} shows {needle!r} {text.count(needle)} times"
+                    )
+            if app.swallowed:
+                world.finding(
+                    "errors", f"{label} swallowed", errors=[repr(e) for e in app.swallowed]
+                )
+        await shot(a, world.out, "daemon-chat-a")
+        await shot(b, world.out, "daemon-chat-b")

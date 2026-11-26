@@ -17,6 +17,8 @@ from rework.orchestrator.workspace import workspace_url_from_env
 TIMEOUT_S = 30.0
 # retry-pr pushes and opens a PR: allow the daemon's delivery lock wait
 RETRY_PR_TIMEOUT_S = 300.0
+# a chat turn is one or more model calls (tool rounds included)
+CHAT_TURN_TIMEOUT_S = 600.0
 
 
 class ApiError(RuntimeError):
@@ -97,6 +99,16 @@ class DaemonClient:
         return await self._post(
             f"/v1/gates/{gate_id}/decide",
             {"approved": approved, "note": note, "decision": decision, "send_back": send_back},
+        )
+
+    async def chat_send(
+        self, chat_id: str, text: str, images: list[str] | None = None
+    ) -> dict[str, Any]:
+        """One owner turn, run by the daemon. A model turn can take minutes."""
+        return await self._post(
+            f"/v1/chats/{chat_id}/messages",
+            {"text": text, "images": images},
+            wait_s=CHAT_TURN_TIMEOUT_S,
         )
 
     async def retry_pr(self, mission_id: str) -> tuple[bool, str]:
