@@ -175,3 +175,54 @@ async def test_failed_step_gets_one_in_mission_retry(tmp_path) -> None:  # type:
             pass
     finally:
         await store.aclose()
+
+
+async def test_second_synthesis_never_emits_a_second_mission_done(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Reproduced live (audit 2026-11-25): a finished mission that got re-run
+    (`resume` used to allow it) emitted a second `mission_done`. Synthesis is a
+    compare-and-set into the terminal status now: an already-DONE mission is
+    left exactly as it is."""
+    store = await open_sqlite(str(tmp_path / "syn2.sqlite3"))
+    try:
+        await store.create_mission(Mission(id="m2", objective="x", status=MissionStatus.RUNNING))
+        bus = InProcessEventBus(store)
+        runner = MissionRunner("m2", store, bus, None, None, None, tmp_path)  # type: ignore[arg-type]
+        await runner._synthesize("m2", ship_decision=True, summary="first")
+        await runner._synthesize("m2", ship_decision=True, summary="second")
+        events = await store.events_since(0, mission_id="m2")
+        assert [e.type.value for e in events].count("mission_done") == 1
+        row = await store.get_mission("m2")
+        assert row is not None and row.result["summary"] == "first"
+    finally:
+        await store.aclose()
+
+
+async def test_synthesis_after_an_owner_cancel_keeps_cancelled(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The owner cancelled after the runner last looked: the runner's DONE must
+    not overwrite it, but the artifacts still land on the row."""
+    store = await open_sqlite(str(tmp_path / "syn3.sqlite3"))
+    try:
+        await store.create_mission(Mission(id="m3", objective="x", status=MissionStatus.RUNNING))
+        rid = run_id("m3", "s", "echo", 1)
+        await store.create_run(
+            Run(id=rid, mission_id="m3", role="echo", step="s", status=RunStatus.COMPLETED)
+        )
+        await store.update_run(rid, artifact={"kind": "echo"})
+        runner = MissionRunner("m3", store, InProcessEventBus(store), None, None, None, tmp_path)  # type: ignore[arg-type]
+        real = store.get_mission
+        calls = {"n": 0}
+
+        async def cancel_on_second_read(mid: str):  # type: ignore[no-untyped-def]
+            calls["n"] += 1
+            if calls["n"] == 2:  # after the read synthesis decides on, before its write
+                await store.update_mission(mid, status=MissionStatus.CANCELLED)
+            return await real(mid)
+
+        store.get_mission = cancel_on_second_read  # type: ignore[method-assign]
+        await runner._synthesize("m3", ship_decision=True)
+        store.get_mission = real  # type: ignore[method-assign]
+        row = await store.get_mission("m3")
+        assert row is not None and row.status == MissionStatus.CANCELLED
+        assert row.result["artifacts"]["echo:s"] == {"kind": "echo"}
+    finally:
+        await store.aclose()

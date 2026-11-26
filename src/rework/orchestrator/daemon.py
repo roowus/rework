@@ -61,6 +61,15 @@ _checkpointer_setup_lock = asyncio.Lock()
 _checkpointer_setup_done: set[str] = set()
 
 
+# a crashed runner's mission is requeued only from a status it was doing (or
+# about to do) work in. PENDING is included: a runner can die before its first
+# PENDING -> RUNNING write. A paused mission stays paused, a finished one stays
+# finished.
+_REQUEUEABLE = frozenset(
+    {MissionStatus.PENDING, MissionStatus.RUNNING, MissionStatus.AWAITING_GATE}
+)
+
+
 class DaemonLocked(Exception):
     pass
 
@@ -425,7 +434,14 @@ class Daemon:
         ):
             if await self._store.list_open_gates(mission.id):
                 continue
-            await self._store.update_mission(mission.id, status=MissionStatus.RUNNING)
+            # compare-and-set: an owner pause/cancel in between stands
+            if (
+                await self._store.transition_mission(
+                    mission.id, MissionStatus.RUNNING, from_={MissionStatus.AWAITING_GATE}
+                )
+                is None
+            ):
+                continue
             await self._bus.publish(
                 EventRecord(
                     mission_id=mission.id,
@@ -548,9 +564,10 @@ class Daemon:
                             elapsed,
                             TRANSIENT_OUTAGE_BUDGET_S,
                         )
-                        await self._store.update_mission(
+                        await self._store.transition_mission(
                             mission_id,
-                            status=MissionStatus.PENDING,
+                            MissionStatus.PENDING,
+                            from_=_REQUEUEABLE,
                             result={
                                 **(mission.result or {}),
                                 "transient_db_error": summary,
@@ -578,9 +595,9 @@ class Daemon:
                         f" {elapsed:.0f}s across {count} crashes, past the"
                         f" {TRANSIENT_OUTAGE_BUDGET_S:.0f}s budget, giving up: {summary}"
                     )
-                await self._store.update_mission(
+                await self._store.transition_mission(
                     mission_id,
-                    status=MissionStatus.FAILED,
+                    MissionStatus.FAILED,
                     result={
                         **(mission.result or {}),
                         "error": error if keep_whole else error[:2000],

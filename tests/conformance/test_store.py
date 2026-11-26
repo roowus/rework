@@ -268,6 +268,30 @@ async def test_spend_by_model(store: StateStore) -> None:
     assert scoped[0]["cost_usd"] == 0.01
 
 
+async def test_transition_mission_is_compare_and_set(store: StateStore) -> None:
+    """kernel/state/transitions.py: the row moves only from an allowed status,
+    in one statement; a refusal returns None and writes nothing."""
+    from rework.kernel.state.transitions import sources
+
+    m = await store.create_mission(Mission(id="m-cas", objective="cas"))
+    moved = await store.transition_mission(m.id, MissionStatus.RUNNING)
+    assert moved is not None and moved.status == MissionStatus.RUNNING
+    # explicit from_ that no longer matches: refused, untouched
+    assert (
+        await store.transition_mission(m.id, MissionStatus.ON_HOLD, from_={MissionStatus.PENDING})
+        is None
+    )
+    # result rides in the same write
+    done = await store.transition_mission(m.id, MissionStatus.DONE, result={"summary": "ok"})
+    assert done is not None and done.result == {"summary": "ok"}
+    # terminal is final: the default sources for RUNNING exclude DONE
+    assert MissionStatus.DONE not in sources(MissionStatus.RUNNING)
+    assert await store.transition_mission(m.id, MissionStatus.RUNNING) is None
+    row = await store.get_mission(m.id)
+    assert row is not None and row.status == MissionStatus.DONE
+    assert await store.transition_mission("m-missing", MissionStatus.RUNNING) is None
+
+
 async def test_leader_lock(store: StateStore) -> None:
     assert await store.acquire_lock("daemon-1") is True
     assert await store.acquire_lock("daemon-2") is False  # live foreign lock refused

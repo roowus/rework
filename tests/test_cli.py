@@ -581,14 +581,22 @@ def test_cancel_pause_resume_commands(rework_db: Path) -> None:
 
         return asyncio.run(read())
 
+    # pause remembers where it paused from; resume puts it back there
+    assert runner.invoke(app, ["pause", mid]).exit_code == 0
+    assert status() == "on_hold"
+    assert runner.invoke(app, ["resume", mid]).exit_code == 0
+    assert status() == "running"
+
     assert runner.invoke(app, ["cancel", mid]).exit_code == 0
     assert status() == "cancelled"
 
-    assert runner.invoke(app, ["pause", mid]).exit_code == 0
-    assert status() == "on_hold"
-
-    assert runner.invoke(app, ["resume", mid]).exit_code == 0
-    assert status() == "running"
+    # a finished mission is final (audit 2026-11-25: `resume` used to flip a
+    # DONE/CANCELLED mission back to running and the daemon re-ran it)
+    for verb in ("pause", "resume"):
+        refused = runner.invoke(app, [verb, mid])
+        assert refused.exit_code == 1
+        assert "it is cancelled" in refused.output
+        assert status() == "cancelled"
 
     # unknown ids fail loudly rather than silently succeeding
     assert runner.invoke(app, ["cancel", "m-nope"]).exit_code == 1
