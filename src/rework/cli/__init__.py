@@ -5,6 +5,7 @@ the database (that is the cross-device design, docs/design.md)."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from pathlib import Path
@@ -2050,7 +2051,11 @@ def serve(
             DaemonLocked,
             checkpointer_factory_for,
         )
-        from rework.orchestrator.workspace import default_bind, start_workspace_server
+        from rework.orchestrator.workspace import (
+            WorkspacePortBusy,
+            default_bind,
+            start_workspace_server,
+        )
         from rework.roles.registry import autodiscover
 
         store = await open_store_from_config(config)
@@ -2099,18 +2104,31 @@ def serve(
         # is localhost by default, tailnet-only when REWORK_HTTP_HOST points at
         # a tailnet IP
         host, port = default_bind()
-        server = await start_workspace_server(store, workroot, host, port)
-        typer.secho(
-            f"workspace API on http://{host}:{port} (tailnet-only when the host is a tailnet IP)",
-            fg=typer.colors.CYAN,
-        )
+        server = None
         try:
+            server = await start_workspace_server(store, workroot, host, port)
+            typer.secho(
+                f"workspace API on http://{host}:{port} "
+                "(tailnet-only when the host is a tailnet IP)",
+                fg=typer.colors.CYAN,
+            )
             await daemon.run_forever()
-        except DaemonLocked as exc:
+        except (DaemonLocked, WorkspacePortBusy) as exc:
             typer.secho(str(exc), fg=typer.colors.RED)
             raise typer.Exit(1) from exc
         finally:
-            await server.cleanup()
+            # EVERY exit closes what serve opened. aiosqlite runs a non-daemon
+            # thread per connection, so a refused start (port busy, lock held,
+            # LeaderLost) that left the store or the library index open printed
+            # its error and then hung instead of exiting (found in the A1 e2e):
+            # systemd never got the exit it needs to restart us
+            if server is not None:
+                await server.cleanup()
+            if library is not None:
+                with contextlib.suppress(Exception):
+                    await library.index.aclose()
+            with contextlib.suppress(Exception):
+                await store.aclose()
 
     asyncio.run(go())
 

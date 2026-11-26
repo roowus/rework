@@ -101,6 +101,16 @@ The daemon runs one runner per mission under a semaphore, holds a leader lock, a
 boot recovery pass (reopen missions, re-enumerate runs, pick up gates decided while down,
 before the first astream call).
 
+The leader lock is fenced. Its heartbeat runs in its own task every sixth of the stale
+window (`REWORK_LOCK_STALE_S`, default 30 s), not from the dispatch loop, so a slow
+iteration cannot let a second daemon in. A heartbeat that returns False (another daemon
+took the row) or keeps failing for the whole window ends the daemon: it cancels its
+runners and exits with `LeaderLost`, and the service manager restarts it as an ordinary
+second daemon. On Postgres both locks are stamped and compared on the database clock, so
+client clock skew cannot move the takeover point. Every `serve` exit path closes the
+store and the library index (a refused start used to print its error and hang on
+aiosqlite's worker thread), and a busy workspace port is a one-line refusal.
+
 Roles are NOT subgraphs of the orchestrator checkpoint; each Run is an independent
 asyncio task with its own checkpointer thread. Parallelism = N run rows for one step.
 
