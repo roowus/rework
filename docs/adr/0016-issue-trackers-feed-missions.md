@@ -62,3 +62,18 @@ one tick and no more.
 - The bridge is off unless `REWORK_PLANE_TOKEN` and friends are set, so a deployment that
   does not want it pays nothing.
 - A tracker outage delays new missions; it cannot fail a finished one.
+
+## Amendment (2026-11-26): GitHub Issues, and sources are a registry
+
+`sources.configured()` lists every source the daemon polls; each runs on its own cadence
+and is off unless its env is set. GitHub Issues joined Plane: `REWORK_GITHUB_REPO=owner/name`
+turns it on, ready = open issues with `REWORK_GITHUB_LABEL` (default `rework`), the mission
+targets the issue's own repo, and it talks through the `gh` CLI (no new token). The
+write-back picks its client from the mission's recorded source kind. Verified live: a
+labelled issue on a throwaway private repo became a mission on a real daemon, ran, and the
+daemon commented the result back on the issue.
+
+When a tracker is a TOOL instead (an agent reading or editing the backlog mid-mission) it
+belongs behind the tracker's own MCP server, opt-in per mission, writes behind gates; the
+source stays the default integration.
+

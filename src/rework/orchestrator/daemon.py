@@ -319,40 +319,37 @@ class Daemon:
             )
 
     async def _poll_sources(self) -> None:
-        """Turn ready work items from the tracker into missions, forever.
+        """Turn ready work items from every configured tracker into missions,
+        forever (ADR 0016: Plane, GitHub Issues). Each source polls on its own
+        cadence; a tick is bounded, so a hung tracker costs one tick, and a
+        failure is a log line rather than a dead daemon."""
+        from rework.sources import configured
 
-        Disabled unless configured (REWORK_PLANE_TOKEN and friends, ADR 0016).
-        Each tick is bounded, so a hung tracker costs one tick, and a failure is
-        a log line rather than a dead daemon."""
-        from rework.sources import poller
-
-        config = poller.plane_config()
-        if not poller.enabled(config):
-            log.info("no issue source configured (REWORK_PLANE_*): poller idle")
+        sources = configured()
+        if not sources:
+            log.info("no issue source configured (REWORK_PLANE_* / REWORK_GITHUB_REPO): idle")
             return
-        client = poller.build_client(config)
-        log.info("polling %s every %.0fs for work items", config["url"], config["interval_s"])
         try:
-            while True:
-                try:
-                    created = await asyncio.wait_for(
-                        poller.poll_once(
-                            self._store,
-                            client,
-                            state=config["state"],
-                            label=config["label"],
-                        ),
-                        timeout=min(config["interval_s"], 60),
-                    )
-                    for mission_id in created:
-                        await self._source_mission(mission_id)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # a tracker outage is a log line
-                    log.warning("source poll failed: %s", exc)
-                await asyncio.sleep(config["interval_s"])
+            await asyncio.gather(*(self._poll_one(src) for src in sources))
         finally:
-            await client.close()
+            for src in sources:
+                with contextlib.suppress(Exception):
+                    await src["client"].close()
+
+    async def _poll_one(self, src: dict[str, Any]) -> None:
+        log.info("polling %s every %.0fs for work items", src["where"], src["interval_s"])
+        while True:
+            try:
+                created = await asyncio.wait_for(
+                    src["poll"](self._store), timeout=min(src["interval_s"], 60)
+                )
+                for mission_id in created:
+                    await self._source_mission(mission_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # a tracker outage is a log line
+                log.warning("%s source poll failed: %s", src["kind"], exc)
+            await asyncio.sleep(src["interval_s"])
 
     async def _source_mission(self, mission_id: str) -> None:
         """A source-created mission carries no plan (the bridge does not know
