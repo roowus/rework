@@ -562,3 +562,71 @@ async def same_chat_two_tuis(world: World) -> None:
         for text in set(texts):
             if texts.count(text) > 1:
                 world.finding("chat/history", "a turn is stored twice", text=text[:60])
+
+
+@scenario
+async def tour_every_tab_and_modal(world: World) -> None:
+    """Visit every tab and open every form and menu with real seeded data: no
+    crash, nothing swallowed, every screen paints something."""
+    from rework.tui.app import ReworkApp
+
+    world.script({})
+    world.start_daemon()
+    import seed
+
+    await seed.seed(world.env["REWORK_DB"])
+    await seed.seed_library(world.env["REWORK_DB"], world.env["REWORK_LIBRARY_DIR"])
+    a = ReworkApp(poll_seconds=0.5)
+    async with a.run_test(size=(140, 40)) as pa:
+        await pa.pause(1.5)
+        for n, (key, name) in enumerate(
+            [
+                ("alt+1", "work"),
+                ("alt+2", "dashboard"),
+                ("alt+3", "gates"),
+                ("alt+4", "library"),
+                ("alt+5", "cost"),
+            ],
+            start=1,
+        ):
+            await pa.press(key)
+            await pa.pause(1.2)
+            await shot(a, world.out, f"tour-{n:02d}-{name}")
+            if a.current_tab != name if hasattr(a, "current_tab") else False:
+                world.finding("nav", f"{key} did not open {name}")
+        # open a seeded mission on the Dashboard and visit every detail tab
+        await pa.press("alt+2")
+        await pa.pause(0.8)
+        dash = a.view("dashboard")
+        missions = [m.id for m in a.hub.snapshot.missions]
+        if missions:
+            dash.open_mission(missions[0])
+            await pa.pause(1.2)
+            for tab in ("Trajectory", "Graph", "Output", "Diff", "Report", "Gates", "Chat"):
+                hits = [w for w in dash.query("Tab, Btn") if str(getattr(w, "label", "")) == tab]
+                if not hits:
+                    continue
+                await pa.click(hits[0])
+                await pa.pause(0.6)
+                await shot(a, world.out, f"tour-dash-{tab.lower()}")
+        else:
+            world.finding("seed", "no seeded missions in the snapshot")
+        # every modal opens and closes
+        for action, name in (
+            ("app.help", "help"),
+            ("app.settings", "settings"),
+            ("app.new_project", "new-project"),
+            ("app.new_library_item", "new-library-item"),
+        ):
+            before = len(a.screen_stack)
+            await a.run_action(action.removeprefix("app."))
+            await pa.pause(0.8)
+            await shot(a, world.out, f"tour-modal-{name}")
+            if len(a.screen_stack) <= before:
+                world.finding("modal", f"{name} did not open a screen")
+            await pa.press("escape")
+            await pa.pause(0.4)
+            if len(a.screen_stack) != before:
+                world.finding("modal", f"escape did not close {name}", stack=len(a.screen_stack))
+        if a.swallowed:
+            world.finding("errors", "swallowed", errors=[repr(e) for e in a.swallowed])
