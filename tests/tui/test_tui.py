@@ -1066,7 +1066,12 @@ async def test_a_single_remaining_card_does_not_offer_launch_all(
         assert len(cards) == 2
         assert all(card.query_one(".pc-allbtn", Btn).display for card in cards)
         await pilot.click(_btn(app, cards[0], "launch"))
-        await _settle(pilot, 1.0)
+        # wait on the outcome, not a fixed second: a loaded CI runner was still
+        # mid-launch when the 1.0 s settle elapsed (flaked on #92)
+        await _wait_for(
+            pilot,
+            lambda: not cards[0].live and not cards[1].query_one(".pc-allbtn", Btn).display,
+        )
         assert not cards[0].live
         assert cards[1].live
         assert not cards[1].query_one(".pc-allbtn", Btn).display, "no dead group action"
