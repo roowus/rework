@@ -121,6 +121,12 @@ the writer expects. Owner verbs (pause/resume/cancel) live once in
 "needs_model")` is promoted on the run row by the engine, and the tool loop switches model
 before its next turn.
 
+A gate and what it says are written together: `create_gate` commits the row, its
+`GATE_OPENED` event and (with `park_mission`) the mission's `RUNNING -> AWAITING_GATE` move
+in one transaction, and `decide_gate` commits the decision with its `GATE_DECIDED` event,
+writing the event only when that call is the one that decided it. Every front end decides
+through `GateManager` (the TUI used to write the row alone).
+
 Roles are NOT subgraphs of the orchestrator checkpoint; each Run is an independent
 asyncio task with its own checkpointer thread. Parallelism = N run rows for one step.
 

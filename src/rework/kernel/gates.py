@@ -137,10 +137,13 @@ class GateManager:
         question: str,
         for_run: str | None = None,
         spec: dict[str, Any] | None = None,
+        *,
+        park_mission: bool = False,
     ) -> Gate:
-        """Create an OPEN gate row and publish GATE_OPENED. The caller then
-        interrupts. `for_run` ties an escalation gate to the run it unblocks,
-        in the SAME row (not a follow-up event: see Gate.for_run)."""
+        """Create an OPEN gate row with its GATE_OPENED event, in ONE store
+        transaction; `park_mission` moves the mission RUNNING -> AWAITING_GATE
+        in the same one. The caller then waits (or interrupts). `for_run` ties
+        an escalation gate to the run it unblocks, in the SAME row."""
         gate = Gate(
             id=new_id("gate"),
             mission_id=mission_id,
@@ -149,21 +152,26 @@ class GateManager:
             for_run=for_run,
             spec=spec,
         )
-        await self._store.create_gate(gate)
-        await self._bus.publish(
-            EventRecord(
-                mission_id=mission_id,
-                type=EventType.GATE_OPENED,
-                payload={
-                    "gate_id": gate.id,
-                    "kind": kind.value,
-                    "question": question,
-                    **({"spec": spec} if spec else {}),
-                },
-            )
+        opened = EventRecord(
+            mission_id=mission_id,
+            type=EventType.GATE_OPENED,
+            payload={
+                "gate_id": gate.id,
+                "kind": kind.value,
+                "question": question,
+                **({"spec": spec} if spec else {}),
+            },
         )
+        await self._store.create_gate(gate, event=opened, park_mission=park_mission)
+        self._fan_out(opened)
         notify_owner(gate)
         return gate
+
+    def _fan_out(self, event: EventRecord) -> None:
+        """Hand an event the store already persisted to in-process listeners."""
+        deliver = getattr(self._bus, "deliver", None)
+        if deliver is not None:
+            deliver(event)
 
     async def decide(
         self,
@@ -183,21 +191,25 @@ class GateManager:
         before = await self._store.get_gate(gate_id)
         if before is None or before.status != GateStatus.OPEN:
             return before
-        gate = await self._store.decide_gate(gate_id, approved, note, decision, send_back)
-        if gate is not None and gate.status != GateStatus.OPEN:
-            await self._bus.publish(
-                EventRecord(
-                    mission_id=gate.mission_id,
-                    type=EventType.GATE_DECIDED,
-                    payload={
-                        "gate_id": gate.id,
-                        "approved": approved,
-                        "note": note,
-                        "decision": decision,
-                        **({"sent_back": True} if send_back else {}),
-                    },
-                )
-            )
+        decided = EventRecord(
+            mission_id=before.mission_id,
+            type=EventType.GATE_DECIDED,
+            payload={
+                "gate_id": gate_id,
+                "approved": approved,
+                "note": note,
+                "decision": decision,
+                **({"sent_back": True} if send_back else {}),
+            },
+        )
+        # the row and its GATE_DECIDED event commit together; the store writes
+        # the event only if THIS call decided the gate (a racing second decide
+        # leaves no event)
+        gate = await self._store.decide_gate(
+            gate_id, approved, note, decision, send_back, event=decided
+        )
+        if decided.seq is not None:
+            self._fan_out(decided)
         return gate
 
     async def reword(self, gate: Gate, question: str) -> Gate | None:
