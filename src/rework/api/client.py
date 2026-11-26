@@ -58,7 +58,10 @@ class DaemonClient:
         try:
             data = response.json()
         except ValueError:
-            data = {"error": response.text, "code": "bad_response"}
+            # not our JSON: an OLDER daemon without the /v1 routes answers with
+            # aiohttp's plain 404, which callers treat as "act in-process"
+            code = "no_api" if response.status_code == 404 else "bad_response"
+            data = {"error": response.text, "code": code}
         if response.status_code >= 400:
             raise ApiError(
                 response.status_code,
@@ -99,3 +102,37 @@ class DaemonClient:
     async def retry_pr(self, mission_id: str) -> tuple[bool, str]:
         out = await self._post(f"/v1/missions/{mission_id}/retry-pr", wait_s=RETRY_PR_TIMEOUT_S)
         return bool(out["ok"]), str(out["detail"])
+
+
+def configured() -> DaemonClient | None:
+    """A client when this front end is pointed at a daemon (REWORK_DAEMON_URL,
+    set by a --target or the env file), else None: the front end then acts
+    in-process, which is what a single-machine setup and the tests do. A
+    remote TUI or CLI always sets the URL, so its commands run on the daemon."""
+    if not os.environ.get("REWORK_DAEMON_URL"):
+        return None
+    return DaemonClient()
+
+
+class NoApi(Exception):
+    """The configured daemon predates the command API (or is unreachable):
+    the caller falls back to acting in-process."""
+
+
+async def call(action: Any) -> Any:
+    """Run `action(client)` against the configured daemon. Raises NoApi when
+    there is no daemon URL, the daemon has no /v1 routes yet (mixed versions
+    during a rollout), or it cannot be reached; an ApiError refusal (409, 404
+    from the API itself, 401) propagates, because the daemon DID decide."""
+    remote = configured()
+    if remote is None:
+        raise NoApi("no daemon configured")
+    try:
+        async with remote:
+            return await action(remote)
+    except ApiError as exc:
+        if exc.code == "no_api":
+            raise NoApi(str(exc)) from exc
+        raise
+    except httpx.TransportError as exc:
+        raise NoApi(f"daemon unreachable: {exc}") from exc

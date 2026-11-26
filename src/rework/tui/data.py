@@ -500,6 +500,22 @@ class TuiData:
         # claiming online. `decide_gate` is idempotent-by-refusal (the UPDATE is
         # guarded on status = open), so a retry cannot double-decide, and
         # stale_ok=False keeps a cached payload from ever faking a verdict.
+        from rework.api import client as api
+
+        try:
+            # ADR 0021: the daemon decides; a racing second TUI is told it lost
+            out = await api.call(
+                lambda c: c.decide_gate(
+                    gate_id, approved, note=note, decision=decision, send_back=send_back
+                )
+            )
+        except api.NoApi:
+            out = None
+        if out is not None:
+            status = str(out["gate"]["status"])
+            if send_back:
+                return status == "sent_back"
+            return status == ("approved" if approved else "rejected")
         # Through GateManager, like the CLI: the row and its GATE_DECIDED event
         # commit together (the TUI used to write the row only, so its
         # decisions were missing from every event-log reader).
@@ -523,10 +539,17 @@ class TuiData:
         return gate.status.value == ("approved" if approved else "rejected")
 
     async def set_mission_status(self, mission_id: str, verb: str) -> Any:
-        """Owner controls: cancel / pause / resume, through the same guarded
-        service as the CLI. A stale screen cannot resurrect or overwrite a
-        mission: the verb applies only to the status the row is REALLY in, and
-        a refusal raises IllegalTransition naming it."""
+        """Owner controls: cancel / pause / resume. Sent to the DAEMON when this
+        TUI is pointed at one (ADR 0021), so several TUIs share one control
+        plane; in-process through the same guarded service otherwise. Either
+        way a stale screen cannot resurrect or overwrite a mission, and a
+        refusal raises with the reason (the daemon's own text over the API)."""
+        from rework.api import client as api
+
+        try:
+            return await api.call(lambda c: c.mission_verb(mission_id, verb))
+        except api.NoApi:
+            pass
         from rework.services import missions as mission_service
 
         store = await self.store()
@@ -545,10 +568,18 @@ class TuiData:
         """Retry push+PR for a finished mission whose delivery failed. Shares
         `rework.orchestrator.delivery.retry_pr` with `rework mission retry-pr`,
         so the button and the command can never disagree."""
+        from rework.api import client as api
         from rework.config import Config
         from rework.kernel.events.bus import InProcessEventBus
         from rework.orchestrator.delivery import retry_pr
 
+        try:
+            # the push runs ON THE DAEMON HOST, where the worktree lives (a
+            # laptop TUI used to try it against a daemon-side path)
+            result: tuple[bool, str] = await api.call(lambda c: c.retry_pr(mission_id))
+            return result
+        except api.NoApi:
+            pass
         store = await self.store()
         # the deployment's commit identity, so the retried merge commit has the
         # same author as the mission's own commits
@@ -559,6 +590,12 @@ class TuiData:
     async def prioritize_mission(self, mission_id: str, priority: str = "high") -> Any:
         """Pickup priority (normal | high): the daemon reads the row, so this
         works from any machine and never touches a running mission."""
+        from rework.api import client as api
+
+        try:
+            return await api.call(lambda c: c.prioritize(mission_id, priority))
+        except api.NoApi:
+            pass
         store = await self.store()
         return await store.update_mission(mission_id, priority=priority)
 
