@@ -315,13 +315,15 @@ async def test_leader_lock_stale_window_is_relative_to_the_last_beat(store: Stat
     longer than the window lets a contender in. Both backends must measure
     this the same way (Postgres measures it on the DATABASE clock, so a client
     whose clock runs ahead cannot steal a live lock)."""
-    assert await store.acquire_lock("holder", stale_after_s=0.4) is True
+    # a 2 s window: wide enough for a Postgres round trip over a tailnet (a
+    # 0.4 s window flaked there), still far from the production 30 s
+    assert await store.acquire_lock("holder", stale_after_s=2.0) is True
     for _ in range(3):
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.5)
         assert await store.heartbeat_lock("holder") is True
-        assert await store.acquire_lock("contender", stale_after_s=0.4) is False
-    await asyncio.sleep(0.6)
-    assert await store.acquire_lock("contender", stale_after_s=0.4) is True
+        assert await store.acquire_lock("contender", stale_after_s=2.0) is False
+    await asyncio.sleep(2.5)
+    assert await store.acquire_lock("contender", stale_after_s=2.0) is True
     assert await store.heartbeat_lock("holder") is False
     await store.release_lock("contender")
 
