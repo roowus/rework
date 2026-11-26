@@ -47,8 +47,46 @@ DELIVERY_LOCK_TTL_S = 120.0
 DELIVERY_HEARTBEAT_S = 20.0
 
 
+class DeliveryBusy(RuntimeError):
+    """The delivery lock could not be taken in time. The caller records the
+    mission as retryable; it never delivers without the lock."""
+
+
+class DeliveryLockLost(RuntimeError):
+    """This process stopped holding the delivery lock part way through (it was
+    taken over after our heartbeats stopped landing). The next step is not
+    taken: another delivery may already be merging and pushing."""
+
+
+class DeliveryGuard:
+    """Handed to the body of `serialized_delivery`. `check()` is called between
+    steps (before the merge, the push and the PR) and raises DeliveryLockLost
+    once the lock is not ours. Steps are not interrupted mid-flight: killing a
+    `git push` half way leaves the remote in an unknown state, while refusing
+    the NEXT step is always safe."""
+
+    def __init__(self, store: StateStore, owner: str) -> None:
+        self._store = store
+        self.owner = owner
+        self.lost = False
+
+    async def check(self) -> None:
+        if not self.lost:
+            try:
+                self.lost = not await self._store.heartbeat_delivery_lock(self.owner)
+            except Exception as exc:  # unreachable store: the beat task decides
+                log.warning("delivery lock check failed: %s", exc)
+        if self.lost:
+            raise DeliveryLockLost(
+                "the delivery lock was taken over during this delivery; "
+                "stopped before the next step (retry-pr finishes it)"
+            )
+
+
 @contextlib.asynccontextmanager
-async def serialized_delivery(store: StateStore) -> AsyncIterator[None]:
+async def serialized_delivery(
+    store: StateStore, *, wait_s: float | None = None
+) -> AsyncIterator[DeliveryGuard]:
     """Hold the ONE delivery lock while merging, pushing and opening a PR.
 
     Two missions finishing together both merged main and both pushed, so both
@@ -57,10 +95,10 @@ async def serialized_delivery(store: StateStore) -> AsyncIterator[None]:
     from a laptop against the same database, so the lock has to live in the
     store (ADR 0013).
 
-    Waiting is bounded and never raises: if the lock cannot be taken in about
-    two TTLs, the caller proceeds WITHOUT it rather than deadlocking a mission.
-    Ordered-but-occasionally-unserialized is a better failure than a mission
-    that hangs on a lock row.
+    Fenced (audit 2026-11-25, 2.3): a lock that cannot be taken within
+    `wait_s` raises DeliveryBusy (it used to deliver WITHOUT the lock), and a
+    heartbeat that returns False, or that keeps failing for the takeover
+    window, marks the guard lost so the body stops before its next step.
     """
     owner = f"deliver-{uuid.uuid4().hex[:12]}"
     # A holder that is ALIVE heartbeats every DELIVERY_HEARTBEAT_S, so a row
@@ -68,31 +106,37 @@ async def serialized_delivery(store: StateStore) -> AsyncIterator[None]:
     # Without the short stale window a crashed delivery blocks the next one for
     # the full TTL, which is four minutes of a mission doing nothing.
     takeover_after = DELIVERY_HEARTBEAT_S * 3
-    deadline = time.monotonic() + DELIVERY_LOCK_TTL_S * 2
-    acquired = False
-    while time.monotonic() < deadline:
-        if await store.acquire_delivery_lock(owner, stale_after_s=takeover_after):
-            acquired = True
-            break
+    deadline = time.monotonic() + (DELIVERY_LOCK_TTL_S * 2 if wait_s is None else wait_s)
+    while not await store.acquire_delivery_lock(owner, stale_after_s=takeover_after):
+        if time.monotonic() >= deadline:
+            raise DeliveryBusy(
+                "another delivery held the lock for too long; this one is left "
+                "retryable instead of pushing unserialized"
+            )
         await asyncio.sleep(1.0)
-    if not acquired:
-        log.warning(
-            "delivery lock busy for %.0fs; delivering unserialized", DELIVERY_LOCK_TTL_S * 2
-        )
-        yield
-        return
+    guard = DeliveryGuard(store, owner)
 
     async def beat() -> None:
+        last_ok = time.monotonic()
         while True:
             await asyncio.sleep(DELIVERY_HEARTBEAT_S)
             try:
-                await store.heartbeat_delivery_lock(owner)
-            except Exception:  # a lost heartbeat must never kill a delivery
-                return
+                if not await store.heartbeat_delivery_lock(owner):
+                    guard.lost = True
+                    log.error("delivery lock %s taken over", owner)
+                    return
+                last_ok = time.monotonic()
+            except Exception as exc:
+                # keep trying: a lost heartbeat must not kill a delivery by
+                # itself, but past the takeover window the lock may be gone
+                log.warning("delivery heartbeat failed: %s", exc)
+                if time.monotonic() - last_ok >= takeover_after - DELIVERY_HEARTBEAT_S:
+                    guard.lost = True
+                    return
 
     task = asyncio.create_task(beat())
     try:
-        yield
+        yield guard
     finally:
         task.cancel()
         with contextlib.suppress(Exception, asyncio.CancelledError):
@@ -459,11 +503,14 @@ async def deliver_pr(
     # the owner rebased one by hand. One lock, not one per step, because a gap
     # between the merge and the push is exactly the window that caused it.
     try:
-        async with serialized_delivery(store):
+        async with serialized_delivery(store) as guard:
+            await guard.check()
             note = await merge_main_before_push(bus, mission_id, branch, worktree, author)
             if note:
                 body = _body_with_merge_note(body, note)
+            await guard.check()
             await push_branch(Path(worktree), branch)
+            await guard.check()
             url = await pr_create(Path(worktree), head=branch, title=title, body=body)
     except Exception as exc:
         error = _error_text(exc)
@@ -475,7 +522,7 @@ async def deliver_pr(
             {
                 **info,
                 "pr_pending": True,
-                "pr_status": "failed",
+                "pr_status": "busy" if isinstance(exc, DeliveryBusy) else "failed",
                 "pr_error": error,
                 "pr_attempts": attempts,
             },
