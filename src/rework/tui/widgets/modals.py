@@ -133,7 +133,10 @@ class Form(ModalScreen[dict[str, str] | None]):
                 yield Btn(self.submit_label, "submit", variant="primary")
 
     def on_mount(self) -> None:
-        first = self.query("Input, TextArea").first()
+        # .first() RAISES on no match. Found by the live TUI e2e: Settings has
+        # only a choice field, so opening it crashed the dialog on mount. A
+        # form with no text field focuses its first button instead.
+        first = self.query("Input, TextArea, Btn").first()
         if first is not None:
             first.focus()
 
