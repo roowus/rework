@@ -1174,6 +1174,10 @@ class DashboardView(View):
                 if btn.action in ("pause", "resume", "cancel", "fetch"):
                     btn.display = actions.can(btn.action, st)
                 elif btn.action == "priority":
+                    # pickup priority only means something while the mission
+                    # waits to be picked up; on a running or finished one the
+                    # button was a dead control (seen in the live TUI e2e)
+                    btn.display = st == "pending"
                     level = getattr(mission, "priority", "normal") if mission else "normal"
                     btn.set_label(f"Priority: {level}")
 
