@@ -307,6 +307,44 @@ async def test_loop_state_round_trip(store: StateStore) -> None:
     assert await store.load_loop_state("m:s:r:1") is None
 
 
+async def test_gate_row_event_and_park_commit_together(store: StateStore) -> None:
+    """Audit 2026-11-25 (2.1): the gate row, its GATE_OPENED event and the
+    mission's move to AWAITING_GATE were three commits; a reader or a crash
+    could see one without the others. create_gate writes all three at once."""
+    m = await store.create_mission(
+        Mission(id="m-gate-tx", objective="x", status=MissionStatus.RUNNING)
+    )
+    opened = EventRecord(mission_id=m.id, type=EventType.GATE_OPENED, payload={"gate_id": "g1"})
+    gate = Gate(id="g1", mission_id=m.id, kind=GateKind.SHIP, question="ship?")
+    await store.create_gate(gate, event=opened, park_mission=True)
+    assert opened.seq is not None
+    row = await store.get_mission(m.id)
+    assert row is not None and row.status == MissionStatus.AWAITING_GATE
+    types = [e.type for e in await store.events_since(0, mission_id=m.id)]
+    assert types == [EventType.GATE_OPENED]
+
+    decided = EventRecord(mission_id=m.id, type=EventType.GATE_DECIDED, payload={"gate_id": "g1"})
+    got = await store.decide_gate("g1", True, event=decided)
+    assert got is not None and got.status == GateStatus.APPROVED and decided.seq is not None
+    # a second (racing) decide changes nothing and writes NO event
+    again = EventRecord(mission_id=m.id, type=EventType.GATE_DECIDED, payload={"gate_id": "g1"})
+    await store.decide_gate("g1", False, event=again)
+    assert again.seq is None
+    types = [e.type for e in await store.events_since(0, mission_id=m.id)]
+    assert types == [EventType.GATE_OPENED, EventType.GATE_DECIDED]
+
+
+async def test_park_mission_never_overrides_an_owner_status(store: StateStore) -> None:
+    m = await store.create_mission(
+        Mission(id="m-gate-held", objective="x", status=MissionStatus.ON_HOLD)
+    )
+    await store.create_gate(
+        Gate(id="g2", mission_id=m.id, kind=GateKind.SHIP, question="?"), park_mission=True
+    )
+    row = await store.get_mission(m.id)
+    assert row is not None and row.status == MissionStatus.ON_HOLD
+
+
 async def test_leader_lock(store: StateStore) -> None:
     assert await store.acquire_lock("daemon-1") is True
     assert await store.acquire_lock("daemon-2") is False  # live foreign lock refused

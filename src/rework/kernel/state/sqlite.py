@@ -703,7 +703,27 @@ class SqliteStore:
         return [self._run(r) for r in rows]
 
     # -- gates ------------------------------------------------------------------
-    async def create_gate(self, gate: Gate) -> Gate:
+    async def create_gate(
+        self, gate: Gate, *, event: EventRecord | None = None, park_mission: bool = False
+    ) -> Gate:
+        # one transaction (_atomic): the row, its GATE_OPENED event and the
+        # mission's RUNNING -> AWAITING_GATE move commit together or not at all
+        await self._insert_gate(gate)
+        if park_mission:
+            await self._db.execute(
+                "UPDATE missions SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+                (
+                    MissionStatus.AWAITING_GATE.value,
+                    time.time(),
+                    gate.mission_id,
+                    MissionStatus.RUNNING.value,
+                ),
+            )
+        if event is not None:
+            await self.append_event(event)
+        return gate
+
+    async def _insert_gate(self, gate: Gate) -> None:
         await self._db.execute(
             "INSERT INTO gates (id, mission_id, kind, question, status, decision_note,"
             " decision, spec, for_run, created_at, decided_at)"
@@ -722,7 +742,6 @@ class SqliteStore:
                 gate.decided_at,
             ),
         )
-        return gate
 
     async def get_gate(self, gate_id: str) -> Gate | None:
         row = await self._fetch_one("SELECT * FROM gates WHERE id = ?", (gate_id,))
@@ -735,8 +754,9 @@ class SqliteStore:
         note: str | None = None,
         decision: dict[str, Any] | None = None,
         send_back: bool = False,
+        event: EventRecord | None = None,
     ) -> Gate | None:
-        await self._db.execute(
+        cur = await self._db.execute(
             "UPDATE gates SET status = ?, decision_note = ?, decision = ?, decided_at = ?"
             " WHERE id = ? AND status = ?",
             (
@@ -750,6 +770,9 @@ class SqliteStore:
                 GateStatus.OPEN.value,
             ),
         )
+        # the event only when THIS call decided it, in the same transaction
+        if event is not None and cur.rowcount > 0:
+            await self.append_event(event)
         return await self.get_gate(gate_id)
 
     async def set_gate_question(self, gate_id: str, question: str) -> Gate | None:

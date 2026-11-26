@@ -43,6 +43,13 @@ class InProcessEventBus:
                 q.put_nowait(persisted)
         return persisted
 
+    def deliver(self, persisted: EventRecord) -> None:
+        """Fan out an event the STORE already wrote (in the same transaction
+        as the row it describes, e.g. a gate decision). Never persists again."""
+        for q in self._subscribers:
+            with contextlib.suppress(asyncio.QueueFull):
+                q.put_nowait(persisted)
+
     def subscribe(self) -> asyncio.Queue[EventRecord]:
         q: asyncio.Queue[EventRecord] = asyncio.Queue(maxsize=1000)
         self._subscribers.add(q)

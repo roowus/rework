@@ -782,7 +782,11 @@ class PostgresStore:
 
     # -- gates ------------------------------------------------------------------
     @_serialized
-    async def create_gate(self, gate: Gate) -> Gate:
+    async def create_gate(
+        self, gate: Gate, *, event: EventRecord | None = None, park_mission: bool = False
+    ) -> Gate:
+        # ONE commit: the row, its GATE_OPENED event and the mission's
+        # RUNNING -> AWAITING_GATE move land together or not at all
         await self._conn.execute(
             "INSERT INTO gates (id, mission_id, kind, question, status, decision_note,"
             " decision, spec, for_run, created_at, decided_at)"
@@ -801,6 +805,18 @@ class PostgresStore:
                 gate.decided_at,
             ),
         )
+        if park_mission:
+            await self._conn.execute(
+                "UPDATE missions SET status = %s, updated_at = %s WHERE id = %s AND status = %s",
+                (
+                    MissionStatus.AWAITING_GATE.value,
+                    time.time(),
+                    gate.mission_id,
+                    MissionStatus.RUNNING.value,
+                ),
+            )
+        if event is not None:
+            await self._insert_event(event)
         await self._conn.commit()
         return gate
 
@@ -817,8 +833,9 @@ class PostgresStore:
         note: str | None = None,
         decision: dict[str, Any] | None = None,
         send_back: bool = False,
+        event: EventRecord | None = None,
     ) -> Gate | None:
-        await self._conn.execute(
+        cur = await self._conn.execute(
             "UPDATE gates SET status = %s, decision_note = %s, decision = %s,"
             " decided_at = %s WHERE id = %s AND status = %s",
             (
@@ -832,6 +849,8 @@ class PostgresStore:
                 GateStatus.OPEN.value,
             ),
         )
+        if event is not None and cur.rowcount > 0:
+            await self._insert_event(event)
         await self._conn.commit()
         return await self.get_gate(gate_id)
 
@@ -874,6 +893,13 @@ class PostgresStore:
     # -- events ---------------------------------------------------------------------
     @_serialized
     async def append_event(self, event: EventRecord) -> EventRecord:
+        await self._insert_event(event)
+        await self._conn.commit()
+        return event
+
+    async def _insert_event(self, event: EventRecord) -> None:
+        """INSERT one event and set its seq, without committing (callers that
+        write it together with another row commit once)."""
         async with self._conn.cursor() as cur:
             await cur.execute(
                 "INSERT INTO events (mission_id, run_id, type, payload, ts)"
@@ -889,8 +915,6 @@ class PostgresStore:
             row = await cur.fetchone()
             assert row is not None
             event.seq = int(row["seq"])
-        await self._conn.commit()
-        return event
 
     @_serialized
     async def events_since(

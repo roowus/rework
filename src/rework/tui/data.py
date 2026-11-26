@@ -500,11 +500,20 @@ class TuiData:
         # claiming online. `decide_gate` is idempotent-by-refusal (the UPDATE is
         # guarded on status = open), so a retry cannot double-decide, and
         # stale_ok=False keeps a cached payload from ever faking a verdict.
+        # Through GateManager, like the CLI: the row and its GATE_DECIDED event
+        # commit together (the TUI used to write the row only, so its
+        # decisions were missing from every event-log reader).
+        from rework.kernel.events.bus import InProcessEventBus
+        from rework.kernel.gates import GateManager
+
+        def _decide(s: Any) -> Any:
+            return GateManager(s, InProcessEventBus(s)).decide(
+                gate_id, approved, note, decision, send_back
+            )
+
         gate = await self._resilient(
             f"decide_gate:{gate_id}",
-            lambda: self._call(
-                lambda s: s.decide_gate(gate_id, approved, note, decision, send_back)
-            ),
+            lambda: self._call(_decide),
             stale_ok=False,
         )
         if gate is None:

@@ -164,7 +164,15 @@ class StateStore(Protocol):
     async def list_runs_by_status(self, status: RunStatus) -> list[Run]: ...
 
     # -- gates --------------------------------------------------------------
-    async def create_gate(self, gate: Gate) -> Gate: ...
+    async def create_gate(
+        self, gate: Gate, *, event: EventRecord | None = None, park_mission: bool = False
+    ) -> Gate:
+        """Insert a gate. With `event`, its GATE_OPENED event is written in the
+        SAME transaction; with `park_mission`, the mission moves RUNNING ->
+        AWAITING_GATE in it too (compare-and-set: any other status is left).
+        The row/event/status triple used to be three commits, and a reader (or
+        a crash) could see one without the others."""
+        ...
 
     async def get_gate(self, gate_id: str) -> Gate | None: ...
 
@@ -175,10 +183,12 @@ class StateStore(Protocol):
         note: str | None = None,
         decision: dict[str, Any] | None = None,
         send_back: bool = False,
+        event: EventRecord | None = None,
     ) -> Gate | None:
-        """Resolve an open gate. `note` is for humans; `decision` is the TYPED
-        answer handed to the paused role as its interrupt() result (None =
-        the role receives a plain bool, as before). `send_back` marks the gate
+        """Resolve an open gate. `event` (GATE_DECIDED) is written in the same
+        transaction, and only when this call is the one that decided it.
+        `note` is for humans; `decision` is the TYPED answer handed to the
+        paused role (None = the role receives a plain bool, as before). `send_back` marks the gate
         `sent_back` instead of approved/rejected (the third final-gate verdict:
         the mission returns to `running` with the owner's feedback)."""
         ...

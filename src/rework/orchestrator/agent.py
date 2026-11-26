@@ -1631,7 +1631,12 @@ class MissionOrchestrator:
             if options:
                 spec["options"] = options
             gate = await self.r._gates.request(
-                self.mid, kind=kind, question=question, for_run=run_id, spec=spec
+                self.mid,
+                kind=kind,
+                question=question,
+                for_run=run_id,
+                spec=spec,
+                park_mission=True,
             )
         await self.store.transition_mission(
             self.mid, MissionStatus.AWAITING_GATE, from_={MissionStatus.RUNNING}
@@ -1705,6 +1710,7 @@ class MissionOrchestrator:
                     f"${spend.spent_usd:.2f} spent). Allow {TURN_EXTENSION} more?"
                 ),
                 spec={"turn_cap": True, "asked_by": "engine"},
+                park_mission=True,
             )
         await self.store.transition_mission(
             self.mid, MissionStatus.AWAITING_GATE, from_={MissionStatus.RUNNING}
@@ -1789,6 +1795,7 @@ class MissionOrchestrator:
                 kind=GateKind.PERMISSION,
                 question=question,
                 spec={"_call": call_id, "asked_by": "orchestrator", "budget_to": wanted},
+                park_mission=True,
             )
         await self.store.transition_mission(
             self.mid, MissionStatus.AWAITING_GATE, from_={MissionStatus.RUNNING}

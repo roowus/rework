@@ -927,7 +927,9 @@ class MissionRunner:
             verdict, round_text = await self._audit_stamp(mission.id, last_audit_artifact)
             question = f"Ship the mission result? audit verdict: {verdict}{round_text}"
             if gate is None:
-                gate = await self._gates.request(mission.id, kind=GateKind.SHIP, question=question)
+                gate = await self._gates.request(
+                    mission.id, kind=GateKind.SHIP, question=question, park_mission=True
+                )
                 await self._bus.publish(
                     EventRecord(
                         mission_id=mission.id,
@@ -937,14 +939,9 @@ class MissionRunner:
                 )
             else:
                 gate = await self._refresh_gate_question(gate, question)
-            # The gate row is committed before the mission status, and the two
-            # writes are never atomic: an open gate beside a `running` row, and
-            # an `awaiting_gate` row whose gate row is not committed yet, are
-            # both legal transients. Readers converge and must wait on BOTH
-            # facts, not on the gate row alone (conftest.wait_for_gate_park).
-            # The order stays gate-row-first: status-first would move the
-            # transient to `awaiting_gate` with no gate row, which the daemon
-            # repair pass and the _handle_halted wait loop both assume away.
+            # A NEW gate parked the mission in the same transaction as its row
+            # (create_gate park_mission). A REUSED open gate (restart) parks
+            # it here; the compare-and-set leaves any other status alone.
             if gate.status == GateStatus.OPEN:
                 await self._store.transition_mission(
                     mission.id, MissionStatus.AWAITING_GATE, from_={MissionStatus.RUNNING}
@@ -1009,7 +1006,7 @@ class MissionRunner:
                 )
             if gate is None:
                 gate = await self._gates.request(
-                    mission.id, kind=GateKind.OPEN_PR, question=question
+                    mission.id, kind=GateKind.OPEN_PR, question=question, park_mission=True
                 )
                 await self._bus.publish(
                     EventRecord(
@@ -1020,14 +1017,9 @@ class MissionRunner:
                 )
             else:
                 gate = await self._refresh_gate_question(gate, question)
-            # The gate row is committed before the mission status, and the two
-            # writes are never atomic: an open gate beside a `running` row, and
-            # an `awaiting_gate` row whose gate row is not committed yet, are
-            # both legal transients. Readers converge and must wait on BOTH
-            # facts, not on the gate row alone (conftest.wait_for_gate_park).
-            # The order stays gate-row-first: status-first would move the
-            # transient to `awaiting_gate` with no gate row, which the daemon
-            # repair pass and the _handle_halted wait loop both assume away.
+            # A NEW gate parked the mission in the same transaction as its row
+            # (create_gate park_mission). A REUSED open gate (restart) parks
+            # it here; the compare-and-set leaves any other status alone.
             if gate.status == GateStatus.OPEN:
                 await self._store.transition_mission(
                     mission.id, MissionStatus.AWAITING_GATE, from_={MissionStatus.RUNNING}
