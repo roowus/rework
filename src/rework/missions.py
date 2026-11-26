@@ -690,10 +690,13 @@ async def create_mission(
     if plan not in PLANS:
         raise ValueError(f"unknown plan {plan!r}; plans: {', '.join(PLANS)}")
     upload_project = project_id is not None and await _upload_project(project_id)
-    # draft needs one too: it runs against a repo even though its deliverable
-    # is the mission's Report tab
+    # draft does NOT need one: its deliverable is the Report tab, its roles
+    # research with the web tools, and a role with no repo gets an empty
+    # per-run workspace (RoleBuildCtx.read_root). Found live (TUI e2e): the
+    # chat proposes draft for research ("write me a report on X"), the card
+    # offers Launch, and launching failed with "requires a repo".
     if (
-        plan in ("fix", "fix-pr", "draft", "audit")
+        plan in ("fix", "fix-pr", "audit")
         and not resolved["repo_path"]
         and not resolved["repo_origin"]
         and not upload_project
