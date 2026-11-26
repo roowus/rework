@@ -226,3 +226,20 @@ async def test_synthesis_after_an_owner_cancel_keeps_cancelled(tmp_path) -> None
         assert row.result["artifacts"]["echo:s"] == {"kind": "echo"}
     finally:
         await store.aclose()
+
+
+async def test_an_orchestrator_failure_with_no_runs_is_failed(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Found live (TUI e2e 2026-11-26): the orchestrator's model failed before it
+    spawned any role; it finished with outcome=failed and ZERO runs, and the
+    mission showed DONE in every UI."""
+    store = await open_sqlite(str(tmp_path / "syn4.sqlite3"))
+    try:
+        await store.create_mission(Mission(id="m4", objective="x", status=MissionStatus.RUNNING))
+        runner = MissionRunner("m4", store, InProcessEventBus(store), None, None, None, tmp_path)  # type: ignore[arg-type]
+        await runner._synthesize("m4", None, outcome="failed", summary="model call failed")
+        row = await store.get_mission("m4")
+        assert row is not None and row.status == MissionStatus.FAILED
+        events = [e.type.value for e in await store.events_since(0, mission_id="m4")]
+        assert "mission_failed" in events and "mission_done" not in events
+    finally:
+        await store.aclose()

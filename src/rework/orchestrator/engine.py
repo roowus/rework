@@ -1316,6 +1316,7 @@ class MissionRunner:
             result["summary"] = summary
         if accepted_findings:
             result["accepted_findings"] = list(accepted_findings)
+        orchestrator_failed = outcome is not None and outcome != "done"
         if outcome is not None:
             result["outcome"] = outcome
             failed = [] if outcome == "done" else list(latest.values())
@@ -1335,7 +1336,11 @@ class MissionRunner:
         elif ship_decision is False:
             status = MissionStatus.CANCELLED
             result["ship"] = "rejected at ship gate"
-        elif failed:
+        elif failed or orchestrator_failed:
+            # the orchestrator's own "failed" is a verdict on the MISSION, even
+            # when no role ran (found live: the orchestrator's model failed before
+            # spawning anything, finish(failed) left zero runs, and the empty
+            # list read as success -> a green DONE that did nothing)
             status = MissionStatus.FAILED
         else:
             status = MissionStatus.DONE
