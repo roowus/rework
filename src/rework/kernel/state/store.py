@@ -68,7 +68,9 @@ class StateStore(Protocol):
         `to`). Returns the updated row, or None when the mission is missing or
         in another status, which callers treat as "someone else moved it
         first" (an owner cancel, the daemon, another TUI). `result`, when
-        given, is written in the same statement."""
+        given, is written in the same statement. A move to a TERMINAL status
+        also closes the mission's still-open gates (rejected, "closed: the
+        mission ended") in the same transaction."""
         ...
 
     # -- agent loop transcript (ADR 0020) ---------------------------------------

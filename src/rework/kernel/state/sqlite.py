@@ -42,7 +42,7 @@ from rework.kernel.state.records import (
     coerce_priority,
 )
 from rework.kernel.state.retry import retry_transient_methods
-from rework.kernel.state.transitions import sources
+from rework.kernel.state.transitions import TERMINAL, sources
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS missions (
@@ -475,6 +475,15 @@ class SqliteStore:
         )
         if row is None:
             return None
+        if to in TERMINAL:
+            # same transaction (_atomic): a finished mission answers nothing, so
+            # its open gates close with it (see the Postgres store's note)
+            await self._db.execute(
+                "UPDATE gates SET status = 'rejected', decided_at = ?,"
+                " decision_note = COALESCE(decision_note, 'closed: the mission ended')"
+                " WHERE mission_id = ? AND status = 'open'",
+                (time.time(), mission_id),
+            )
         return self._mission(row)
 
     # -- agent loop transcript (ADR 0020): durable per turn, any host resumes --

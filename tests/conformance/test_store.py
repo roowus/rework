@@ -347,6 +347,37 @@ async def test_park_mission_never_overrides_an_owner_status(store: StateStore) -
     assert row is not None and row.status == MissionStatus.ON_HOLD
 
 
+async def test_a_finished_mission_closes_its_open_gates(store: StateStore) -> None:
+    """Found by the live TUI e2e: a cancelled mission's owner question stayed
+    open in every Gates list. A terminal transition closes the mission's open
+    gates in the same transaction; a decided gate keeps its decision, and
+    another mission's gates are untouched."""
+    m = await store.create_mission(
+        Mission(id="m-end", objective="x", status=MissionStatus.AWAITING_GATE)
+    )
+    other = await store.create_mission(
+        Mission(id="m-other", objective="y", status=MissionStatus.AWAITING_GATE)
+    )
+    await store.create_gate(
+        Gate(id="g-open", mission_id=m.id, kind=GateKind.QUESTION, question="?")
+    )
+    await store.create_gate(
+        Gate(id="g-done", mission_id=m.id, kind=GateKind.SHIP, question="ship?")
+    )
+    await store.decide_gate("g-done", True)
+    await store.create_gate(
+        Gate(id="g-other", mission_id=other.id, kind=GateKind.QUESTION, question="?")
+    )
+    assert await store.transition_mission(m.id, MissionStatus.CANCELLED) is not None
+    assert await store.list_open_gates(m.id) == []
+    closed = await store.get_gate("g-open")
+    assert closed is not None and closed.status == GateStatus.REJECTED
+    assert "mission ended" in (closed.decision_note or "")
+    kept = await store.get_gate("g-done")
+    assert kept is not None and kept.status == GateStatus.APPROVED
+    assert [g.id for g in await store.list_open_gates(other.id)] == ["g-other"]
+
+
 async def test_leader_lock(store: StateStore) -> None:
     assert await store.acquire_lock("daemon-1") is True
     assert await store.acquire_lock("daemon-2") is False  # live foreign lock refused
