@@ -169,3 +169,41 @@ class RoleSpec(ABC):
 
     def initial_state(self, ctx: RoleBuildCtx) -> dict[str, Any]:
         return {"objective": ctx.mission.objective}
+
+
+LOOPS = ("native", "pi")
+
+
+def loop_kind(ctx: RoleBuildCtx) -> str:
+    """Which agent runs this role's loop (ADR 0022): the run's context `loop`
+    (the orchestrator's per-spawn choice), else REWORK_ROLE_LOOP, else native."""
+    import os
+
+    wanted = str((ctx.run.context or {}).get("loop") or os.environ.get("REWORK_ROLE_LOOP") or "")
+    wanted = wanted.strip().lower() or "native"
+    return wanted if wanted in LOOPS else "native"
+
+
+def role_loop(ctx: RoleBuildCtx, system_prompt: str, catalog_id: str) -> Any:
+    """The pi loop node for a READ-ONLY role when this run asks for it, else
+    None (the caller builds its native loop). Read-only: pi gets `read` only."""
+    if loop_kind(ctx) != "pi":
+        return None
+    from rework.nodes.pi_loop import READ_ONLY_TOOLS, make_pi_loop_node
+    from rework.nodes.tools import role_env
+
+    entry = ctx.catalog.resolve(catalog_id)
+    return make_pi_loop_node(
+        store=ctx.store,
+        bus=ctx.bus,
+        mission_id=ctx.mission.id,
+        run_id=ctx.run.id,
+        model_id=entry.model,
+        system_prompt=system_prompt,
+        workdir=ctx.read_root,
+        budget=ctx.budget,
+        env=role_env(ctx.read_root, ctx.mission.id),
+        tools=READ_ONLY_TOOLS,
+        effort=ctx.run.model_ref.get("effort"),
+        price=entry.estimate_cost,
+    )
