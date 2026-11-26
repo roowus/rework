@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import fcntl
 import io
 import os
@@ -662,8 +663,24 @@ async def start_workspace_server(
     runner = web.AppRunner(build_workspace_app(store, workroot))
     await runner.setup()
     site = web.TCPSite(runner, host, port)
-    await site.start()
+    try:
+        await site.start()
+    except OSError as exc:
+        await runner.cleanup()
+        if exc.errno in (errno.EADDRINUSE, errno.EACCES):
+            # found live: a second daemon on ANOTHER database died with a raw
+            # asyncio traceback because the first held the default port
+            raise WorkspacePortBusy(
+                f"cannot bind the workspace API on {host}:{port} ({exc.strerror}): "
+                "another process (often a second `rework serve`) holds it; "
+                "set REWORK_HTTP_PORT to a free port for this daemon"
+            ) from exc
+        raise
     return runner
+
+
+class WorkspacePortBusy(RuntimeError):
+    """The workspace API's address is taken: a clear refusal, not a traceback."""
 
 
 def workspace_url_from_env() -> str:

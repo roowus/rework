@@ -156,6 +156,11 @@ class Config:
     max_roles: int = 0
     git_author_name: str = "rework"  # agent commit identity; per-deployment via env
     git_author_email: str = "rework@rework.local"
+    # leader lock (REWORK_LOCK_STALE_S): a lock whose heartbeat is older than
+    # this may be taken over. The heartbeat runs in its own task every sixth
+    # of it, so one slow dispatch iteration can no longer let a second daemon
+    # in (the old window was 10 poll ticks = 5 s, driven by the dispatch loop).
+    lock_stale_s: float = 30.0
 
     @property
     def git_author(self) -> tuple[str, str]:
@@ -179,6 +184,7 @@ class Config:
                 max_roles=_max_roles(),
                 git_author_name=author_name,
                 git_author_email=author_email,
+                lock_stale_s=_lock_stale_s(),
             )
         state_dir = Path(db).expanduser().parent
         checkpoints = os.environ.get(
@@ -191,7 +197,20 @@ class Config:
             max_roles=_max_roles(),
             git_author_name=author_name,
             git_author_email=author_email,
+            lock_stale_s=_lock_stale_s(),
         )
+
+
+def _lock_stale_s() -> float:
+    """REWORK_LOCK_STALE_S, else 30 s; never below 3 s (the heartbeat period
+    is a sixth of it, and a sub-second beat would only add load)."""
+    raw = os.environ.get("REWORK_LOCK_STALE_S")
+    if raw:
+        try:
+            return max(3.0, float(raw))
+        except ValueError:
+            pass
+    return 30.0
 
 
 def _concurrency(sqlite_default: int | None = None) -> int:

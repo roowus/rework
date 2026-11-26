@@ -65,6 +65,14 @@ class DaemonLocked(Exception):
     pass
 
 
+class LeaderLost(DaemonLocked):
+    """This daemon no longer holds the leader lock: another daemon took it over
+    (our heartbeat went stale) or the row was removed. Continuing would be a
+    split brain, two daemons dispatching the same missions, so the daemon stops
+    its runners and exits; the service manager restarts it and it waits its
+    turn like any second daemon."""
+
+
 def preview_dispatch_allowed() -> bool:
     """A preview daemon (ADR 0008) does not dispatch role runs unless its owner
     opted in with --allow-missions (REWORK_PREVIEW_ALLOW_MISSIONS=1)."""
@@ -181,11 +189,13 @@ class Daemon:
         self._owner = f"daemon-{uuid.uuid4().hex[:8]}"
         self._code: CodeChangeWatcher | None = None
         self._source_task: asyncio.Task[None] | None = None
+        self._beat_task: asyncio.Task[None] | None = None
+        self._lost = asyncio.Event()
 
     async def run_forever(self) -> None:
         # staleness must be a small multiple of the heartbeat period, or a
         # SIGKILLed daemon (no cleanup, fresh heartbeat) blocks restarts
-        stale_after = max(self._config.poll_interval_s * 10, 5.0)
+        stale_after = self._config.lock_stale_s
         if not await self._store.acquire_lock(self._owner, stale_after_s=stale_after):
             raise DaemonLocked(
                 f"another daemon holds this database's lock "
@@ -205,15 +215,31 @@ class Daemon:
             # the issue-tracker poller runs on ITS OWN cadence, not the hot
             # dispatch loop: a slow tracker must never delay a mission (ADR 0016)
             self._source_task = asyncio.create_task(self._poll_sources())
+            # the heartbeat has its OWN task: driven by the dispatch loop, one
+            # slow iteration (pickup, an auto-update check, a store retry) was
+            # enough for a second daemon to see a stale lock and take over
+            self._lost = asyncio.Event()
+            self._beat_task = asyncio.create_task(self._heartbeat(stale_after))
             while True:
-                await self._store.heartbeat_lock(self._owner)
                 await self._pickup_pending()
                 await self._repair_stale_gate_status()
                 self._reap()
                 self._check_code()
                 await self._maybe_auto_update()
-                await asyncio.sleep(self._config.poll_interval_s)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._lost.wait(), self._config.poll_interval_s)
+                if self._lost.is_set():
+                    await self._stop_runners()
+                    raise LeaderLost(
+                        f"daemon {self._owner} lost the leader lock "
+                        f"(heartbeat older than {stale_after:.0f}s or taken over); "
+                        "stopped its runners to avoid a split brain"
+                    )
         finally:
+            if self._beat_task is not None:
+                self._beat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._beat_task
             # no leaked task on any exit path: CancelledError, a normal return
             # and `raise SystemExit(0)` from auto-update all come through here
             if self._source_task is not None:
@@ -222,6 +248,46 @@ class Daemon:
                     await self._source_task
             await self._capacity.stop()
             await self._store.release_lock(self._owner)
+
+    async def _heartbeat(self, stale_after: float) -> None:
+        """Keep the leader lock fresh; set `_lost` the moment it is not ours.
+
+        A heartbeat that returns False means the row names another owner (we
+        were taken over) or is gone: lost at once. A heartbeat that RAISES
+        (the store is unreachable) is not proof of loss, but once our last
+        good beat is older than the stale window minus one period, another
+        daemon may legitimately have taken over, so we must assume we did."""
+        period = max(stale_after / 6, 0.05)
+        last_ok = time.monotonic()
+        while True:
+            await asyncio.sleep(period)
+            try:
+                held = await self._store.heartbeat_lock(self._owner)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                silent = time.monotonic() - last_ok
+                log.warning("leader heartbeat failed (%.1fs since last): %s", silent, exc)
+                if silent >= stale_after - period:
+                    log.error("leader lock may be lost: no heartbeat for %.1fs", silent)
+                    self._lost.set()
+                    return
+                continue
+            if not held:
+                log.error("leader lock lost: %s no longer owns it", self._owner)
+                self._lost.set()
+                return
+            last_ok = time.monotonic()
+
+    async def _stop_runners(self) -> None:
+        """Cancel every mission runner (lock lost). Their rows are left as
+        they are: the store is the truth and the new leader recovers them."""
+        tasks = [t for t in self._runners.values() if not t.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._runners.clear()
 
     def _log_dropped_env(self) -> None:
         """Say ONCE, by name and never by value, which variables the role

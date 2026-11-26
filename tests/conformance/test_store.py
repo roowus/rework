@@ -286,6 +286,22 @@ async def test_leader_lock_stale_takeover(store: StateStore) -> None:
     assert await store.heartbeat_lock("dead-daemon") is False
 
 
+async def test_leader_lock_stale_window_is_relative_to_the_last_beat(store: StateStore) -> None:
+    """A live heartbeat keeps the lock for the whole window; only silence for
+    longer than the window lets a contender in. Both backends must measure
+    this the same way (Postgres measures it on the DATABASE clock, so a client
+    whose clock runs ahead cannot steal a live lock)."""
+    assert await store.acquire_lock("holder", stale_after_s=0.4) is True
+    for _ in range(3):
+        await asyncio.sleep(0.15)
+        assert await store.heartbeat_lock("holder") is True
+        assert await store.acquire_lock("contender", stale_after_s=0.4) is False
+    await asyncio.sleep(0.6)
+    assert await store.acquire_lock("contender", stale_after_s=0.4) is True
+    assert await store.heartbeat_lock("holder") is False
+    await store.release_lock("contender")
+
+
 async def test_leader_lock_concurrent_acquire(store: StateStore) -> None:
     """The old acquire was read-then-write: two daemons could both pass the
     stale check and both win. The atomic upsert admits exactly one."""

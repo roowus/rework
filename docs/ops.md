@@ -530,7 +530,10 @@ This needs the target's `targets.toml` entry to have an `ssh` host (the
 it the command says so and exits 1).
 
 A `DaemonLocked` right after a restart is benign: the old heartbeat is still
-fresh; systemd's restart retry wins after one stale window.
+fresh; systemd's restart retry wins after one stale window (`REWORK_LOCK_STALE_S`,
+default 30 s). A `LeaderLost` exit means another daemon took this database's lock
+over; the daemon stopped its runners on purpose so two daemons never drive the same
+missions. If you see it without a second daemon, look for a stalled store connection.
 
 ### rework cannot overload its host
 

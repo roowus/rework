@@ -255,6 +255,11 @@ async def end_idle_transaction(conn: Any) -> None:
         pass
 
 
+# The server's wall clock as epoch seconds (the column's unit). clock_timestamp,
+# not now(): now() is frozen at transaction start.
+_DB_NOW = "EXTRACT(EPOCH FROM clock_timestamp())"
+
+
 def _serialized(method: Any) -> Any:
     """Serialize a store method against the shared connection, and always
     leave it in a committed state.
@@ -1203,14 +1208,17 @@ class PostgresStore:
     # both pass the stale check and both win; M3 hardening) ------------------------------
     @_serialized
     async def acquire_lock(self, owner: str, stale_after_s: float = 60.0) -> bool:
-        now = time.time()
+        # The DATABASE clock, not this client's: the daemon and a laptop CLI
+        # can disagree by seconds, which would move the takeover point (and a
+        # client clock running ahead could steal a live lock).
         cur = await self._conn.execute(
-            "INSERT INTO daemon_lock (id, owner, heartbeat_at) VALUES (1, %s, %s)"
+            "INSERT INTO daemon_lock (id, owner, heartbeat_at)"
+            f" VALUES (1, %s, {_DB_NOW})"
             " ON CONFLICT (id) DO UPDATE SET"
             " owner = EXCLUDED.owner, heartbeat_at = EXCLUDED.heartbeat_at"
             " WHERE daemon_lock.owner = EXCLUDED.owner"
-            "    OR daemon_lock.heartbeat_at <= %s",
-            (owner, now, now - stale_after_s),
+            f"    OR daemon_lock.heartbeat_at <= {_DB_NOW} - %s",
+            (owner, stale_after_s),
         )
         await self._conn.commit()
         return cur.rowcount > 0
@@ -1218,8 +1226,8 @@ class PostgresStore:
     @_serialized
     async def heartbeat_lock(self, owner: str) -> bool:
         cur = await self._conn.execute(
-            "UPDATE daemon_lock SET heartbeat_at = %s WHERE id = 1 AND owner = %s",
-            (time.time(), owner),
+            f"UPDATE daemon_lock SET heartbeat_at = {_DB_NOW} WHERE id = 1 AND owner = %s",
+            (owner,),
         )
         await self._conn.commit()
         return cur.rowcount > 0
@@ -1232,14 +1240,16 @@ class PostgresStore:
     # -- delivery lock (ADR 0013): see sqlite.py for the contract -------------
     @_serialized
     async def acquire_delivery_lock(self, owner: str, stale_after_s: float = 120.0) -> bool:
-        now = time.time()
+        # database clock: the laptop (`rework retry-pr`) and the daemon both
+        # take this lock, so client clocks must not decide who is stale
         cur = await self._conn.execute(
-            "INSERT INTO delivery_lock (id, owner, heartbeat_at) VALUES (1, %s, %s)"
+            "INSERT INTO delivery_lock (id, owner, heartbeat_at)"
+            f" VALUES (1, %s, {_DB_NOW})"
             " ON CONFLICT (id) DO UPDATE SET"
             " owner = EXCLUDED.owner, heartbeat_at = EXCLUDED.heartbeat_at"
             " WHERE delivery_lock.owner = EXCLUDED.owner"
-            "    OR delivery_lock.heartbeat_at <= %s",
-            (owner, now, now - stale_after_s),
+            f"    OR delivery_lock.heartbeat_at <= {_DB_NOW} - %s",
+            (owner, stale_after_s),
         )
         await self._conn.commit()
         return cur.rowcount > 0
@@ -1247,8 +1257,8 @@ class PostgresStore:
     @_serialized
     async def heartbeat_delivery_lock(self, owner: str) -> bool:
         cur = await self._conn.execute(
-            "UPDATE delivery_lock SET heartbeat_at = %s WHERE id = 1 AND owner = %s",
-            (time.time(), owner),
+            f"UPDATE delivery_lock SET heartbeat_at = {_DB_NOW} WHERE id = 1 AND owner = %s",
+            (owner,),
         )
         await self._conn.commit()
         return cur.rowcount > 0
