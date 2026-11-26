@@ -1,0 +1,1 @@
+{"summary": "Fix is correct: add() now adds; mul() unaffected and still passing.", "findings": [], "standing_assessments": {"proportionality": "proportionate (no accessory)", "complexity": "trivial, appropriate", "priority": "appropriate", "coverage": "adequate: existing tests pin the change", "business_logic_risk": "none"}, "coverage": [], "warnings": [], "blockers": []}

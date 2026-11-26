@@ -34,7 +34,10 @@ def _build(entry: ModelEntry, extra: dict[str, Any] | None = None) -> ModelProvi
     provider defaults (ANTHROPIC_API_KEY / OPENAI_API_KEY). extra carries env-independent
     credentials (e.g. per-endpoint keys for openai-compatible providers)."""
     if entry.provider == "fake":
-        return FakeProvider()
+        # REWORK_FAKE_SCRIPT drives a real daemon in e2e runs; unset = empty fake
+        from rework.kernel.llm.adapters.fake import scripted_from_env
+
+        return scripted_from_env()
     if entry.provider == "anthropic":
         key = os.environ.get(entry.api_key_env or "ANTHROPIC_API_KEY")
         return AnthropicProvider(api_key=key, base_url=entry.base_url)
