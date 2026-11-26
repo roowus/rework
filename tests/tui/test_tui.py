@@ -6096,3 +6096,34 @@ async def test_the_proposal_budget_field_is_on_screen(
         await _wait_for(pilot, lambda: field.region.width > 0)
         assert field.region.width > 0
         assert card.region.contains_region(field.region), (field.region, card.region)
+
+
+async def test_priority_is_offered_only_while_a_mission_waits_for_pickup(
+    ids: dict[str, str], env: Path
+) -> None:
+    """Pickup priority only orders PENDING missions: on a running mission the
+    Dashboard's Priority button was a dead control (seen in the live TUI e2e)."""
+    from rework.kernel.state.records import Mission
+
+    store = await _store(env)
+    try:
+        await store.create_mission(Mission(id="m-queued00001", objective="wait in line"))
+    finally:
+        await store.aclose()
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        await pilot.press("alt+2")
+        dash = app.view("dashboard")
+
+        def priority_shown() -> bool:
+            return any(
+                b.action == "priority" and b.display for b in dash.query("#dash-controls Btn")
+            )
+
+        dash.open_mission(ids["running"])
+        await _settle(pilot, 0.6)
+        assert not priority_shown(), "priority offered on a RUNNING mission"
+        dash.open_mission("m-queued00001")
+        await _wait_for(pilot, priority_shown)
+        assert priority_shown(), "priority hidden on a PENDING mission"
