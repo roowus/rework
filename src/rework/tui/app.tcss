@@ -172,6 +172,9 @@ MenuScreen { background: transparent; align: left top; }
 /* the editable budget on a proposal card (the owner reprices before Launch) */
 .pc-budget { margin-top: 1; }
 .pc-budget-row { height: 1; margin-top: 1; }
+/* auto, or the label takes 1fr of the row and pushes the input past the right
+   edge (found by the live TUI e2e: the editable budget was never on screen) */
+.pc-budget-label { width: auto; }
 .pc-budget-row .spacer { width: 1fr; margin-left: 1; }
 .pc-budget-input { width: 10; background: $raised; border: none; padding: 0 1; }
 .pc-budget-input:focus { background: $overlay; border: none; }
