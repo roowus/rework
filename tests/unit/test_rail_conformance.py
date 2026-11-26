@@ -238,3 +238,40 @@ def test_the_plan_kind_guard_accepts_what_the_mission_creator_stamps() -> None:
     # with steps as runnable regardless of kind
     spec = json.loads(json.dumps(PLAN_FIX))
     assert spec["steps"]
+
+
+# -- the freshness rule compares COMMITS (audit 2026-11-25, 3.3) -------------
+
+
+def _audit_of(sha: str, at: float) -> Run:
+    run = _clean_audit(at)
+    return run.model_copy(update={"artifact": {**(run.artifact or {}), "reviewed_sha": sha}})
+
+
+def test_a_later_write_to_an_old_coder_row_is_not_an_unaudited_change() -> None:
+    """The clock rule counted ANY later write to a coder row (a status flip, a
+    model_ref update on resume) as new code. The audit reviewed the commit the
+    coder left, so it is fresh."""
+    coder = _coder(1.0, GOOD_TESTS).model_copy(update={"updated_at": 9.0})
+    assert audit_problem([coder, _audit_of("abc", 2.0)], {}) is None
+
+
+def test_a_new_commit_after_the_audit_is_unaudited() -> None:
+    newer = _coder(3.0, GOOD_TESTS)
+    newer = newer.model_copy(
+        update={"id": "m:r:coder:3", "artifact": {**(newer.artifact or {}), "commit": "def"}}
+    )
+    problem = audit_problem([_coder(1.0, GOOD_TESTS), _audit_of("abc", 2.0), newer], {})
+    assert problem is not None and "def" in problem and "abc" in problem
+
+
+def test_a_coder_still_running_after_the_audit_is_unaudited() -> None:
+    live = _run("coder", RunStatus.RUNNING, at=3.0)
+    problem = audit_problem([_coder(1.0, GOOD_TESTS), _audit_of("abc", 2.0), live], {})
+    assert problem is not None and "still running" in problem
+
+
+def test_an_audit_without_a_recorded_commit_keeps_the_clock_rule() -> None:
+    """Rows from before reviewed_sha existed."""
+    later = _coder(3.0, GOOD_TESTS)
+    assert audit_problem([_coder(1.0, GOOD_TESTS), _clean_audit(2.0), later], {}) is not None

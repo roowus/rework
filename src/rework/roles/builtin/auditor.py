@@ -93,6 +93,10 @@ class AuditorState(TypedDict, total=False):
     final_text: str
     artifact: dict[str, Any] | None
     artifact_error: str | None
+    # the commit under review: HEAD of the worktree when the audit started.
+    # Stamped onto the artifact so the finish rail can compare COMMITS, not
+    # clocks (rails.audit_problem).
+    reviewed_sha: str | None
 
 
 class AuditorSpec(RoleSpec):
@@ -167,6 +171,9 @@ class AuditorSpec(RoleSpec):
         )
 
         async def prepare(state: AuditorState) -> dict[str, Any]:
+            from rework.nodes.git_ops import head_sha
+
+            reviewed = await head_sha(Path(str(workspace))) if workspace else None
             parts: list[str] = []
             brief = str(run_ctx.get("brief") or state["objective"])
             parts.append(f"Mission brief (what this change was supposed to do): {brief}")
@@ -204,7 +211,10 @@ class AuditorSpec(RoleSpec):
                     payload={"note": "audit context assembled"},
                 )
             )
-            return {"messages": [{"role": "user", "content": "\n\n".join(parts)}]}
+            return {
+                "messages": [{"role": "user", "content": "\n\n".join(parts)}],
+                "reviewed_sha": reviewed,
+            }
 
         loop = make_toolloop_node(
             provider=ctx.provider,
@@ -241,14 +251,23 @@ class AuditorSpec(RoleSpec):
             goal=self.goal,
         )
 
+        async def stamp(state: AuditorState) -> dict[str, Any]:
+            """Mechanical: the commit this audit reviewed rides on the artifact."""
+            artifact = state.get("artifact")
+            if artifact is None or not state.get("reviewed_sha"):
+                return {}
+            return {"artifact": {**artifact, "reviewed_sha": state["reviewed_sha"]}}
+
         graph = StateGraph(AuditorState)
         graph.add_node("prepare", prepare)
         graph.add_node("loop", loop)  # type: ignore[arg-type]  # plain-callable node factory
         graph.add_node("report", report)  # type: ignore[arg-type]
+        graph.add_node("stamp", stamp)
         graph.add_edge(START, "prepare")
         graph.add_edge("prepare", "loop")
         graph.add_edge("loop", "report")
-        graph.add_edge("report", END)
+        graph.add_edge("report", "stamp")
+        graph.add_edge("stamp", END)
         return graph.compile()
 
 

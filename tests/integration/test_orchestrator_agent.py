@@ -1254,7 +1254,10 @@ async def test_finish_done_is_refused_without_a_fresh_audit(world: dict[str, Any
             turn(call("finish", "n9", outcome="failed", summary="stopped, nothing ships")),
         ],
     )
-    provider.route("Fulfill the task", _coder_script("first") + _coder_script("second"))
+    # the second coder must COMMIT something new: the rail compares the commit
+    # the audit reviewed with the newest handoff's commit (audit 2026-11-25,
+    # 3.3), so a coder that rewrites the same bytes changes nothing to audit
+    provider.route("Fulfill the task", _coder_script("first") + _second_change_script())
     provider.route("Find issues", _auditor_script(AUDIT_CLEAN))
     await asyncio.wait_for(runner(world).run(), timeout=30)
 
@@ -1264,7 +1267,7 @@ async def test_finish_done_is_refused_without_a_fresh_audit(world: dict[str, Any
         if m.role == "tool"
     ]
     assert any("no auditor has completed" in t for t in out)
-    assert any("ran after the last completed audit" in t for t in out)
+    assert any("those changes are unaudited" in t for t in out)
     mission = await store.get_mission("mo")
     assert mission is not None and mission.status == MissionStatus.FAILED, "it never shipped"
 
@@ -2014,3 +2017,29 @@ async def test_endless_cut_offs_terminate_as_a_failure(world: dict[str, Any]) ->
     assert "stopped calling tools" in str(result)
     # 2 bounded retries, then the 3 idle strikes: bounded, not a loop
     assert len(provider.requests) == 5
+
+
+def _second_change_script() -> list[Any]:
+    """A coder whose change is NEW (a second file), so it leaves a new commit."""
+    from conftest import CODER_TESTS_BLOCK
+    from rework.kernel.llm.types import ChatResult, ToolCall, Usage
+
+    return [
+        ChatResult(
+            text="one more change",
+            tool_calls=[
+                ToolCall(
+                    id="c9",
+                    name="run_command",
+                    arguments={"command": "printf 'EXTRA = 1\\n' > extra.py"},
+                )
+            ],
+            usage=Usage(input_tokens=10, output_tokens=5),
+            stop_reason="tool_calls",
+        ),
+        ChatResult(
+            text="added extra.py" + CODER_TESTS_BLOCK,
+            usage=Usage(input_tokens=10, output_tokens=8),
+            stop_reason="end_turn",
+        ),
+    ]
