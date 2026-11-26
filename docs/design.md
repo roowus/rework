@@ -111,6 +111,12 @@ client clock skew cannot move the takeover point. Every `serve` exit path closes
 store and the library index (a refused start used to print its error and hang on
 aiosqlite's worker thread), and a busy workspace port is a one-line refusal.
 
+Mission status is a state machine (ADR 0018): `kernel/state/transitions.py` lists the
+legal moves, terminal statuses are final, and every status write is a compare-and-set
+(`StateStore.transition_mission`) that applies only while the row is still in the status
+the writer expects. Owner verbs (pause/resume/cancel) live once in
+`rework.services.missions`; pause records `held_from`, resume restores it.
+
 Roles are NOT subgraphs of the orchestrator checkpoint; each Run is an independent
 asyncio task with its own checkpointer thread. Parallelism = N run rows for one step.
 
