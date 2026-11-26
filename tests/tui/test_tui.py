@@ -6052,3 +6052,22 @@ async def test_the_final_retry_failure_is_part_of_the_offline_ladder(
     assert data._reconnecting_hint, "the offline note is set"
     assert data._last_good["projects"] == got
     await data.aclose()
+
+
+async def test_every_menu_form_opens_and_closes(ids: dict[str, str], env: Path) -> None:
+    """Found by the live TUI e2e tour: File/Help > Settings crashed on mount
+    (its only field is a choice, and the form's focus query raised
+    NoMatches). Every form and dialog the menus open must open cleanly and
+    close on escape."""
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        for action in ("settings", "help", "new_project", "new_library_item"):
+            depth = len(app.screen_stack)
+            await app.run_action(action)
+            await _wait_for(pilot, lambda depth=depth: len(app.screen_stack) > depth)
+            assert len(app.screen_stack) > depth, f"{action} opened nothing"
+            await pilot.press("escape")
+            await _wait_for(pilot, lambda depth=depth: len(app.screen_stack) == depth)
+            assert len(app.screen_stack) == depth, f"escape did not close {action}"
+        assert not app.swallowed, app.swallowed
