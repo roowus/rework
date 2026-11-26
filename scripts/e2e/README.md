@@ -22,3 +22,5 @@ Scenarios:
   mission must leave no open gate.
 - `gates_tab_answer_and_badge`: an orchestrator question answered by typing in
   B's Gates tab reaches the orchestrator; the badge clears in both TUIs.
+- `same_chat_two_tuis`: both TUIs on ONE chat; every turn shows in both, and
+  every model turn sees the whole conversation.
