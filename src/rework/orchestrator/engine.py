@@ -2100,30 +2100,6 @@ class MissionRunner:
         )
         return True
 
-    async def _has_open_gate(self, run: Run) -> bool:
-        payload = run.escalation or {}
-        question = str(payload.get("question") or "")
-        gates = await self._store.list_open_gates(self.mission_id)
-        return any(g.question == question for g in gates)
-
-    async def _decision_for(self, run: Run) -> tuple[bool, str] | None:
-        """(approved, gate_id) for this run's halt question, from the event log.
-        The event log is store truth: it survives daemon restarts, so a decision
-        made while we were down is picked up here (ADR 0002)."""
-        payload = run.escalation or {}
-        question = str(payload.get("question") or "")
-        events = await self._store.events_since(0, mission_id=self.mission_id, limit=2000)
-        gate_id: str | None = None
-        for e in events:  # last GATE_OPENED for this question wins
-            if e.type == EventType.GATE_OPENED and e.payload.get("question") == question:
-                gate_id = e.payload.get("gate_id")
-        if gate_id is None:
-            return None
-        for e in reversed(events):  # latest decision for that gate
-            if e.type == EventType.GATE_DECIDED and e.payload.get("gate_id") == gate_id:
-                return bool(e.payload.get("approved")), gate_id
-        return None
-
     @staticmethod
     def _gate_kind(payload: dict[str, Any]) -> GateKind:
         """The gate kind for an escalation. `blocked` and `needs_context` are

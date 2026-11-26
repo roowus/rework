@@ -19,6 +19,7 @@ import aiosqlite
 from rework.kernel.state.migrations import COLUMN_MIGRATIONS, SCHEMA_VERSION, alter_sql
 from rework.kernel.state.records import (
     MISSION_LIGHT_COLUMNS,
+    WEEK_OFFSET_S,
     BudgetState,
     Charge,
     Chat,
@@ -573,18 +574,6 @@ class SqliteStore:
         )
         return [self._mission(r) for r in rows]
 
-    async def list_missions_for_pickup(self, status: MissionStatus, limit: int) -> list[Mission]:
-        """Daemon pickup: OLDEST first, id as tiebreak (created_at is not unique).
-
-        An old pending mission must never be hidden behind newer ones, so the
-        limit only ever trims the newest end of the queue.
-        """
-        rows = await self._fetch_all(
-            "SELECT * FROM missions WHERE status = ? ORDER BY created_at ASC, id ASC LIMIT ?",
-            (status.value, limit),
-        )
-        return [self._mission(r) for r in rows]
-
     # -- projects (ADR 0005) --------------------------------------------------
     async def create_project(self, project: Project) -> Project:
         await self._db.execute(
@@ -921,8 +910,8 @@ class SqliteStore:
 
         SQLite has strftime but no date_trunc, so bucketing is done on the
         epoch column: secs/86400 for whole UTC days, /3600 for hours, and
-        /604800 for weeks (Monday-anchored only in the sense of "epoch
-        weeks" — the label is generated in UTC so every backend agrees).
+        /604800 for weeks, shifted by WEEK_OFFSET_S so weeks start on Monday
+        like Postgres' date_trunc('week').
         """
         if bucket not in ("day", "hour", "week", "total"):
             raise ValueError(f"unknown bucket {bucket!r}")
@@ -930,6 +919,8 @@ class SqliteStore:
             raise ValueError(f"unknown group_by {group_by!r}")
 
         divisor = {"hour": 3600, "day": 86400, "week": 604800, "total": 0}[bucket]
+        # Monday-anchored weeks, like Postgres' date_trunc (records.WEEK_OFFSET_S)
+        offset = WEEK_OFFSET_S if bucket == "week" else 0.0
         group_expr = {
             "none": "''",
             "project": "COALESCE(m.project_id, '')",
@@ -939,7 +930,11 @@ class SqliteStore:
 
         sql = (
             "SELECT "
-            + ("0 AS bucket" if divisor == 0 else f"CAST(c.ts / {divisor} AS INTEGER) AS bucket")
+            + (
+                "0 AS bucket"
+                if divisor == 0
+                else f"CAST((c.ts - {offset}) / {divisor} AS INTEGER) AS bucket"
+            )
             + f", {group_expr} AS group_key,"
             " COUNT(*) AS calls,"
             " COALESCE(SUM(c.input_tokens), 0) AS input_tokens,"
@@ -964,7 +959,7 @@ class SqliteStore:
         rows = await self._fetch_all(sql, tuple(params))
         return [
             {
-                "bucket_start": float(r["bucket"]) * divisor,
+                "bucket_start": float(r["bucket"]) * divisor + offset,
                 "bucket_label": bucket_label(r["bucket"], bucket),
                 "group_key": str(r["group_key"] or ""),
                 "calls": int(r["calls"] or 0),

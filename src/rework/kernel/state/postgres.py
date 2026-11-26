@@ -19,6 +19,7 @@ from psycopg.rows import DictRow
 from rework.kernel.state.migrations import COLUMN_MIGRATIONS, SCHEMA_VERSION, alter_sql
 from rework.kernel.state.records import (
     MISSION_LIGHT_COLUMNS,
+    WEEK_OFFSET_S,
     BudgetState,
     Charge,
     Chat,
@@ -634,19 +635,6 @@ class PostgresStore:
         )
         return [self._mission(r) for r in rows]
 
-    @_serialized
-    async def list_missions_for_pickup(self, status: MissionStatus, limit: int) -> list[Mission]:
-        """Daemon pickup: OLDEST first, id as tiebreak (created_at is not unique).
-
-        An old pending mission must never be hidden behind newer ones, so the
-        limit only ever trims the newest end of the queue.
-        """
-        rows = await self._fetch_all(
-            "SELECT * FROM missions WHERE status = %s ORDER BY created_at ASC, id ASC LIMIT %s",
-            (status.value, limit),
-        )
-        return [self._mission(r) for r in rows]
-
     # -- projects (ADR 0005) --------------------------------------------------
     @_serialized
     async def create_project(self, project: Project) -> Project:
@@ -1065,7 +1053,8 @@ class PostgresStore:
                 bucket_num: float | None = None
             else:
                 start = float(r["bucket_ts"].timestamp())  # bucket START epoch
-                bucket_num = start / divisor if divisor else None
+                offset = WEEK_OFFSET_S if bucket == "week" else 0.0
+                bucket_num = (start - offset) / divisor if divisor else None
             out.append(
                 {
                     "bucket_start": start,
