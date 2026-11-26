@@ -82,6 +82,12 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_mission ON runs(mission_id);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
+CREATE TABLE IF NOT EXISTS loop_state (
+    run_id TEXT PRIMARY KEY,
+    turns INTEGER NOT NULL,
+    messages TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS gates (
     id TEXT PRIMARY KEY,
     mission_id TEXT NOT NULL,
@@ -468,6 +474,28 @@ class SqliteStore:
         if row is None:
             return None
         return self._mission(row)
+
+    # -- agent loop transcript (ADR 0020): durable per turn, any host resumes --
+    async def save_loop_state(
+        self, run_id: str, turns: int, messages: list[dict[str, Any]]
+    ) -> None:
+        await self._db.execute(
+            "INSERT INTO loop_state (run_id, turns, messages, updated_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(run_id) DO UPDATE SET turns = EXCLUDED.turns,"
+            " messages = EXCLUDED.messages, updated_at = EXCLUDED.updated_at",
+            (run_id, turns, json.dumps(messages, default=str), time.time()),
+        )
+
+    async def load_loop_state(self, run_id: str) -> tuple[int, list[dict[str, Any]]] | None:
+        row = await self._fetch_one(
+            "SELECT turns, messages FROM loop_state WHERE run_id = ?", (run_id,)
+        )
+        if row is None:
+            return None
+        return int(row["turns"]), list(json.loads(row["messages"]) or [])
+
+    async def clear_loop_state(self, run_id: str) -> None:
+        await self._db.execute("DELETE FROM loop_state WHERE run_id = ?", (run_id,))
 
     # -- transient crash counter -------------------------------------------
     # One statement each, committed: a counter bump must survive the crash it

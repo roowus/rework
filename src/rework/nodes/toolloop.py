@@ -110,14 +110,10 @@ def _load_loop(
         return None
     try:
         saved = json.loads(path.read_text(encoding="utf-8"))
-        messages = saved["messages"]
-        if initial and messages and messages[0].get("content") != initial[0].get("content"):
-            return None
         # a transcript must not end on an assistant tool call without results
-        while (
-            messages and messages[-1].get("role") == "assistant" and messages[-1].get("tool_calls")
-        ):
-            messages.pop()
+        messages = _resumable(saved["messages"], initial)
+        if messages is None:
+            return None
         return messages, int(saved.get("turns") or 0)
     except (OSError, ValueError, KeyError, TypeError):
         return None
@@ -132,6 +128,54 @@ def _save_loop(path: Path | None, messages: list[dict[str, Any]], turns: int) ->
         tmp.replace(path)
     except OSError:
         log.warning("could not save loop transcript to %s", path)
+
+
+def _resumable(
+    messages: list[dict[str, Any]], initial: list[dict[str, Any]]
+) -> list[dict[str, Any]] | None:
+    """The saved transcript if it belongs to THIS run (same opening message),
+    with any trailing unanswered tool call dropped; else None."""
+    if initial and messages and messages[0].get("content") != initial[0].get("content"):
+        return None
+    messages = list(messages)
+    while messages and messages[-1].get("role") == "assistant" and messages[-1].get("tool_calls"):
+        messages.pop()
+    return messages
+
+
+async def _load_state(
+    store: StateStore, run_id: str, path: Path | None, initial: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], int] | None:
+    """The run's transcript from the STORE (ADR 0020): any host can resume it.
+    A legacy loop.json from before the store held it is read once as a fallback,
+    so a run interrupted across the upgrade still resumes."""
+    try:
+        saved = await store.load_loop_state(run_id)
+    except Exception as exc:  # the loop must never die for a resume read
+        log.warning("loop state read failed for %s: %s", run_id, exc)
+        saved = None
+    if saved is not None:
+        turns, messages = saved
+        kept = _resumable(messages, initial)
+        return (kept, turns) if kept is not None else None
+    return _load_loop(path, initial)
+
+
+async def _save_state(
+    store: StateStore, run_id: str, messages: list[dict[str, Any]], turns: int
+) -> None:
+    try:
+        await store.save_loop_state(run_id, turns, messages)
+    except Exception as exc:  # losing a resume point costs replay, not the run
+        log.warning("loop state save failed for %s: %s", run_id, exc)
+
+
+async def _clear_state(store: StateStore, run_id: str, path: Path | None) -> None:
+    try:
+        await store.clear_loop_state(run_id)
+    except Exception as exc:
+        log.warning("loop state clear failed for %s: %s", run_id, exc)
+    _clear_loop(path)
 
 
 def _clear_loop(path: Path | None) -> None:
@@ -298,7 +342,7 @@ def make_toolloop_node(
         # RESUME (pause, budget gate, daemon restart): the loop is ONE graph
         # node, so a re-entered node used to start over at turn 1 and pay for
         # every earlier turn again. The transcript is saved after each turn.
-        saved = _load_loop(resume_file, messages)
+        saved = await _load_state(store, run_id, resume_file, messages)
         if saved is not None:
             messages, turns = saved
             await emit("turn", {"turn": turns, "text": f"resumed at turn {turns}"})
@@ -409,7 +453,7 @@ def make_toolloop_node(
                     final = "".join(parts)
                 else:
                     final = result.text
-                _clear_loop(resume_file)
+                await _clear_state(store, run_id, resume_file)
                 return {"messages": messages, "loop_turns": turns, "final_text": final}
             for tc in result.tool_calls:
                 await emit(
@@ -435,7 +479,7 @@ def make_toolloop_node(
                 messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "name": tc.name, "content": out}
                 )
-            _save_loop(resume_file, messages, turns)
+            await _save_state(store, run_id, messages, turns)
         if stop_note is None:
             stop_note = f"stopped: turn budget ({limit}) reached"
             # HANDOFF NOTE (found on dogfood #2): a role cut off at its budget
@@ -447,7 +491,7 @@ def make_toolloop_node(
                 stop_note = f"{stop_note}\n\n{handoff}"
                 # in the transcript too: report writers read messages, not this
                 messages.append({"role": "assistant", "content": handoff})
-        _clear_loop(resume_file)
+        await _clear_state(store, run_id, resume_file)
         return {"messages": messages, "loop_turns": turns, "final_text": stop_note}
 
     return node

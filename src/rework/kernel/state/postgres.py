@@ -129,6 +129,14 @@ _DDL = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_charges_mission ON charges(mission_id)",
     """
+    CREATE TABLE IF NOT EXISTS loop_state (
+        run_id TEXT PRIMARY KEY,
+        turns INTEGER NOT NULL,
+        messages TEXT NOT NULL,
+        updated_at DOUBLE PRECISION NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS daemon_lock (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         owner TEXT NOT NULL,
@@ -198,6 +206,7 @@ _TABLES = [
     "daemon_lock",
     "delivery_lock",
     "complaints",
+    "loop_state",
 ]
 
 
@@ -514,6 +523,33 @@ class PostgresStore:
             return None
             await self._conn.commit()
         return self._mission(row)
+
+    # -- agent loop transcript (ADR 0020) ---------------------------------------
+    @_serialized
+    async def save_loop_state(
+        self, run_id: str, turns: int, messages: list[dict[str, Any]]
+    ) -> None:
+        await self._conn.execute(
+            "INSERT INTO loop_state (run_id, turns, messages, updated_at) VALUES (%s, %s, %s, %s)"
+            " ON CONFLICT (run_id) DO UPDATE SET turns = EXCLUDED.turns,"
+            " messages = EXCLUDED.messages, updated_at = EXCLUDED.updated_at",
+            (run_id, turns, json.dumps(messages, default=str), time.time()),
+        )
+        await self._conn.commit()
+
+    @_serialized
+    async def load_loop_state(self, run_id: str) -> tuple[int, list[dict[str, Any]]] | None:
+        row = await self._fetch_one(
+            "SELECT turns, messages FROM loop_state WHERE run_id = %s", (run_id,)
+        )
+        if row is None:
+            return None
+        return int(row["turns"]), list(json.loads(row["messages"]) or [])
+
+    @_serialized
+    async def clear_loop_state(self, run_id: str) -> None:
+        await self._conn.execute("DELETE FROM loop_state WHERE run_id = %s", (run_id,))
+        await self._conn.commit()
 
     # -- transient crash counter (daemon requeue policy) --------------------
     # Read only through these methods: Mission does not carry the field, so a
