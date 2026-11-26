@@ -16,6 +16,7 @@ from typing import Any
 import psycopg
 from psycopg.rows import DictRow
 
+from rework.kernel.state.migrations import COLUMN_MIGRATIONS, SCHEMA_VERSION, alter_sql
 from rework.kernel.state.records import (
     MISSION_LIGHT_COLUMNS,
     BudgetState,
@@ -1379,37 +1380,11 @@ class PostgresStore:
         )
 
 
+# the ONE list both backends share (kernel/state/migrations.py), as the full
+# ALTER statements this module's lock-timeout loop runs
 _MIGRATIONS: list[tuple[str, str, str]] = [
-    # (table, column, DDL): check-then-alter. ALTER TABLE takes ACCESS
-    # EXCLUSIVE even as a no-op IF NOT EXISTS, so issuing one on every open
-    # convoyed every CLI/daemon connection behind any long-lived reader
-    # (found live: an attach process idle-in-transaction froze all store
-    # opens for minutes). The catalog read is cheap and takes no table lock;
-    # the ALTER runs only when a column is genuinely missing, under a short
-    # lock_timeout so a deploy colliding with a live reader fails loudly
-    # instead of wedging the queue.
-    (
-        "charges",
-        "cached_tokens",
-        "ALTER TABLE charges ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0",
-    ),
-    ("missions", "repo_origin", "ALTER TABLE missions ADD COLUMN repo_origin TEXT"),
-    ("missions", "project_id", "ALTER TABLE missions ADD COLUMN project_id TEXT"),
-    ("missions", "chat_id", "ALTER TABLE missions ADD COLUMN chat_id TEXT"),
-    ("missions", "title", "ALTER TABLE missions ADD COLUMN title TEXT"),
-    (
-        "missions",
-        "priority",
-        "ALTER TABLE missions ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'",
-    ),
-    (
-        "missions",
-        "transient_crash_count",
-        "ALTER TABLE missions ADD COLUMN transient_crash_count INTEGER NOT NULL DEFAULT 0",
-    ),
-    ("gates", "for_run", "ALTER TABLE gates ADD COLUMN for_run TEXT"),
-    ("gates", "decision", "ALTER TABLE gates ADD COLUMN decision TEXT"),
-    ("gates", "spec", "ALTER TABLE gates ADD COLUMN spec TEXT"),
+    (table, column, alter_sql(table, column, definition))
+    for table, column, definition in COLUMN_MIGRATIONS
 ]
 
 
@@ -1464,6 +1439,16 @@ async def open_postgres(url: str) -> PostgresStore:
             except Exception:
                 await conn.rollback()
                 raise
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_version (id INTEGER PRIMARY KEY CHECK (id = 1),"
+            " version INTEGER NOT NULL)"
+        )
+        await conn.execute(
+            "INSERT INTO schema_version (id, version) VALUES (1, %s)"
+            " ON CONFLICT (id) DO UPDATE SET"
+            " version = GREATEST(schema_version.version, EXCLUDED.version)",
+            (SCHEMA_VERSION,),
+        )
         await conn.commit()
     except BaseException:
         await conn.close()  # never leak a half-migrated connection
