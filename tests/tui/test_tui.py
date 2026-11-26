@@ -181,6 +181,18 @@ def _btn(app: ReworkApp, root: Any, action: str) -> Btn:
     raise AssertionError(f"no visible button {action!r}")
 
 
+async def _click(pilot: Any, button: Btn) -> None:
+    """Click a button once the layout has given it a region.
+
+    A button shown by a sync AFTER its card mounts has no region for a beat; a
+    click sent then lands on nothing and the test sees "nothing happened". Under
+    parallel load this failed 22 of 60 runs of the launch-all replay test, on
+    main and on the commit before it. Waiting for the region costs nothing when
+    it is already there."""
+    await _wait_for(pilot, lambda: button.region.width > 0 and button.region.height > 0)
+    await pilot.click(button)
+
+
 def script_provider(monkeypatch: pytest.MonkeyPatch, results: list[ChatResult]) -> FakeProvider:
     """Every OrchestratorChat built by the app talks to this scripted provider."""
     provider = FakeProvider(results)
@@ -482,7 +494,7 @@ async def test_approve_a_gate_by_clicking(ids: dict[str, str], env: Path) -> Non
         assert ids["gate"] in lst.keys
         lst.activate(ids["gate"], via_mouse=True)
         await _settle(pilot)
-        await pilot.click(_btn(app, gates, "approve"))
+        await _click(pilot, _btn(app, gates, "approve"))
         await _settle(pilot, 0.8)
     store = await _store(env)
     try:
@@ -589,7 +601,7 @@ async def test_chat_proposes_then_launch_creates_mission(
             before = {m.id for m in await store.list_missions(limit=100)}
         finally:
             await store.aclose()
-        await pilot.click(_btn(app, cards[-1], "launch"))
+        await _click(pilot, _btn(app, cards[-1], "launch"))
         await _settle(pilot, 1.0)
         assert list(app.query(MissionCard))
         chat_id = app.view("work").convo.id
@@ -640,7 +652,7 @@ async def test_the_edited_budget_is_the_cap_the_mission_is_created_with(
         assert card.proposal.budget_usd == 3.0
         card.query_one("#budget", Input).value = "7.50"
         await _settle(pilot, 0.3)
-        await pilot.click(_btn(app, card, "launch"))
+        await _click(pilot, _btn(app, card, "launch"))
         await _settle(pilot, 1.0)
     store = await _store(env)
     try:
@@ -759,14 +771,14 @@ async def test_launching_one_card_leaves_its_sibling_pending(
         await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 2)
         cards = list(app.query(ProposalCard))
         assert len(cards) == 2
-        await pilot.click(_btn(app, cards[0], "launch"))
+        await _click(pilot, _btn(app, cards[0], "launch"))
         # wait on the outcome, not a fixed second (flaked on a loaded CI runner)
         await _wait_for(pilot, lambda: not cards[0].live)
         assert not cards[0].live, "the launched proposal is settled"
         assert cards[1].live, "its sibling is untouched"
         assert cards[1].query_one(".card-actions").display
         chat_id = app.view("work").convo.id
-        await pilot.click(_btn(app, cards[1], "launch"))
+        await _click(pilot, _btn(app, cards[1], "launch"))
         await _wait_for(pilot, lambda: not cards[1].live)
         assert not cards[1].live
         assert not app.swallowed
@@ -814,7 +826,7 @@ async def test_launch_all_creates_one_mission_per_proposal(
         await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 2)
         cards = list(app.query(ProposalCard))
         assert len(cards) == 2
-        await pilot.click(_btn(app, cards[0], "launch-all"))
+        await _click(pilot, _btn(app, cards[0], "launch-all"))
         # POLL, do not sleep a fixed 1.5 s: on a loaded CI runner both launches
         # can still be in flight when the sleep elapses, so a card is still
         # `live` and the assertion fails (the same class of race `_wait_for` was
@@ -875,7 +887,7 @@ async def test_a_second_proposing_turn_retires_the_first_turns_card(
         app.view("work").on_proposal_card_decided(ProposalCard.Decided(cards[0], True))
         await _settle(pilot, 1.0)
         # "Launch all" runs only the new turn's proposals
-        await pilot.click(_btn(app, cards[1], "launch-all"))
+        await _click(pilot, _btn(app, cards[1], "launch-all"))
         await _settle(pilot, 2.0)
         assert not any(card.live for card in cards)
         assert not app.swallowed
@@ -1066,7 +1078,7 @@ async def test_a_single_remaining_card_does_not_offer_launch_all(
         cards = list(app.query(ProposalCard))
         assert len(cards) == 2
         assert all(card.query_one(".pc-allbtn", Btn).display for card in cards)
-        await pilot.click(_btn(app, cards[0], "launch"))
+        await _click(pilot, _btn(app, cards[0], "launch"))
         # wait on the outcome, not a fixed second: a loaded CI runner was still
         # mid-launch when the 1.0 s settle elapsed (flaked on #92)
         await _wait_for(
@@ -1359,7 +1371,7 @@ async def test_a_saved_chat_with_two_unlaunched_proposals_shows_and_launches_bot
         assert [c.proposal.objective for c in cards] == ["say hello", "say goodbye"]
         assert all(card.live for card in cards), "nothing launched, so both are pending"
         assert all(card.query_one(".pc-allbtn", Btn).display for card in cards)
-        await pilot.click(_btn(app, cards[0], "launch-all"))
+        await _click(pilot, _btn(app, cards[0], "launch-all"))
         # POLL, do not sleep a fixed 1.5 s, and give a launch real headroom: on a
         # loaded CI runner the two scripted missions (each a create_mission, some
         # git) can take well past a few seconds, so a card is still `live` when a
@@ -1388,7 +1400,7 @@ async def test_fix_plan_without_repo_asks_instead_of_crashing(
         await _settle(pilot)
         await pilot.press("f", "i", "x", "enter")
         await _settle(pilot, 1.0)
-        await pilot.click(_btn(app, list(app.query(ProposalCard))[-1], "launch"))
+        await _click(pilot, _btn(app, list(app.query(ProposalCard))[-1], "launch"))
         await _settle(pilot, 0.8)
         text = " ".join(str(s.render()) for s in app.query(".step-gate"))
         assert "repo" in text
@@ -1787,7 +1799,7 @@ async def test_dashboard_ai_search_ranks_and_opens(
         for ch in "flaky":
             await pilot.press(ch)
         await _settle(pilot, 0.5)
-        await pilot.click(_btn(app, dash, "ai-search"))
+        await _click(pilot, _btn(app, dash, "ai-search"))
         await _settle(pilot, 1.5)
         assert provider.requests, "the ✦ search asked the model"
         assert "flaky" in provider.requests[0].messages[0]["content"]
@@ -1898,7 +1910,7 @@ async def test_dashboard_ai_search_uses_the_one_list(
         plain = _row_texts(app)
         assert len(plain) > 2, plain
 
-        await pilot.click(_btn(app, dash, "ai-search"))
+        await _click(pilot, _btn(app, dash, "ai-search"))
         await _settle(pilot, 1.5)
         assert provider.requests, "the ✦ search asked the model"
         assert bar.value == "the", "it ran on the query already in the box"
@@ -1981,7 +1993,7 @@ async def test_dashboard_ai_search_never_resurrects_a_zero_match_query(
         empty = app.query_one("#mission-list .rowlist-empty")
         assert empty.display and "No missions match" in str(empty.render())
 
-        await pilot.click(_btn(app, dash, "ai-search"))
+        await _click(pilot, _btn(app, dash, "ai-search"))
         await _settle(pilot, 1.5)
 
         # nothing was asked of the model: there is no match to rank
@@ -2033,7 +2045,7 @@ async def test_dashboard_ai_search_drops_picks_that_do_not_match(
         strict = [k for k in lst.selectable if not k.startswith("§")]
         assert strict == [ids["running"]], strict
 
-        await pilot.click(_btn(app, dash, "ai-search"))
+        await _click(pilot, _btn(app, dash, "ai-search"))
         await _settle(pilot, 1.5)
         assert provider.requests, "a matching query does call the model"
         # the model was only offered the strict match
@@ -2248,7 +2260,7 @@ async def test_dashboard_ai_search_without_credentials_says_so(
         await pilot.press("slash")
         await pilot.press("x")
         await _settle(pilot, 0.5)
-        await pilot.click(_btn(app, dash, "ai-search"))
+        await _click(pilot, _btn(app, dash, "ai-search"))
         await _settle(pilot, 1.0)
         assert dash.ai_results is None
         assert "AI search unavailable: no model with credentials" in dash.ai_note
@@ -2284,7 +2296,7 @@ async def test_pause_and_cancel_from_dashboard(ids: dict[str, str], env: Path) -
         app.open_mission(ids["running"])
         await _settle(pilot, 0.8)
         head = app.query_one("#dash-controls")
-        await pilot.click(_btn(app, head, "pause"))
+        await _click(pilot, _btn(app, head, "pause"))
         await _settle(pilot, 0.8)
         store = await _store(env)
         try:
@@ -2332,7 +2344,7 @@ async def test_library_search_read_and_retire(ids: dict[str, str], env: Path) ->
         await _settle(pilot, 0.8)
         lib = app.view("library")
         assert lib.selected is not None and lib.selected.name == "pytest-flaky-triage"
-        await pilot.click(_btn(app, lib, "retire"))
+        await _click(pilot, _btn(app, lib, "retire"))
         await _settle(pilot, 0.8)
         item_id = lib.selected.id
     from rework.library.store import open_library_store
@@ -2353,14 +2365,14 @@ async def test_library_add_item(ids: dict[str, str], env: Path) -> None:
         await _settle(pilot)
         await pilot.press("alt+4")
         await _settle(pilot)
-        await pilot.click(_btn(app, app.view("library"), "new"))
+        await _click(pilot, _btn(app, app.view("library"), "new"))
         await pilot.pause()
         form = app.screen
         assert isinstance(form, Form)
         form.query_one("#f-name").value = "uv-migration"
         form.query_one("#f-description").value = "moving CI to uv"
         form.query_one("#f-body").text = "# uv\nuse `uv sync`"
-        await pilot.click(_btn(app, form, "submit"))
+        await _click(pilot, _btn(app, form, "submit"))
         await _settle(pilot, 1.2)
     from rework.library.store import open_library_store
 
@@ -2961,7 +2973,7 @@ async def test_preview_pr_refuses_non_digit_number(
         form = await _open_preview_modal(pilot, app)
         form.query_one("#f-pr").value = "abc"
         form.query_one("#f-repo").value = str(repo)
-        await pilot.click(_btn(app, form, "submit"))
+        await _click(pilot, _btn(app, form, "submit"))
         await _settle(pilot)
     assert any("digits" in text for _, text in app.notifications_sent)
     assert calls == [], calls
@@ -2978,7 +2990,7 @@ async def test_preview_pr_refuses_empty_repo_path(
         form = await _open_preview_modal(pilot, app)
         form.query_one("#f-pr").value = "128"
         form.query_one("#f-repo").value = "   "
-        await pilot.click(_btn(app, form, "submit"))
+        await _click(pilot, _btn(app, form, "submit"))
         await _settle(pilot, 1.0)
     assert any("local git repo" in text for _, text in app.notifications_sent)
     assert calls == [], calls
@@ -3008,7 +3020,7 @@ async def test_preview_pr_refuses_a_path_that_is_not_a_git_repo(
         form = await _open_preview_modal(pilot, app)
         form.query_one("#f-pr").value = "128"
         form.query_one("#f-repo").value = str(tmp_path / "not-a-repo")
-        await pilot.click(_btn(app, form, "submit"))
+        await _click(pilot, _btn(app, form, "submit"))
         await _settle(pilot, 1.0)
     assert any("Not a git repo" in text for _, text in app.notifications_sent)
     assert all(cmd[:2] != ["rework", "preview"] for cmd in calls), calls
@@ -3049,7 +3061,7 @@ async def test_preview_a_pr_end_to_end_through_the_menu(
         form = await _open_preview_modal(pilot, app)
         form.query_one("#f-pr").value = "128"
         form.query_one("#f-repo").value = str(repo)
-        await pilot.click(_btn(app, form, "submit"))
+        await _click(pilot, _btn(app, form, "submit"))
         await _settle(pilot)
         await app.workers.wait_for_complete()
         assert not app.swallowed, app.swallowed
@@ -5048,7 +5060,7 @@ async def test_dashboard_ai_search_deadline_covers_the_run_fetch(
             await pilot.press(ch)
         await _settle(pilot, 0.5)
         started = asyncio.get_running_loop().time()
-        await pilot.click(_btn(app, dash, "ai-search"))
+        await _click(pilot, _btn(app, dash, "ai-search"))
         await _settle(pilot, 2.0)
         assert asyncio.get_running_loop().time() - started < 4.0, "the budget held"
         assert provider.requests, "a hung fetch still reaches the model"
@@ -5089,7 +5101,7 @@ async def test_dashboard_escape_dismisses_an_in_flight_ai_search(
         for ch in "flaky":
             await pilot.press(ch)
         await _settle(pilot, 0.5)
-        await pilot.click(_btn(app, dash, "ai-search"))
+        await _click(pilot, _btn(app, dash, "ai-search"))
         await _settle(pilot, 0.4)
         assert dash._ai_busy is True, "the search is in flight"
         await pilot.press("escape")
@@ -5142,7 +5154,7 @@ async def _launch_fix_proposal(
     await _settle(pilot, 1.0)
     cards = list(app.query(ProposalCard))
     assert cards, "the proposal must render as a card"
-    await pilot.click(_btn(app, cards[-1], "launch"))
+    await _click(pilot, _btn(app, cards[-1], "launch"))
     await _settle(pilot, 1.0)
     store = await _store(env)
     try:
@@ -5242,12 +5254,12 @@ async def test_add_files_pushes_parsed_paths_into_an_upload_project(
         await _settle(pilot)
         dash = app.view("dashboard")
         dash.project = ids["upload_project"]
-        await pilot.click(_btn(app, dash, "add-files"))
+        await _click(pilot, _btn(app, dash, "add-files"))
         await _settle(pilot)
         form = app.screen
         assert isinstance(form, Form)
         form.query_one("#f-paths").text = "~/notes.md\na.md"
-        await pilot.click(_btn(app, form, "submit"))
+        await _click(pilot, _btn(app, form, "submit"))
         await _settle(pilot, 1.0)
         assert not app.swallowed
     assert seen == [(ids["upload_project"], [str(tmp_path / "notes.md"), "a.md"])], seen
@@ -5280,14 +5292,14 @@ async def test_add_files_accepts_a_path_with_a_space(
         await _settle(pilot)
         dash = app.view("dashboard")
         dash.project = ids["upload_project"]
-        await pilot.click(_btn(app, dash, "add-files"))
+        await _click(pilot, _btn(app, dash, "add-files"))
         await _settle(pilot)
         form = app.screen
         assert isinstance(form, Form)
         label = str(form.query(".form-label").first().render())
         assert "one path per line" in label, label
         form.query_one("#f-paths").text = f"{spaced}\nnotes.md"
-        await pilot.click(_btn(app, form, "submit"))
+        await _click(pilot, _btn(app, form, "submit"))
         await _settle(pilot, 1.0)
         assert not app.swallowed
     assert seen == [(ids["upload_project"], [str(spaced), "notes.md"])], seen
@@ -5453,7 +5465,7 @@ async def test_dashboard_open_mission_sends_a_message_through_the_shared_publish
         assert box.value == "", "cleared once delivered"
         # the Send button does the same thing
         box.value = "second note"
-        await pilot.click(_btn(app, dash, "msg-send"))
+        await _click(pilot, _btn(app, dash, "msg-send"))
         await _settle(pilot, 0.8)
     assert calls == [
         (ids["running"], "please also run the linter"),
@@ -5565,7 +5577,7 @@ async def test_dashboard_transcript_button_opens_the_mission_transcript(
         app.open_mission(ids["running"])
         await _settle(pilot, 0.8)
         dash = app.view("dashboard")
-        await pilot.click(_btn(app, dash, "transcript"))
+        await _click(pilot, _btn(app, dash, "transcript"))
         await _wait_for(pilot, lambda: app.view("work").convo is not None)
         await _settle(pilot, 0.6)
         work = app.view("work")
@@ -5591,7 +5603,7 @@ async def test_work_transcript_button_opens_the_mission_transcript(
         await _settle(pilot, 0.8)
         work = app.view("work")
         assert work.mission_in_view() == ids["running"]
-        await pilot.click(_btn(app, work, "transcript"))
+        await _click(pilot, _btn(app, work, "transcript"))
         await _wait_for(pilot, lambda: work.convo is not None and work.convo.id == chat_id)
         await _settle(pilot, 0.6)
         assert work.convo is not None and work.convo.id == chat_id
