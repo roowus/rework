@@ -6071,3 +6071,28 @@ async def test_every_menu_form_opens_and_closes(ids: dict[str, str], env: Path) 
             await _wait_for(pilot, lambda depth=depth: len(app.screen_stack) == depth)
             assert len(app.screen_stack) == depth, f"escape did not close {action}"
         assert not app.swallowed, app.swallowed
+
+
+async def test_the_proposal_budget_field_is_on_screen(
+    ids: dict[str, str], env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Found by the live TUI e2e: the editable budget field was laid out past
+    the card's right edge (its label took 1fr of the row), so the owner could
+    never see or change the budget before Launch."""
+    from textual.widgets import Input
+
+    from rework.tui.widgets.cards import ProposalCard
+
+    script_provider(monkeypatch, [propose(objective="say hi", plan="echo")])
+    app = _app()
+    async with app.run_test(size=SIZE) as pilot:
+        await _settle(pilot)
+        for ch in "say hi":
+            await pilot.press(ch if ch != " " else "space")
+        await pilot.press("enter")
+        await _wait_for(pilot, lambda: len(app.query(ProposalCard)) >= 1)
+        card = app.query(ProposalCard).first()
+        field = card.query_one("#budget", Input)
+        await _wait_for(pilot, lambda: field.region.width > 0)
+        assert field.region.width > 0
+        assert card.region.contains_region(field.region), (field.region, card.region)
