@@ -381,3 +381,91 @@ async def dashboard_controls_two_tuis(world: World) -> None:
                 world.finding(
                     "errors", f"{label} swallowed", errors=[repr(e) for e in app.swallowed]
                 )
+
+
+@scenario
+async def gates_tab_answer_and_badge(world: World) -> None:
+    """An orchestrator question answered from TUI B's Gates tab by typing: the
+    answer reaches the orchestrator, the badge clears in BOTH TUIs, and the
+    Decided list shows it."""
+    from textual.widgets import TextArea
+
+    from rework.tui.app import ReworkApp
+
+    world.script(
+        {
+            "MISSION ORCHESTRATOR": [
+                {
+                    "tool_calls": [
+                        {
+                            "name": "ask_owner",
+                            "arguments": {"question": "Formal or casual greeting?"},
+                        }
+                    ]
+                },
+                {
+                    "tool_calls": [
+                        {
+                            "name": "finish",
+                            "arguments": {
+                                "outcome": "done",
+                                "summary": "The owner chose the greeting style.",
+                            },
+                        }
+                    ]
+                },
+            ]
+        }
+    )
+    world.start_daemon()
+    install_chat([propose("greet formally or casually", "Greeting")])
+    a = ReworkApp(poll_seconds=0.5)
+    b = ReworkApp(poll_seconds=0.5)
+    async with a.run_test(size=(140, 40)) as pa, b.run_test(size=(140, 40)) as pb:
+        await pa.pause(0.8)
+        mid = await _launch_one(world, a, pa, "greet formally or casually")
+        if mid is None:
+            return
+
+        def badge(app: Any) -> int:
+            return len([g for g in app.hub.snapshot.gates if g.status.value == "open"])
+
+        for label, app, pilot in (("A", a, pa), ("B", b, pb)):
+            if not await until(pilot, lambda app=app: badge(app) == 1, 20):
+                world.finding("gates", f"{label}: badge never showed the question", n=badge(app))
+        await pb.press("alt+3")
+        await pb.pause(1.0)
+        gates_view = b.view("gates")
+        if gates_view.selected is None:
+            world.finding("gates", "B: the open question is not selected on entry")
+            gates = await b.hub.data.open_gates()
+            if not gates:
+                return
+        area = b.query_one("#gate-text", TextArea)
+        area.focus()
+        area.text = "casual"
+        await shot(b, world.out, "gates-01-typed")
+        await pb.press("alt+a")
+        await pb.pause(0.5)
+        for label, app, pilot in (("A", a, pa), ("B", b, pb)):
+            if not await until(pilot, lambda app=app: badge(app) == 0, 15):
+                world.finding("gates", f"{label}: badge still shows an open gate", n=badge(app))
+        if not await until(pa, lambda: statuses(a).get(mid) == "done", 25):
+            world.finding(
+                "sync", "mission did not finish after the answer", seen=statuses(a).get(mid)
+            )
+        await shot(b, world.out, "gates-02-after")
+        # the orchestrator received the typed answer
+        from rework.kernel.state.records import orchestrator_chat_id
+
+        msgs = await a.hub.data.chat_messages(orchestrator_chat_id(mid))
+        tool_out = " ".join(str(m.body.get("content", "")) for m in msgs if m.role == "tool")
+        if "casual" not in tool_out:
+            world.finding(
+                "gates", "the typed answer never reached the orchestrator", tool_out=tool_out[-300:]
+            )
+        for label, app in (("A", a), ("B", b)):
+            if app.swallowed:
+                world.finding(
+                    "errors", f"{label} swallowed", errors=[repr(e) for e in app.swallowed]
+                )

@@ -20,3 +20,5 @@ Scenarios:
 - `dashboard_controls_two_tuis`: pause, resume and cancel from A's Dashboard;
   B, the daemon and A's buttons must agree after every step, and a cancelled
   mission must leave no open gate.
+- `gates_tab_answer_and_badge`: an orchestrator question answered by typing in
+  B's Gates tab reaches the orchestrator; the badge clears in both TUIs.
