@@ -1406,6 +1406,16 @@ class MissionOrchestrator:
             if await self._pending_owner_messages():
                 return "the owner sent you a message (it is in the conversation now)"
             asking = [r for r in runs if _open_question(r) and r.status not in TERMINAL]
+            # needs_model is a POLICY, not a question (ADR 0019): promote on the
+            # row and answer the ask mechanically; only an exhausted catalog
+            # reaches the orchestrator. This path used to exist only for the
+            # interrupt() pause, which no real role uses, so it never fired.
+            promoted_any = False
+            for r in [r for r in asking if (r.escalation or {}).get("kind") == "needs_model"]:
+                if await self.r.promote_asking_run(r):
+                    promoted_any = True
+            if promoted_any:
+                continue
             fresh_q = [
                 r for r in asking if (r.escalation or {}).get("id") not in self.questions_seen
             ]

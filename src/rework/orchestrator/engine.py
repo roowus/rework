@@ -74,6 +74,13 @@ DEFAULT_PLAN: dict[str, Any] = {"steps": [{"step": "echo", "role": "echo"}]}
 CheckpointerFactory = Callable[[str], Awaitable[tuple[Any, Callable[[], Awaitable[None]]]]]
 
 
+def _provider_for(entry: Any) -> ModelProvider:
+    """A promoted model's provider, built the same way as a run's first one."""
+    from rework.kernel.llm.adapters.retry import with_retries
+
+    return with_retries(build_provider(entry))
+
+
 def _plan_steps(mission: Mission) -> list[dict[str, Any]]:
     plan = mission.plan or DEFAULT_PLAN
     steps = plan.get("steps") or []
@@ -282,6 +289,7 @@ class RunSupervisor:
             mission=self._mission,
             catalog=self._catalog,
             provider=base_provider if self._provider else with_retries(base_provider),
+            provider_for=None if self._provider else _provider_for,
             store=self._store,
             bus=self._bus,
             gates=GateManager(self._store, self._bus),
@@ -2057,6 +2065,57 @@ class MissionRunner:
             await self._supervisor.resume_with_decision(
                 resumed, {"resolution": "model_promoted", "model": promoted.id}
             )
+        return True
+
+    async def promote_asking_run(self, run: Run) -> bool:
+        """needs_model for a role that ASKED (the blocking ask on its run row,
+        the pause every real role uses). Writes the escalation model onto the
+        row, which the tool loop picks up before its next turn, then answers
+        the ask so the role unblocks. Returns False when there is no model to
+        promote to: the ask stays open for the orchestrator or the owner, and a
+        note says why so it is not asked twice."""
+        esc = dict(run.escalation or {})
+        if esc.get("promotion_tried"):
+            return False
+        fresh = await self._store.get_run(run.id) or run
+        current_id = str(fresh.model_ref.get("id") or "")
+        promoted = self.escalation_entry(current_id)
+        if promoted is None:
+            await self._store.update_run(run.id, escalation={**esc, "promotion_tried": True})
+            await self._bus.publish(
+                EventRecord(
+                    mission_id=self.mission_id,
+                    run_id=run.id,
+                    type=EventType.INFO,
+                    payload={
+                        "note": f"needs_model: no stronger model than {current_id!r}; "
+                        "the question goes to the orchestrator"
+                    },
+                )
+            )
+            return False
+        await self._store.update_run(
+            run.id,
+            model_ref={**fresh.model_ref, "id": promoted.id},
+            escalation={
+                **esc,
+                "promotion_tried": True,
+                "answer": f"model promoted to {promoted.id}; your next turn runs on it. "
+                "Continue the task.",
+            },
+        )
+        await self._bus.publish(
+            EventRecord(
+                mission_id=self.mission_id,
+                run_id=run.id,
+                type=EventType.MODEL_PROMOTED,
+                payload={
+                    "from": current_id,
+                    "to": promoted.id,
+                    "detail": str(esc.get("question") or "")[:200],
+                },
+            )
+        )
         return True
 
     async def _has_open_gate(self, run: Run) -> bool:

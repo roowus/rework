@@ -29,7 +29,7 @@ from conftest import (
 from rework.kernel.events.bus import InProcessEventBus
 from rework.kernel.gates import GateManager
 from rework.kernel.llm.types import ChatResult, ToolCall, Usage
-from rework.kernel.state.records import Mission, MissionStatus, RunStatus
+from rework.kernel.state.records import EventType, Mission, MissionStatus, RunStatus
 from rework.kernel.state.sqlite import SqliteStore, open_sqlite
 from rework.missions import orchestrated_plan
 from rework.orchestrator.agent import MARKER, orchestrator_chat_id, orchestrator_run_id
@@ -2014,3 +2014,71 @@ async def test_endless_cut_offs_terminate_as_a_failure(world: dict[str, Any]) ->
     assert "stopped calling tools" in str(result)
     # 2 bounded retries, then the 3 idle strikes: bounded, not a loop
     assert len(provider.requests) == 5
+
+
+async def test_a_needs_model_ask_promotes_the_running_role(
+    world: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR 0019 (audit 2026-11-25, 3.1): `ask_orchestrator(kind=needs_model)` is
+    the only way a real role asks for a stronger model, and it used to reach the
+    orchestrator as a plain question: the promotion policy lived on the
+    interrupt() path that no real role takes. Now the engine promotes the run on
+    its row, answers the ask, and the loop's NEXT turn runs on the new model."""
+    monkeypatch.setenv("REWORK_ESCALATION_MODEL", "pro")
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call(
+                    "spawn_role",
+                    "p1",
+                    role="investigator",
+                    step="investigate",
+                    brief="find the add() bug",
+                    model="flash",
+                ),
+                call("wait", "p2"),
+            ),
+            turn(call("finish", "p3", outcome="failed", summary="stop after the investigation")),
+        ],
+    )
+    provider.route(
+        "Investigate any brief",
+        [
+            ChatResult(
+                text="this is beyond me",
+                tool_calls=[
+                    call(
+                        "ask_orchestrator",
+                        "q1",
+                        question="I need a stronger model for this",
+                        kind="needs_model",
+                    )
+                ],
+                usage=Usage(input_tokens=20, output_tokens=10),
+                stop_reason="tool_calls",
+            ),
+            *_investigator_script(),
+        ],
+    )
+    await asyncio.wait_for(runner(world).run(), timeout=30)
+
+    runs = [r for r in await store.list_runs("mo") if r.role == "investigator"]
+    assert runs and runs[0].status == RunStatus.COMPLETED
+    assert runs[0].model_ref["id"] == "pro", "the run row names the promoted model"
+    events = await store.events_since(0, mission_id="mo", limit=2000)
+    promoted = [e for e in events if e.type == EventType.MODEL_PROMOTED]
+    assert promoted and promoted[0].payload["from"] == "flash"
+    assert promoted[0].payload["to"] == "pro"
+    # the ledger proves the switch: flash before the ask, pro after it
+    models = [m["model"] for m in await store.spend_by_model("mo")]
+    assert "fake-flash" in models and "fake-pro" in models
+    # it never became an orchestrator question
+    tool_out = [
+        m.body.get("content", "")
+        for m in await store.chat_messages(orchestrator_chat_id("mo"))
+        if m.role == "tool"
+    ]
+    assert not any("I need a stronger model" in t for t in tool_out)
