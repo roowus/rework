@@ -2111,3 +2111,45 @@ def _second_change_script() -> list[Any]:
             stop_reason="end_turn",
         ),
     ]
+
+
+async def test_an_owner_rejection_is_reported_and_not_re_asked(world: dict[str, Any]) -> None:
+    """Found live (audit e2e 2026-11-26): rejecting an echo gate aborted the run,
+    the orchestrator read a bare "aborted", spawned the same step again, and the
+    owner was asked the SAME question at a fresh gate (mission stuck
+    awaiting_gate). The wait result now says the owner rejected it, and an
+    identical respawn is refused."""
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+    world["mission"].plan = {**(world["mission"].plan or {}), "playbook": "draft"}
+    await store.update_mission("mo", plan=world["mission"].plan)
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call("spawn_role", "e1", role="echo", step="echo", brief="say hi"),
+                call("wait", "e2"),
+            ),
+            turn(call("spawn_role", "e3", role="echo", step="echo", brief="say hi")),
+            turn(call("finish", "e4", outcome="failed", summary="the owner declined the greeting")),
+        ],
+    )
+    task = asyncio.create_task(runner(world).run())
+    for _ in range(200):
+        gates = await store.list_open_gates("mo")
+        if gates:
+            break
+        await asyncio.sleep(0.05)
+    assert gates, "echo's gate never opened"
+    await GateManager(store, InProcessEventBus(store)).decide(gates[0].id, approved=False)
+    await asyncio.wait_for(task, timeout=30)
+
+    out = [
+        m.body.get("content", "")
+        for m in await store.chat_messages(orchestrator_chat_id("mo"))
+        if m.role == "tool"
+    ]
+    assert any("OWNER REJECTED" in t for t in out), out
+    assert any("same question" in t for t in out), "the identical respawn was not refused"
+    assert len([r for r in await store.list_runs("mo") if r.role == "echo"]) == 1
+    assert not await store.list_open_gates("mo")

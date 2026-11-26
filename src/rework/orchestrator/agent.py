@@ -1265,6 +1265,17 @@ class MissionOrchestrator:
         live = [r for r in prior if r.status not in TERMINAL]
         if live:
             raise ToolError(f"step {step!r} already has a live run {live[-1].id}")
+        if prior and prior[-1].status == RunStatus.ABORTED:
+            rejected = await self._owner_rejection(prior[-1])
+            previous = str((prior[-1].context or {}).get("brief") or "")
+            if rejected is not None and " ".join(brief.split()) == " ".join(previous.split()):
+                # mechanical rail: the same brief would ask the owner the same
+                # question they just answered no to
+                raise ToolError(
+                    f"the owner rejected {prior[-1].id}'s gate; spawning {role!r} again "
+                    "with the same brief would ask them the same question. Change the "
+                    "brief to address why it was rejected, or finish."
+                )
         if writes_code(role) and not self.mission.repo_path:
             raise ToolError(f"this mission has no repo; a {role} cannot run")
         model = str(args.get("model") or "").strip() or None
@@ -1495,9 +1506,28 @@ class MissionOrchestrator:
         note = self._queued_note(run.id)
         return f"{run.id} (queued)" if note else run.id
 
+    async def _owner_rejection(self, run: Run) -> Any:
+        """The decided, REJECTED gate that ended this run, if one did."""
+        for gate in reversed(await self.store.list_gates(self.mid)):
+            if gate.for_run == run.id and gate.status == GateStatus.REJECTED:
+                return gate
+        return None
+
     async def _report(self, run: Run) -> str:
         if run.status == RunStatus.COMPLETED:
             return f"{run.id} ({run.role}) completed: {artifact_summary(run.artifact)}"
+        if run.status == RunStatus.ABORTED:
+            rejected = await self._owner_rejection(run)
+            if rejected is not None:
+                # found live: a bare "aborted" read as a failure, and the model
+                # re-spawned the step, which asked the owner the SAME question
+                # again and parked the mission at a fresh gate
+                note = f": {rejected.decision_note}" if rejected.decision_note else ""
+                return (
+                    f"{run.id} ({run.role}) aborted: the OWNER REJECTED its gate "
+                    f"({rejected.question[:120]!r}){note}. Do not run it again as is; "
+                    "finish, or change the approach and say why."
+                )
         reason = ""
         events = await self._all_events()
         for ev in reversed(events):
