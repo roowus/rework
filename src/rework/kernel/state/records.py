@@ -333,6 +333,15 @@ class BudgetExceeded(Exception):
         )
 
 
+# Week buckets start on MONDAY 00:00 UTC on every backend. The epoch began on a
+# Thursday, so plain `ts // 604800` weeks ran Thursday to Wednesday on SQLite
+# while Postgres' date_trunc('week') is Monday-based: the same charge landed in
+# different weeks, and Postgres' Monday start was then labelled through the
+# epoch-week numbering. Week n starts at n * 604800 + WEEK_OFFSET_S
+# (1970-01-05 was the first Monday).
+WEEK_OFFSET_S = 4 * 86400.0
+
+
 def bucket_label(bucket: int | float | None, kind: str) -> str:
     """Human label for a spend-history bucket, from the bucket NUMBER.
 
@@ -348,7 +357,8 @@ def bucket_label(bucket: int | float | None, kind: str) -> str:
     if bucket is None:
         return ""
     seconds = {"hour": 3600, "day": 86400, "week": 604800}.get(kind, 86400)
-    start = _dt.datetime.fromtimestamp(float(bucket) * seconds, tz=_dt.UTC)
+    offset = WEEK_OFFSET_S if kind == "week" else 0.0
+    start = _dt.datetime.fromtimestamp(float(bucket) * seconds + offset, tz=_dt.UTC)
     if kind == "hour":
         return start.strftime("%Y-%m-%d %H:00")
     if kind == "week":

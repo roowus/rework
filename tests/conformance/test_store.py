@@ -69,7 +69,7 @@ async def test_list_missions_by_status(store: StateStore) -> None:
     assert len(everything) == 2
 
 
-async def test_list_missions_for_pickup_is_oldest_first(store: StateStore) -> None:
+async def test_pickup_is_oldest_first_with_an_id_tiebreak(store: StateStore) -> None:
     """Pickup must never hide an old mission behind newer ones: the daemon's
     window is oldest-first, so `limit` only trims the newest end. create_mission
     persists the record's created_at, so the timestamps are set explicitly
@@ -94,14 +94,16 @@ async def test_list_missions_for_pickup_is_oldest_first(store: StateStore) -> No
         Mission(id="m-done", objective="already done", status=MissionStatus.DONE, created_at=0.0)
     )
 
-    picked = await store.list_missions_for_pickup(status=MissionStatus.PENDING, limit=10)
+    # the query the daemon really picks up with (list_missions_for_pickup was
+    # an unused duplicate; its ordering guarantees are pinned here instead)
+    picked = await store.next_pending_missions(limit=10)
     assert [m.id for m in picked] == ["m-oldest", "tie-a", "tie-b", "m-newest"]
 
     # other statuses are never candidates, even when they are the oldest rows
     assert "m-done" not in {m.id for m in picked}
 
     # the limit trims the NEWEST end: the oldest stays visible with limit 2
-    oldest_two = await store.list_missions_for_pickup(status=MissionStatus.PENDING, limit=2)
+    oldest_two = await store.next_pending_missions(limit=2)
     assert [m.id for m in oldest_two] == ["m-oldest", "tie-a"]
 
 
@@ -515,6 +517,23 @@ async def test_one_chat_owns_many_missions(store: StateStore) -> None:
     assert [m.id for m in mine] == [b.id, a.id]
     running = await store.list_missions(status=MissionStatus.PENDING, chat_id="chat-2")
     assert [m.id for m in running] == [other.id]
+
+
+async def test_spend_history_weeks_start_on_monday_on_every_backend(store: StateStore) -> None:
+    """SQLite bucketed weeks as epoch weeks (Thursday to Wednesday: 1970-01-01
+    was a Thursday) while Postgres' date_trunc('week') starts on Monday, so one
+    charge landed in different weeks per backend. Both are Monday-based now."""
+    import datetime as dt
+
+    sunday = dt.datetime(2026, 11, 22, 12, tzinfo=dt.UTC).timestamp()  # a Sunday
+    monday = dt.datetime(2026, 11, 23, 12, tzinfo=dt.UTC).timestamp()  # the next Monday
+    m = await store.create_mission(Mission(id=new_id("m"), objective="weeks"))
+    for ts in (sunday, monday):
+        await store.charge(Charge(mission_id=m.id, model="x", cost_usd=1.0, ts=ts))
+    rows = await store.spend_history(bucket="week", mission_id=m.id)
+    assert [r["bucket_label"] for r in rows] == ["week of 2026-11-16", "week of 2026-11-23"]
+    starts = [dt.datetime.fromtimestamp(r["bucket_start"], tz=dt.UTC) for r in rows]
+    assert all(d.weekday() == 0 and d.hour == 0 for d in starts), starts
 
 
 async def test_spend_history_buckets_and_groups(store: StateStore) -> None:
