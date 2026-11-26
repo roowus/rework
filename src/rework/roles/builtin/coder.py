@@ -112,6 +112,7 @@ class CoderSpec(RoleSpec):
 
         loop = make_toolloop_node(
             provider=ctx.provider,
+            provider_for=ctx.provider_for,
             catalog=ctx.catalog,
             catalog_id=catalog_id,
             executor=web_executor(

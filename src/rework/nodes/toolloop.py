@@ -259,11 +259,35 @@ def make_toolloop_node(
     on_start: Any | None = None,
     resume_file: Path | None = None,
     progress_check: Any | None = None,
+    provider_for: Any | None = None,
 ) -> ToolLoopNode:
     """`bus` (optional) turns on TRAJECTORY events: one per model turn and one
     per tool call, so the UI can show the agent loop the way Claude Code and
-    pi do instead of a bare 'running'. Without it the loop is silent (tests)."""
+    pi do instead of a bare 'running'. Without it the loop is silent (tests).
+
+    `provider_for(entry)` builds the provider for a PROMOTED model (needs_model,
+    ADR 0019); None keeps `provider` (an injected test provider serves every
+    model, and a single-provider deployment's adapter takes any model id)."""
     entry = catalog.resolve(catalog_id)
+    # the model can change mid-run: the engine's needs_model policy promotes a
+    # run by writing a new catalog id onto its row (ADR 0019). The loop reads
+    # the row before each turn, like a redirect, and swaps entry + provider.
+    current: dict[str, Any] = {"entry": entry, "provider": provider}
+
+    async def _maybe_promote() -> str | None:
+        run = await store.get_run(run_id)
+        wanted = str(((run.model_ref if run else None) or {}).get("id") or "")
+        if not wanted or wanted == current["entry"].id:
+            return None
+        try:
+            promoted = catalog.resolve(wanted)
+        except Exception:
+            log.warning("promotion to unknown model %r ignored", wanted)
+            return None
+        current["entry"] = promoted
+        if provider_for is not None:
+            current["provider"] = provider_for(promoted)
+        return promoted.id
 
     async def emit(kind: str, payload: dict[str, Any]) -> None:
         if bus is None:
@@ -288,7 +312,7 @@ def make_toolloop_node(
                 input_tokens=result_usage.input_tokens,
                 output_tokens=result_usage.output_tokens,
                 cached_tokens=getattr(result_usage, "cached_tokens", 0) or 0,
-                cost_usd=entry.estimate_cost(
+                cost_usd=current["entry"].estimate_cost(
                     result_usage.input_tokens,
                     result_usage.output_tokens,
                     getattr(result_usage, "cached_tokens", 0) or 0,
@@ -309,17 +333,18 @@ def make_toolloop_node(
         ]
         try:
             _compact(ask)
-            result = await provider.complete(
+            live = current["entry"]
+            result = await current["provider"].complete(
                 ChatRequest(
-                    model=entry.model,
+                    model=live.model,
                     system=system_prompt,
                     messages=ask,
                     temperature=temperature,
-                    max_tokens=min(entry.max_output, 2048),
+                    max_tokens=min(live.max_output, 2048),
                     session_id=run_id,
                 )
             )
-            await charge(result.usage, entry.model)
+            await charge(result.usage, live.model)
             return (result.text or "").strip()
         except Exception as exc:  # the note is a courtesy; never fail the run
             log.warning("handoff note failed: %s", exc)
@@ -361,6 +386,9 @@ def make_toolloop_node(
                 first_cut = len(messages)
             # the orchestrator can steer a running role (ADR 0007 redirect):
             # the instruction arrives on the run row and is read once
+            promoted = await _maybe_promote()
+            if promoted:
+                await emit("turn", {"turn": turns, "text": f"model promoted to {promoted}"})
             redirect = await _take_redirect(store, run_id)
             if redirect:
                 messages.append({"role": "user", "content": f"[Orchestrator redirect] {redirect}"})
@@ -395,19 +423,20 @@ def make_toolloop_node(
                     }
                 )
             _compact(messages)
-            result = await provider.complete(
+            live = current["entry"]
+            result = await current["provider"].complete(
                 ChatRequest(
-                    model=entry.model,
+                    model=live.model,
                     system=system_prompt,
                     messages=messages,
                     tools=specs,
                     temperature=temperature,
-                    max_tokens=entry.max_output,
+                    max_tokens=live.max_output,
                     effort=effort,
                     session_id=run_id,
                 )
             )
-            await charge(result.usage, entry.model)
+            await charge(result.usage, live.model)
             turns += 1
             await emit(
                 "turn",

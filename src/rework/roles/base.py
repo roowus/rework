@@ -60,6 +60,9 @@ class RoleBuildCtx(BaseModel):
     mission: Mission
     catalog: ModelCatalog
     provider: ModelProvider
+    # builds the provider for ANOTHER catalog entry (needs_model promotion);
+    # None = keep `provider` (tests inject one provider for every model)
+    provider_for: Callable[[Any], ModelProvider] | None = None
     store: StateStore
     bus: EventBus
     gates: GateManager

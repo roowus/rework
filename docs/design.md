@@ -117,6 +117,10 @@ legal moves, terminal statuses are final, and every status write is a compare-an
 the writer expects. Owner verbs (pause/resume/cancel) live once in
 `rework.services.missions`; pause records `held_from`, resume restores it.
 
+`needs_model` is a policy, not a question (ADR 0019): an `ask_orchestrator(kind=
+"needs_model")` is promoted on the run row by the engine, and the tool loop switches model
+before its next turn.
+
 Roles are NOT subgraphs of the orchestrator checkpoint; each Run is an independent
 asyncio task with its own checkpointer thread. Parallelism = N run rows for one step.
 
