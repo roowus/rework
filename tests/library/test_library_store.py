@@ -780,3 +780,80 @@ async def test_two_writers_do_not_make_the_store_flap_between_dsns(
     blob = " ".join(messages) + " ".join(str(r.args) for r in caplog.records)
     for secret in ("STALEPASS", "LIVEHOSTPASS", stale, fresh):
         assert secret not in blob, "no password or URL ever reaches the log"
+
+
+# -- consistency (audit 2026-11-25, finding 3.7) --------------------------------
+
+
+async def test_targeted_writes_do_not_revert_each_other(library_index) -> None:
+    """The embedding backfill read rows, embedded for up to 30 s, then upserted
+    the WHOLE row: a retire (and `uses` counts) written meanwhile were undone.
+    set_vector / set_status touch one column each."""
+    item = await library_index.upsert_item(_item("concurrent"))
+    stale = await library_index.get_item(item.id)  # the backfill's early read
+    await library_index.set_status(item.id, ItemStatus.RETIRED)
+    await library_index.record_use(item.id)
+    await library_index.set_vector(item.id, "emb-1", [0.1, 0.2])
+    assert stale is not None and stale.status == ItemStatus.ACTIVE
+    after = await library_index.get_item(item.id)
+    assert after is not None
+    assert after.status == ItemStatus.RETIRED, "the retire survived the embedding write"
+    assert after.uses == 1
+    assert after.vectors == {"emb-1": [0.1, 0.2]}
+    await library_index.set_vector(item.id, "emb-2", [0.3])
+    again = await library_index.get_item(item.id)
+    assert again is not None and set(again.vectors) == {"emb-1", "emb-2"}
+
+
+async def test_a_pre_vectors_sqlite_table_is_migrated(tmp_path) -> None:
+    """Reproduced on ~/.rework/state.sqlite3: a library table created before
+    hybrid search had no `vectors` column, the SQLite migration list did not
+    add it, and every upsert failed with "no column named vectors"."""
+    import sqlite3
+
+    db = tmp_path / "old.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE library_items (id TEXT PRIMARY KEY, type TEXT NOT NULL, name TEXT NOT NULL,"
+        " description TEXT NOT NULL DEFAULT '', body_path TEXT, tags TEXT NOT NULL DEFAULT '[]',"
+        " provenance TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL,"
+        " version INTEGER NOT NULL DEFAULT 1, uses INTEGER NOT NULL DEFAULT 0,"
+        " created_at REAL NOT NULL, updated_at REAL NOT NULL)"
+    )
+    conn.commit()
+    conn.close()
+    store = await open_library_store(str(db))
+    try:
+        saved = await store.upsert_item(_item("after the upgrade"))
+        assert (await store.get_item(saved.id)) is not None
+    finally:
+        await store.aclose()
+
+
+def test_concurrent_git_writes_neither_collide_nor_mix(tmp_path) -> None:
+    """Daemon, MCP server, TUI and CLI each commit to the same library repo.
+    Unlocked, git's index.lock made a write fail, and a commit without a
+    pathspec could take another writer's staged file."""
+    import subprocess
+    from concurrent.futures import ThreadPoolExecutor
+
+    lib = GitLibrary(tmp_path / "lib")
+    lib.ensure_repo()
+    items = [_item(f"item {i}") for i in range(12)]
+
+    def write(item: LibraryItem) -> str:
+        return lib.write_body(item, f"body of {item.name}\n", f"add {item.name}")
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        paths = list(pool.map(write, items))
+    # every commit carries exactly its own file
+    for item, path in zip(items, paths, strict=True):
+        assert (lib.root / path).read_text() == f"body of {item.name}\n"
+        files = subprocess.run(
+            ["git", "log", "-1", "--format=", "--name-only", f"--grep=^add {item.name}$"],
+            cwd=lib.root,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        assert files == [path], f"{item.name}'s commit holds {files}"

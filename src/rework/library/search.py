@@ -64,7 +64,10 @@ class HybridSearch:
         )
         for item, vector in zip(missing, vectors, strict=True):
             item.vectors = {**(item.vectors or {}), self._embedder_model: vector}
-            await self._index.upsert_item(item)
+            # ONE column: the rows above were read up to an embedding call ago,
+            # and a whole-row upsert from them reverted any activate/retire and
+            # lost `uses` counts written meanwhile
+            await self._index.set_vector(item.id, self._embedder_model, vector)
         return len(missing)
 
     @property
