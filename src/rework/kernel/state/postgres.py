@@ -42,7 +42,7 @@ from rework.kernel.state.records import (
     coerce_priority,
 )
 from rework.kernel.state.retry import retry_transient
-from rework.kernel.state.transitions import sources
+from rework.kernel.state.transitions import TERMINAL, sources
 
 _DDL = [
     """
@@ -270,6 +270,17 @@ async def end_idle_transaction(conn: Any) -> None:
 # The server's wall clock as epoch seconds (the column's unit). clock_timestamp,
 # not now(): now() is frozen at transaction start.
 _DB_NOW = "EXTRACT(EPOCH FROM clock_timestamp())"
+
+
+# A finished mission answers nothing: its still-open gates are closed in the
+# SAME statement batch as the terminal transition (see transitions.py). Found by
+# the live TUI e2e: a cancelled mission's owner question stayed in every Gates
+# list, asking for a decision nobody would read.
+_CLOSE_OPEN_GATES_PG = (
+    "UPDATE gates SET status = 'rejected', decided_at = %s,"
+    " decision_note = COALESCE(decision_note, 'closed: the mission ended')"
+    " WHERE mission_id = %s AND status = 'open'"
+)
 
 
 def _serialized(method: Any) -> Any:
@@ -523,7 +534,9 @@ class PostgresStore:
         )
         if row is None:
             return None
-            await self._conn.commit()
+        if to in TERMINAL:
+            await self._conn.execute(_CLOSE_OPEN_GATES_PG, (time.time(), mission_id))
+        await self._conn.commit()
         return self._mission(row)
 
     # -- agent loop transcript (ADR 0020) ---------------------------------------
