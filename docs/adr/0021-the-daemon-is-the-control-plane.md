@@ -2,8 +2,9 @@
 
 ## Status
 
-Accepted (2026-11-26). Phase 1 (command API) landed; phase 2 moves the TUI and CLI onto
-it; phase 3 adds the read API and event stream.
+Accepted (2026-11-26). Phase 1 (command API) and phase 2a (TUI and CLI owner actions go
+through it) landed; phase 2b moves chat turns and AI search into the daemon; phase 3
+adds the read API and event stream.
 
 ## Context
 
@@ -38,3 +39,14 @@ stream replace direct DB polling.
 
 - Every owner action has one implementation and one executor.
 - Clients need network reach to the daemon (they already did for uploads and fetch).
+
+## Phase 2a (2026-11-26)
+
+With `REWORK_DAEMON_URL` set (a `--target`, or the env file), the TUI's and the CLI's
+owner actions (pause, resume, cancel, prioritize, gate decisions, retry-pr) are sent to
+the daemon. `api.client.call` falls back to in-process when no URL is set, when the
+daemon predates `/v1` (aiohttp's plain 404, mixed versions during a rollout) or when it
+is unreachable; a refusal from the API itself is final and shown as is. Verified with
+two TUI data layers in separate processes, each on an empty local database, racing one
+gate on a real daemon: one decision, one `gate_decided`, each told whether it won.
+

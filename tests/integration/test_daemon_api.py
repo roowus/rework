@@ -96,3 +96,57 @@ async def test_the_token_guards_every_route(api: dict[str, Any]) -> None:
         assert denied.value.status == 401
     row = await store.get_mission("m-3")
     assert row is not None and row.status == MissionStatus.RUNNING
+
+
+async def test_the_cli_sends_its_verbs_to_the_daemon(
+    api: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With REWORK_DAEMON_URL set, `rework pause/cancel/resume` are executed by
+    the daemon: the CLI's own REWORK_DB points at an EMPTY database, so a
+    command that worked must have gone over the API."""
+    from typer.testing import CliRunner
+
+    from rework.cli import app
+
+    store = api["store"]
+    await store.create_mission(Mission(id="m-cli", objective="x", status=MissionStatus.RUNNING))
+    monkeypatch.setenv("REWORK_DAEMON_URL", api["url"])
+    monkeypatch.setenv("REWORK_DB", str(tmp_path / "empty-client-side.sqlite3"))
+    runner = CliRunner()
+
+    def run(*argv: str) -> Any:
+        return await_in_thread(lambda: runner.invoke(app, list(argv)))
+
+    paused = await run("pause", "m-cli")
+    assert paused.exit_code == 0 and "on_hold" in paused.output
+    cancelled = await run("cancel", "m-cli")
+    assert cancelled.exit_code == 0 and "cancelled" in cancelled.output
+    refused = await run("resume", "m-cli")
+    assert refused.exit_code == 1 and "it is cancelled" in refused.output
+    row = await store.get_mission("m-cli")
+    assert row is not None and row.status == MissionStatus.CANCELLED
+
+
+async def test_an_old_daemon_without_the_api_falls_back_in_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mixed versions during a rollout: a daemon without /v1 answers a plain
+    404; the front end must act in-process instead of failing."""
+    from aiohttp import web
+
+    from rework.api import client as api_client
+
+    old = web.Application()
+    server = TestServer(old)
+    await server.start_server()
+    try:
+        monkeypatch.setenv("REWORK_DAEMON_URL", str(server.make_url("")).rstrip("/"))
+        with pytest.raises(api_client.NoApi):
+            await api_client.call(lambda c: c.mission_verb("m-x", "pause"))
+    finally:
+        await server.close()
+
+
+async def await_in_thread(fn: Any) -> Any:
+    """CliRunner calls asyncio.run inside; keep it off this test's loop."""
+    return await asyncio.to_thread(fn)

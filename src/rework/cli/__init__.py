@@ -1458,8 +1458,18 @@ def _set_mission_status(mission_id: str, verb: str) -> None:
     from rework.services import missions as mission_service
 
     async def go() -> str:
+        from rework.api import client as api
         from rework.config import Config, open_store_from_config
 
+        # ADR 0021: the daemon executes it when one is configured
+        try:
+            remote = await api.call(lambda c: c.mission_verb(mission_id, verb))
+            return str(remote["status"])
+        except api.ApiError as exc:
+            typer.echo(str(exc) if exc.status != 404 else f"unknown mission {mission_id}", err=True)
+            raise typer.Exit(1) from None
+        except api.NoApi:
+            pass
         store = await open_store_from_config(Config.from_env())
         try:
             updated = await mission_service.VERBS[verb](store, mission_id)
@@ -1488,9 +1498,16 @@ def retry_pr_cmd(mission_id: str) -> None:
     from rework.orchestrator.delivery import retry_pr
 
     async def go() -> tuple[bool, str]:
+        from rework.api import client as api
         from rework.config import Config, open_store_from_config
         from rework.kernel.events.bus import InProcessEventBus
 
+        # on the daemon host, where the worktree is (ADR 0021)
+        try:
+            result: tuple[bool, str] = await api.call(lambda c: c.retry_pr(mission_id))
+            return result
+        except api.NoApi:
+            pass
         config = Config.from_env()
         store = await open_store_from_config(config)
         try:
@@ -1625,6 +1642,19 @@ def approve(
         elif answer is not None:
             decision = {"feedback": answer}
 
+        from rework.api import client as api
+
+        try:
+            out = await api.call(
+                lambda c: c.decide_gate(gate_id, not reject, note=note, decision=decision)
+            )
+            return True, str(out["gate"]["status"])
+        except api.ApiError as exc:
+            if exc.status == 404:
+                return False, "gate not found"
+            raise
+        except api.NoApi:
+            pass
         store = await open_store_from_config(Config.from_env())
         try:
             gates = GateManager(store, InProcessEventBus(store))
