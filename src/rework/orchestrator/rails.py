@@ -145,12 +145,49 @@ def audit_problem(runs: list[Run], plan: dict[str, Any] | None) -> str | None:
             "branch before the mission can finish"
         )
     last_audit = audits[-1]
-    after = [r for r in coders if (r.updated_at or r.created_at) > last_audit.created_at]
-    if after:
-        return (
-            f"coder {after[-1].id} ({after[-1].status}) ran after the last completed "
-            f"audit {last_audit.id}: those changes are unaudited"
-        )
+    reviewed = str((last_audit.artifact or {}).get("reviewed_sha") or "")
+    if reviewed:
+        # COMMITS, not clocks: the audit says which commit it reviewed, and the
+        # newest code-writing handoff says which commit it left. Any later
+        # write to an old coder row (a status flip, a model_ref update) used to
+        # count as "unaudited changes" under the timestamp rule.
+        # the newest handoff that actually COMMITTED: a coder that changed
+        # nothing leaves commit=None, and an unchanged branch is still exactly
+        # what the auditor reviewed
+        committed_handoffs = [
+            r
+            for r in runs
+            if is_code_handoff(r)
+            and (r.artifact or {}).get("commit")
+            and r.status == RunStatus.COMPLETED
+        ]
+        handoff = committed_handoffs[-1] if committed_handoffs else None
+        live = [
+            r
+            for r in coders
+            if r.status not in (RunStatus.COMPLETED, RunStatus.FAILED, RunStatus.ABORTED)
+        ]
+        if live:
+            return (
+                f"coder {live[-1].id} ({live[-1].status}) is still running after the last "
+                f"completed audit {last_audit.id}: its changes are unaudited"
+            )
+        committed = str((handoff.artifact or {}).get("commit") or "") if handoff else ""
+        if committed and committed != reviewed:
+            return (
+                f"coder {handoff.id if handoff else '?'} committed {committed[:12]} but the last "
+                f"completed audit {last_audit.id} reviewed {reviewed[:12]}: "
+                "those changes are unaudited"
+            )
+    else:
+        # an audit with no recorded commit (rows from before reviewed_sha):
+        # the old clock rule
+        after = [r for r in coders if (r.updated_at or r.created_at) > last_audit.created_at]
+        if after:
+            return (
+                f"coder {after[-1].id} ({after[-1].status}) ran after the last completed "
+                f"audit {last_audit.id}: those changes are unaudited"
+            )
     if coders:
         gap = handoff_tests_gap(coders[-1].artifact)
         if gap:

@@ -133,6 +133,10 @@ async def test_vertical_slice_happy_path(slice_world: dict[str, Any]) -> None:
     assert "planted bug" in str(by_step["code"].context.get("investigation", ""))
     # auditor saw the diff and the worktree (diff-only policy)
     assert "return a + b" in str(by_step["audit"].context.get("diff", ""))
+    # the audit names the commit it reviewed, and it is the coder's commit:
+    # the finish rail compares these, not timestamps (audit 2026-11-25, 3.3)
+    audit_artifact = by_step["audit"].artifact or {}
+    assert audit_artifact.get("reviewed_sha") == coder_artifact.get("commit")
 
 
 async def test_vertical_slice_veto_triggers_revision(slice_world: dict[str, Any]) -> None:
