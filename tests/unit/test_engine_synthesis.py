@@ -243,3 +243,18 @@ async def test_an_orchestrator_failure_with_no_runs_is_failed(tmp_path) -> None:
         assert "mission_failed" in events and "mission_done" not in events
     finally:
         await store.aclose()
+
+
+async def test_a_cancelled_mission_says_cancelled_not_failed(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Found live (TUI e2e): an owner cancel ended with a MISSION_FAILED event,
+    which every trajectory painted as a red "mission failed"."""
+    store = await open_sqlite(str(tmp_path / "syn5.sqlite3"))
+    try:
+        await store.create_mission(Mission(id="m5", objective="x", status=MissionStatus.RUNNING))
+        await store.transition_mission("m5", MissionStatus.CANCELLED)
+        runner = MissionRunner("m5", store, InProcessEventBus(store), None, None, None, tmp_path)  # type: ignore[arg-type]
+        await runner._synthesize("m5", None)
+        types = [e.type.value for e in await store.events_since(0, mission_id="m5")]
+        assert "cancelled" in types and "mission_failed" not in types
+    finally:
+        await store.aclose()

@@ -1394,10 +1394,17 @@ class MissionRunner:
         # re-run of this mission starts its count at zero
         await self._store.reset_transient_crash_count(mission_id)
         log.info("mission %s: %s", mission_id, status.value)
-        event = EventType.MISSION_DONE if status == MissionStatus.DONE else EventType.MISSION_FAILED
-        await self._bus.publish(
-            EventRecord(mission_id=mission_id, type=event, payload={"runs": len(runs)})
-        )
+        # the event names what happened: a CANCELLED mission was stopped by the
+        # owner (or the burn gate), not failed. Found by the live TUI e2e: an
+        # owner cancel showed "✗ mission failed" in red on the Dashboard.
+        event = {
+            MissionStatus.DONE: EventType.MISSION_DONE,
+            MissionStatus.CANCELLED: EventType.CANCELLED,
+        }.get(status, EventType.MISSION_FAILED)
+        payload: dict[str, Any] = {"runs": len(runs)}
+        if status == MissionStatus.CANCELLED:
+            payload["reason"] = str(result.get("ship") or result.get("reason") or "by the owner")
+        await self._bus.publish(EventRecord(mission_id=mission_id, type=event, payload=payload))
         await self._write_back_to_source(mission_id, status)
 
     async def _write_back_to_source(self, mission_id: str, status: MissionStatus) -> None:
