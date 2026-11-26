@@ -760,13 +760,14 @@ async def test_launching_one_card_leaves_its_sibling_pending(
         cards = list(app.query(ProposalCard))
         assert len(cards) == 2
         await pilot.click(_btn(app, cards[0], "launch"))
-        await _settle(pilot, 1.0)
+        # wait on the outcome, not a fixed second (flaked on a loaded CI runner)
+        await _wait_for(pilot, lambda: not cards[0].live)
         assert not cards[0].live, "the launched proposal is settled"
         assert cards[1].live, "its sibling is untouched"
         assert cards[1].query_one(".card-actions").display
         chat_id = app.view("work").convo.id
         await pilot.click(_btn(app, cards[1], "launch"))
-        await _settle(pilot, 1.0)
+        await _wait_for(pilot, lambda: not cards[1].live)
         assert not cards[1].live
         assert not app.swallowed
     store = await _store(env)
