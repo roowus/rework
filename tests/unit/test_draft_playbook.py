@@ -252,3 +252,24 @@ def test_the_chat_defaults_a_missing_plan_but_never_overrides_a_named_one() -> N
     assert proposal_plan({"plan": "echo"}, audit) == "echo"
     assert proposal_plan({}, "audit the code base and write the missing tests") == "fix"
     assert proposal_plan({}, "fix the login crash") == "fix"
+
+
+async def test_a_draft_mission_needs_no_repo(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Found live (TUI e2e 2026-11-26): the chat proposes `draft` for research
+    ("write a report on X"), the card offers Launch, and launching failed with
+    "--plan draft requires a repo". Draft's deliverable is the Report tab and
+    its roles research with the web tools; fix/fix-pr/audit still need a repo."""
+    from rework.kernel.state.sqlite import open_sqlite
+    from rework.missions import create_mission
+
+    store = await open_sqlite(str(tmp_path / "s.sqlite3"))
+    try:
+        mission = await create_mission(
+            "write a short report on X", plan="draft", store=store, orchestrator_model="flash"
+        )
+        assert mission.repo_path is None and mission.repo_origin is None
+        for plan in ("fix", "fix-pr", "audit"):
+            with pytest.raises(ValueError, match="requires a repo"):
+                await create_mission("change code", plan=plan, store=store)
+    finally:
+        await store.aclose()
