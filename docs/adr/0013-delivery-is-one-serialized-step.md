@@ -32,8 +32,16 @@ The alternative (wait for a 120 second TTL) means a crashed delivery blocks the 
 for two minutes, which is a mission doing nothing.
 
 **Waiting is bounded and never fatal.** If the lock cannot be taken in about four minutes,
-delivery proceeds unserialized with a warning. Ordered-but-occasionally-unserialized beats
-a mission hanging on a lock row.
+the delivery is recorded as retryable (`pr_status: busy`, `pr_pending: true`) and the
+mission keeps its work; `retry-pr` finishes it. (Amended 2026-11-26: it used to proceed
+unserialized, which is exactly the double-push this ADR exists to prevent.)
+
+**A lost lock stops the next step.** The body gets a guard and calls `check()` before the
+merge, the push and the PR. A heartbeat that returns False (taken over) or that keeps
+failing for the takeover window marks the guard lost, and the next step raises
+`DeliveryLockLost` instead of running. A step already in flight is not interrupted:
+killing a `git push` half way leaves the remote in an unknown state, refusing the next one
+is always safe.
 
 **The ship path merges.** `_deliver_branch` calls `merge_main_before_push` under the same
 lock, so the two delivery paths cannot drift apart again.

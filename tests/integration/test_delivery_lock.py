@@ -204,3 +204,59 @@ def test_heartbeat_interval_is_shorter_than_the_ttl(heartbeat: float) -> None:
     from rework.orchestrator.delivery import DELIVERY_LOCK_TTL_S
 
     assert heartbeat < DELIVERY_LOCK_TTL_S / 2
+
+
+async def test_a_busy_lock_is_refused_never_bypassed(store) -> None:
+    """Audit 2026-11-25 (2.3): past its wait the delivery used to proceed WITHOUT
+    the lock. It now raises DeliveryBusy, and deliver_pr records the mission as
+    retryable instead of pushing unserialized."""
+    from rework.orchestrator.delivery import DeliveryBusy
+
+    assert await store.acquire_delivery_lock("holder", stale_after_s=60.0) is True
+    ran = False
+    with pytest.raises(DeliveryBusy):
+        async with serialized_delivery(store, wait_s=0.3):
+            ran = True
+    assert ran is False, "the body must not run without the lock"
+    await store.release_delivery_lock("holder")
+
+
+async def test_a_lost_lock_stops_before_the_next_step(store) -> None:
+    """Taken over mid-delivery: the guard refuses the next step."""
+    from rework.orchestrator.delivery import DeliveryLockLost
+
+    steps: list[str] = []
+    with pytest.raises(DeliveryLockLost):
+        async with serialized_delivery(store) as guard:
+            await guard.check()
+            steps.append("merge")
+            # another process takes the row over (our beats stopped landing)
+            await store.release_delivery_lock(guard.owner)
+            assert await store.acquire_delivery_lock("intruder", stale_after_s=60.0)
+            await guard.check()
+            steps.append("push")
+    assert steps == ["merge"], "nothing may be pushed after the lock is lost"
+    # the intruder's lock is untouched by our release on the way out
+    assert await store.heartbeat_delivery_lock("intruder") is True
+    await store.release_delivery_lock("intruder")
+
+
+async def test_deliver_pr_records_busy_as_retryable(store, monkeypatch) -> None:
+    from rework.orchestrator import delivery as delivery_mod
+
+    await store.create_mission(Mission(id="m-busy", objective="x"))
+    assert await store.acquire_delivery_lock("holder", stale_after_s=60.0) is True
+    monkeypatch.setattr(delivery_mod, "DELIVERY_LOCK_TTL_S", 0.15)
+
+    async def must_not_push(*_a: Any, **_k: Any) -> None:
+        raise AssertionError("pushed without the delivery lock")
+
+    monkeypatch.setattr(delivery_mod, "push_branch", must_not_push)
+    url = await delivery_mod.deliver_pr(
+        store, None, "m-busy", branch="b", worktree="/nonexistent", title="t", body="x"
+    )
+    assert url is None
+    row = await store.get_mission("m-busy")
+    assert row is not None
+    assert row.result["pr_pending"] is True and row.result["pr_status"] == "busy"
+    await store.release_delivery_lock("holder")
