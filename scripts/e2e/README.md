@@ -17,3 +17,6 @@ Scenarios:
   mission; TUI B approves the gate; both must converge on done.
 - `finished_card_controls`: a repo-less draft mission runs an investigator and
   an auditor to done; the finished card must offer no pause/cancel.
+- `dashboard_controls_two_tuis`: pause, resume and cancel from A's Dashboard;
+  B, the daemon and A's buttons must agree after every step, and a cancelled
+  mission must leave no open gate.

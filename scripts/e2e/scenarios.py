@@ -267,3 +267,117 @@ async def finished_card_controls(world: World) -> None:
                 snap_status=statuses(a).get(mc.mission_id),
             )
         await shot(a, world.out, "finished-card")
+
+
+def _orchestrator_parks_on_owner(question: str) -> dict[str, Any]:
+    """A daemon script whose orchestrator asks the owner and then waits, so the
+    mission stays live long enough to be paused, resumed and cancelled."""
+    return {
+        "MISSION ORCHESTRATOR": [
+            {"tool_calls": [{"name": "ask_owner", "arguments": {"question": question}}]},
+            {
+                "tool_calls": [
+                    {
+                        "name": "finish",
+                        "arguments": {
+                            "outcome": "done",
+                            "summary": "The owner answered; nothing else was needed.",
+                        },
+                    }
+                ]
+            },
+        ]
+    }
+
+
+async def _launch_one(world: World, a: Any, pa: Any, objective: str) -> str | None:
+    from rework.tui.widgets.cards import MissionCard, ProposalCard
+
+    await type_text(pa, objective)
+    await pa.press("enter")
+    if not await until(pa, lambda: len(a.query(ProposalCard)) >= 1):
+        world.finding("work/chat", "no proposal card", objective=objective)
+        return None
+    card = list(a.query(ProposalCard))[-1]
+    launch = next(b for b in card.query("Btn") if getattr(b, "action", "") == "launch")
+    await until(pa, lambda: launch.region.width > 0)
+    await pa.click(launch)
+    if not await until(pa, lambda: len(a.query(MissionCard)) >= 1, 15):
+        world.finding("work/launch", "no mission card after launch", objective=objective)
+        return None
+    return str(list(a.query(MissionCard))[-1].mission_id)
+
+
+@scenario
+async def dashboard_controls_two_tuis(world: World) -> None:
+    """Pause, resume and cancel from TUI A's Dashboard; TUI B, the daemon and
+    A's own buttons must agree after every step."""
+    from rework.tui.app import ReworkApp
+
+    world.script(_orchestrator_parks_on_owner("Which greeting do you prefer?"))
+    world.start_daemon()
+    install_chat([propose("pick a greeting", "Greeting")])
+    a = ReworkApp(poll_seconds=0.5)
+    b = ReworkApp(poll_seconds=0.5)
+    async with a.run_test(size=(140, 40)) as pa, b.run_test(size=(140, 40)) as pb:
+        await pa.pause(0.8)
+        mid = await _launch_one(world, a, pa, "pick a greeting")
+        if mid is None:
+            return
+        if not await until(pa, lambda: statuses(a).get(mid) == "awaiting_gate", 20):
+            world.finding("sync", "mission never reached awaiting_gate", seen=statuses(a).get(mid))
+        await pa.press("alt+2")
+        a.view("dashboard").open_mission(mid)
+        await pa.pause(1.0)
+        await shot(a, world.out, "dash-01-open")
+
+        dash = a.view("dashboard")
+
+        def button(verb: str) -> Any:
+            return next(
+                (x for x in dash.query("Btn") if getattr(x, "action", "") == verb and x.display),
+                None,
+            )
+
+        async def press(verb: str, *, twice: bool = False) -> bool:
+            btn = button(verb)
+            if btn is None:
+                world.finding("dashboard", f"no visible {verb} button", status=statuses(a).get(mid))
+                return False
+            await until(pa, lambda: btn.region.width > 0)
+            await pa.click(btn)
+            if twice:  # cancel is armed by the first click
+                await pa.pause(0.2)
+                await pa.click(btn)
+            return True
+
+        for verb, want, twice in (
+            ("pause", "on_hold", False),
+            ("resume", "awaiting_gate", False),
+            ("cancel", "cancelled", True),
+        ):
+            if not await press(verb, twice=twice):
+                continue
+            for label, app, pilot in (("A", a, pa), ("B", b, pb)):
+                if not await until(
+                    pilot, lambda app=app, want=want: statuses(app).get(mid) == want, 15
+                ):
+                    world.finding(
+                        "sync", f"after {verb}, {label} shows {statuses(app).get(mid)} not {want}"
+                    )
+            await shot(a, world.out, f"dash-{verb}")
+        # a cancelled mission offers none of the verbs
+        await pa.pause(1.0)
+        left = sorted(v for v in ("pause", "resume", "cancel") if button(v) is not None)
+        if left:
+            world.finding("dashboard", "cancelled mission still offers controls", shown=left)
+        # and its open owner question is gone from both Gates lists
+        for label, app in (("A", a), ("B", b)):
+            open_for = [g for g in await app.hub.data.open_gates() if g.mission_id == mid]
+            if open_for:
+                world.finding("gates", f"{label}: a cancelled mission still has an open gate")
+        for label, app in (("A", a), ("B", b)):
+            if app.swallowed:
+                world.finding(
+                    "errors", f"{label} swallowed", errors=[repr(e) for e in app.swallowed]
+                )
