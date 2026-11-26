@@ -103,8 +103,16 @@ async def test_heartbeat_is_independent_of_a_slow_dispatch_loop(
         task = asyncio.create_task(daemon.run_forever())
         await _until(lambda: _owner_is(store, daemon._owner))
         await asyncio.sleep(1.5)
-        # a contender honoring the same window must still be refused
-        assert await store.acquire_lock("contender", stale_after_s=0.6) is False
+        # a contender is ANOTHER daemon: its own connection, like in production
+        # (sharing the daemon's connection raced its in-flight heartbeat
+        # transaction: "cannot start a transaction within a transaction" on CI)
+        other = await open_sqlite(str(tmp_path / "state.sqlite3"))
+        try:
+            assert await other.acquire_lock("contender", stale_after_s=0.6) is False
+        finally:
+            await other.aclose()
+        # stop it between store calls: let the slow pickup be the await it
+        # is parked in, not a heartbeat write
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
