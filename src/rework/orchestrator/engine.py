@@ -1403,9 +1403,7 @@ class MissionRunner:
         }.get(status, EventType.MISSION_FAILED)
         payload: dict[str, Any] = {"runs": len(runs)}
         if status == MissionStatus.CANCELLED:
-            payload["reason"] = str(
-                result.get("ship") or result.get("reason") or "by the owner"
-            )
+            payload["reason"] = str(result.get("ship") or result.get("reason") or "by the owner")
         await self._bus.publish(EventRecord(mission_id=mission_id, type=event, payload=payload))
         await self._write_back_to_source(mission_id, status)
 
