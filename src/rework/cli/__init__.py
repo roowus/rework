@@ -2936,9 +2936,8 @@ def library_activate(item_id: str, note: str | None = typer.Option(None)) -> Non
             ok, reason = external_gate_status(item)
             if not ok:
                 raise typer.BadParameter(f"cannot activate {item_id}: {reason}")
-            item.status = item.status.__class__.ACTIVE
-            item.touch()
-            await index.upsert_item(item)
+            # one column, not a whole-row upsert from this read (audit 3.7)
+            await index.set_status(item.id, item.status.__class__.ACTIVE)
             return f"{item.id} is now active ({item.type.value} {item.name!r})"
         finally:
             await index.aclose()
@@ -3020,9 +3019,8 @@ def library_approve_external(item_id: str) -> None:
             ok, reason = external_gate_status(item)
             if not ok:
                 raise typer.BadParameter(reason)
-            item.status = item.status.__class__.ACTIVE
-            item.touch()
-            await index.upsert_item(item)
+            # one column, not a whole-row upsert from this read (audit 3.7)
+            await index.set_status(item.id, item.status.__class__.ACTIVE)
             return f"{item.id} external ingest approved; now active ({item.name!r})"
         finally:
             await index.aclose()
@@ -3041,9 +3039,8 @@ def library_retire(item_id: str) -> None:
             item = await index.get_item(item_id)
             if item is None:
                 raise typer.BadParameter(f"item not found: {item_id}")
-            item.status = item.status.__class__.RETIRED
-            item.touch()
-            await index.upsert_item(item)
+            # one column, not a whole-row upsert from this read (audit 3.7)
+            await index.set_status(item.id, item.status.__class__.RETIRED)
             return f"{item.id} retired ({item.type.value} {item.name!r})"
         finally:
             await index.aclose()

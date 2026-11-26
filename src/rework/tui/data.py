@@ -438,15 +438,12 @@ class TuiData:
     async def library_set_status(self, item_id: str, retire: bool) -> bool:
         """a / d on the library split: activate or retire the selected item."""
         index, _git = await self.library()
-        item = await index.get_item(item_id)
-        if item is None:
-            return False
         from rework.library.model import ItemStatus
 
-        item.status = ItemStatus.RETIRED if retire else ItemStatus.ACTIVE
-        item.touch()
-        await index.upsert_item(item)
-        return True
+        changed = await index.set_status(
+            item_id, ItemStatus.RETIRED if retire else ItemStatus.ACTIVE
+        )
+        return changed is not None
 
     async def mission_result_path(self, mission_id: str) -> str | None:
         """Where the daemon says this mission's finished worktree lives (None =

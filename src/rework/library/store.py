@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -63,6 +64,15 @@ _MIGRATIONS: list[tuple[str, str, str]] = [
 # sqlite has no information_schema: PRAGMA table_info + conditional ALTER, the
 # additive path the state store already uses (kernel/state/sqlite.py).
 _SQLITE_MIGRATIONS: list[tuple[str, str, str]] = [
+    # vectors was missing here (only Postgres had it): a SQLite library table
+    # created before hybrid search never got the column, and EVERY upsert on it
+    # failed with "no column named vectors" (reproduced on ~/.rework's own
+    # state.sqlite3, audit 2026-11-25 3.7)
+    (
+        "library_items",
+        "vectors",
+        "ALTER TABLE library_items ADD COLUMN vectors TEXT NOT NULL DEFAULT '{}'",
+    ),
     ("library_items", "body", "ALTER TABLE library_items ADD COLUMN body TEXT"),
 ]
 
@@ -125,6 +135,16 @@ class LibraryStore(Protocol):
         behind this same interface."""
 
     async def record_use(self, item_id: str) -> None: ...
+
+    async def set_status(self, item_id: str, status: ItemStatus) -> LibraryItem | None:
+        """Change ONE column. A whole-row upsert from a stale read (an
+        embedding backfill holding rows for 30 s) used to undo a concurrent
+        activate/retire and drop `uses` counts."""
+        ...
+
+    async def set_vector(self, item_id: str, model: str, vector: list[float]) -> None:
+        """Merge one embedding into the row's vectors, touching nothing else."""
+        ...
 
     async def aclose(self) -> None: ...
 
@@ -253,6 +273,23 @@ class SqliteLibraryStore:
     async def record_use(self, item_id: str) -> None:
         await self._conn.execute(
             "UPDATE library_items SET uses = uses + 1 WHERE id = ?", (item_id,)
+        )
+        await self._conn.commit()
+
+    async def set_status(self, item_id: str, status: ItemStatus) -> LibraryItem | None:
+        await self._conn.execute(
+            "UPDATE library_items SET status = ?, updated_at = ? WHERE id = ?",
+            (status.value, time.time(), item_id),
+        )
+        await self._conn.commit()
+        return await self.get_item(item_id)
+
+    async def set_vector(self, item_id: str, model: str, vector: list[float]) -> None:
+        # json_set merges in SQL: no read-modify-write window on the row
+        await self._conn.execute(
+            "UPDATE library_items SET vectors = json_set(COALESCE(vectors, '{}'), ?, json(?))"
+            " WHERE id = ?",
+            (f'$."{model}"', json.dumps(vector), item_id),
         )
         await self._conn.commit()
 
@@ -489,6 +526,31 @@ class PostgresLibraryStore:
 
         await self._run(_op)
 
+    async def set_status(self, item_id: str, status: ItemStatus) -> LibraryItem | None:
+        async def _op(conn: Any) -> None:
+            await conn.execute(
+                "UPDATE library_items SET status = %s, updated_at = %s WHERE id = %s",
+                (status.value, time.time(), item_id),
+            )
+            await conn.commit()
+
+        await self._run(_op)
+        return await self.get_item(item_id)
+
+    async def set_vector(self, item_id: str, model: str, vector: list[float]) -> None:
+        async def _op(conn: Any) -> None:
+            # jsonb merge in SQL: no read-modify-write window on the row
+            await conn.execute(
+                "UPDATE library_items SET vectors ="
+                " (COALESCE(NULLIF(vectors, ''), '{}')::jsonb"
+                " || jsonb_build_object(%s::text, %s::jsonb))::text"
+                " WHERE id = %s",
+                (model, json.dumps(vector), item_id),
+            )
+            await conn.commit()
+
+        await self._run(_op)
+
 
 class _LibLock:
     """Single-connection serialization (same rationale as StateStore's
@@ -627,19 +689,39 @@ class GitLibrary:
         rel = item.body_path or self.body_path_for(item)
         dest = self.root / rel
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(body)
-        self._git("add", rel)
-        self._git(
-            "-c",
-            f"user.name={self._author[0]}",
-            "-c",
-            f"user.email={self._author[1]}",
-            "commit",
-            "-m",
-            message,
-            "--allow-empty",
-        )
+        # The daemon, the library MCP server, the TUI and the CLI all write
+        # here. Unlocked, two concurrent writes collided on git's index.lock
+        # (the contribute failed), and a pathspec-less commit could sweep
+        # another process's staged file in under the wrong message (audit
+        # 2026-11-25, 3.7). One flock per library, and the commit names its path.
+        with self._lock():
+            dest.write_text(body)
+            self._git("add", "--", rel)
+            self._git(
+                "-c",
+                f"user.name={self._author[0]}",
+                "-c",
+                f"user.email={self._author[1]}",
+                "commit",
+                "-m",
+                message,
+                "--allow-empty",
+                "--",
+                rel,
+            )
         return rel
+
+    @contextlib.contextmanager
+    def _lock(self) -> Any:
+        import fcntl
+
+        lock_path = self.root / ".git" / "rework-library.lock"
+        with open(lock_path, "a") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle, fcntl.LOCK_UN)
 
     def read_body(self, item: LibraryItem) -> str | None:
         if not item.body_path:
