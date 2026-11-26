@@ -1398,7 +1398,7 @@ def role_env_allow(name: str) -> None:
 def cancel(mission_id: str) -> None:
     """Cancel a mission. Works from any machine: the daemon notices the status
     and stops the roles within one poll; spent money stays spent."""
-    _set_mission_status(mission_id, "cancelled")
+    _set_mission_status(mission_id, "cancel")
 
 
 @app.command()
@@ -1407,13 +1407,15 @@ def pause(mission_id: str) -> None:
 
     Live roles are stopped; their checkpoints survive, so `rework resume` (or
     the UI) continues from where they were."""
-    _set_mission_status(mission_id, "on_hold")
+    _set_mission_status(mission_id, "pause")
 
 
 @app.command()
 def resume(mission_id: str) -> None:
-    """Resume a paused mission (or un-cancel one that never got far)."""
-    _set_mission_status(mission_id, "running")
+    """Resume a paused mission, back to the status it was paused from.
+
+    A finished (done, failed or cancelled) mission is refused, never re-run."""
+    _set_mission_status(mission_id, "resume")
 
 
 @app.command()
@@ -1450,21 +1452,24 @@ def prioritize(
     typer.echo(f"{mission_id}: priority {asyncio.run(go())}")
 
 
-def _set_mission_status(mission_id: str, status: str) -> None:
-    from rework.kernel.state.records import MissionStatus
+def _set_mission_status(mission_id: str, verb: str) -> None:
+    """pause / resume / cancel through the shared, guarded service."""
+    from rework.kernel.state.transitions import IllegalTransition
+    from rework.services import missions as mission_service
 
     async def go() -> str:
         from rework.config import Config, open_store_from_config
 
         store = await open_store_from_config(Config.from_env())
         try:
-            mission = await store.get_mission(mission_id)
-            if mission is None:
-                typer.echo(f"unknown mission {mission_id}", err=True)
-                raise typer.Exit(1)
-            updated = await store.update_mission(mission_id, status=MissionStatus(status))
-            assert updated is not None
+            updated = await mission_service.VERBS[verb](store, mission_id)
             return updated.status.value
+        except KeyError:
+            typer.echo(f"unknown mission {mission_id}", err=True)
+            raise typer.Exit(1) from None
+        except IllegalTransition as exc:
+            typer.echo(str(exc), err=True)
+            raise typer.Exit(1) from None
         finally:
             await store.aclose()
 

@@ -516,22 +516,24 @@ class TuiData:
             return gate.status.value == "sent_back"
         return gate.status.value == ("approved" if approved else "rejected")
 
-    async def set_mission_status(self, mission_id: str, status: str) -> Any:
-        """Owner controls: cancel / pause / resume. The daemon reads the row, so
-        this works from any machine — no daemon RPC needed."""
-        from rework.kernel.state.records import MissionStatus
+    async def set_mission_status(self, mission_id: str, verb: str) -> Any:
+        """Owner controls: cancel / pause / resume, through the same guarded
+        service as the CLI. A stale screen cannot resurrect or overwrite a
+        mission: the verb applies only to the status the row is REALLY in, and
+        a refusal raises IllegalTransition naming it."""
+        from rework.services import missions as mission_service
 
         store = await self.store()
-        return await store.update_mission(mission_id, status=MissionStatus(status))
+        return await mission_service.VERBS[verb](store, mission_id)
 
     async def cancel_mission(self, mission_id: str) -> Any:
-        return await self.set_mission_status(mission_id, "cancelled")
+        return await self.set_mission_status(mission_id, "cancel")
 
     async def pause_mission(self, mission_id: str) -> Any:
-        return await self.set_mission_status(mission_id, "on_hold")
+        return await self.set_mission_status(mission_id, "pause")
 
     async def resume_mission(self, mission_id: str) -> Any:
-        return await self.set_mission_status(mission_id, "running")
+        return await self.set_mission_status(mission_id, "resume")
 
     async def retry_pr(self, mission_id: str) -> tuple[bool, str]:
         """Retry push+PR for a finished mission whose delivery failed. Shares

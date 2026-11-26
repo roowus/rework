@@ -40,6 +40,7 @@ from rework.kernel.state.records import (
     coerce_priority,
 )
 from rework.kernel.state.retry import retry_transient
+from rework.kernel.state.transitions import sources
 
 _DDL = [
     """
@@ -485,6 +486,34 @@ class PostgresStore:
             )
             await self._conn.commit()
         return await self.get_mission(mission_id)
+
+    @_serialized
+    async def transition_mission(
+        self,
+        mission_id: str,
+        to: MissionStatus,
+        *,
+        from_: frozenset[MissionStatus] | set[MissionStatus] | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> Mission | None:
+        allowed = sorted(s.value for s in (from_ if from_ is not None else sources(to)))
+        if not allowed:
+            return None
+        sets = ["status = %s", "updated_at = %s"]
+        params: list[Any] = [to.value, time.time()]
+        if result is not None:
+            sets.append("result = %s")
+            params.append(_j(result))
+        marks = ", ".join("%s" for _ in allowed)
+        row = await self._fetch_one(
+            f"UPDATE missions SET {', '.join(sets)} WHERE id = %s AND status IN ({marks})"
+            " RETURNING *",
+            (*params, mission_id, *allowed),
+        )
+        if row is None:
+            return None
+            await self._conn.commit()
+        return self._mission(row)
 
     # -- transient crash counter (daemon requeue policy) --------------------
     # Read only through these methods: Mission does not carry the field, so a

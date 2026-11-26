@@ -49,6 +49,7 @@ from rework.kernel.state.records import (
 )
 from rework.kernel.state.retry import is_transient_db_error
 from rework.kernel.state.store import StateStore
+from rework.kernel.state.transitions import TERMINAL
 from rework.logs import bind
 from rework.missions import project_is_upload
 from rework.nodes.git_ops import DEFAULT_GIT_AUTHOR
@@ -63,6 +64,9 @@ log = logging.getLogger("rework.engine")
 
 # how many times the owner may send a mission back from a final gate in one run
 MAX_SEND_BACKS = 5
+
+# every status a mission can still finish from (kernel/state/transitions.py)
+_UNFINISHED = frozenset(set(MissionStatus) - TERMINAL)
 
 DEFAULT_PLAN: dict[str, Any] = {"steps": [{"step": "echo", "role": "echo"}]}
 
@@ -539,7 +543,9 @@ class MissionRunner:
         self._workroot.mkdir(parents=True, exist_ok=True)
         mission = await self._ensure_repo(mission)
         if mission.status == MissionStatus.PENDING:
-            await self._store.update_mission(mission.id, status=MissionStatus.RUNNING)
+            await self._store.transition_mission(
+                mission.id, MissionStatus.RUNNING, from_={MissionStatus.PENDING}
+            )
         self._supervisor = RunSupervisor(
             mission,
             self._store,
@@ -932,7 +938,9 @@ class MissionRunner:
             # transient to `awaiting_gate` with no gate row, which the daemon
             # repair pass and the _handle_halted wait loop both assume away.
             if gate.status == GateStatus.OPEN:
-                await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
+                await self._store.transition_mission(
+                    mission.id, MissionStatus.AWAITING_GATE, from_={MissionStatus.RUNNING}
+                )
             ship_decision = await self._gate_decision(mission.id, gate.id)
             if ship_decision is None:
                 # Send-back: mission back to running, don't synthesize
@@ -1013,7 +1021,9 @@ class MissionRunner:
             # transient to `awaiting_gate` with no gate row, which the daemon
             # repair pass and the _handle_halted wait loop both assume away.
             if gate.status == GateStatus.OPEN:
-                await self._store.update_mission(mission.id, status=MissionStatus.AWAITING_GATE)
+                await self._store.transition_mission(
+                    mission.id, MissionStatus.AWAITING_GATE, from_={MissionStatus.RUNNING}
+                )
             pr_approved = await self._gate_decision(mission.id, gate.id)
             if pr_approved is None:
                 # Send-back: mission back to running, don't synthesize
@@ -1358,7 +1368,31 @@ class MissionRunner:
                 extra = "\n\n".join(lines)
                 summary = f"{summary.rstrip()}\n\n{extra}" if summary.strip() else extra
                 result["summary"] = summary
-        await self._store.update_mission(mission_id, status=status, result=result)
+        # compare-and-set into the terminal status: only from an UNFINISHED
+        # status. If the owner cancelled between the read above and here, the
+        # row is CANCELLED and stays so; the artifacts still land on it.
+        written = await self._store.transition_mission(
+            mission_id, status, from_=_UNFINISHED, result=result
+        )
+        if written is None:
+            current = await self._store.get_mission(mission_id)
+            if current is None or current.status not in TERMINAL:
+                return  # moved by someone else to a live status: not ours to end
+            if current.status == MissionStatus.DONE:
+                # already finished DONE (a duplicate synthesis, e.g. a resumed
+                # finished mission): never emit a second mission_done
+                log.info("mission %s already done; synthesis skipped", mission_id)
+                return
+            # the owner (or the burn gate) ended it first: that verdict stands,
+            # the artifacts still land on the row
+            if current.status != status:
+                log.info(
+                    "mission %s: %s already, not %s", mission_id, current.status.value, status.value
+                )
+            status = current.status
+            await self._store.update_mission(
+                mission_id, result={**(current.result or {}), **result}
+            )
         # terminal: the transient-crash budget belongs to ONE run, so a later
         # re-run of this mission starts its count at zero
         await self._store.reset_transient_crash_count(mission_id)
@@ -1464,19 +1498,24 @@ class MissionRunner:
             self._send_back_feedback = feedback
             await send_owner_message(mission_id, feedback, store=self._store)
             # back to running, so the orchestrator reaches _final_gates again
-            await self._store.update_mission(mission_id, status=MissionStatus.RUNNING)
+            # (_clear_awaiting_gate above already did it unless the owner paused
+            # or cancelled meanwhile, which must stand)
+            await self._store.transition_mission(
+                mission_id, MissionStatus.RUNNING, from_={MissionStatus.AWAITING_GATE}
+            )
             return None
         return gate.status == GateStatus.APPROVED
 
     async def _clear_awaiting_gate(self, mission_id: str) -> None:
         """AWAITING_GATE -> RUNNING once no gate of the mission is open. A
         mission the owner paused or cancelled meanwhile is left alone."""
-        mission = await self._store.get_mission(mission_id)
-        if mission is None or mission.status != MissionStatus.AWAITING_GATE:
-            return
         if await self._store.list_open_gates(mission_id):
             return
-        await self._store.update_mission(mission_id, status=MissionStatus.RUNNING)
+        # compare-and-set: a mission the owner paused or cancelled in between
+        # is not AWAITING_GATE any more and stays as the owner left it
+        await self._store.transition_mission(
+            mission_id, MissionStatus.RUNNING, from_={MissionStatus.AWAITING_GATE}
+        )
 
     async def _dispatch_step(self, mission: Mission, step: dict[str, Any]) -> list[Run]:
         role = str(step["role"])
@@ -1732,7 +1771,9 @@ class MissionRunner:
             kind=GateKind.GENERIC,
             question=question,
         )
-        await self._store.update_mission(self.mission_id, status=MissionStatus.ON_HOLD)
+        await self._store.transition_mission(
+            self.mission_id, MissionStatus.ON_HOLD, from_={MissionStatus.RUNNING}
+        )
         # stop spending while the owner decides: live roles are cancelled and
         # resume from their checkpoints if the budget is extended
         assert self._supervisor is not None
@@ -1756,15 +1797,27 @@ class MissionRunner:
                 await asyncio.sleep(self._poll)
         decision = await self._gate_decision(self.mission_id, gate.id)
         if not decision:
-            await self._store.update_mission(
+            current = await self._store.get_mission(self.mission_id)
+            await self._store.transition_mission(
                 self.mission_id,
-                status=MissionStatus.CANCELLED,
-                result={"reason": "burn cap rejected"},
+                MissionStatus.CANCELLED,
+                result={
+                    **((current.result if current else None) or {}),
+                    "reason": "burn cap rejected",
+                },
             )
             return "cancelled"
         await record_raise(self._store, mission, float(cap), new_cap, reason, auto=False)
         await self._reload_plan()
-        await self._store.update_mission(self.mission_id, status=MissionStatus.RUNNING)
+        # ON_HOLD -> RUNNING only: an owner cancel during the burn gate stands
+        if (
+            await self._store.transition_mission(
+                self.mission_id, MissionStatus.RUNNING, from_={MissionStatus.ON_HOLD}
+            )
+            is None
+        ):
+            if await self._owner_signal() == "cancelled":
+                return "cancelled"
         for run in await self._store.list_runs(self.mission_id):
             if not _terminal(run) and run.status != RunStatus.HALTED_ESCALATED:
                 await self._supervisor.ensure_started(run)
@@ -1825,7 +1878,9 @@ class MissionRunner:
             # row alone (conftest.wait_for_gate_park). Status-first instead
             # shows `awaiting_gate` with no gate row, which the daemon repair
             # pass and the wait loop below both assume away.
-            await self._store.update_mission(self.mission_id, status=MissionStatus.AWAITING_GATE)
+            await self._store.transition_mission(
+                self.mission_id, MissionStatus.AWAITING_GATE, from_={MissionStatus.RUNNING}
+            )
         # The wait happens INSIDE the mission-slot park. This loop used to sleep
         # bare, so a mission parked on an escalation held a REWORK_CONCURRENCY
         # slot for the whole (formerly 45 minute) wait; every other gate wait
@@ -1838,7 +1893,9 @@ class MissionRunner:
                     break
                 await asyncio.sleep(self._poll)
         if gated:
-            await self._store.update_mission(self.mission_id, status=MissionStatus.RUNNING)
+            await self._store.transition_mission(
+                self.mission_id, MissionStatus.RUNNING, from_={MissionStatus.AWAITING_GATE}
+            )
         # apply decisions, straight from each run's gate row
         for run, gate_id in gated:
             if gate_id is None:

@@ -53,6 +53,24 @@ class StateStore(Protocol):
         priority: str | None = None,
     ) -> Mission | None: ...
 
+    async def transition_mission(
+        self,
+        mission_id: str,
+        to: MissionStatus,
+        *,
+        from_: frozenset[MissionStatus] | set[MissionStatus] | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> Mission | None:
+        """Compare-and-set the mission's status (kernel/state/transitions.py).
+
+        One statement: the row moves to `to` ONLY while its status is still in
+        `from_` (default: every status the transition table allows to reach
+        `to`). Returns the updated row, or None when the mission is missing or
+        in another status, which callers treat as "someone else moved it
+        first" (an owner cancel, the daemon, another TUI). `result`, when
+        given, is written in the same statement."""
+        ...
+
     async def increment_transient_crash_count(self, mission_id: str) -> int:
         """Bump and return the mission's transient crash count (0 if no row)."""
         ...

@@ -40,6 +40,7 @@ from rework.kernel.state.records import (
     coerce_priority,
 )
 from rework.kernel.state.retry import retry_transient_methods
+from rework.kernel.state.transitions import sources
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS missions (
@@ -441,6 +442,32 @@ class SqliteStore:
         params.append(mission_id)
         await self._db.execute(f"UPDATE missions SET {', '.join(sets)} WHERE id = ?", tuple(params))
         return await self.get_mission(mission_id)
+
+    async def transition_mission(
+        self,
+        mission_id: str,
+        to: MissionStatus,
+        *,
+        from_: frozenset[MissionStatus] | set[MissionStatus] | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> Mission | None:
+        allowed = sorted(s.value for s in (from_ if from_ is not None else sources(to)))
+        if not allowed:
+            return None
+        sets = ["status = ?", "updated_at = ?"]
+        params: list[Any] = [to.value, time.time()]
+        if result is not None:
+            sets.append("result = ?")
+            params.append(_j(result))
+        marks = ", ".join("?" for _ in allowed)
+        row = await self._fetch_one(
+            f"UPDATE missions SET {', '.join(sets)} WHERE id = ? AND status IN ({marks})"
+            " RETURNING *",
+            (*params, mission_id, *allowed),
+        )
+        if row is None:
+            return None
+        return self._mission(row)
 
     # -- transient crash counter -------------------------------------------
     # One statement each, committed: a counter bump must survive the crash it

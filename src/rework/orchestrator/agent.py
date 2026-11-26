@@ -1612,7 +1612,9 @@ class MissionOrchestrator:
             gate = await self.r._gates.request(
                 self.mid, kind=kind, question=question, for_run=run_id, spec=spec
             )
-        await self.store.update_mission(self.mid, status=MissionStatus.AWAITING_GATE)
+        await self.store.transition_mission(
+            self.mid, MissionStatus.AWAITING_GATE, from_={MissionStatus.RUNNING}
+        )
         # waiting for the OWNER: hold no daemon mission slot meanwhile
         async with self.r._waiting():
             while True:
@@ -1623,7 +1625,11 @@ class MissionOrchestrator:
                 if mission is not None and mission.status == MissionStatus.CANCELLED:
                     return "the owner cancelled the mission"
                 await asyncio.sleep(self.r._poll)
-        await self.store.update_mission(self.mid, status=MissionStatus.RUNNING)
+        # only a mission still parked here goes back to RUNNING: an owner
+        # pause or cancel that landed during the wait must not be overwritten
+        await self.store.transition_mission(
+            self.mid, MissionStatus.RUNNING, from_={MissionStatus.AWAITING_GATE}
+        )
         text = answer_text(row)
         if run_id is not None:
             run = await self.store.get_run(run_id)
@@ -1679,14 +1685,20 @@ class MissionOrchestrator:
                 ),
                 spec={"turn_cap": True, "asked_by": "engine"},
             )
-        await self.store.update_mission(self.mid, status=MissionStatus.AWAITING_GATE)
+        await self.store.transition_mission(
+            self.mid, MissionStatus.AWAITING_GATE, from_={MissionStatus.RUNNING}
+        )
         async with self.r._waiting():  # no daemon slot while the owner decides
             while True:
                 row = await self.store.get_gate(gate.id)
                 if row is not None and row.status != GateStatus.OPEN:
                     break
                 await asyncio.sleep(self.r._poll)
-        await self.store.update_mission(self.mid, status=MissionStatus.RUNNING)
+        # only a mission still parked here goes back to RUNNING: an owner
+        # pause or cancel that landed during the wait must not be overwritten
+        await self.store.transition_mission(
+            self.mid, MissionStatus.RUNNING, from_={MissionStatus.AWAITING_GATE}
+        )
         return row.status == GateStatus.APPROVED
 
     async def _request_budget(self, call_id: str, args: dict[str, Any]) -> str:
@@ -1757,14 +1769,20 @@ class MissionOrchestrator:
                 question=question,
                 spec={"_call": call_id, "asked_by": "orchestrator", "budget_to": wanted},
             )
-        await self.store.update_mission(self.mid, status=MissionStatus.AWAITING_GATE)
+        await self.store.transition_mission(
+            self.mid, MissionStatus.AWAITING_GATE, from_={MissionStatus.RUNNING}
+        )
         async with self.r._waiting():  # no daemon slot while the owner decides
             while True:
                 row = await self.store.get_gate(gate.id)
                 if row is not None and row.status != GateStatus.OPEN:
                     break
                 await asyncio.sleep(self.r._poll)
-        await self.store.update_mission(self.mid, status=MissionStatus.RUNNING)
+        # only a mission still parked here goes back to RUNNING: an owner
+        # pause or cancel that landed during the wait must not be overwritten
+        await self.store.transition_mission(
+            self.mid, MissionStatus.RUNNING, from_={MissionStatus.AWAITING_GATE}
+        )
         if row.status != GateStatus.APPROVED:
             return (
                 f"owner declined the budget raise (cap stays ${cap:.2f}): {row.decision_note or ''}"
