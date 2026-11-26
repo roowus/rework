@@ -16,6 +16,7 @@ from typing import Any
 
 import aiosqlite
 
+from rework.kernel.state.migrations import COLUMN_MIGRATIONS, SCHEMA_VERSION, alter_sql
 from rework.kernel.state.records import (
     MISSION_LIGHT_COLUMNS,
     BudgetState,
@@ -1256,34 +1257,20 @@ async def open_sqlite(path: str) -> SqliteStore:
     # on the slower CI runner); 10s is far above any held-write here
     await db.execute("PRAGMA busy_timeout = 10000")
     await db.executescript(_DDL)
-    # migrations for databases created before a column existed
-    cols = await db.execute("PRAGMA table_info(charges)")
-    names = {row[1] for row in await cols.fetchall()}
-    if "cached_tokens" not in names:
-        await db.execute("ALTER TABLE charges ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0")
-    cols = await db.execute("PRAGMA table_info(missions)")
-    names = {row[1] for row in await cols.fetchall()}
-    if "repo_origin" not in names:
-        await db.execute("ALTER TABLE missions ADD COLUMN repo_origin TEXT")
-    if "project_id" not in names:
-        await db.execute("ALTER TABLE missions ADD COLUMN project_id TEXT")
-    if "chat_id" not in names:
-        await db.execute("ALTER TABLE missions ADD COLUMN chat_id TEXT")
-    if "title" not in names:
-        await db.execute("ALTER TABLE missions ADD COLUMN title TEXT")
-    if "priority" not in names:
-        await db.execute("ALTER TABLE missions ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'")
-    if "transient_crash_count" not in names:
-        await db.execute(
-            "ALTER TABLE missions ADD COLUMN transient_crash_count INTEGER NOT NULL DEFAULT 0"
-        )
-    cols = await db.execute("PRAGMA table_info(gates)")
-    names = {row[1] for row in await cols.fetchall()}
-    if "for_run" not in names:
-        await db.execute("ALTER TABLE gates ADD COLUMN for_run TEXT")
-    if "decision" not in names:
-        await db.execute("ALTER TABLE gates ADD COLUMN decision TEXT")
-    if "spec" not in names:
-        await db.execute("ALTER TABLE gates ADD COLUMN spec TEXT")
+    # migrations for databases created before a column existed: the ONE list
+    # both backends share (kernel/state/migrations.py)
+    for table, column, definition in COLUMN_MIGRATIONS:
+        cols = await db.execute(f"PRAGMA table_info({table})")
+        if column not in {row[1] for row in await cols.fetchall()}:
+            await db.execute(alter_sql(table, column, definition))
+    await db.execute(
+        "CREATE TABLE IF NOT EXISTS schema_version (id INTEGER PRIMARY KEY CHECK (id = 1),"
+        " version INTEGER NOT NULL)"
+    )
+    await db.execute(
+        "INSERT INTO schema_version (id, version) VALUES (1, ?)"
+        " ON CONFLICT(id) DO UPDATE SET version = MAX(version, EXCLUDED.version)",
+        (SCHEMA_VERSION,),
+    )
     await db.commit()
     return SqliteStore(db)
