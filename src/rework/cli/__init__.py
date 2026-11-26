@@ -579,7 +579,7 @@ def _render_artifact(role: str, artifact: dict[str, Any]) -> list[str]:
             out.append("RULED OUT")
             for r in ruled:
                 out.append(f"  {r.get('area')}: {r.get('evidence')}")
-    elif role == "coder":
+    elif role == "coder" or artifact.get("kind") == "coder_handoff":
         out.append("HANDOFF")
         out.append(f"  branch: {artifact.get('branch')}")
         out.append(f"  commit: {artifact.get('commit')}")
@@ -990,7 +990,7 @@ def _render_md(runs: list[tuple[Any, dict[str, Any]]], spend: Any, mission: Any)
             out.append("")
             continue
         role = run.role
-        if role == "coder":
+        if artifact.get("kind") == "coder_handoff" or role == "coder":
             out.append("### Handoff")
             out.append("")
             out.append(f"- branch: `{artifact.get('branch')}`")

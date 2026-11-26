@@ -368,7 +368,9 @@ class GatesView(View):
         # what would ship: the latest coder diff + the auditor's verdict
         diff_label = self.query_one("#gate-diff-label")
         diff_box = self.query_one("#gate-diff", Static)
-        coder = [r for r in runs if r.role == "coder" and r.artifact and r.artifact.get("diff")]
+        from rework.orchestrator.rails import is_code_handoff
+
+        coder = [r for r in runs if is_code_handoff(r) and r.artifact and r.artifact.get("diff")]
         auditor = [r for r in runs if r.role == "auditor" and r.artifact]
         show_diff = bool(coder) and gate.kind.value in ("ship", "open_pr", "generic")
         diff_label.display = diff_box.display = show_diff or bool(auditor)

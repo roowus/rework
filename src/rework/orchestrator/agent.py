@@ -48,6 +48,13 @@ from rework.kernel.state.records import run_id as make_run_id
 from rework.logs import bind
 from rework.orchestrator.engine import MAX_SEND_BACKS
 from rework.orchestrator.rails import (
+    CODER_HANDOFF,
+    latest_handoff,
+    reads_like_status_note,
+    summary_is_substantive,
+    writes_code,
+)
+from rework.orchestrator.rails import (
     accepted_findings as _accepted_findings,
 )
 from rework.orchestrator.rails import (
@@ -55,11 +62,6 @@ from rework.orchestrator.rails import (
 )
 from rework.orchestrator.rails import (
     findings_problem as _findings_problem,
-)
-from rework.orchestrator.rails import (
-    reads_like_status_note,
-    summary_is_substantive,
-    writes_code,
 )
 
 log = logging.getLogger("rework.orchestrator")
@@ -532,14 +534,19 @@ _TOOLS: list[ToolSpec] = [
 
 # usual wiring: context a role gets automatically from the latest finished run
 # of the producing role (explicit `inputs` override it)
+# consumer role -> context key -> (producer, field). A producer is a role name,
+# or CODER_HANDOFF for "the latest code-writing handoff", whichever role left
+# it (the coder or a harness, ADR 0015). Keyed by role name for code-writing
+# producers was the bug: an auditor after a harness run got no diff at all.
 AUTO_WIRING: dict[str, dict[str, tuple[str, str | None]]] = {
     "coder": {"investigation": ("investigator", None)},
+    "harness": {"investigation": ("investigator", None)},
     "auditor": {
-        "diff": ("coder", "diff"),
-        "worktree_path": ("coder", "worktree"),
-        "coder_tests": ("coder", "tests"),
-        "base_sha": ("coder", "base_sha"),
-        "changed_files": ("coder", "changed_files"),
+        "diff": (CODER_HANDOFF, "diff"),
+        "worktree_path": (CODER_HANDOFF, "worktree"),
+        "coder_tests": (CODER_HANDOFF, "tests"),
+        "base_sha": (CODER_HANDOFF, "base_sha"),
+        "changed_files": (CODER_HANDOFF, "changed_files"),
         "investigation": ("investigator", None),
     },
 }
@@ -1369,7 +1376,11 @@ class MissionOrchestrator:
     async def _wire(self, role: str, runs: list[Run]) -> dict[str, Any]:
         context: dict[str, Any] = {}
         for key, (producer, field) in AUTO_WIRING.get(role, {}).items():
-            done = [r for r in runs if r.role == producer and r.status == RunStatus.COMPLETED]
+            if producer == CODER_HANDOFF:
+                handoff = latest_handoff(runs)
+                done = [handoff] if handoff is not None else []
+            else:
+                done = [r for r in runs if r.role == producer and r.status == RunStatus.COMPLETED]
             if not done or not done[-1].artifact:
                 continue
             artifact = done[-1].artifact or {}

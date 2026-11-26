@@ -620,10 +620,13 @@ async def retry_pr(
     branch = str(result.get("pr_branch") or "")
     if not branch:
         runs = await store.list_runs(mission_id)
-        coders = [r for r in runs if r.role == "coder" and (r.artifact or {}).get("branch")]
-        if coders:
-            branch = str((coders[-1].artifact or {}).get("branch") or "")
-            result.setdefault("pr_worktree", (coders[-1].artifact or {}).get("worktree"))
+        from rework.orchestrator.rails import latest_handoff
+
+        # any code-writing handoff (coder OR harness, ADR 0015)
+        handoff = latest_handoff(runs, completed_only=False)
+        if handoff is not None:
+            branch = str((handoff.artifact or {}).get("branch") or "")
+            result.setdefault("pr_worktree", (handoff.artifact or {}).get("worktree"))
     if not branch:
         return False, (
             f"mission {mission_id} has no recorded branch to push; "

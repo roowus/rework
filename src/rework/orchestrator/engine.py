@@ -56,7 +56,7 @@ from rework.nodes.git_ops import DEFAULT_GIT_AUTHOR
 from rework.nodes.report_sections import accepted_findings_section, mechanical_verdict
 from rework.orchestrator.delivery import DELIVERY_RESULT_KEYS
 from rework.orchestrator.limits import MissionSlot, RoleLimiter
-from rework.orchestrator.rails import audit_problem, writes_code
+from rework.orchestrator.rails import audit_problem, latest_handoff
 from rework.roles.base import EscalationKind, RoleBuildCtx
 from rework.roles.registry import RoleRegistry
 
@@ -1100,14 +1100,7 @@ class MissionRunner:
             return
         coder = results.get("code")
         if coder is None or not (coder.artifact or {}).get("branch"):
-            coders = [
-                r
-                for r in await self._store.list_runs(mission.id)
-                if writes_code(r.role)
-                and r.status == RunStatus.COMPLETED
-                and (r.artifact or {}).get("branch")
-            ]
-            coder = coders[-1] if coders else None
+            coder = latest_handoff(await self._store.list_runs(mission.id))
         if coder is None:
             return
         art = coder.artifact or {}
@@ -1236,12 +1229,9 @@ class MissionRunner:
 
         coder_run = results.get("code")
         if coder_run is None or not (coder_run.artifact or {}).get("branch"):
-            coders = [
-                r
-                for r in await self._store.list_runs(mission.id)
-                if r.role == "coder" and (r.artifact or {}).get("branch")
-            ]
-            coder_run = coders[-1] if coders else coder_run
+            # any code-writing handoff (coder OR harness), not role == "coder"
+            found = latest_handoff(await self._store.list_runs(mission.id), completed_only=False)
+            coder_run = found or coder_run
         if results.get("audit") is None:
             audits = [
                 r

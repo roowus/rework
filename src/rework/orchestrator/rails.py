@@ -34,9 +34,33 @@ from rework.nodes.testing import handoff_tests_gap
 # audit rail, the auto-wiring, the continue-branch scan and the ship picker.
 WRITING_ROLES = frozenset({"coder", "harness"})
 
+# The artifact a code-writing role leaves (roles/builtin/coding.py). Consumers
+# look a producer up by THIS, not by role name: a new code-writing role that
+# leaves the same handoff is wired, delivered and audited with no list to edit.
+CODER_HANDOFF = "coder_handoff"
+
 
 def writes_code(run_role: str) -> bool:
     return run_role in WRITING_ROLES
+
+
+def is_code_handoff(run: Run) -> bool:
+    """A run whose artifact is a code-writing handoff (coder or harness)."""
+    return (run.artifact or {}).get("kind") == CODER_HANDOFF or (
+        writes_code(run.role) and bool((run.artifact or {}).get("branch"))
+    )
+
+
+def latest_handoff(runs: list[Run], *, completed_only: bool = True) -> Run | None:
+    """The newest code-writing handoff with a branch (runs are created_at-ordered)."""
+    found = [
+        r
+        for r in runs
+        if is_code_handoff(r)
+        and (r.artifact or {}).get("branch")
+        and (not completed_only or r.status == RunStatus.COMPLETED)
+    ]
+    return found[-1] if found else None
 
 
 # -- which runs count ---------------------------------------------------------
