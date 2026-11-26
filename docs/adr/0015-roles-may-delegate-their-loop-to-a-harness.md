@@ -60,6 +60,15 @@ make any output trustworthy and neither cares who wrote the code.
 - **Let the harness commit and push.** Natural for a harness, but it hands a worker the
   power to rewrite history and push. The host commits (ADR 0014).
 
+## Amendment (2026-11-26): consumers key on the artifact kind
+
+Four consumers still looked for `role == "coder"` after this ADR landed: the auditor's
+auto-wiring, `_create_pr`, `retry_pr` and the TUI's diff view. An auditor spawned after
+a harness run got no diff, worktree, tests or base sha. They now find the producer with
+`rails.latest_handoff` / `rails.is_code_handoff`, which match `kind: "coder_handoff"`
+whatever role left it. A new code-writing role that leaves the same handoff needs no
+list edited anywhere.
+
 ## Consequences
 
 - A mission can hand the hard change to a tuned agent and keep every rail.
