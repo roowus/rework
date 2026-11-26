@@ -262,6 +262,16 @@ class WorkView(View):
             return  # nothing open, or a load is in flight and owns the log
         self._tick_chat(convo.id)
 
+    async def _adopt_remote_turn(self, chat_id: str) -> None:
+        """A turn the DAEMON ran wrote its rows with the daemon's connection, so
+        this TUI never saw their ids. This view paints the turn live from the
+        result, so the rows up to the store's head are already on screen: move
+        both marks past them, or the next poll paints the turn a second time."""
+        head = await self.hub.guard(partial(self.hub.data.chat_messages_max_id, chat_id), None)
+        if head is not None and self.convo is not None and self.convo.id == chat_id:
+            self._chat_cursor = max(self._chat_cursor, head)
+            self._rendered_max_id = max(self._rendered_max_id, head)
+
     @work(exclusive=True, group="chat-poll")
     async def _tick_chat(self, chat_id: str) -> None:
         data = self.hub.data
@@ -737,7 +747,17 @@ class WorkView(View):
             log.add(self._thinking)
             started = time.monotonic()
             try:
-                result = await engine.send(text, images=attachments or None)
+                from rework.api import client as api
+
+                try:
+                    # the daemon runs the turn when one is configured, so every
+                    # TUI on this chat shares ONE engine (ADR 0021 phase 2b);
+                    # it writes the rows, the poller paints them elsewhere
+                    result = await convo.send_remote(text, attachments or None)
+                    await self._adopt_remote_turn(convo.id)
+                except api.NoApi:
+                    # no daemon, or one without the chat route: run it here
+                    result = await convo.send_local(text, attachments or None)
             except Exception as exc:
                 self._clear_thinking()
                 log.add(

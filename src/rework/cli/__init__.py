@@ -2142,7 +2142,13 @@ def serve(
         server = None
         try:
             server = await start_workspace_server(
-                store, workroot, host, port, bus=bus, git_author=config.git_author
+                store,
+                workroot,
+                host,
+                port,
+                bus=bus,
+                git_author=config.git_author,
+                library=library,
             )
             typer.secho(
                 f"workspace API on http://{host}:{port} "

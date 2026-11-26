@@ -2,9 +2,8 @@
 
 ## Status
 
-Accepted (2026-11-26). Phase 1 (command API) and phase 2a (TUI and CLI owner actions go
-through it) landed; phase 2b moves chat turns and AI search into the daemon; phase 3
-adds the read API and event stream.
+Accepted (2026-11-26). Phase 1 (command API), phase 2a (TUI and CLI owner actions) and
+phase 2b (chat turns) landed; phase 3 adds the read API and event stream.
 
 ## Context
 
@@ -49,4 +48,15 @@ daemon predates `/v1` (aiohttp's plain 404, mixed versions during a rollout) or 
 is unreachable; a refusal from the API itself is final and shown as is. Verified with
 two TUI data layers in separate processes, each on an empty local database, racing one
 gate on a real daemon: one decision, one `gate_decided`, each told whether it won.
+
+## Phase 2b (2026-11-26): chat turns run on the daemon
+
+`POST /v1/chats/{id}/messages` runs one owner turn (`services.chat.send`): one engine per
+chat in the daemon, one turn at a time per chat (an asyncio lock: one daemon process serves
+turns), the Library handed in. With a daemon configured, the TUI's engine gets no provider
+of its own and only mirrors the pending proposals for Launch/Scrap; the daemon writes the
+transcript and every TUI's poller paints it. No daemon, or one without the route, runs the
+turn in the TUI as before. Verified live: two TUIs on ONE chat, the TUIs' model factory
+booby-trapped, three alternating turns; each shows once in both and every model turn sees
+the whole conversation.
 

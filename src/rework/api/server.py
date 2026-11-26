@@ -67,6 +67,7 @@ def add_routes(
     *,
     authorized: Any,
     git_author: tuple[str, str] | None = None,
+    library: Any | None = None,
 ) -> None:
     """Mount the /v1 command routes. `authorized(request) -> bool` is the
     workspace API's own bearer check, so one token guards both."""
@@ -160,7 +161,23 @@ def add_routes(
         ok, detail = await retry_pr(store, bus, mission_id, **kwargs)
         return web.json_response({"ok": ok, "detail": detail})
 
+    async def chat_send(request: web.Request) -> web.Response:
+        from rework.services import chat as chat_service
+
+        body = await _body(request)
+        text = str(body.get("text") or "").strip()
+        if not text:
+            raise ValueError("text is required")
+        images = body.get("images") or None
+        if images is not None and not isinstance(images, list):
+            raise ValueError("images must be a list of paths")
+        result = await chat_service.send(
+            store, request.match_info["chat_id"], text, images=images, library=library
+        )
+        return web.json_response(result)
+
     app.router.add_get("/v1", guard(version))
+    app.router.add_post("/v1/chats/{chat_id}/messages", guard(chat_send))
     app.router.add_post("/v1/missions/{mission_id}/{verb:pause|resume|cancel}", guard(mission_verb))
     app.router.add_post("/v1/missions/{mission_id}/prioritize", guard(prioritize))
     app.router.add_post("/v1/missions/{mission_id}/message", guard(message))

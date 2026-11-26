@@ -368,7 +368,13 @@ class Conversation:
             kwargs["on_turn"] = on_turn
         if _accepts(OrchestratorChat.__init__, "library"):
             kwargs["library"] = await self._library_handle()
-        self.engine = OrchestratorChat(build_provider(entry), catalog, model_id, **kwargs)
+        # With a daemon configured the DAEMON runs every turn (send_remote):
+        # this engine only mirrors the pending proposals for Launch/Scrap, so
+        # it gets no provider of its own and never calls a model from here
+        from rework.api import client as api
+
+        provider = _NoLocalTurns() if api.configured() is not None else build_provider(entry)
+        self.engine = OrchestratorChat(provider, catalog, model_id, **kwargs)
         await self.engine.load()
         # EVERY proposal that never launched is restored, in order, so a
         # reloaded chat shows all of them and a bare "yes" launches all of them
@@ -387,6 +393,48 @@ class Conversation:
             return LibraryHandle(index=index, git=git)
         except Exception:
             return None
+
+    async def send_remote(self, text: str, images: list[str] | None) -> Any:
+        """Run this turn ON THE DAEMON (ADR 0021 phase 2b) and rebuild the
+        engine-shaped result locally. Raises api.NoApi when no daemon (or an
+        older one) is configured; the caller then runs the turn in-process.
+
+        The local engine still mirrors the pending proposals, because Launch
+        and Scrap read them; the transcript itself lives in the store, where
+        the daemon wrote it."""
+        from rework.api import client as api
+        from rework.orchestrator.chat import ChatResult, Proposal
+
+        out = await api.call(lambda c: c.chat_send(self.id, text, images))
+        proposals = [Proposal(**p) for p in out.get("proposals") or []]
+        result = ChatResult(
+            reply=str(out.get("reply") or ""),
+            proposals=proposals,
+            launched_all=bool(out.get("launched_all")),
+            scrapped_all=bool(out.get("scrapped_all")),
+            asked=str(out.get("asked") or ""),
+            turn_tokens=int(out.get("turn_tokens") or 0),
+            turn_cost_usd=float(out.get("turn_cost_usd") or 0.0),
+        )
+        if self.engine is not None:
+            if proposals:
+                self.engine.proposals = list(proposals)
+            elif result.launched_all or result.scrapped_all:
+                self.engine.proposals = []
+        return result
+
+    async def send_local(self, text: str, images: list[str] | None) -> Any:
+        """Run the turn in THIS process (no daemon, or an older one). The engine
+        may have been built without a provider (daemon mode): give it one."""
+        if isinstance(getattr(self.engine, "_provider", None), _NoLocalTurns):
+            from rework.config import load_catalog
+            from rework.kernel.llm.adapters import build_provider
+
+            catalog = load_catalog()
+            self.engine._provider = build_provider(
+                catalog.resolve(self.chat.model_id or default_model(catalog))
+            )
+        return await self.engine.send(text, images=images)
 
     async def launch(self, snap: Snapshot, proposal: Any) -> Any:
         """Create the mission a confirmed proposal describes. Raises ValueError
@@ -464,6 +512,17 @@ class Conversation:
             ]
             self.engine.launched = False
         return mission
+
+
+class _NoLocalTurns:
+    """The provider of a TUI engine whose turns run on the daemon. Reaching it
+    means a turn ran locally after all (an older daemon without the chat route
+    falls back to a real provider via api.NoApi before this is built)."""
+
+    name = "daemon"
+
+    async def complete(self, request: Any) -> Any:
+        raise RuntimeError("this chat's turns run on the daemon; no local model call")
 
 
 def same_proposal(a: Any, b: Any) -> bool:
