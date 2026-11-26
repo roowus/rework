@@ -71,6 +71,23 @@ class StateStore(Protocol):
         given, is written in the same statement."""
         ...
 
+    # -- agent loop transcript (ADR 0020) ---------------------------------------
+    async def save_loop_state(
+        self, run_id: str, turns: int, messages: list[dict[str, Any]]
+    ) -> None:
+        """Upsert a role's agent-loop transcript after a turn. The loop is ONE
+        graph node, so this is what lets a resumed run continue at its last
+        turn instead of paying for every earlier one again, on any host."""
+        ...
+
+    async def load_loop_state(self, run_id: str) -> tuple[int, list[dict[str, Any]]] | None:
+        """(turns, messages) saved for the run, or None."""
+        ...
+
+    async def clear_loop_state(self, run_id: str) -> None:
+        """Drop the transcript once the loop finished (the artifact carries on)."""
+        ...
+
     async def increment_transient_crash_count(self, mission_id: str) -> int:
         """Bump and return the mission's transient crash count (0 if no row)."""
         ...

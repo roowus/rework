@@ -292,6 +292,21 @@ async def test_transition_mission_is_compare_and_set(store: StateStore) -> None:
     assert await store.transition_mission("m-missing", MissionStatus.RUNNING) is None
 
 
+async def test_loop_state_round_trip(store: StateStore) -> None:
+    """ADR 0020: the agent loop transcript is upserted per turn, read back
+    exactly (tool calls included), and cleared when the loop ends."""
+    assert await store.load_loop_state("m:s:r:1") is None
+    msgs = [
+        {"role": "user", "content": "brief"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "1", "name": "x"}]},
+    ]
+    await store.save_loop_state("m:s:r:1", 1, msgs[:1])
+    await store.save_loop_state("m:s:r:1", 2, msgs)
+    assert await store.load_loop_state("m:s:r:1") == (2, msgs)
+    await store.clear_loop_state("m:s:r:1")
+    assert await store.load_loop_state("m:s:r:1") is None
+
+
 async def test_leader_lock(store: StateStore) -> None:
     assert await store.acquire_lock("daemon-1") is True
     assert await store.acquire_lock("daemon-2") is False  # live foreign lock refused
