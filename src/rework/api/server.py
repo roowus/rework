@@ -238,8 +238,66 @@ def add_routes(
             bus.unsubscribe(wake)
         return response
 
+    async def run_ask(request: web.Request) -> web.Response:
+        """A role whose loop runs OUTSIDE the daemon (pi, ADR 0022) asks the
+        orchestrator through the same run-row ask the native loop uses: the
+        question lands on the run row, the orchestrator (or the owner) answers
+        it, and this call returns the answer. Long-poll: it waits."""
+        from rework.nodes.escalate import EscalationAwareExecutor
+
+        body = await _body(request)
+        question = str(body.get("question") or "").strip()
+        if not question:
+            raise ValueError("question is required")
+        run = await store.get_run(request.match_info["run_id"])
+        if run is None:
+            raise KeyError(request.match_info["run_id"])
+        mission = await store.get_mission(run.mission_id)
+        if mission is None:
+            raise KeyError(run.mission_id)
+
+        class _Ctx:  # the slice of RoleBuildCtx the ask path reads
+            pass
+
+        ctx = _Ctx()
+        ctx.store, ctx.bus, ctx.run, ctx.mission = store, bus, run, mission  # type: ignore[attr-defined]
+        from rework.kernel.gates import GateManager
+
+        ctx.gates = GateManager(store, bus)  # type: ignore[attr-defined]
+        from contextlib import nullcontext
+
+        ctx.parked = nullcontext  # type: ignore[attr-defined]
+        answer = await EscalationAwareExecutor(None, ctx).execute(
+            "ask_orchestrator", {"question": question, "kind": body.get("kind") or "question"}
+        )
+        return web.json_response({"answer": answer})
+
+    async def library_search(request: web.Request) -> web.Response:
+        if library is None:
+            return web.json_response({"items": [], "note": "no library on this daemon"})
+        query = str(request.query.get("q") or "").strip()
+        if not query:
+            raise ValueError("q is required")
+        items = await library.search_items(query, request.query.get("type") or None)
+        return web.json_response(
+            {
+                "items": [
+                    {
+                        "id": i.id,
+                        "type": i.type.value,
+                        "name": i.name,
+                        "description": i.description,
+                        "body": (i.body or "")[:4000],
+                    }
+                    for i in items[:20]
+                ]
+            }
+        )
+
     app.router.add_get("/v1", guard(version))
     app.router.add_get("/v1/events", guard(events))
+    app.router.add_post("/v1/runs/{run_id}/ask", guard(run_ask))
+    app.router.add_get("/v1/library/search", guard(library_search))
     app.router.add_post("/v1/chats/{chat_id}/messages", guard(chat_send))
     app.router.add_post("/v1/missions/{mission_id}/{verb:pause|resume|cancel}", guard(mission_verb))
     app.router.add_post("/v1/missions/{mission_id}/prioritize", guard(prioritize))
