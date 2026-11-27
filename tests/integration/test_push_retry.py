@@ -356,12 +356,13 @@ async def test_git_timeout_keeps_the_real_output(
     shim.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
 
-    code, out = await git_ops._run(tmp_path, "push", timeout_s=1)
+    # 3 s, not 1: under a loaded CI box `sh` alone can take a second to start
+    code, out = await git_ops._run(tmp_path, "push", timeout_s=3)
 
     assert code == 124
     lines = out.splitlines()
     assert lines[:2] == ["remote: banner line", "fatal: early EOF"], out
-    assert lines[-1] == "(git timeout after 1s)"
+    assert lines[-1] == "(git timeout after 3s)"
     assert push_failure_is_transient(out, code) is True
 
 
@@ -1168,3 +1169,4 @@ def test_cli_retry_pr_refuses_a_draft_mission_with_a_clean_message(tmp_path: Pat
     assert "Report tab" in combined
     assert "Traceback" not in combined, "the refusal is an expected outcome, not a crash"
     assert _remote_refs(bare) == ["main"], "the retry pushed a draft mission's branch"
+
