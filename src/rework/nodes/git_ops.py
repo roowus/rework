@@ -80,12 +80,17 @@ async def _run(repo: Path, *args: str, timeout_s: float = 60.0) -> tuple[int, st
             await asyncio.wait_for(proc.wait(), timeout=max(deadline - loop.time(), 0.001))
         except TimeoutError:
             timed_out = True
-    text = b"".join(chunks).decode(errors="replace").strip()
     if timed_out:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(proc.wait(), timeout=5)
+        # what git wrote just before the deadline is still in the pipe: keep
+        # it (found under load: the banner landed after the last read)
+        with contextlib.suppress(TimeoutError):
+            chunks.append(await asyncio.wait_for(proc.stdout.read(), timeout=1))
+    text = b"".join(chunks).decode(errors="replace").strip()
+    if timed_out:
         note = f"(git timeout after {timeout_s:g}s)"
         return 124, f"{text}\n{note}" if text else note
     return proc.returncode or 0, text
