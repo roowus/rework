@@ -88,7 +88,8 @@ async def test_same_output_shape_as_the_native_loop(tmp_path: Path) -> None:
         spend = await store.mission_spend("m-pi")
         assert round(spend.spent_usd, 3) == 0.33, "priced by the catalog, not pi's $0"
         argv = (tmp_path / "argv.txt").read_text()
-        assert "--tools read" in argv and "--no-session" in argv and "--system-prompt SYS" in argv
+        assert "--tools read,ask_orchestrator,library_search" in argv
+        assert "--no-session" in argv and "--system-prompt SYS" in argv
     finally:
         await store.aclose()
 

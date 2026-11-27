@@ -38,9 +38,17 @@ lets the `harness` role run Claude Code as a coder.
 Equivalent on this task. One task is not an eval; the next step is the eval harness on
 real repos before any default changes.
 
+## Amendment (2026-11-26): ask_orchestrator and the Library inside pi
+
+pi has no MCP flag, but a LOCAL extension in an isolated agent dir works under `-p` (the
+hangs came from the owner's npm extensions). rework bundles one, `nodes/pi_extension`, as
+the only extension a role's pi loads. It registers `ask_orchestrator` and `library_search`,
+which call the daemon's `POST /v1/runs/{run}/ask` (the same run-row ask the native loop
+uses, long-polled until answered) and `GET /v1/library/search`. Verified live: a pi-run
+investigator on a real daemon asked "Which file should I start with?", the orchestrator
+answered with `answer_escalation`, pi received "Start with calc.py." and continued.
+
 ## Not yet
 
-- `ask_orchestrator` and the Library are not available inside pi (they need an MCP bridge;
-  pi -p hangs with extension flags on 0.80.10, so that is its own piece of work).
 - Mid-run redirect and `needs_model` promotion apply to the native loop only.
 - Writing roles (coder) on pi, and Claude Code as the loop for non-coding roles.

@@ -18,8 +18,9 @@ What rework keeps doing, around pi:
   (ADR 0009), its tools limited to what the role may use (read-only roles get
   `read` only), and an isolated agent dir so no user extension loads.
 
-Mid-loop owner/orchestrator questions and Library tools are NOT available inside
-pi yet (they need an MCP bridge); a pi-run role finishes with what it has.
+Inside pi a role also has `ask_orchestrator` and `library_search`: a small
+bundled pi extension (nodes/pi_extension) that calls the daemon's /v1 routes, so
+the daemon stays the one control plane. No user extension loads.
 """
 
 from __future__ import annotations
@@ -42,8 +43,10 @@ log = logging.getLogger("rework.nodes")
 PI_TIMEOUT_S = 30 * 60
 # tools a read-only role (investigator, auditor, surveyor) may hand to pi; a
 # writing role adds edit/write/bash
-READ_ONLY_TOOLS = ("read",)
-WRITE_TOOLS = ("read", "edit", "write", "bash")
+# the bridge tools every pi-run role gets (nodes/pi_extension)
+BRIDGE_TOOLS = ("ask_orchestrator", "library_search")
+READ_ONLY_TOOLS = ("read", *BRIDGE_TOOLS)
+WRITE_TOOLS = ("read", "edit", "write", "bash", *BRIDGE_TOOLS)
 
 
 def pi_binary() -> str | None:
@@ -65,9 +68,15 @@ def _agent_dir() -> Path:
     someone's editor plugins)."""
     src = Path(os.environ.get("PI_CODING_AGENT_DIR") or Path.home() / ".pi" / "agent")
     dest = Path(tempfile.mkdtemp(prefix="rework-pi-"))
-    for name in ("models.json", "auth.json", "settings.json"):
+    for name in ("models.json", "auth.json"):
         if (src / name).is_file():
             shutil.copy2(src / name, dest / name)
+    # rework's own bridge extension (ask_orchestrator, library_search): the ONE
+    # extension a role's pi loads. Not the owner's settings.json: it lists their
+    # npm packages, which would load into a role.
+    bridge = Path(__file__).parent / "pi_extension"
+    if bridge.is_dir():
+        shutil.copytree(bridge, dest / "extensions" / "rework")
     return dest
 
 
@@ -139,6 +148,13 @@ def make_pi_loop_node(
         provider, model = pi_target(model_id)
         agent_dir = await asyncio.to_thread(_agent_dir)
         run_env = {**env, "PI_CODING_AGENT_DIR": str(agent_dir)}
+        # the bridge extension calls the daemon for asks and Library searches
+        from rework.orchestrator.workspace import workspace_url_from_env
+
+        run_env["REWORK_DAEMON_URL"] = workspace_url_from_env()
+        run_env["REWORK_RUN_ID"] = run_id
+        if os.environ.get("REWORK_TOKEN"):
+            run_env["REWORK_TOKEN"] = os.environ["REWORK_TOKEN"]
         proc = await asyncio.create_subprocess_exec(
             *argv(binary, prompt, system_prompt, provider, model, tools, effort),
             cwd=str(workdir),
