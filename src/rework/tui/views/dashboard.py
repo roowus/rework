@@ -2041,10 +2041,8 @@ class DashboardView(View):
     async def _deliver_message(self, mission_id: str, text: str) -> None:
         """Talk to the OPEN mission, whatever chat it came from: the shared
         owner-message publisher (ADR 0007), the same one `rework message` uses."""
-        from rework.missions import send_owner_message
-
         try:
-            await send_owner_message(mission_id, text, store=await self.hub.data.store())
+            await self.hub.data.send_owner_message(mission_id, text)
         except Exception as exc:
             self.toast(f"Could not reach the mission: {clip(str(exc), 200)}", severity="error")
             return

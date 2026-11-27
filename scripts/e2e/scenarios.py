@@ -63,6 +63,35 @@ def daemon_proposal(objective: str, title: str, plan: str = "echo") -> dict[str,
     }
 
 
+def trap_database(app: Any) -> list[str]:
+    """ADR 0021 phase 3: with a daemon configured a TUI must never open the
+    database or the Library index. Records (does not raise) every open, with
+    the TuiData method that asked, so a scenario reports them as findings."""
+    import traceback
+
+    opened: list[str] = []
+    data = app.hub.data
+    real_store, real_library = data.store, data.library
+
+    def caller() -> str:
+        for frame in reversed(traceback.extract_stack()[:-2]):
+            if "rework/tui" in frame.filename:
+                return f"{Path(frame.filename).name}:{frame.name}"
+        return "?"
+
+    async def store() -> Any:
+        opened.append(f"store <- {caller()}")
+        return await real_store()
+
+    async def library() -> Any:
+        opened.append(f"library <- {caller()}")
+        return await real_library()
+
+    data.store = store
+    data.library = library
+    return opened
+
+
 def install_chat(turns: list[ChatResult]) -> None:
     import rework.kernel.llm.adapters as adapters
 
@@ -128,6 +157,7 @@ async def chat_launch_and_cross_tui_gate(world: World) -> None:
     # chat turns run on the daemon: the proposal is in its script above
     a = ReworkApp(poll_seconds=0.5)
     b = ReworkApp(poll_seconds=0.5)
+    a_opened, b_opened = trap_database(a), trap_database(b)
     async with a.run_test(size=(140, 40)) as pa, b.run_test(size=(140, 40)) as pb:
         await pa.pause(0.8)
         await pb.pause(0.8)
@@ -194,6 +224,10 @@ async def chat_launch_and_cross_tui_gate(world: World) -> None:
                     f"{label} swallowed exceptions",
                     errors=[repr(e) for e in app.swallowed],
                 )
+
+    for who, opened in (("A", a_opened), ("B", b_opened)):
+        if opened:
+            world.finding("no-db", f"TUI {who} opened the database", calls=sorted(set(opened)))
 
 
 @scenario
@@ -266,6 +300,7 @@ async def finished_card_controls(world: World) -> None:
     world.start_daemon()
     # chat turns run on the daemon: the proposal is in its script above
     a = ReworkApp(poll_seconds=0.5)
+    a_opened = trap_database(a)
     async with a.run_test(size=(140, 40)) as pa:
         await pa.pause(0.8)
         await type_text(pa, "say hi")
@@ -303,6 +338,9 @@ async def finished_card_controls(world: World) -> None:
                 snap_status=statuses(a).get(mc.mission_id),
             )
         await shot(a, world.out, "finished-card")
+
+    if a_opened:
+        world.finding("no-db", "TUI a opened the database", calls=sorted(set(a_opened)))
 
 
 def _orchestrator_parks_on_owner(question: str) -> dict[str, Any]:
@@ -360,6 +398,8 @@ async def dashboard_controls_two_tuis(world: World) -> None:
     # chat turns run on the daemon: the proposal is in its script above
     a = ReworkApp(poll_seconds=0.5)
     b = ReworkApp(poll_seconds=0.5)
+    a_opened = trap_database(a)
+    b_opened = trap_database(b)
     async with a.run_test(size=(140, 40)) as pa, b.run_test(size=(140, 40)) as pb:
         await pa.pause(0.8)
         mid = await _launch_one(world, a, pa, "pick a greeting")
@@ -423,6 +463,10 @@ async def dashboard_controls_two_tuis(world: World) -> None:
                     "errors", f"{label} swallowed", errors=[repr(e) for e in app.swallowed]
                 )
 
+    for who, opened in (("a", a_opened), ("b", b_opened)):
+        if opened:
+            world.finding("no-db", f"TUI {who} opened the database", calls=sorted(set(opened)))
+
 
 @scenario
 async def gates_tab_answer_and_badge(world: World) -> None:
@@ -467,6 +511,8 @@ async def gates_tab_answer_and_badge(world: World) -> None:
     # chat turns run on the daemon: the proposal is in its script above
     a = ReworkApp(poll_seconds=0.5)
     b = ReworkApp(poll_seconds=0.5)
+    a_opened = trap_database(a)
+    b_opened = trap_database(b)
     async with a.run_test(size=(140, 40)) as pa, b.run_test(size=(140, 40)) as pb:
         await pa.pause(0.8)
         mid = await _launch_one(world, a, pa, "greet formally or casually")
@@ -516,6 +562,10 @@ async def gates_tab_answer_and_badge(world: World) -> None:
                     "errors", f"{label} swallowed", errors=[repr(e) for e in app.swallowed]
                 )
 
+    for who, opened in (("a", a_opened), ("b", b_opened)):
+        if opened:
+            world.finding("no-db", f"TUI {who} opened the database", calls=sorted(set(opened)))
+
 
 @scenario
 async def tour_every_tab_and_modal(world: World) -> None:
@@ -530,6 +580,7 @@ async def tour_every_tab_and_modal(world: World) -> None:
     await seed.seed(world.env["REWORK_DB"])
     await seed.seed_library(world.env["REWORK_DB"], world.env["REWORK_LIBRARY_DIR"])
     a = ReworkApp(poll_seconds=0.5)
+    a_opened = trap_database(a)
     async with a.run_test(size=(140, 40)) as pa:
         await pa.pause(1.5)
         for n, (key, name) in enumerate(
@@ -584,6 +635,10 @@ async def tour_every_tab_and_modal(world: World) -> None:
         if a.swallowed:
             world.finding("errors", "swallowed", errors=[repr(e) for e in a.swallowed])
 
+    for who, opened in (("a", a_opened),):
+        if opened:
+            world.finding("no-db", f"TUI {who} opened the database", calls=sorted(set(opened)))
+
 
 @scenario
 async def same_chat_turns_on_the_daemon(world: World) -> None:
@@ -620,6 +675,8 @@ async def same_chat_turns_on_the_daemon(world: World) -> None:
             for s in app.query_one("#chat-log", Trajectory).query("*")
         )
 
+    a_opened = trap_database(a)
+    b_opened = trap_database(b)
     async with a.run_test(size=(140, 40)) as pa, b.run_test(size=(140, 40)) as pb:
         await pa.pause(0.8)
         await type_text(pa, "first from A")
@@ -665,6 +722,10 @@ async def same_chat_turns_on_the_daemon(world: World) -> None:
         await shot(a, world.out, "daemon-chat-a")
         await shot(b, world.out, "daemon-chat-b")
 
+    for who, opened in (("a", a_opened), ("b", b_opened)):
+        if opened:
+            world.finding("no-db", f"TUI {who} opened the database", calls=sorted(set(opened)))
+
 
 @scenario
 async def live_updates_are_fast(world: World) -> None:
@@ -696,6 +757,8 @@ async def live_updates_are_fast(world: World) -> None:
     world.start_daemon()
     a = ReworkApp(poll_seconds=0.5)
     b = ReworkApp(poll_seconds=30.0)  # B must NOT be saved by its timer
+    a_opened = trap_database(a)
+    b_opened = trap_database(b)
     async with a.run_test(size=(140, 40)) as pa, b.run_test(size=(140, 40)) as pb:
         await pa.pause(0.8)
         await pb.pause(2.0)  # B's first poll + stream connect
@@ -715,6 +778,10 @@ async def live_updates_are_fast(world: World) -> None:
             world.finding("live", f"B saw the pause only after {lag:.1f}s")
         else:
             print(f"live update lag: {lag:.2f}s", flush=True)
+
+    for who, opened in (("a", a_opened), ("b", b_opened)):
+        if opened:
+            world.finding("no-db", f"TUI {who} opened the database", calls=sorted(set(opened)))
 
 
 @scenario
@@ -761,6 +828,8 @@ async def heartbeat_from_the_daemon(world: World) -> None:
         return await original_store()
 
     b.hub.data.store = no_database  # type: ignore[method-assign]
+    a_opened = trap_database(a)
+    b_opened = trap_database(b)
     async with a.run_test(size=(140, 40)) as pa, b.run_test(size=(140, 40)) as pb:
         await pa.pause(0.8)
         await pb.pause(1.5)
@@ -802,3 +871,7 @@ async def heartbeat_from_the_daemon(world: World) -> None:
         print(
             f"B heartbeat: {len(b.hub.snapshot.missions)} missions, online={b.hub.snapshot.online}"
         )
+
+    for who, opened in (("a", a_opened), ("b", b_opened)):
+        if opened:
+            world.finding("no-db", f"TUI {who} opened the database", calls=sorted(set(opened)))

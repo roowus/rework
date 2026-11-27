@@ -180,9 +180,7 @@ class LibraryView(View):
         else:
             try:
                 items = await data.library_hybrid_search(q)
-                from rework.library.embeddings import embeddings_from_env
-
-                self.mode = "hybrid" if embeddings_from_env() is not None else "keyword"
+                self.mode = getattr(data, "library_mode", "") or "keyword"
             except Exception:
                 items = await self.hub.guard(lambda: data.library_search(q), [])
                 self.mode = "keyword"
@@ -404,8 +402,7 @@ class LibraryView(View):
             return
         if ok:
             self.toast("Retired" if retire else "Activated")
-            index, _ = await self.hub.data.library()
-            self.selected = await index.get_item(item_id)
+            self.selected = await self.hub.data.library_item(item_id)
             with self.painting():  # the app can close during the awaits above
                 self._paint_reader()
             self._search()

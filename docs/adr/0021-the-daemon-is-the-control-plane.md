@@ -4,9 +4,9 @@
 
 Accepted (2026-11-26). Phases 1 (command API), 2a (owner actions), 2b (chat turns) and 3a
 (live event stream), 3b (the heartbeat as one `/v1/snapshot` read) and 3c (detail reads over
-`/v1/read`) landed. A TUI that only watches never opens the database. Remaining direct store
-use is WRITES without a command route yet (new chat, rename, notes, projects, mission
-creation from forms).
+`/v1/read`) and 3d (every owner write as a command) landed: with a daemon configured a TUI
+opens neither the database nor the Library index. The one local exception is `repo_dir`
+(uploading a folder from the client's disk), which starts on the client by nature.
 
 ## Context
 
@@ -115,3 +115,32 @@ change. The allowlist is the compatibility list: change it with a version bump.
 Verified live: `heartbeat_from_the_daemon` now fails if TUI B opens the database at all
 while it watches A's mission and visits Dashboard, Gates and Cost: 0 opens. Negative
 control: with reads forced to the store the same run reports 8 opens.
+
+## Phase 3d (2026-11-26): every owner write is a command
+
+New routes: `POST /v1/chats`, `PATCH /v1/chats/{id}` (title, project, model, effort,
+first mission; nothing else), `DELETE /v1/chats/{id}`, `POST /v1/chats/{id}/notes`,
+`POST /v1/missions` (the same `missions.create_mission`, budget/plan/repo rules
+included), `POST /v1/projects` (`services/projects.py`, shared with the no-daemon path),
+and the Library: `GET/POST /v1/library/items`, `GET /v1/library/items/{id}`,
+`POST /v1/library/items/{id}/status`. The dashboard's owner message now goes through
+`/v1/missions/{id}/message` like the Work view's. A daemon with no Library answers 409
+`unavailable`.
+
+Decisions:
+- A launched mission's local `repo` path resolves on the DAEMON's machine, where the
+  mission runs. That is a behaviour change for a remote TUI (its local path meant nothing
+  to the daemon anyway); a folder on the client travels by `repo_dir` upload, which stays
+  a client-side call.
+- The chat engine a daemon-mode TUI keeps (it mirrors pending proposals for Launch and
+  Scrap) reads its history over `/v1/read` and gets no Library handle; if an older daemon
+  forces a local turn, it is re-pointed at the real store first, because a local turn writes.
+- The Library tab's "hybrid" label now comes from where the search ran (the daemon's
+  embedder), not from the TUI machine's environment.
+- A note written over the API returns its row id, and the writing TUI marks it as its own,
+  as the tracked local store did, so the transcript poller does not paint it twice.
+
+Verified: a unit-level test runs every TUI write with the database and the Library index
+booby-trapped and checks each one on the daemon's store (negative control: removing one
+route fails it). Every live e2e scenario now traps both TUIs' database and Library opens:
+8 scenarios, 0 findings; with `new_chat` sabotaged the live run names it.

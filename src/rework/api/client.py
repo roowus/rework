@@ -115,6 +115,77 @@ class DaemonClient:
         )
         return remote_store.decode(method, out["result"])
 
+    async def _send(self, verb: str, path: str, body: dict[str, Any] | None = None) -> Any:
+        response = await self._http.request(verb, path, json=body if body is not None else None)
+        try:
+            data = response.json()
+        except ValueError:
+            code = "no_api" if response.status_code in (404, 405) else "bad_response"
+            data = {"error": response.text, "code": code}
+        if response.status_code >= 400:
+            raise ApiError(
+                response.status_code,
+                str(data.get("code") or "error"),
+                str(data.get("error") or response.text),
+            )
+        return data
+
+    async def create_chat(self, **fields: Any) -> Any:
+        from rework.kernel.state.records import Chat
+
+        return Chat.model_validate((await self._post("/v1/chats", fields))["chat"])
+
+    async def update_chat(self, chat_id: str, **fields: Any) -> Any:
+        from rework.kernel.state.records import Chat
+
+        out = await self._send("PATCH", f"/v1/chats/{chat_id}", fields)
+        return Chat.model_validate(out["chat"])
+
+    async def delete_chat(self, chat_id: str) -> None:
+        await self._send("DELETE", f"/v1/chats/{chat_id}")
+
+    async def chat_note(self, chat_id: str, display: str) -> int | None:
+        return (await self._post(f"/v1/chats/{chat_id}/notes", {"display": display}))["id"]
+
+    async def create_mission(self, objective: str, **fields: Any) -> Any:
+        from rework.kernel.state.records import Mission
+
+        out = await self._post("/v1/missions", {"objective": objective, **fields})
+        return Mission.model_validate(out["mission"])
+
+    async def create_project(self, name: str, repos: list[dict[str, Any]]) -> Any:
+        from rework.kernel.state.records import Project
+
+        out = await self._post("/v1/projects", {"name": name, "repos": repos})
+        return Project.model_validate(out["project"])
+
+    async def library_items(
+        self, query: str = "", *, hybrid: bool = False
+    ) -> tuple[list[Any], str]:
+        from rework.library.model import LibraryItem
+
+        params = {"q": query, **({"mode": "hybrid"} if hybrid else {})}
+        out = await self._send("GET", f"/v1/library/items?{httpx.QueryParams(params)}")
+        return [LibraryItem.model_validate(i) for i in out["items"]], str(out.get("mode") or "")
+
+    async def library_item(self, item_id: str) -> Any:
+        from rework.library.model import LibraryItem
+
+        out = await self._send("GET", f"/v1/library/items/{item_id}")
+        return LibraryItem.model_validate(out["item"])
+
+    async def library_add(self, **fields: Any) -> tuple[Any, str]:
+        from rework.library.model import LibraryItem
+
+        out = await self._post("/v1/library/items", fields)
+        return LibraryItem.model_validate(out["item"]), str(out.get("note") or "")
+
+    async def library_status(self, item_id: str, status: str) -> Any:
+        from rework.library.model import LibraryItem
+
+        out = await self._post(f"/v1/library/items/{item_id}/status", {"status": status})
+        return LibraryItem.model_validate(out["item"])
+
     async def mission_verb(self, mission_id: str, verb: str) -> dict[str, Any]:
         return (await self._post(f"/v1/missions/{mission_id}/{verb}"))["mission"]
 
