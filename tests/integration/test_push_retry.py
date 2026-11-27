@@ -1169,4 +1169,3 @@ def test_cli_retry_pr_refuses_a_draft_mission_with_a_clean_message(tmp_path: Pat
     assert "Report tab" in combined
     assert "Traceback" not in combined, "the refusal is an expected outcome, not a crash"
     assert _remote_refs(bare) == ["main"], "the retry pushed a draft mission's branch"
-
