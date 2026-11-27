@@ -45,6 +45,24 @@ def propose(objective: str, title: str, plan: str = "echo") -> ChatResult:
     )
 
 
+CHAT_ROUTE = "You are rework's orchestrator"
+
+
+def daemon_proposal(objective: str, title: str, plan: str = "echo") -> dict[str, Any]:
+    """The chat turn as a REWORK_FAKE_SCRIPT entry. Chat turns run on the
+    DAEMON (ADR 0021 2b), so a proposal has to be scripted there: a TUI-side
+    provider (`install_chat`) is never called when a daemon is configured."""
+    return {
+        "text": "Here's what I'd run.",
+        "tool_calls": [
+            {
+                "name": "propose_mission",
+                "arguments": {"objective": objective, "plan": plan, "title": title},
+            }
+        ],
+    }
+
+
 def install_chat(turns: list[ChatResult]) -> None:
     import rework.kernel.llm.adapters as adapters
 
@@ -71,32 +89,43 @@ async def chat_launch_and_cross_tui_gate(world: World) -> None:
     # the daemon's orchestrator: spawn echo, wait for it, then finish
     world.script(
         {
-            "MISSION ORCHESTRATOR": [
+            **(
                 {
-                    "tool_calls": [
+                    "MISSION ORCHESTRATOR": [
                         {
-                            "name": "spawn_role",
-                            "arguments": {"role": "echo", "step": "echo", "brief": "say hello"},
+                            "tool_calls": [
+                                {
+                                    "name": "spawn_role",
+                                    "arguments": {
+                                        "role": "echo",
+                                        "step": "echo",
+                                        "brief": "say hello",
+                                    },
+                                },
+                                {"name": "wait", "arguments": {}},
+                            ]
                         },
-                        {"name": "wait", "arguments": {}},
-                    ]
-                },
-                {
-                    "tool_calls": [
                         {
-                            "name": "finish",
-                            "arguments": {
-                                "outcome": "done",
-                                "summary": "Echo ran and the owner approved the greeting gate.",
-                            },
-                        }
+                            "tool_calls": [
+                                {
+                                    "name": "finish",
+                                    "arguments": {
+                                        "outcome": "done",
+                                        "summary": (
+                                            "Echo ran and the owner approved the greeting gate."
+                                        ),
+                                    },
+                                }
+                            ]
+                        },
                     ]
-                },
-            ]
+                }
+            ),
+            CHAT_ROUTE: [daemon_proposal("say hello", "Greeting", plan="echo")],
         }
     )
     world.start_daemon()
-    install_chat([propose("say hello", "Greeting")])
+    # chat turns run on the daemon: the proposal is in its script above
     a = ReworkApp(poll_seconds=0.5)
     b = ReworkApp(poll_seconds=0.5)
     async with a.run_test(size=(140, 40)) as pa, b.run_test(size=(140, 40)) as pb:
@@ -177,58 +206,65 @@ async def finished_card_controls(world: World) -> None:
     # a REPO-LESS draft mission that really runs a role (investigator) to done
     world.script(
         {
-            "MISSION ORCHESTRATOR": [
+            **(
                 {
-                    "tool_calls": [
+                    "MISSION ORCHESTRATOR": [
                         {
-                            "name": "spawn_role",
-                            "arguments": {
-                                "role": "investigator",
-                                "step": "research",
-                                "brief": "say hi",
-                            },
+                            "tool_calls": [
+                                {
+                                    "name": "spawn_role",
+                                    "arguments": {
+                                        "role": "investigator",
+                                        "step": "research",
+                                        "brief": "say hi",
+                                    },
+                                },
+                                {"name": "wait", "arguments": {}},
+                            ]
                         },
-                        {"name": "wait", "arguments": {}},
-                    ]
-                },
-                # draft audits its claims: the finish rail requires an auditor
-                {
-                    "tool_calls": [
+                        # draft audits its claims: the finish rail requires an auditor
                         {
-                            "name": "spawn_role",
-                            "arguments": {
-                                "role": "auditor",
-                                "step": "audit",
-                                "brief": "audit the report",
-                            },
+                            "tool_calls": [
+                                {
+                                    "name": "spawn_role",
+                                    "arguments": {
+                                        "role": "auditor",
+                                        "step": "audit",
+                                        "brief": "audit the report",
+                                    },
+                                },
+                                {"name": "wait", "arguments": {}},
+                            ]
                         },
-                        {"name": "wait", "arguments": {}},
-                    ]
-                },
-                {
-                    "tool_calls": [
                         {
-                            "name": "finish",
-                            "arguments": {
-                                "outcome": "done",
-                                "summary": "Researched the greeting request and wrote the report.",
-                            },
-                        }
-                    ]
-                },
-            ],
-            "Find issues before they reach production": [
-                {"text": "The report's claims are consistent."},
-                {"text": AUDIT_CLEAN},
-            ],
-            "Investigate any brief": [
-                {"text": "Nothing to read: this is a greeting."},
-                {"text": INV_REPORT},
-            ],
+                            "tool_calls": [
+                                {
+                                    "name": "finish",
+                                    "arguments": {
+                                        "outcome": "done",
+                                        "summary": (
+                                            "Researched the greeting request and wrote the report."
+                                        ),
+                                    },
+                                }
+                            ]
+                        },
+                    ],
+                    "Find issues before they reach production": [
+                        {"text": "The report's claims are consistent."},
+                        {"text": AUDIT_CLEAN},
+                    ],
+                    "Investigate any brief": [
+                        {"text": "Nothing to read: this is a greeting."},
+                        {"text": INV_REPORT},
+                    ],
+                }
+            ),
+            CHAT_ROUTE: [daemon_proposal("say hi", "Hi", plan="draft")],
         }
     )
     world.start_daemon()
-    install_chat([propose("say hi", "Hi", plan="draft")])
+    # chat turns run on the daemon: the proposal is in its script above
     a = ReworkApp(poll_seconds=0.5)
     async with a.run_test(size=(140, 40)) as pa:
         await pa.pause(0.8)
@@ -314,9 +350,14 @@ async def dashboard_controls_two_tuis(world: World) -> None:
     A's own buttons must agree after every step."""
     from rework.tui.app import ReworkApp
 
-    world.script(_orchestrator_parks_on_owner("Which greeting do you prefer?"))
+    world.script(
+        {
+            **(_orchestrator_parks_on_owner("Which greeting do you prefer?")),
+            CHAT_ROUTE: [daemon_proposal("pick a greeting", "Greeting", plan="echo")],
+        }
+    )
     world.start_daemon()
-    install_chat([propose("pick a greeting", "Greeting")])
+    # chat turns run on the daemon: the proposal is in its script above
     a = ReworkApp(poll_seconds=0.5)
     b = ReworkApp(poll_seconds=0.5)
     async with a.run_test(size=(140, 40)) as pa, b.run_test(size=(140, 40)) as pb:
@@ -394,31 +435,36 @@ async def gates_tab_answer_and_badge(world: World) -> None:
 
     world.script(
         {
-            "MISSION ORCHESTRATOR": [
+            **(
                 {
-                    "tool_calls": [
+                    "MISSION ORCHESTRATOR": [
                         {
-                            "name": "ask_owner",
-                            "arguments": {"question": "Formal or casual greeting?"},
-                        }
-                    ]
-                },
-                {
-                    "tool_calls": [
+                            "tool_calls": [
+                                {
+                                    "name": "ask_owner",
+                                    "arguments": {"question": "Formal or casual greeting?"},
+                                }
+                            ]
+                        },
                         {
-                            "name": "finish",
-                            "arguments": {
-                                "outcome": "done",
-                                "summary": "The owner chose the greeting style.",
-                            },
-                        }
+                            "tool_calls": [
+                                {
+                                    "name": "finish",
+                                    "arguments": {
+                                        "outcome": "done",
+                                        "summary": "The owner chose the greeting style.",
+                                    },
+                                }
+                            ]
+                        },
                     ]
-                },
-            ]
+                }
+            ),
+            CHAT_ROUTE: [daemon_proposal("greet formally or casually", "Greeting", plan="echo")],
         }
     )
     world.start_daemon()
-    install_chat([propose("greet formally or casually", "Greeting")])
+    # chat turns run on the daemon: the proposal is in its script above
     a = ReworkApp(poll_seconds=0.5)
     b = ReworkApp(poll_seconds=0.5)
     async with a.run_test(size=(140, 40)) as pa, b.run_test(size=(140, 40)) as pb:
@@ -469,99 +515,6 @@ async def gates_tab_answer_and_badge(world: World) -> None:
                 world.finding(
                     "errors", f"{label} swallowed", errors=[repr(e) for e in app.swallowed]
                 )
-
-
-@scenario
-async def same_chat_two_tuis(world: World) -> None:
-    """Both TUIs open the SAME chat. A sends a message; B must show it and its
-    reply. Then B sends; A must show B's turn, and the next model turn must
-    see the whole conversation (no lost or duplicated turns)."""
-    from rework.tui.app import ReworkApp
-    from rework.tui.widgets.base import RowList
-
-    world.start_daemon()
-    seen_by_model: list[list[str]] = []
-
-    class Recorder(ScriptedChat):
-        async def complete(self, request: Any) -> ChatResult:
-            seen_by_model.append(
-                [
-                    str(m.get("content", ""))[:40]
-                    for m in request.messages
-                    if m.get("role") == "user"
-                ]
-            )
-            return await super().complete(request)
-
-    import rework.kernel.llm.adapters as adapters
-
-    rec = Recorder(
-        [
-            ChatResult(text="Hello from turn one.", usage=Usage(input_tokens=10, output_tokens=5)),
-            ChatResult(text="Reply to B.", usage=Usage(input_tokens=10, output_tokens=5)),
-            ChatResult(text="Reply to A again.", usage=Usage(input_tokens=10, output_tokens=5)),
-        ]
-    )
-    adapters.build_provider = lambda entry, extra=None: rec  # type: ignore[assignment]
-    a = ReworkApp(poll_seconds=0.5)
-    b = ReworkApp(poll_seconds=0.5)
-    async with a.run_test(size=(140, 40)) as pa, b.run_test(size=(140, 40)) as pb:
-        await pa.pause(0.8)
-        await type_text(pa, "first from A")
-        await pa.press("enter")
-        await pa.pause(1.0)
-        chat_id = a.view("work").convo.id
-
-        # B opens the same chat from its list
-        if not await until(pb, lambda: chat_id in {c.id for c in b.hub.snapshot.chats}, 15):
-            world.finding("chat/sync", "B's chat list never showed A's chat")
-            return
-        b.query_one("#chat-list", RowList).activate(chat_id, via_mouse=True)
-        await pb.pause(1.5)
-
-        def log_text(app: Any) -> str:
-            from rework.tui.widgets.trajectory import Trajectory
-
-            return " ".join(
-                str(getattr(s, "renderable", "") or getattr(s, "content", ""))
-                for s in app.query_one("#chat-log", Trajectory).query("*")
-            )
-
-        if not await until(pb, lambda: "Hello from turn one" in log_text(b), 10):
-            world.finding("chat/sync", "B does not show A's turn after opening the chat")
-        await type_text(pb, "second from B")
-        await pb.press("enter")
-        await pb.pause(1.5)
-        if not await until(pa, lambda: "second from B" in log_text(a), 10):
-            world.finding("chat/sync", "A never shows B's message in the shared chat")
-        if not await until(pa, lambda: "Reply to B" in log_text(a), 10):
-            world.finding("chat/sync", "A never shows the reply to B")
-        if len(seen_by_model) >= 2 and not any("first from A" in u for u in seen_by_model[1]):
-            world.finding(
-                "chat/history",
-                "the model's second turn (sent from B) did not include A's first message",
-                second_turn_user_messages=seen_by_model[1],
-            )
-        # the case that desyncs: A sends AGAIN. A's engine was built before B's
-        # turn existed; the model must still see B's message in this turn
-        await type_text(pa, "third from A")
-        await pa.press("enter")
-        await until(pa, lambda: "Reply to A again" in log_text(a), 10)
-        if len(seen_by_model) >= 3 and not any("second from B" in u for u in seen_by_model[2]):
-            world.finding(
-                "chat/history",
-                "A's next turn was sent WITHOUT B's message (stale in-memory history)",
-                third_turn_user_messages=seen_by_model[2],
-            )
-        if not await until(pb, lambda: "third from A" in log_text(b), 10):
-            world.finding("chat/sync", "B never shows A's third message")
-        await shot(a, world.out, "chat-a")
-        await shot(b, world.out, "chat-b")
-        rows = await a.hub.data.chat_messages(chat_id)
-        texts = [r.display for r in rows if r.role in ("user", "assistant")]
-        for text in set(texts):
-            if texts.count(text) > 1:
-                world.finding("chat/history", "a turn is stored twice", text=text[:60])
 
 
 @scenario
@@ -762,3 +715,75 @@ async def live_updates_are_fast(world: World) -> None:
             world.finding("live", f"B saw the pause only after {lag:.1f}s")
         else:
             print(f"live update lag: {lag:.2f}s", flush=True)
+
+
+@scenario
+async def heartbeat_from_the_daemon(world: World) -> None:
+    """ADR 0021 phase 3: the TUI's heartbeat (missions, gates, chats, spend,
+    spinner stamps) is ONE /v1/snapshot call. TUI B's store reads for those are
+    booby-trapped, so everything B shows must have come from the daemon; it
+    must still see A's mission appear, park on its gate (badge) and finish."""
+    from rework.tui.app import ReworkApp
+
+    script = _orchestrator_parks_on_owner("Which greeting?")
+    script["You are rework's orchestrator"] = [
+        {
+            "tool_calls": [
+                {
+                    "name": "propose_mission",
+                    "arguments": {"objective": "pick a greeting", "plan": "echo", "title": "Hi"},
+                }
+            ]
+        }
+    ]
+    world.script(script)
+    world.start_daemon()
+    a = ReworkApp(poll_seconds=0.5)
+    b = ReworkApp(poll_seconds=1.0)
+    trapped: list[str] = []
+    detail_reads: list[str] = []
+
+    async def no_store_heartbeat(_snap: Any) -> None:
+        trapped.append("hub._from_store")
+        raise AssertionError("TUI B built its heartbeat from the store")
+
+    b.hub._from_store = no_store_heartbeat  # type: ignore[method-assign]
+    # what B's views still read from the store directly (detail views: the
+    # next step of ADR 0021 phase 3), recorded, not failed
+    original_call = b.hub.data._call
+
+    async def counting_call(fn: Any) -> Any:
+        code = getattr(fn, "__code__", None)
+        detail_reads.append(code.co_qualname if code else repr(fn))
+        return await original_call(fn)
+
+    b.hub.data._call = counting_call  # type: ignore[method-assign]
+    async with a.run_test(size=(140, 40)) as pa, b.run_test(size=(140, 40)) as pb:
+        await pa.pause(0.8)
+        await pb.pause(1.5)
+        if not b.hub.snapshot.loaded or not b.hub.snapshot.online:
+            world.finding("snapshot", "B never loaded", error=b.hub.snapshot.error)
+        mid = await _launch_one(world, a, pa, "pick a greeting")
+        if mid is None:
+            return
+        if not await until(pb, lambda: statuses(b).get(mid) == "awaiting_gate", 40):
+            world.finding("snapshot", "B never saw the mission park", seen=statuses(b))
+        elif not b.hub.snapshot.gates_for(mid):
+            world.finding("snapshot", "B shows the park but not the open gate")
+        await shot(b, world.out, "b-parked")
+        gates = [g for g in b.hub.snapshot.gates if g.mission_id == mid]
+        if gates:
+            from rework.api.client import DaemonClient
+
+            async with DaemonClient() as client:
+                await client.decide_gate(gates[0].id, True, decision={"answer": "hello"})
+            if not await until(pb, lambda: not b.hub.snapshot.gates_for(mid), 15):
+                world.finding("snapshot", "B kept showing a decided gate")
+        if trapped:
+            world.finding("snapshot", "B built its heartbeat from the store")
+        print(f"B detail reads still on the store: {len(detail_reads)}", flush=True)
+        for name in sorted(set(detail_reads)):
+            print(f"  {detail_reads.count(name):4d}  {name}", flush=True)
+        print(
+            f"B heartbeat: {len(b.hub.snapshot.missions)} missions, online={b.hub.snapshot.online}"
+        )

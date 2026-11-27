@@ -303,7 +303,8 @@ specified in `docs/tui/DESIGN.md`; every view is built from that kit.
 
 Rules: mouse first with keys as accelerators (`alt+1..5`, `ctrl+n`, `alt+a/x`);
 one click acts; esc goes back, esc twice quits; ctrl+c copies (OSC 52 +
-pbcopy), never quits. One `Hub` polls the store and broadcasts snapshots;
+pbcopy), never quits. One `Hub` polls (the daemon's `/v1/snapshot` when one is
+configured, the store otherwise: ADR 0021) and broadcasts snapshots;
 every poll is guarded, a dead connection shows `○ offline` with stale data,
 and `ReworkApp._handle_exception` turns surprises into toasts. Gate
 notifications are configurable (`REWORK_NOTIFY=toast,bell,os|none`, or File ›

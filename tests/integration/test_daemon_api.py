@@ -220,3 +220,213 @@ async def test_the_event_stream_delivers_what_the_daemon_publishes(
     await asyncio.wait_for(done.wait(), 5)
     follower.cancel()
     assert any(e["type"] == "owner_message" and e["mission_id"] == "m-ev" for e in got), got
+
+
+async def _seed_snapshot_world(store: Any) -> dict[str, Any]:
+    """One of everything the heartbeat shows, plus the things it must hide."""
+    import time as _time
+
+    from rework.kernel.state.records import (
+        ORCHESTRATOR_CHAT_PREFIX,
+        Charge,
+        Chat,
+        ChatMessage,
+        EventRecord,
+        Project,
+        Run,
+        RunStatus,
+    )
+
+    project = await store.create_project(Project(name="toy"))
+    await store.create_mission(
+        Mission(
+            id="m-run",
+            objective="x" * 5000,
+            status=MissionStatus.RUNNING,
+            project_id=project.id,
+            plan={"steps": [{"step": "do", "role": "echo"}]},
+            result={"big": "y" * 1000},
+        )
+    )
+    await store.create_mission(Mission(id="m-done", objective="old", status=MissionStatus.DONE))
+    await store.create_run(
+        Run(
+            id="m-run:do:echo:1",
+            mission_id="m-run",
+            role="echo",
+            step="do",
+            status=RunStatus.RUNNING,
+        )
+    )
+    await store.append_event(
+        EventRecord(mission_id="m-run", run_id="m-run:do:echo:1", type=EventType.PROGRESS)
+    )
+    gate = await GateManager(store, InProcessEventBus(store)).request(
+        "m-run", kind=GateKind.SHIP, question="ship?"
+    )
+    talk = await store.create_chat(Chat(title="a real conversation"))
+    await store.append_chat_message(ChatMessage(chat_id=talk.id, role="user", body={"text": "hi"}))
+    empty = await store.create_chat(Chat(title="empty"))
+    orch = await store.create_chat(Chat(id=f"{ORCHESTRATOR_CHAT_PREFIX}m-run", title="machinery"))
+    await store.append_chat_message(
+        ChatMessage(chat_id=orch.id, role="assistant", body={"text": "internal"})
+    )
+    await store.charge(Charge(mission_id="m-run", model="fake", cost_usd=0.25))
+    return {"gate": gate, "talk": talk, "empty": empty, "orch": orch, "now": _time.time()}
+
+
+async def test_the_snapshot_is_the_whole_heartbeat_in_one_call(api: dict[str, Any]) -> None:
+    """ADR 0021 phase 3: one GET gives a front end everything its heartbeat
+    shows: light missions, open gates, projects, the LISTED chats (no empty
+    chat, no orchestrator transcript), spend since the client's midnight, and
+    the spinner's event stamps for the running mission and its run."""
+    store = api["store"]
+    seeded = await _seed_snapshot_world(store)
+    async with _client(api) as client:
+        snap = await client.snapshot(spend_since=seeded["now"] - 3600)
+    by_id = {m.id: m for m in snap["missions"]}
+    assert set(by_id) == {"m-run", "m-done"}
+    running = by_id["m-run"]
+    assert running.light and running.plan is None and running.result is None
+    assert len(running.objective) < 5000, "the objective is clipped like list_missions_light"
+    assert [g.id for g in snap["gates"]] == [seeded["gate"].id]
+    assert [p.name for p in snap["projects"]] == ["toy"]
+    assert [c.id for c in snap["chats"]] == [seeded["talk"].id]
+    assert snap["chats"][0].last_message_at is not None
+    assert snap["spend_today"] == pytest.approx(0.25)
+    assert {"m-run", "m-run:do:echo:1", "*"} <= set(snap["last_event"])
+    assert "m-done" not in snap["last_event"], "only running missions are stamped"
+    assert snap["budget_raises"] == [] and snap["event_seq"] > 0
+
+
+async def test_the_snapshot_cursor_carries_each_budget_raise_exactly_once(
+    api: dict[str, Any],
+) -> None:
+    """The budget-raise toast rides the snapshot: the first call primes the
+    cursor at "now" (yesterday's raises are not re-announced), a raise after
+    it arrives in exactly one later snapshot, and the cursor moves past a
+    burst of unrelated events too."""
+    from rework.kernel.state.records import EventRecord
+
+    store = api["store"]
+    await store.create_mission(Mission(id="m-b", objective="x", status=MissionStatus.RUNNING))
+    await store.append_event(EventRecord(mission_id="m-b", type=EventType.BUDGET_RAISED))
+    async with _client(api) as client:
+        first = await client.snapshot()
+        assert first["budget_raises"] == [], "a fresh shell starts from now"
+        await store.append_event(EventRecord(mission_id="m-b", type=EventType.INFO))
+        await store.append_event(EventRecord(mission_id="m-b", type=EventType.BUDGET_RAISED))
+        second = await client.snapshot(events_after=first["event_seq"])
+        assert [e.type for e in second["budget_raises"]] == [EventType.BUDGET_RAISED]
+        third = await client.snapshot(events_after=second["event_seq"])
+        assert third["budget_raises"] == [] and third["event_seq"] == second["event_seq"]
+
+
+async def test_the_snapshot_rejects_bad_numbers_and_wrong_tokens(api: dict[str, Any]) -> None:
+    async with _client(api) as client:
+        response = await client._http.get("/v1/snapshot", params={"events_after": "soon"})
+        assert response.status_code == 400 and response.json()["code"] == "bad_request"
+    async with _client(api, token="wrong") as client:
+        with pytest.raises(ApiError) as denied:
+            await client.snapshot()
+        assert denied.value.status == 401
+
+
+async def test_the_snapshot_equals_what_the_tui_reads_from_the_store(
+    api: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drift guard: a hub fed by the daemon and a hub reading the store
+    directly must show the SAME snapshot (same rules, one module)."""
+    from rework.tui.data import TuiData
+    from rework.tui.hub import Hub
+
+    store = api["store"]
+    await _seed_snapshot_world(store)
+
+    local = Hub(TuiData(store_factory=lambda: store))
+    local_snap = await local.refresh()
+
+    monkeypatch.setenv("REWORK_DAEMON_URL", api["url"])
+
+    def no_database() -> Any:
+        raise AssertionError("a daemon-backed hub must not open the database")
+
+    remote = Hub(TuiData(store_factory=no_database))
+    remote_snap = await remote.refresh()
+
+    assert remote_snap.online and remote_snap.loaded, remote_snap.error
+    assert [m.id for m in remote_snap.missions] == [m.id for m in local_snap.missions]
+    assert [m.model_dump() for m in remote_snap.missions] == [
+        m.model_dump() for m in local_snap.missions
+    ]
+    assert [g.id for g in remote_snap.gates] == [g.id for g in local_snap.gates]
+    assert [p.id for p in remote_snap.projects] == [p.id for p in local_snap.projects]
+    assert [c.model_dump() for c in remote_snap.chats] == [c.model_dump() for c in local_snap.chats]
+    assert remote_snap.spend_today == pytest.approx(local_snap.spend_today)
+    assert set(remote_snap.last_event) == set(local_snap.last_event)
+
+
+async def test_an_unreachable_daemon_is_offline_not_a_database_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured daemon that is down must show as OFFLINE with the last
+    good data, never quietly go around it to the database (that would bring
+    back the second-runtime TUI the API exists to remove)."""
+    from rework.tui.data import TuiData
+    from rework.tui.hub import Hub
+
+    monkeypatch.setenv("REWORK_DAEMON_URL", "http://127.0.0.1:9")  # discard port
+
+    def no_database() -> Any:
+        raise AssertionError("must not fall back to the database")
+
+    snap = await Hub(TuiData(store_factory=no_database)).refresh()
+    assert not snap.online and snap.error
+
+
+async def test_an_older_daemon_without_the_snapshot_route_falls_back_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mixed versions during a rollout: a daemon that answers aiohttp's plain
+    404 for /v1/snapshot makes the hub read the store, and it is not asked
+    again every poll."""
+    from aiohttp import web
+
+    from rework.tui.data import TuiData
+    from rework.tui.hub import Hub
+
+    hits: list[str] = []
+
+    async def plain_404(request: web.Request) -> web.Response:
+        hits.append(request.path)
+        raise web.HTTPNotFound()
+
+    old = web.Application()
+    old.router.add_get("/v1/snapshot", plain_404)
+    server = TestServer(old)
+    await server.start_server()
+    store = await open_sqlite(str(tmp_path / "local.sqlite3"))
+    await store.create_mission(Mission(id="m-local", objective="x"))
+    try:
+        monkeypatch.setenv("REWORK_DAEMON_URL", str(server.make_url("")).rstrip("/"))
+        hub = Hub(TuiData(store_factory=lambda: store))
+        first = await hub.refresh()
+        second = await hub.refresh()
+        assert [m.id for m in first.missions] == ["m-local"]
+        assert [m.id for m in second.missions] == ["m-local"]
+        assert hits == ["/v1/snapshot"], "an old daemon is asked once, then remembered"
+    finally:
+        await server.close()
+        await store.aclose()
+
+
+async def test_the_snapshot_is_compressed_on_the_wire(api: dict[str, Any]) -> None:
+    """An active TUI polls every second over the tailnet: the reply is compressed."""
+    store = api["store"]
+    for n in range(30):
+        await store.create_mission(Mission(id=f"m-z{n}", objective="the same words " * 40))
+    async with _client(api) as client:
+        response = await client._http.get("/v1/snapshot")
+    assert response.status_code == 200
+    assert response.headers.get("content-encoding") in {"gzip", "deflate"}
+    assert len(response.json()["missions"]) == 30
