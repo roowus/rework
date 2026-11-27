@@ -726,8 +726,18 @@ async def live_updates_are_fast(world: World) -> None:
     # the chat (proposal) and the mission orchestrator (park on a question)
     script = _orchestrator_parks_on_owner("Which greeting?")
     script["You are rework's orchestrator"] = [
-        {"tool_calls": [{"name": "propose_mission", "arguments": {
-            "objective": "pick a greeting", "plan": "echo", "title": "Greeting"}}]}
+        {
+            "tool_calls": [
+                {
+                    "name": "propose_mission",
+                    "arguments": {
+                        "objective": "pick a greeting",
+                        "plan": "echo",
+                        "title": "Greeting",
+                    },
+                }
+            ]
+        }
     ]
     world.script(script)
     world.start_daemon()
