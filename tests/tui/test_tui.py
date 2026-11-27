@@ -380,6 +380,7 @@ def test_target_label_names_the_database(monkeypatch: pytest.MonkeyPatch) -> Non
     from rework.tui.app import target_label
 
     monkeypatch.delenv("REWORK_TARGET_NAME", raising=False)
+    monkeypatch.delenv("REWORK_DAEMON_URL", raising=False)
     monkeypatch.setenv("REWORK_DB", "/tmp/x.sqlite3")
     assert target_label() == "local"
     monkeypatch.setenv("REWORK_DB", "postgresql://u:p@100.107.125.118:5433/rework_state")
@@ -388,6 +389,24 @@ def test_target_label_names_the_database(monkeypatch: pytest.MonkeyPatch) -> Non
     assert target_label() == "db.example.com"
     monkeypatch.setenv("REWORK_TARGET_NAME", "staging")
     assert target_label() == "staging"
+
+
+def test_target_label_names_the_daemon_when_one_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Found live (a DB-less TUI on the Mac against the rewvis daemon): the
+    status bar showed the host of a REWORK_DB the TUI never uses. With a daemon
+    configured, every read and write goes to the daemon, so that is the label."""
+    from rework.tui.app import target_label
+
+    monkeypatch.delenv("REWORK_TARGET_NAME", raising=False)
+    monkeypatch.setenv("REWORK_DB", "postgresql://u:p@127.0.0.1:1/none")
+    monkeypatch.setenv("REWORK_DAEMON_URL", "http://100.107.125.118:8941")
+    assert target_label() == "rewvis"
+    monkeypatch.setenv("REWORK_DAEMON_URL", "http://daemon.example.com:8941")
+    assert target_label() == "daemon.example.com"
+    monkeypatch.setenv("REWORK_TARGET_NAME", "prod")
+    assert target_label() == "prod"
 
 
 async def test_a_hanging_database_never_freezes_input(
