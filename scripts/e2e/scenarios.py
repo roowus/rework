@@ -720,7 +720,8 @@ async def live_updates_are_fast(world: World) -> None:
 @scenario
 async def heartbeat_from_the_daemon(world: World) -> None:
     """ADR 0021 phase 3: the TUI's heartbeat (missions, gates, chats, spend,
-    spinner stamps) is ONE /v1/snapshot call. TUI B's store reads for those are
+    spinner stamps) is ONE /v1/snapshot call, and its detail views read over
+    /v1/read: a TUI that only watches never opens the database. TUI B's store reads for those are
     booby-trapped, so everything B shows must have come from the daemon; it
     must still see A's mission appear, park on its gate (badge) and finish."""
     from rework.tui.app import ReworkApp
@@ -748,16 +749,18 @@ async def heartbeat_from_the_daemon(world: World) -> None:
         raise AssertionError("TUI B built its heartbeat from the store")
 
     b.hub._from_store = no_store_heartbeat  # type: ignore[method-assign]
-    # what B's views still read from the store directly (detail views: the
-    # next step of ADR 0021 phase 3), recorded, not failed
-    original_call = b.hub.data._call
+    # phase 3c: B's detail reads go to the daemon too, so B must never open
+    # the database at all while it only watches (A does the writing)
+    detail_reads: list[str] = []
+    original_store = b.hub.data.store
 
-    async def counting_call(fn: Any) -> Any:
-        code = getattr(fn, "__code__", None)
-        detail_reads.append(code.co_qualname if code else repr(fn))
-        return await original_call(fn)
+    async def no_database() -> Any:
+        import traceback
 
-    b.hub.data._call = counting_call  # type: ignore[method-assign]
+        detail_reads.append(traceback.extract_stack(limit=3)[0].name)
+        return await original_store()
+
+    b.hub.data.store = no_database  # type: ignore[method-assign]
     async with a.run_test(size=(140, 40)) as pa, b.run_test(size=(140, 40)) as pb:
         await pa.pause(0.8)
         await pb.pause(1.5)
@@ -781,9 +784,21 @@ async def heartbeat_from_the_daemon(world: World) -> None:
                 world.finding("snapshot", "B kept showing a decided gate")
         if trapped:
             world.finding("snapshot", "B built its heartbeat from the store")
-        print(f"B detail reads still on the store: {len(detail_reads)}", flush=True)
-        for name in sorted(set(detail_reads)):
-            print(f"  {detail_reads.count(name):4d}  {name}", flush=True)
+        # visit B's detail views so their reads actually run
+        try:
+            for key in ("alt+2", "alt+3", "alt+5", "alt+2"):
+                await pb.press(key)
+                await pb.pause(1.5)
+            await shot(b, world.out, "b-detail")
+        except Exception as exc:
+            world.finding("snapshot", "could not visit B's views", error=str(exc))
+        if detail_reads:
+            world.finding(
+                "snapshot",
+                "B opened the database",
+                callers=sorted(set(detail_reads)),
+                count=len(detail_reads),
+            )
         print(
             f"B heartbeat: {len(b.hub.snapshot.missions)} missions, online={b.hub.snapshot.online}"
         )

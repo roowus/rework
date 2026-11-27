@@ -340,7 +340,7 @@ class Conversation:
         try:
             from rework.budget_policy import typical_finished_cost
 
-            return await typical_finished_cost(await self.data.store())
+            return await typical_finished_cost(await self.data.reader())
         except Exception:  # a replay must never die for lack of a ledger
             return None
 

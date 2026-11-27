@@ -106,6 +106,15 @@ class DaemonClient:
             )
         return from_json(response.json())
 
+    async def read(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        """One StateStore read on the daemon (api/remote_store), typed."""
+        from rework.api import remote_store
+
+        out = await self._post(
+            "/v1/read", {"method": method, "args": remote_store.bind(method, args, kwargs)}
+        )
+        return remote_store.decode(method, out["result"])
+
     async def mission_verb(self, mission_id: str, verb: str) -> dict[str, Any]:
         return (await self._post(f"/v1/missions/{mission_id}/{verb}"))["mission"]
 

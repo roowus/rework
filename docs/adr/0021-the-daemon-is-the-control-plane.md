@@ -3,8 +3,10 @@
 ## Status
 
 Accepted (2026-11-26). Phases 1 (command API), 2a (owner actions), 2b (chat turns) and 3a
-(live event stream) and 3b (the heartbeat as one `/v1/snapshot` read) landed. Detail views
-(an open mission's events, runs and spend; the Cost tab) still read the store.
+(live event stream), 3b (the heartbeat as one `/v1/snapshot` read) and 3c (detail reads over
+`/v1/read`) landed. A TUI that only watches never opens the database. Remaining direct store
+use is WRITES without a command route yet (new chat, rename, notes, projects, mission
+creation from forms).
 
 ## Context
 
@@ -94,3 +96,22 @@ store, once, remembered.
 Verified live (`scripts/e2e`, `heartbeat_from_the_daemon`): TUI B's store-backed heartbeat
 is booby-trapped; it still saw A's mission appear, park on its gate and the gate clear.
 The run also counts B's remaining direct store reads: detail views, the next step.
+
+## Phase 3c (2026-11-26): detail reads over the API
+
+`POST /v1/read {"method", "args"}` runs one allowlisted `StateStore` READ on the daemon
+(`api/remote_store.READS`: get/list/events/spend/chat-transcript methods, nothing that
+writes). Arguments and the result are encoded by the method's own type hints, so the TUI's
+`RemoteReadStore` returns the same typed records a local store does; a test calls every
+allowlisted read both ways and asserts equality. A write method, an unknown method or a
+bad argument is 400. `TuiData.reader()` is the daemon when one is configured, the store
+otherwise; a daemon without the route (plain 404) is remembered and the store is used.
+
+Trade-off, accepted on purpose: this is a generic read RPC, so the API surface is the
+`StateStore` read signatures. That kept 20 reads from becoming 20 bespoke routes and makes
+drift impossible (one definition), at the cost that renaming a read method is an API
+change. The allowlist is the compatibility list: change it with a version bump.
+
+Verified live: `heartbeat_from_the_daemon` now fails if TUI B opens the database at all
+while it watches A's mission and visits Dashboard, Gates and Cost: 0 opens. Negative
+control: with reads forced to the store the same run reports 8 opens.
