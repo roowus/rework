@@ -21,7 +21,7 @@ from rework.nodes.report_sections import resolve_sections
 from rework.nodes.report_writer import make_report_writer_node
 from rework.nodes.toolloop import make_toolloop_node
 from rework.nodes.tools import ComplaintAwareExecutor
-from rework.roles.base import RoleBuildCtx, RoleSpec
+from rework.roles.base import RoleBuildCtx, RoleSpec, role_loop
 from rework.web.tools import web_executor
 
 if TYPE_CHECKING:
@@ -104,7 +104,7 @@ class InvestigatorSpec(RoleSpec):
                 "messages": [{"role": "user", "content": first_message}],
             }
 
-        loop = make_toolloop_node(
+        loop = role_loop(ctx, system_prompt, catalog_id) or make_toolloop_node(
             provider=ctx.provider,
             provider_for=ctx.provider_for,
             catalog=ctx.catalog,
@@ -144,7 +144,7 @@ class InvestigatorSpec(RoleSpec):
 
         graph = StateGraph(InvestigatorState)
         graph.add_node("prepare", prepare)
-        graph.add_node("loop", loop)  # type: ignore[arg-type]  # node factories are plain callables
+        graph.add_node("loop", loop)
         graph.add_node("report", report)  # type: ignore[arg-type]
         graph.add_edge(START, "prepare")
         graph.add_edge("prepare", "loop")
