@@ -103,10 +103,11 @@ class EscalationAwareExecutor:
         if not question:
             return "error: a question is required"
         kind = str(args.get("kind") or "question")
-        mission = await self._ctx.store.get_mission(self._ctx.mission.id)
-        if mission is not None and (mission.plan or {}).get("orchestrator"):
-            return await self._ask_orchestrator(question, kind)
-        return await self._ask_owner(question)
+        # ONE pause primitive (ADR 0023): every ask lands on the run row, and
+        # the DRIVER decides who answers it. The orchestrator answers on an
+        # orchestrated mission; the template driver applies the needs_model
+        # policy and otherwise opens the owner gate (engine._ask_owner_for).
+        return await self._ask_orchestrator(question, kind)
 
     async def _ask_orchestrator(self, question: str, kind: str) -> str:
         store = self._ctx.store
@@ -170,25 +171,6 @@ class EscalationAwareExecutor:
                     self._served.add(ask_id)
                     return f"orchestrator: {esc['answer']}"
 
-    async def _ask_owner(self, question: str) -> str:
-        """Legacy (non-orchestrated) missions: the owner answers via a gate."""
-        gate = await self._ctx.gates.request(
-            self._ctx.mission.id,
-            kind=GateKind.QUESTION,
-            question=question[:2000],
-            for_run=self._ctx.run.id,
-            spec={"placeholder": "your answer"},
-        )
-        async with self._ctx.parked():
-            while True:
-                await asyncio.sleep(self._poll)
-                row = await self._ctx.store.get_gate(gate.id)
-                if row is not None and row.status != GateStatus.OPEN:
-                    return f"owner: {answer_text(row)}"
-                run = await self._ctx.store.get_run(self._ctx.run.id)
-                if run is None or run.status in (RunStatus.ABORTED, RunStatus.FAILED):
-                    return "the orchestrator stopped this run"
-
 
 def answer_text(gate: Any) -> str:
     """A decided gate as one line a model can act on."""
@@ -207,3 +189,47 @@ def answer_text(gate: Any) -> str:
         return ("done" if done else "not done") + (f": {text}" if text else "")
     verdict = "approved" if approved else "rejected"
     return f"{verdict}: {text}" if text else verdict
+
+
+async def ask_owner_gate(ctx: Any, question: str, *, kind: GateKind = GateKind.QUESTION) -> Any:
+    """Open (or re-find) ONE gate for this run and block until the owner decides
+    it. Returns what the role receives: the typed answer dict (with `approved`)
+    when the owner gave one, else the plain approved bool.
+
+    The run-row primitive in gate form: the gate row carries `for_run`, so a
+    restart finds the SAME gate (open or already decided while the daemon was
+    down) instead of opening a second one."""
+    existing = [
+        g
+        for g in await ctx.store.list_gates(ctx.mission.id)
+        if g.for_run == ctx.run.id and g.question == question[:2000]
+    ]
+    gate = (
+        existing[-1]
+        if existing
+        else await ctx.gates.request(
+            ctx.mission.id,
+            kind=kind,
+            question=question[:2000],
+            for_run=ctx.run.id,
+            park_mission=True,
+        )
+    )
+    async with ctx.parked():
+        while True:
+            row = await ctx.store.get_gate(gate.id)
+            if row is not None and row.status != GateStatus.OPEN:
+                break
+            await asyncio.sleep(POLL_S)
+    # the owner answered: the mission is working again (compare-and-set, so an
+    # owner pause or cancel in the meantime stands)
+    from rework.kernel.state.records import MissionStatus
+
+    if not [g for g in await ctx.store.list_open_gates(ctx.mission.id)]:
+        await ctx.store.transition_mission(
+            ctx.mission.id, MissionStatus.RUNNING, from_={MissionStatus.AWAITING_GATE}
+        )
+    approved = row.status == GateStatus.APPROVED
+    if row.decision:
+        return {**row.decision, "approved": approved}
+    return approved

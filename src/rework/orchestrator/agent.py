@@ -1265,7 +1265,7 @@ class MissionOrchestrator:
         live = [r for r in prior if r.status not in TERMINAL]
         if live:
             raise ToolError(f"step {step!r} already has a live run {live[-1].id}")
-        if prior and prior[-1].status == RunStatus.ABORTED:
+        if prior and prior[-1].status in (RunStatus.ABORTED, RunStatus.COMPLETED):
             rejected = await self._owner_rejection(prior[-1])
             previous = str((prior[-1].context or {}).get("brief") or "")
             if rejected is not None and " ".join(brief.split()) == " ".join(previous.split()):
@@ -1458,19 +1458,6 @@ class MissionOrchestrator:
                     f"{r.id} asked {_short((r.escalation or {}).get('question') or '', 120)!r}"
                     for r in asking
                 )
-            halted = [r for r in runs if r.status == RunStatus.HALTED_ESCALATED]
-            if halted:
-                reported = [r for r in halted if self.seen.get(r.id) != "halted"]
-                for r in reported:
-                    self.seen[r.id] = "halted"
-                    payload = r.escalation or {}
-                    await self._note(
-                        f"{r.id} escalated ({payload.get('kind', '?')}); "
-                        "handling by policy or owner gate"
-                    )
-                # escalation policies + owner gates (blocks until decided)
-                await self.r._handle_halted(halted)
-                continue
             changed = [r for r in runs if r.status in TERMINAL and self.seen.get(r.id) != r.status]
             if changed:
                 lines = []
@@ -1514,9 +1501,10 @@ class MissionOrchestrator:
         return None
 
     async def _report(self, run: Run) -> str:
-        if run.status == RunStatus.COMPLETED:
-            return f"{run.id} ({run.role}) completed: {artifact_summary(run.artifact)}"
-        if run.status == RunStatus.ABORTED:
+        # an owner rejection is news whatever status the run ended in: with one
+        # pause primitive (ADR 0023) the role RECEIVES the "no" and completes,
+        # where the old interrupt path aborted it
+        if run.status in (RunStatus.COMPLETED, RunStatus.ABORTED):
             rejected = await self._owner_rejection(run)
             if rejected is not None:
                 # found live: a bare "aborted" read as a failure, and the model
@@ -1524,10 +1512,12 @@ class MissionOrchestrator:
                 # again and parked the mission at a fresh gate
                 note = f": {rejected.decision_note}" if rejected.decision_note else ""
                 return (
-                    f"{run.id} ({run.role}) aborted: the OWNER REJECTED its gate "
+                    f"{run.id} ({run.role}) {run.status.value}: the OWNER REJECTED its gate "
                     f"({rejected.question[:120]!r}){note}. Do not run it again as is; "
                     "finish, or change the approach and say why."
                 )
+        if run.status == RunStatus.COMPLETED:
+            return f"{run.id} ({run.role}) completed: {artifact_summary(run.artifact)}"
         reason = ""
         events = await self._all_events()
         for ev in reversed(events):

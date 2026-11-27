@@ -43,9 +43,12 @@ defaults `rework <rework@rework.local>`; the owner's deployment uses
 
 ## Hard rules (architecture invariants)
 
-1. `interrupt()` must be the FIRST side effect of any node that pauses (gates,
-   escalations). Everything before it replays on resume. Only `GateManager.request` and
-   the escalate node are sanctioned wrappers.
+1. ONE pause primitive: a role pauses by ASKING on its run row
+   (`ask_orchestrator`, or `ask_owner_gate` for a run-scoped owner gate). The driver
+   decides who answers (the orchestrator, the needs_model policy, or the owner). The ask
+   id is deterministic, so a restart consumes an answer written while the daemon was down
+   instead of asking again. Never call LangGraph `interrupt()` in a role: the engine
+   treats it as a bug (ADR 0023).
 2. No blocking calls inside async nodes: async SDKs only, subprocesses via
    `asyncio.create_subprocess_exec`. (Linted via ruff `ASYNC` rules.)
 3. The store is the source of truth. In-process events/queues are latency optimizations

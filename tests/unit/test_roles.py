@@ -9,7 +9,6 @@ from typing import Any
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.types import Command
 
 from rework.kernel.budget.ledger import Budget
 from rework.kernel.events.bus import InProcessEventBus
@@ -75,32 +74,44 @@ async def test_echo_compiles(echo_ctx: RoleBuildCtx) -> None:
         assert registry.get(name).build_graph(echo_ctx) is not None
 
 
-async def test_echo_interrupts_then_resumes(echo_ctx: RoleBuildCtx) -> None:
+async def _decide_when_open(ctx: RoleBuildCtx, approved: bool) -> str:
+    """Answer echo's gate from the side, like `rework approve` does."""
+    import asyncio
+
+    for _ in range(200):
+        gates = await ctx.store.list_open_gates(ctx.mission.id)
+        if gates:
+            await ctx.gates.decide(gates[0].id, approved)
+            return gates[0].question
+        await asyncio.sleep(0.02)
+    raise AssertionError("echo's gate never opened")
+
+
+async def test_echo_asks_the_owner_then_finishes(echo_ctx: RoleBuildCtx) -> None:
+    """One pause primitive (ADR 0023): echo blocks in a run-scoped owner gate
+    and finishes with the owner's answer; no interrupt, no resume."""
+    import asyncio
+
     graph = autodiscover().get("echo").build_graph(echo_ctx)
-    assert graph is not None
     graph.checkpointer = InMemorySaver()
     config: dict[str, Any] = {"configurable": {"thread_id": "t1"}}
-
-    # first run reaches the gate and stops on the interrupt
-    result = await graph.ainvoke({"objective": "say hello"}, config=config)
-    assert "__interrupt__" in result
-    interrupt_payload = result["__interrupt__"][0].value
-    assert "Approve completion" in interrupt_payload["question"]
-
-    # resume with the decision (what the engine will do from the gate row)
-    final = await graph.ainvoke(Command(resume=True), config=config)
-    assert final["artifact"] == {
-        "kind": "echo",
-        "objective": "say hello",
-        "approved": True,
-    }
+    run = asyncio.create_task(graph.ainvoke({"objective": "say hello"}, config=config))
+    question = await _decide_when_open(echo_ctx, True)
+    final = await asyncio.wait_for(run, 10)
+    assert "Approve completion" in question
+    assert "__interrupt__" not in final
+    assert final["artifact"] == {"kind": "echo", "objective": "say hello", "approved": True}
+    gate = (await echo_ctx.store.list_gates("m1"))[0]
+    assert gate.for_run == echo_ctx.run.id, "the gate names the run it unblocks"
 
 
 async def test_echo_rejection_flows_through(echo_ctx: RoleBuildCtx) -> None:
+    import asyncio
+
     graph = autodiscover().get("echo").build_graph(echo_ctx)
-    assert graph is not None
     graph.checkpointer = InMemorySaver()
     config: dict[str, Any] = {"configurable": {"thread_id": "t2"}}
-    await graph.ainvoke({"objective": "try again"}, config=config)
-    final = await graph.ainvoke(Command(resume=False), config=config)
+    run = asyncio.create_task(graph.ainvoke({"objective": "try again"}, config=config))
+    await _decide_when_open(echo_ctx, False)
+    final = await asyncio.wait_for(run, 10)
     assert final["artifact"]["approved"] is False

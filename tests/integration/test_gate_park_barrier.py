@@ -140,38 +140,27 @@ async def test_the_barrier_returns_once_the_mission_row_is_parked(parked_world: 
     assert lying.gate_reads == 6, lying.gate_reads
 
 
-async def test_the_barrier_waits_for_the_gated_run_row_too(parked_world: Any) -> None:
-    """The chaos flavour: mission status can already say AWAITING_GATE while the
-    gated run is not parked yet. A restart in that window re-fires the interrupt
-    and opens a duplicate gate, so the run row is part of the barrier."""
+async def test_the_barrier_waits_for_the_runs_own_gate(parked_world: Any) -> None:
+    """With one pause primitive (ADR 0023) a parked RUN is one with an open gate
+    of its own (`for_run`); the gate and the mission's AWAITING_GATE are written
+    in one transaction, so the old "run row lags" window cannot happen. The
+    barrier must still refuse a run whose OWN gate is not open (another run's
+    gate does not count)."""
     store: SqliteStore = parked_world["store"]
     mission: Mission = parked_world["mission"]
     run: Run = parked_world["run"]
-    # only the RUN row lags here: the mission row is parked for real
-    running_run = LyingStore(
-        store,
-        stale_run_status=RunStatus.RUNNING,
-        stale_run_polls=10**9,
-    )
     with pytest.raises(TimeoutError):
         await wait_for_gate_park(
-            running_run,
+            store,
             mission.id,
             mission_status=MissionStatus.AWAITING_GATE,
-            run_id=run.id,
-            timeout_s=0.5,
+            run_id=f"{mission.id}:do:other:1",
+            timeout_s=0.3,
         )
-    assert running_run.run_reads >= 5, running_run.run_reads
-    # once the run's park lands, the same call returns
-    caught_up = LyingStore(
-        store,
-        stale_run_status=RunStatus.RUNNING,
-        stale_run_polls=4,
-    )
     await wait_for_gate_park(
-        caught_up,
+        store,
         mission.id,
         mission_status=MissionStatus.AWAITING_GATE,
         run_id=run.id,
+        timeout_s=2,
     )
-    assert caught_up.run_reads == 5, caught_up.run_reads

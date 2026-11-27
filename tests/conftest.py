@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from rework.kernel.llm.types import ChatResult, ToolCall, Usage
-from rework.kernel.state.records import MissionStatus, RunStatus
+from rework.kernel.state.records import MissionStatus
 from rework.kernel.state.store import StateStore
 
 if TYPE_CHECKING:
@@ -90,9 +90,8 @@ async def wait_for_gate_park(
 
     The engine commits the gate row in one autocommit statement and the fact a
     test then relies on in a LATER one: the mission status AWAITING_GATE
-    (`_final_gates` for ship/open_pr, `_handle_halted` for an escalation), or
-    the gated run's HALTED_ESCALATED row (written in `_consume_result`, before
-    `_handle_halted` opens the gate for that run). A reader therefore CAN see an
+    (`_final_gates` for ship/open_pr), or the run's own gate (`for_run`, opened
+    by `ask_owner_gate` / `_ask_owner_for`). A reader therefore CAN see an
     open gate beside a `running` mission, or beside a run that is not parked
     yet. Waiting on the gate row alone is a race: under CPU load the poll wins,
     the test cancels or restarts early, and the next assertion reads the
@@ -103,14 +102,14 @@ async def wait_for_gate_park(
 
     - an open gate exists for the mission, AND
     - `mission_status`, when given, is the mission's status, AND
-    - `run_id`, when given, is a run whose status is HALTED_ESCALATED.
+    - `run_id`, when given, has an open gate of its own (`for_run`).
 
     `what` names the wait in the TimeoutError and defaults to a description of
     the facts asked for."""
     label = what or (
         f"gate open for {mission_id}"
         + (f" and mission {mission_status.value}" if mission_status is not None else "")
-        + (f" and run {run_id} halted_escalated" if run_id is not None else "")
+        + (f" and run {run_id} parked at its gate" if run_id is not None else "")
     )
 
     async def parked() -> bool:
@@ -121,8 +120,11 @@ async def wait_for_gate_park(
             if mission is None or mission.status != mission_status:
                 return False
         if run_id is not None:
-            run = await store.get_run(run_id)
-            if run is None or run.status != RunStatus.HALTED_ESCALATED:
+            # ONE pause primitive (ADR 0023): a parked run is one whose gate
+            # (for_run) is open; the gate row and the mission's AWAITING_GATE
+            # are written in one transaction (create_gate park_mission)
+            gates = await store.list_open_gates(mission_id)
+            if not any(g.for_run == run_id for g in gates):
                 return False
         return True
 

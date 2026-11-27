@@ -6,10 +6,10 @@ Design (docs/design.md#orchestrator, ADR 0002):
   tasks. Deterministic run ids make create_run idempotent.
 - The store is the truth. Wake conditions re-derive from store rows every loop;
   in-process tasks are just the execution mechanism (CLAUDE.md rule 3).
-- One pause primitive: a role node calls interrupt() first; the engine persists
-  the payload onto the run, materializes a gate row from it, and later resumes
-  with Command(resume=decision). Decisions made while the daemon was down are
-  honored because resume always reads the gate row.
+- One pause primitive (ADR 0023): a role asks on its run row and blocks; the
+  driver answers it (orchestrator, needs_model policy, or an owner gate). A
+  restart re-runs the role from its checkpoint and its ask, with the same
+  deterministic id, consumes an answer written while the daemon was down.
 
 M1 scope: fixed single-step plans (mission.plan or the echo default). The LLM
 plan/dispatch/check-in nodes land with the M2 vertical slice.
@@ -24,8 +24,6 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, nullcontext
 from pathlib import Path
 from typing import Any
-
-from langgraph.types import Command
 
 from rework.budget_policy import budget_policy, raises_summary, record_raise, try_auto_raise
 from rework.kernel.events.bus import EventBus
@@ -57,7 +55,7 @@ from rework.nodes.report_sections import accepted_findings_section, mechanical_v
 from rework.orchestrator.delivery import DELIVERY_RESULT_KEYS
 from rework.orchestrator.limits import MissionSlot, RoleLimiter
 from rework.orchestrator.rails import audit_problem, latest_handoff
-from rework.roles.base import EscalationKind, RoleBuildCtx
+from rework.roles.base import RoleBuildCtx
 from rework.roles.registry import RoleRegistry
 
 log = logging.getLogger("rework.engine")
@@ -386,33 +384,23 @@ class RunSupervisor:
 
     async def _consume_result(self, run: Run, result: Any) -> None:
         if isinstance(result, dict) and "__interrupt__" in result:
-            payload = result["__interrupt__"][0].value
-            log.info("role %s halted: %s", run.role, str(payload)[:200])
-            await self._store.update_run(
-                run.id, status=RunStatus.HALTED_ESCALATED, escalation=payload
+            # there is ONE pause primitive, the ask on the run row (ADR 0023):
+            # a graph that still calls interrupt() is a bug, not a pause
+            raise RuntimeError(
+                f"role {run.role} called interrupt(); roles pause with "
+                "ask_orchestrator / ask_owner_gate (ADR 0023)"
             )
-            await self._bus.publish(
-                EventRecord(
-                    mission_id=self._mission.id,
-                    run_id=run.id,
-                    type=EventType.ROLE_HALTED,
-                    payload=payload,
-                )
+        artifact = result.get("artifact") if isinstance(result, dict) else None
+        log.info("role %s completed", run.role)
+        await self._store.update_run(run.id, status=RunStatus.COMPLETED, artifact=artifact or {})
+        await self._bus.publish(
+            EventRecord(
+                mission_id=self._mission.id,
+                run_id=run.id,
+                type=EventType.ROLE_COMPLETED,
+                payload={"role": run.role},
             )
-        else:
-            artifact = result.get("artifact") if isinstance(result, dict) else None
-            log.info("role %s completed", run.role)
-            await self._store.update_run(
-                run.id, status=RunStatus.COMPLETED, artifact=artifact or {}
-            )
-            await self._bus.publish(
-                EventRecord(
-                    mission_id=self._mission.id,
-                    run_id=run.id,
-                    type=EventType.ROLE_COMPLETED,
-                    payload={"role": run.role},
-                )
-            )
+        )
 
     async def ensure_started(self, run: Run) -> None:
         """Start the run's task unless it is already live or finished."""
@@ -427,44 +415,6 @@ class RunSupervisor:
             return
         resume = run.status == RunStatus.RUNNING  # crashed mid-flight
         self.tasks[run.id] = asyncio.create_task(self._execute(run, resume))
-
-    async def resume_with_decision(self, run: Run, decision: Any) -> None:
-        """Resume a halted run with a gate/escalation decision. Idempotent: the
-        pump loop can re-enter _handle_halted while a resume task is still
-        starting (its run row stays HALTED_ESCALATED until it flips RUNNING),
-        so a live task for this run means a resume is already in flight."""
-        existing = self.tasks.get(run.id)
-        if existing is not None and not existing.done():
-            return
-        self.tasks[run.id] = asyncio.create_task(self._execute_resume(run, decision))
-
-    async def _execute_resume(self, run: Run, decision: Any) -> None:
-        bind(mission=self._mission.id, run=run.id, role=run.role)
-        await self.limiter.acquire(run.id)
-        log.info("role %s resuming with a decision", run.role)
-        try:
-            graph = await self._build_graph(run)
-            await self._store.update_run(run.id, status=RunStatus.RUNNING)
-            config = self._run_config(run)
-            result = await graph.ainvoke(Command(resume=decision), config=config)
-            await self._consume_result(run, result)
-        except Exception as exc:
-            if is_transient_db_error(exc):
-                self._fatal = exc
-                raise
-            log.exception("role %s resume failed", run.role)
-            await self._store.update_run(run.id, status=RunStatus.FAILED)
-            await self._bus.publish(
-                EventRecord(
-                    mission_id=self._mission.id,
-                    run_id=run.id,
-                    type=EventType.INFO,
-                    payload={"error": f"resume failed: {type(exc).__name__}: {exc}"},
-                )
-            )
-        finally:
-            self.limiter.release(run.id)
-            await self._close_ctx(run.id)
 
     async def check_fatal(self) -> None:
         """Re-raise a transient database error that escaped a role run.
@@ -1443,26 +1393,6 @@ class MissionRunner:
         except Exception as exc:  # a tracker outage must not touch a finished mission
             log.warning("write-back for %s failed: %s", mission_id, exc)
 
-    @staticmethod
-    def _resume_value(gate: Any) -> Any:
-        """What the paused role receives when this gate is resolved.
-
-        A gate may carry a TYPED answer (Gate.decision) — feedback text, a
-        choice among options, structured changes. When it does, that dict is the
-        role's interrupt() result, so the agent can act on what the owner
-        actually said instead of inferring it from a boolean. When it does not,
-        the role gets the plain bool it has always received, so every role
-        written before typed answers existed keeps working unchanged.
-
-        `approved` is always present in the dict form (mirrors the row status)
-        so existing "if decision:" checks on the role side keep working."""
-        if gate is None:
-            return False
-        approved = gate.status == GateStatus.APPROVED
-        if gate.decision:
-            return {**gate.decision, "approved": approved}
-        return approved
-
     def _waiting(self) -> AbstractAsyncContextManager[None]:
         """Hold no daemon mission slot while this mission only waits.
 
@@ -1573,35 +1503,13 @@ class MissionRunner:
         return [created]
 
     async def _recover_run(self, run: Run) -> None:
-        """Bring one in-flight run back after a restart. A HALTED run whose
-        gate was decided while the engine was down resumes with the row's
-        decision (a plain resume would re-fire the interrupt and open a
-        duplicate gate); a rejection without feedback aborts it; anything else
-        not terminal is (re)started from its checkpoint."""
+        """Bring one in-flight run back after a restart: (re)start it from its
+        checkpoint. A role that was parked in an ask re-asks with the same
+        deterministic id, so an answer written while the daemon was down is
+        consumed, never asked again (ADR 0011/0023)."""
         assert self._supervisor is not None
         if _terminal(run):
             return
-        if run.status == RunStatus.HALTED_ESCALATED:
-            gate = await self._latest_gate_for_run(run)
-            if gate is not None and gate.status == GateStatus.APPROVED:
-                await self._supervisor.resume_with_decision(run, self._resume_value(gate))
-                return
-            if gate is not None and gate.status == GateStatus.REJECTED:
-                if gate.decision:
-                    # rejected WITH feedback: deliver the answer, don't abort
-                    await self._supervisor.resume_with_decision(run, self._resume_value(gate))
-                    return
-                await self._store.update_run(run.id, status=RunStatus.ABORTED)
-                await self._bus.publish(
-                    EventRecord(
-                        mission_id=self.mission_id,
-                        run_id=run.id,
-                        type=EventType.CANCELLED,
-                        payload={"reason": "gate rejected while engine was down"},
-                    )
-                )
-                return
-            return  # still waiting on its gate: the pump re-materializes it
         await self._supervisor.ensure_started(run)
 
     async def _resolve_context(self, mission: Mission, step: dict[str, Any]) -> dict[str, Any]:
@@ -1710,9 +1618,17 @@ class MissionRunner:
             fresh: list[Run] = [r for r in fetched if r is not None]
             if await self._burn_gate_hit() == "cancelled":
                 return "cancelled"
-            halted = [r for r in fresh if r.status == RunStatus.HALTED_ESCALATED]
-            if halted:
-                await self._handle_halted(halted)
+            # the ONE pause primitive (ADR 0023): a role asking on its run row.
+            # needs_model is answered by policy here, as the orchestrator's
+            # wait does; any other ask (or an exhausted promotion) becomes an
+            # owner gate, since the template driver has no orchestrator to ask
+            for run in fresh:
+                esc = run.escalation or {}
+                if not esc.get("id") or esc.get("answer") is not None:
+                    continue
+                if esc.get("kind") == "needs_model" and await self.promote_asking_run(run):
+                    continue
+                await self._ask_owner_for(run)
             if all(_terminal(r) for r in fresh):
                 return "ok"
             await asyncio.sleep(self._poll)
@@ -1840,129 +1756,6 @@ class MissionRunner:
         )
         return "ok"
 
-    async def _handle_halted(self, halted: list[Run]) -> None:
-        """Apply escalation policies, then materialize gates for the rest.
-
-        needs_model is handled mechanically first (promote within the provider,
-        resume the role): the human only sees it when the catalog runs out.
-        Everything else becomes a gate; the gate ID opened FOR a run is tracked
-        so decisions are read from that row directly (question-matching broke
-        for escalations whose payload carries detail, not question)."""
-        assert self._supervisor is not None
-        gated: list[tuple[Run, str | None]] = []  # (run, open_gate_id or None)
-        for run in halted:
-            # a resume already in flight (earlier iteration): skip; the row
-            # flips RUNNING when the resume lands, and re-gating a resuming
-            # run would loop forever (found live in the exhaustion test)
-            live = self._supervisor.tasks.get(run.id)
-            if live is not None and not live.done():
-                continue
-            payload = run.escalation or {}
-            if str(payload.get("kind")) == EscalationKind.NEEDS_MODEL.value:
-                if await self._promote_and_resume(run):
-                    continue
-            # falls through to a human gate; reuse the run's existing open
-            # gate when a previous pass opened one (idempotent materialization)
-            existing = await self._open_gate_for_run(run)
-            if existing is None:
-                # for_run rides ON the row: recovery reads the link from the
-                # gate itself, so a kill between commit and event publish can
-                # no longer orphan the gate (see Gate.for_run)
-                gate = await self._gates.request(
-                    self.mission_id,
-                    kind=self._gate_kind(payload),
-                    question=str(payload.get("question") or payload.get("detail") or "proceed?"),
-                    for_run=run.id,
-                    # the raw kind ("blocked", "needs_context") is not a
-                    # GateKind, so it collapsed to GENERIC and the gates tab
-                    # could not tell "I am stuck" from a generic question
-                    spec={"escalation_kind": str(payload.get("kind") or "generic")},
-                )
-                gated.append((run, gate.id))
-            else:
-                gated.append((run, existing.id))
-        if gated:
-            # gate rows first, status second, same reason as _final_gates: the
-            # pair is never atomic, so a reader may see an open escalation gate
-            # beside a running row and must wait on both facts, not the gate
-            # row alone (conftest.wait_for_gate_park). Status-first instead
-            # shows `awaiting_gate` with no gate row, which the daemon repair
-            # pass and the wait loop below both assume away.
-            await self._store.transition_mission(
-                self.mission_id, MissionStatus.AWAITING_GATE, from_={MissionStatus.RUNNING}
-            )
-        # The wait happens INSIDE the mission-slot park. This loop used to sleep
-        # bare, so a mission parked on an escalation held a REWORK_CONCURRENCY
-        # slot for the whole (formerly 45 minute) wait; every other gate wait
-        # already gives the slot back (see _gate_decision, _pause_until_resumed,
-        # _burn_gate_hit).
-        async with self._waiting():
-            while True:
-                open_gates = await self._store.list_open_gates(self.mission_id)
-                if not open_gates:
-                    break
-                await asyncio.sleep(self._poll)
-        if gated:
-            await self._store.transition_mission(
-                self.mission_id, MissionStatus.RUNNING, from_={MissionStatus.AWAITING_GATE}
-            )
-        # apply decisions, straight from each run's gate row
-        for run, gate_id in gated:
-            if gate_id is None:
-                continue
-            gate_row = await self._store.get_gate(gate_id)
-            if gate_row is None or gate_row.status == GateStatus.OPEN:
-                continue  # decided while we were down is handled by recovery; not open here
-            fresh = await self._store.get_run(run.id)
-            if fresh is None or fresh.status != RunStatus.HALTED_ESCALATED:
-                continue
-            if gate_row.status == GateStatus.APPROVED:
-                await self._supervisor.resume_with_decision(fresh, self._resume_value(gate_row))
-            elif gate_row.decision:
-                # REJECTED WITH FEEDBACK: the owner said no AND said why (or
-                # asked for changes). The role must SEE that to act on it —
-                # aborting the run here would throw the feedback away. It
-                # resumes with the typed answer, `approved` False, and gets one
-                # chance to correct course; the step still moves on afterwards.
-                await self._supervisor.resume_with_decision(fresh, self._resume_value(gate_row))
-            else:
-                await self._store.update_run(fresh.id, status=RunStatus.ABORTED)
-                await self._bus.publish(
-                    EventRecord(
-                        mission_id=self.mission_id,
-                        run_id=fresh.id,
-                        type=EventType.CANCELLED,
-                        payload={"reason": "gate rejected"},
-                    )
-                )
-
-    async def _gates_for_run(self, run: Run) -> list[Any]:
-        """Every gate row pointing at this run, oldest first.
-
-        The link is the gate row's `for_run` column. It used to be an INFO
-        event published right AFTER the gate row was committed, so a kill in
-        between left a gate nobody could attribute: recovery found no decision,
-        the run stayed HALTED_ESCALATED, the pump looped forever and the
-        mission hung until a 60s test timeout (found live on a slow 3.13 CI
-        runner). The row is written atomically with the gate, so it cannot
-        lose the race."""
-        gates = await self._store.list_gates(self.mission_id)
-        return [g for g in gates if g.for_run == run.id]
-
-    async def _open_gate_for_run(self, run: Run) -> Any:
-        """The run's open gate, if a previous pass materialized one."""
-        for gate in reversed(await self._gates_for_run(run)):
-            if gate.status == GateStatus.OPEN:
-                return gate
-        return None
-
-    async def _latest_gate_for_run(self, run: Run) -> Any:
-        """The run's most recent gate ROW, any status. Recovery uses this to
-        apply a decision made while the engine was down: resuming the parked
-        graph plain would re-fire the interrupt and open a duplicate gate."""
-        gates = await self._gates_for_run(run)
-        return gates[-1] if gates else None
-
     async def _latest_gate_of_kind(self, kind: GateKind) -> Any:
         """The mission's most recent gate of this kind that is reusable (ship and
         open_pr recovery: a restart must read the EXISTING gate, not open a
@@ -2024,48 +1817,38 @@ class MissionRunner:
         except UnknownModelError:
             return None
 
-    async def _promote_and_resume(self, run: Run) -> bool:
-        """needs_model policy: escalate the role to the configured escalation
-        model and resume it. Returns True when handled mechanically; False falls
-        through to a human gate. Reads the run ROW: model_ref gets resolved onto
-        it at graph-build time, and the in-memory object here may predate that."""
-        payload = run.escalation or {}
-        fresh = await self._store.get_run(run.id)
-        current_id = str((fresh or run).model_ref.get("id") or "")
-        promoted = self.escalation_entry(current_id)
-        if promoted is None:
-            await self._bus.publish(
-                EventRecord(
-                    mission_id=self.mission_id,
-                    run_id=run.id,
-                    type=EventType.INFO,
-                    payload={
-                        "note": f"needs_model: no higher tier for {current_id!r}; "
-                        "escalating to human"
-                    },
-                )
-            )
-            return False
-        new_ref = {**(fresh or run).model_ref, "id": promoted.id}
-        await self._store.update_run(run.id, model_ref=new_ref)
-        await self._bus.publish(
-            EventRecord(
-                mission_id=self.mission_id,
-                run_id=run.id,
-                type=EventType.MODEL_PROMOTED,
-                payload={
-                    "from": current_id,
-                    "to": promoted.id,
-                    "detail": str(payload.get("detail") or "")[:200],
-                },
+    async def _ask_owner_for(self, run: Run) -> None:
+        """A template-driven role's open ask, for the owner: one QUESTION gate
+        per ask (found again after a restart by for_run + the ask id on its
+        spec); once decided, the answer is written onto the run row and the
+        role, parked in its ask, continues."""
+        from rework.nodes.escalate import answer_text
+
+        esc = dict(run.escalation or {})
+        ask_id = str(esc.get("id"))
+        gates = [
+            g
+            for g in await self._store.list_gates(self.mission_id)
+            if g.for_run == run.id and (g.spec or {}).get("ask_id") == ask_id
+        ]
+        gate = (
+            gates[-1]
+            if gates
+            else await self._gates.request(
+                self.mission_id,
+                kind=self._gate_kind({"kind": esc.get("kind")}),
+                question=str(esc.get("question") or "proceed?"),
+                for_run=run.id,
+                spec={"ask_id": ask_id, "escalation_kind": str(esc.get("kind") or "question")},
+                park_mission=True,
             )
         )
-        resumed = await self._store.get_run(run.id)
-        if resumed is not None and self._supervisor is not None:
-            await self._supervisor.resume_with_decision(
-                resumed, {"resolution": "model_promoted", "model": promoted.id}
-            )
-        return True
+        if gate.status == GateStatus.OPEN:
+            return  # the pump comes back next tick; the role stays parked
+        await self._store.update_run(
+            run.id, escalation={**esc, "answer": f"owner: {answer_text(gate)}"}
+        )
+        await self._clear_awaiting_gate(self.mission_id)
 
     async def promote_asking_run(self, run: Run) -> bool:
         """needs_model for a role that ASKED (the blocking ask on its run row,

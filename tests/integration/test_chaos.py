@@ -46,7 +46,6 @@ class CrashySpec(RoleSpec):
 
     def build_graph(self, ctx: RoleBuildCtx):  # type: ignore[no-untyped-def]
         from langgraph.graph import END, START, StateGraph
-        from langgraph.types import interrupt
 
         async def work(state: dict) -> dict:  # type: ignore[no-untyped-def]
             return {"worked": True}
@@ -56,10 +55,14 @@ class CrashySpec(RoleSpec):
             return {"ground": True}
 
         async def gate(state: dict) -> dict:  # type: ignore[no-untyped-def]
-            decision = interrupt({"kind": "question", "detail": "finish it?"})
+            # the ONE pause primitive (ADR 0023): a run-scoped owner gate
+            from rework.nodes.escalate import ask_owner_gate
+
+            decision = await ask_owner_gate(ctx, "finish it?")
             return {
                 "artifact": {
-                    "approved": bool(decision),
+                    "approved": decision is True
+                    or (isinstance(decision, dict) and bool(decision.get("approved"))),
                     "ground": bool(state.get("ground")),
                 }
             }
@@ -358,9 +361,10 @@ async def test_escalation_gate_links_to_its_run_on_the_row(world: dict[str, Any]
     assert (fresh.artifact or {}).get("approved") is True
 
 
-async def test_gate_rejected_while_down_aborts_on_restart(world: dict[str, Any]) -> None:
-    """Same, but the answer is no: the run aborts from the row's decision and
-    the mission still completes (the plan moves on)."""
+async def test_gate_rejected_while_down_reaches_the_role_on_restart(world: dict[str, Any]) -> None:
+    """Same, but the answer is no: on restart the role RECEIVES the rejection
+    from the row (one pause primitive, ADR 0023: a "no" is an answer, not an
+    abort), records approved=False and the mission still completes."""
     store: SqliteStore = world["store"]
     mission = await store.create_mission(
         Mission(
@@ -399,7 +403,8 @@ async def test_gate_rejected_while_down_aborts_on_restart(world: dict[str, Any])
     task2 = asyncio.create_task(runner2.run())
     await asyncio.wait_for(task2, timeout=60)
     fresh = await store.get_run(f"{mission.id}:do:crashy:1")
-    assert fresh is not None and fresh.status.value == "aborted"
+    assert fresh is not None and fresh.status.value == "completed"
+    assert (fresh.artifact or {}).get("approved") is False
     mission_row = await store.get_mission(mission.id)
     assert mission_row is not None and mission_row.status == MissionStatus.DONE
 
@@ -592,21 +597,21 @@ async def test_typed_gate_answer_reaches_the_role(world: dict[str, Any]) -> None
     that dict (including `approved`) instead of a bare True.
     """
     from langgraph.graph import END, START, StateGraph
-    from langgraph.types import interrupt
 
+    from rework.nodes.escalate import ask_owner_gate
     from rework.roles.base import RoleSpec
 
     seen: list[Any] = []
 
     class EchoDecisionSpec(RoleSpec):
         name = "echo_decision"
-        description = "records whatever its interrupt() returned"
+        description = "records whatever its owner gate returned"
         goal = "record the decision"
         default_model = "flash"
 
         def build_graph(self, ctx):  # type: ignore[no-untyped-def]
             async def ask(state: dict) -> dict:  # type: ignore[no-untyped-def]
-                value = interrupt({"kind": "question", "detail": "how should I change it?"})
+                value = await ask_owner_gate(ctx, "how should I change it?")
                 seen.append(value)
                 return {"artifact": {"decision": value}}
 

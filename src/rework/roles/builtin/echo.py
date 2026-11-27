@@ -1,9 +1,8 @@
 """Echo: the M1 stub role.
 
-Proves the whole pause/resume machinery with zero LLM calls: emit progress,
-interrupt once at a gate (the engine materializes the gate row from the interrupt
-payload, ADR 0002), consume the decision, complete with an artifact. The vertical
-slice (M2) replaces this with real roles.
+Proves the pause machinery with zero LLM calls: emit progress, ask the owner once
+through a gate (the one pause primitive every role uses, ADR 0023), consume the
+decision, complete with an artifact.
 """
 
 from __future__ import annotations
@@ -11,9 +10,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import interrupt
 
-from rework.kernel.state.records import EventRecord, EventType
+from rework.kernel.state.records import EventRecord, EventType, GateKind
+from rework.nodes.escalate import ask_owner_gate
 from rework.roles.base import RoleBuildCtx, RoleSpec
 
 if TYPE_CHECKING:
@@ -47,16 +46,15 @@ class EchoSpec(RoleSpec):
             return {}
 
         async def gate(state: EchoState) -> dict[str, Any]:
-            # interrupt FIRST (ADR 0002): no side effects before this line. The
-            # engine materializes the gate row from this payload; on resume this
-            # returns the decision instead of raising.
-            decision = interrupt(
-                {
-                    "kind": "ship",
-                    "question": f"Echo says: '{state['objective']}'. Approve completion?",
-                }
-            )
-            return {"decision": decision}
+            # The ONE pause primitive (ADR 0023): ask on the run row. On a
+            # legacy mission that is a QUESTION-free ship gate for the owner;
+            # on an orchestrated one, the orchestrator answers. The role blocks
+            # in this call, gives its slots back while it waits, and a restart
+            # re-asks with the same deterministic id, so an answer written while
+            # the daemon was down is consumed, never re-asked.
+            question = f"Echo says: '{state['objective']}'. Approve completion?"
+            answer = await ask_owner_gate(ctx, question, kind=GateKind.SHIP)
+            return {"decision": answer}
 
         async def finish(state: EchoState) -> dict[str, Any]:
             await ctx.bus.publish(
@@ -71,7 +69,7 @@ class EchoSpec(RoleSpec):
                 "artifact": {
                     "kind": "echo",
                     "objective": state["objective"],
-                    "approved": bool(state["decision"]),
+                    "approved": _approved(state["decision"]),
                 }
             }
 
@@ -84,3 +82,10 @@ class EchoSpec(RoleSpec):
         graph.add_edge("gate", "finish")
         graph.add_edge("finish", END)
         return graph.compile()
+
+
+def _approved(decision: Any) -> bool:
+    """The owner gate returns a bool, or a typed answer dict carrying `approved`."""
+    if isinstance(decision, dict):
+        return bool(decision.get("approved"))
+    return bool(decision)
