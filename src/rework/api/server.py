@@ -272,6 +272,33 @@ def add_routes(
         )
         return web.json_response({"answer": answer})
 
+    async def snapshot(request: web.Request) -> web.Response:
+        """A front end's whole heartbeat in one read (services/snapshot.py):
+        missions (light), open gates, projects, listed chats, spend since
+        `?spend_since=<epoch>`, budget raises after `?events_after=<seq>` and
+        the spinner's event stamps. The TUI never needs the database for it."""
+        from rework.services import snapshot as snapshot_service
+
+        def number(name: str, kind: Any) -> Any:
+            raw = request.query.get(name)
+            if raw in (None, ""):
+                return None
+            try:
+                return kind(raw)
+            except ValueError:
+                raise ValueError(f"{name} must be a number") from None
+
+        snap = await snapshot_service.build(
+            store,
+            spend_since=number("spend_since", float),
+            events_after=number("events_after", int),
+        )
+        response = web.json_response(snapshot_service.to_json(snap))
+        # ~130 KiB of repetitive JSON per poll on a busy store: compression (httpx
+        # asks for it by default) cuts the tailnet cost several-fold
+        response.enable_compression()
+        return response
+
     async def library_search(request: web.Request) -> web.Response:
         if library is None:
             return web.json_response({"items": [], "note": "no library on this daemon"})
@@ -296,6 +323,7 @@ def add_routes(
 
     app.router.add_get("/v1", guard(version))
     app.router.add_get("/v1/events", guard(events))
+    app.router.add_get("/v1/snapshot", guard(snapshot))
     app.router.add_post("/v1/runs/{run_id}/ask", guard(run_ask))
     app.router.add_get("/v1/library/search", guard(library_search))
     app.router.add_post("/v1/chats/{chat_id}/messages", guard(chat_send))

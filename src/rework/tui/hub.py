@@ -23,19 +23,23 @@ from typing import Any
 
 from textual.css.query import NoMatches
 
-from rework.kernel.state.records import ORCHESTRATOR_CHAT_PREFIX, EventType
+from rework.kernel.state.records import EventType
+
+# the list and spinner rules live in services.snapshot, shared with the daemon
+from rework.services.snapshot import (
+    CHAT_FETCH,
+    CHAT_LIMIT,
+    EVENT_WINDOW,
+    STAMP_MISSIONS,
+    chat_candidates,
+    is_orchestrator_transcript,
+    listed_chats,
+)
 from rework.tui.data import TuiData
 
 log = logging.getLogger("rework.tui")
 
-# the spinner stamp sweep: at most this many running missions per poll, each one
-# small query of this many newest events
-STAMP_MISSIONS = 24
-EVENT_WINDOW = 40
-# the Work list shows at most CHAT_LIMIT chats; the store is asked for more so the
-# orchestrator transcripts filtered out of the window cannot starve it
-CHAT_LIMIT = 200
-CHAT_FETCH = 600
+__all__ = ["CHAT_LIMIT", "EVENT_WINDOW", "STAMP_MISSIONS", "Hub", "Snapshot"]
 
 
 def midnight() -> float:
@@ -164,17 +168,8 @@ class Hub:
                 loaded=self.snapshot.loaded,
             )
             try:
-                snap.missions = await self.data.missions(limit=200)
-                snap.gates = await self.data.open_gates()
-                snap.projects = await self.data.projects()
-                snap.chats = await self._chats()
-                snap.chats_failed = self._chats_failed
-                snap.spend_today = await self._spend_today()
-                snap.budget_raises = await self._budget_raises()
-                await self._event_stamps(snap)
-                snap.online = not self.data._reconnecting_hint
-                snap.error = self.data._reconnecting_hint
-                snap.loaded = True
+                if not await self._from_daemon(snap):
+                    await self._from_store(snap)
                 if self._failures:
                     log.info("back online after %d failed refreshes", self._failures)
                 self._failures = 0
@@ -203,6 +198,45 @@ class Hub:
         finally:
             self._busy = False
 
+    async def _from_daemon(self, snap: Snapshot) -> bool:
+        """One call to the daemon's /v1/snapshot (ADR 0021 phase 3). False when
+        no daemon is configured (or it predates the route): read the store."""
+        fetch = getattr(self.data, "remote_snapshot", None)
+        if fetch is None:  # a data layer with no daemon side (test fakes)
+            return False
+        remote = await fetch(spend_since=midnight(), events_after=self._budget_seq)
+        if remote is None:
+            return False
+        snap.missions = remote["missions"]
+        snap.gates = remote["gates"]
+        snap.projects = remote["projects"]
+        snap.chats = remote["chats"]
+        snap.chats_failed = False
+        snap.spend_today = remote["spend_today"]
+        # the first call primes the cursor at "now" and carries no raises
+        snap.budget_raises = remote["budget_raises"] if self._budget_seq is not None else []
+        self._budget_seq = remote["event_seq"]
+        snap.last_event = remote["last_event"]
+        snap.online = True
+        snap.error = ""
+        snap.loaded = True
+        return True
+
+    async def _from_store(self, snap: Snapshot) -> None:
+        """No daemon: the same view read from the store directly (a single
+        machine, the tests), with the TuiData offline/last-good ladder."""
+        snap.missions = await self.data.missions(limit=200)
+        snap.gates = await self.data.open_gates()
+        snap.projects = await self.data.projects()
+        snap.chats = await self._chats()
+        snap.chats_failed = self._chats_failed
+        snap.spend_today = await self._spend_today()
+        snap.budget_raises = await self._budget_raises()
+        await self._event_stamps(snap)
+        snap.online = not self.data._reconnecting_hint
+        snap.error = self.data._reconnecting_hint
+        snap.loaded = True
+
     async def _event_stamps(self, snap: Snapshot) -> None:
         """Newest event ts per running mission and per run, for the spinner.
 
@@ -228,12 +262,7 @@ class Hub:
 
     @staticmethod
     def _is_orchestrator_transcript(chat: Any) -> bool:
-        # A mission orchestrator's own conversation is machinery, not a chat:
-        # there is one per mission and the owner never writes in it. It stays
-        # reachable per mission (the Dashboard Chat tab shows it read-only, and
-        # the Transcript buttons open `orchestrator_chat_id(mission.id)`); it
-        # is hidden from the list, not deleted.
-        return str(chat.id).startswith(ORCHESTRATOR_CHAT_PREFIX)
+        return is_orchestrator_transcript(chat)
 
     async def _chats(self) -> list[Any]:
         """The Work list: user conversations only.
@@ -258,9 +287,7 @@ class Hub:
             chats = await self.data.chats(limit=CHAT_FETCH)
         except AttributeError:  # store without chat support
             return []
-        # orchestrator transcripts are dropped BEFORE the cap so the busiest
-        # chats in the store cannot crowd real conversations out of the window
-        candidates = [c for c in chats if not self._is_orchestrator_transcript(c)]
+        candidates = chat_candidates(chats)
         if not candidates:
             return []
         try:
@@ -271,18 +298,7 @@ class Hub:
             kept = [c for c in self.snapshot.chats if str(c.id) in asked]
             self._chats_failed = not kept
             return kept
-        listed = [c for c in candidates if str(c.id) in filled]
-        # newest MESSAGE first; updated_at is only the tiebreaker and a chat
-        # with no message time sorts last (the store orders the same way, this
-        # keeps the list right for a store or fake that does not)
-        listed.sort(
-            key=lambda c: (
-                getattr(c, "last_message_at", None) is None,
-                -float(getattr(c, "last_message_at", None) or 0),
-                -float(getattr(c, "updated_at", 0) or 0),
-            )
-        )
-        return listed[:CHAT_LIMIT]
+        return listed_chats(candidates, filled)
 
     async def _budget_raises(self) -> list[Any]:
         try:

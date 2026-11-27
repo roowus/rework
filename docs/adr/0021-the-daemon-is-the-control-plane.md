@@ -3,7 +3,8 @@
 ## Status
 
 Accepted (2026-11-26). Phases 1 (command API), 2a (owner actions), 2b (chat turns) and 3a
-(live event stream) landed; a single aggregate read (`/v1/snapshot`) is the remaining step.
+(live event stream) and 3b (the heartbeat as one `/v1/snapshot` read) landed. Detail views
+(an open mission's events, runs and spend; the Cost tab) still read the store.
 
 ## Context
 
@@ -73,3 +74,23 @@ live: a TUI with its poll set to 30 s saw another TUI's pause in 0.35 s.
 The TUI still reads its data from the store after a wake; moving those reads behind one
 `/v1/snapshot` call is the step that lets a TUI run with no database access at all.
 
+
+## Phase 3b (2026-11-26): the heartbeat is one read
+
+`GET /v1/snapshot` returns everything the TUI's heartbeat shows: light missions, open
+gates, projects, the listed chats, spend since the client's `?spend_since=` (its local
+midnight: the daemon does not know the owner's timezone), budget raises after
+`?events_after=` (the reply's `event_seq` is the next cursor; no cursor = start from now),
+and the spinner's event stamps. It replaces 8 to 30 store round trips per poll, made from
+the TUI over the tailnet, with one HTTP call answered next to the database.
+
+The rules (which chats are listed, how stamps are read, where the cursor starts) live in
+`services/snapshot.py`, used by both the daemon and the TUI's no-daemon path, and a test
+asserts both paths produce the same snapshot. With a daemon configured, an unreachable
+daemon shows OFFLINE with the last good data; the TUI never goes around it to the
+database. Only a daemon that predates the route (plain 404) sends the hub back to the
+store, once, remembered.
+
+Verified live (`scripts/e2e`, `heartbeat_from_the_daemon`): TUI B's store-backed heartbeat
+is booby-trapped; it still saw A's mission appear, park on its gate and the gate clear.
+The run also counts B's remaining direct store reads: detail views, the next step.

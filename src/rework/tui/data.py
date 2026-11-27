@@ -87,6 +87,11 @@ async def _maybe_await(value: Any) -> Any:
 LAST_GOOD_MAX = 256
 
 
+# A heartbeat answer later than this is an outage: the hub is single-flight, so
+# a hung request would otherwise freeze every refresh for the client's 30 s
+SNAPSHOT_TIMEOUT_S = 8.0
+
+
 class TuiData:
     """Lazy single connections + thin query methods. All async; the Textual
     loop is the only caller (single-connection stores are safe here)."""
@@ -130,6 +135,11 @@ class TuiData:
         self._last_good: OrderedDict[str, Any] = OrderedDict()
         # set when a reconnect failed; the shell shows it as an offline note
         self._reconnecting_hint: str = ""
+        # the configured daemon answered 404 to /v1/snapshot (an older build)
+        self._snapshot_unsupported = False
+        # ONE kept-alive client for the heartbeat (a poll every second must not
+        # open a TCP connection each time); closed in aclose
+        self._remote: Any | None = None
 
     async def store(self) -> StateStore:
         if self._store is None:
@@ -303,6 +313,9 @@ class TuiData:
         return self._index, self._git
 
     async def aclose(self) -> None:
+        if self._remote is not None:
+            await self._remote.aclose()
+            self._remote = None
         if self._store is not None:
             await self._store.aclose()
             self._store = None
@@ -355,54 +368,42 @@ class TuiData:
     async def recent_event_stamps(
         self, mission_id: str, limit: int = 40, deep_limit: int = 400
     ) -> dict[str, float]:
-        """Newest event epoch for a mission and for each run seen in its newest
-        `limit` events: {mission_id: ts, run_id: ts, ...}. Empty = nothing seen.
-
-        ONE store query (the newest `limit` events), then a scan in Python.
-
-        A busy interleaved mission can push a quiet run's newest event out of
-        that window. Only a SATURATED window (it returned `limit` rows) can hide
-        a run, so only then: one `list_runs`, and if a running run has no key,
-        one wider read of `deep_limit` events to find it. Worst case is 3
-        queries for a mission, 1 for most. A run still unseen after that has NO
-        key, which the caller treats as unknown and animates (never a borrowed
-        mission stamp).
-
-        One wrapper with its own key and NO last-good fallback: on a store
-        failure this raises (the caller treats that as "unknown", which
+        """Newest event epoch for a mission and each run in its newest events
+        (rules: services.snapshot.event_stamps). NO last-good fallback: on a
+        store failure this raises (the caller treats that as "unknown", which
         animates) instead of replaying an old stamp that would claim the run
         has been silent."""
+        from rework.services.snapshot import event_stamps
 
-        def _fold(rows: list[Any], out: dict[str, float]) -> None:
-            # the store returns a window oldest-first, so take the max per key
-            # instead of relying on order
-            for row in rows:
-                if not row.ts:
-                    continue
-                ts = float(row.ts)
-                for key in (mission_id, str(row.run_id) if row.run_id else None):
-                    if key is not None and ts > out.get(key, 0.0):
-                        out[key] = ts
+        return await self._resilient(
+            f"stamps:{mission_id}",
+            lambda: self._call(lambda s: event_stamps(s, mission_id, limit, deep_limit)),
+            stale_ok=False,
+        )
 
-        async def _window(n: int) -> list[Any]:
-            return await self._call(
-                lambda s: s.events_since(0, mission_id=mission_id, limit=n, newest_first=True)
-            )
+    async def remote_snapshot(
+        self, *, spend_since: float | None = None, events_after: int | None = None
+    ) -> dict[str, Any] | None:
+        """The daemon's snapshot when a daemon is configured (one HTTP call,
+        no database access), else None and the hub reads the store itself.
+        An unreachable daemon RAISES: that is an outage the hub shows as
+        offline, not a reason to go around the daemon to the database. Only an
+        older daemon without the route falls back (remembered, not re-asked)."""
+        from rework.api import client as api
 
-        async def _q() -> dict[str, float]:
-            rows = await _window(limit)
-            out: dict[str, float] = {}
-            _fold(rows, out)
-            if len(rows) >= limit:
-                runs = await self._call(lambda s: s.list_runs(mission_id))
-                live = [
-                    r.id for r in runs if str(getattr(r.status, "value", r.status)) == "running"
-                ]
-                if any(rid not in out for rid in live):
-                    _fold(await _window(deep_limit), out)
-            return out
-
-        return await self._resilient(f"stamps:{mission_id}", _q, stale_ok=False)
+        if self._snapshot_unsupported:
+            return None
+        if self._remote is None:
+            self._remote = api.configured(timeout_s=SNAPSHOT_TIMEOUT_S)
+            if self._remote is None:
+                return None
+        try:
+            return await self._remote.snapshot(spend_since=spend_since, events_after=events_after)
+        except api.ApiError as exc:
+            if exc.code == "no_api":
+                self._snapshot_unsupported = True
+                return None
+            raise
 
     async def mission_runs(self, mission_id: str) -> list[Run]:
         return await self._resilient(

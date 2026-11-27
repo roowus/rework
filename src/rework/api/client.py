@@ -35,12 +35,13 @@ class DaemonClient:
         token: str | None = None,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        timeout_s: float = TIMEOUT_S,
     ) -> None:
         self.base_url = (base_url or workspace_url_from_env()).rstrip("/")
         self._token = token if token is not None else os.environ.get("REWORK_TOKEN")
         headers = {"Authorization": f"Bearer {self._token}"} if self._token else {}
         self._http = httpx.AsyncClient(
-            base_url=self.base_url, headers=headers, timeout=TIMEOUT_S, transport=transport
+            base_url=self.base_url, headers=headers, timeout=timeout_s, transport=transport
         )
 
     async def aclose(self) -> None:
@@ -76,6 +77,34 @@ class DaemonClient:
         response = await self._http.get("/v1")
         response.raise_for_status()
         return int(response.json()["api"])
+
+    async def snapshot(
+        self, *, spend_since: float | None = None, events_after: int | None = None
+    ) -> dict[str, Any]:
+        """The daemon's global view, as typed records (services.snapshot)."""
+        from rework.services.snapshot import from_json
+
+        params: dict[str, Any] = {}
+        if spend_since is not None:
+            params["spend_since"] = spend_since
+        if events_after is not None:
+            params["events_after"] = events_after
+        response = await self._http.get("/v1/snapshot", params=params)
+        if response.status_code == 404 and "application/json" not in response.headers.get(
+            "content-type", ""
+        ):
+            raise ApiError(404, "no_api", "this daemon has no /v1/snapshot")
+        if response.status_code >= 400:
+            try:
+                data = response.json()
+            except ValueError:
+                data = {}
+            raise ApiError(
+                response.status_code,
+                str(data.get("code") or "error"),
+                str(data.get("error") or response.text),
+            )
+        return from_json(response.json())
 
     async def mission_verb(self, mission_id: str, verb: str) -> dict[str, Any]:
         return (await self._post(f"/v1/missions/{mission_id}/{verb}"))["mission"]
@@ -116,14 +145,14 @@ class DaemonClient:
         return bool(out["ok"]), str(out["detail"])
 
 
-def configured() -> DaemonClient | None:
+def configured(timeout_s: float = TIMEOUT_S) -> DaemonClient | None:
     """A client when this front end is pointed at a daemon (REWORK_DAEMON_URL,
     set by a --target or the env file), else None: the front end then acts
     in-process, which is what a single-machine setup and the tests do. A
     remote TUI or CLI always sets the URL, so its commands run on the daemon."""
     if not os.environ.get("REWORK_DAEMON_URL"):
         return None
-    return DaemonClient()
+    return DaemonClient(timeout_s=timeout_s)
 
 
 class NoApi(Exception):
