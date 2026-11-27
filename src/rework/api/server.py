@@ -299,6 +299,31 @@ def add_routes(
         response.enable_compression()
         return response
 
+    async def read(request: web.Request) -> web.Response:
+        """One StateStore READ, run on the daemon's store (ADR 0021 phase 3c):
+        `{"method": "list_runs", "args": {"mission_id": "m-1"}}` ->
+        `{"result": ...}`. Only the allowlisted read methods are served
+        (api/remote_store.READS); a write is refused as 400."""
+        from rework.api import remote_store
+
+        body = await _body(request)
+        method = str(body.get("method") or "")
+        if method not in remote_store.READS:
+            raise ValueError(f"{method or '(none)'} is not a remote read")
+        args = body.get("args") or {}
+        if not isinstance(args, dict):
+            raise ValueError("args must be an object")
+        from pydantic import ValidationError
+
+        try:
+            kwargs = remote_store.unbind(method, args)
+        except ValidationError as exc:
+            raise ValueError(f"bad arguments for {method}: {exc.errors()[0]['msg']}") from None
+        result = await getattr(store, method)(**kwargs)
+        response = web.json_response({"result": remote_store.encode(method, result)})
+        response.enable_compression()
+        return response
+
     async def library_search(request: web.Request) -> web.Response:
         if library is None:
             return web.json_response({"items": [], "note": "no library on this daemon"})
@@ -324,6 +349,7 @@ def add_routes(
     app.router.add_get("/v1", guard(version))
     app.router.add_get("/v1/events", guard(events))
     app.router.add_get("/v1/snapshot", guard(snapshot))
+    app.router.add_post("/v1/read", guard(read))
     app.router.add_post("/v1/runs/{run_id}/ask", guard(run_ask))
     app.router.add_get("/v1/library/search", guard(library_search))
     app.router.add_post("/v1/chats/{chat_id}/messages", guard(chat_send))

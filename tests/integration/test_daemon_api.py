@@ -430,3 +430,109 @@ async def test_the_snapshot_is_compressed_on_the_wire(api: dict[str, Any]) -> No
     assert response.status_code == 200
     assert response.headers.get("content-encoding") in {"gzip", "deflate"}
     assert len(response.json()["missions"]) == 30
+
+
+async def test_every_remote_read_equals_the_local_store(api: dict[str, Any]) -> None:
+    """ADR 0021 phase 3c: each allowlisted StateStore read, called over
+    /v1/read, returns exactly what the store returns locally: same types,
+    same values. This is the contract the TUI's detail views rely on."""
+
+    from rework.api.remote_store import READS, RemoteReadStore
+
+    store = api["store"]
+    seeded = await _seed_snapshot_world(store)
+    calls: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {
+        "get_mission": (("m-run",), {}),
+        "get_run": (("m-run:do:echo:1",), {}),
+        "get_project": (((await store.list_projects())[0].id,), {}),
+        "get_chat": ((seeded["talk"].id,), {}),
+        "list_runs": (("m-run",), {}),
+        "list_gates": (("m-run",), {}),
+        "list_open_gates": ((), {}),
+        "list_projects": ((), {}),
+        "list_chats": ((), {"limit": 10}),
+        "list_missions_light": ((), {"limit": 50}),
+        "list_missions": ((), {"status": MissionStatus.DONE}),
+        "events_since": ((0,), {"mission_id": "m-run", "newest_first": True}),
+        "mission_spend": (("m-run",), {}),
+        "run_charges": (("m-run:do:echo:1",), {}),
+        "spend_by_model": ((), {}),
+        "spend_history": ((), {"bucket": "total", "since": seeded["now"] - 3600}),
+        "chat_messages": ((seeded["talk"].id,), {}),
+        "chat_messages_max_id": ((seeded["talk"].id,), {}),
+        "chat_messages_since": ((seeded["talk"].id, 0), {}),
+        "chat_ids_with_conversation": (([seeded["talk"].id, seeded["empty"].id],), {}),
+        "chat_ids_with_messages": (([seeded["talk"].id, seeded["empty"].id],), {}),
+    }
+    assert set(calls) == READS, "every served read is pinned here"
+    remote = RemoteReadStore(_client(api))
+    try:
+        for method, (args, kwargs) in calls.items():
+            local = await getattr(store, method)(*args, **kwargs)
+            over_api = await getattr(remote, method)(*args, **kwargs)
+            assert over_api == local, method
+            if isinstance(local, list) and local:
+                assert type(over_api[0]) is type(local[0]), method
+    finally:
+        await remote.aclose()
+
+
+async def test_the_read_route_refuses_writes_and_bad_arguments(api: dict[str, Any]) -> None:
+    """/v1/read serves READS only: a write method, an unknown method, or an
+    argument the method does not take is a 400, and nothing is written."""
+    from rework.api.remote_store import RemoteReadStore
+
+    store = api["store"]
+    async with _client(api) as client:
+        for body in (
+            {"method": "update_mission", "args": {"mission_id": "m-x"}},
+            {"method": "create_mission", "args": {}},
+            {"method": "__class__", "args": {}},
+            {"method": "list_runs", "args": {"mission_id": "m", "drop": True}},
+            {"method": "events_since", "args": {"seq": "not a number"}},
+            {"method": "list_runs", "args": ["m"]},
+        ):
+            response = await client._http.post("/v1/read", json=body)
+            assert response.status_code == 400, (body, response.text)
+            assert response.json()["code"] == "bad_request"
+    remote = RemoteReadStore(_client(api))
+    try:
+        with pytest.raises(AttributeError):
+            remote.update_mission  # noqa: B018 - the attribute access is the test
+    finally:
+        await remote.aclose()
+    assert await store.list_missions_light() == []
+
+
+async def test_a_tui_against_a_daemon_reads_detail_views_without_a_database(
+    api: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The point of phase 3c: with REWORK_DAEMON_URL set, the TUI's detail
+    reads (runs, gates, events, spend, budget, report, transcript) all work
+    while opening the database is an error."""
+    from rework.tui.data import TuiData
+
+    store = api["store"]
+    seeded = await _seed_snapshot_world(store)
+    monkeypatch.setenv("REWORK_DAEMON_URL", api["url"])
+
+    def no_database() -> Any:
+        raise AssertionError("a daemon-backed TUI must not open the database")
+
+    data = TuiData(store_factory=no_database)
+    try:
+        assert [r.id for r in await data.mission_runs("m-run")] == ["m-run:do:echo:1"]
+        assert [g.id for g in await data.gates("m-run")] == [seeded["gate"].id]
+        assert (await data.get_mission("m-run")).plan is not None, "the FULL row"
+        assert await data.mission_events("m-run")
+        assert await data.mission_events_newest("m-run", limit=5)
+        assert await data.mission_spend("m-run") == pytest.approx(0.25)
+        assert (await data.mission_budget("m-run")).spent_usd == pytest.approx(0.25)
+        assert (await data.spend_total())["usd"] == pytest.approx(0.25)
+        assert await data.spend_history(bucket="day", since=seeded["now"] - 86400)
+        assert "m-run" in await data.mission_report("m-run")
+        assert [m.role for m in await data.chat_messages(seeded["talk"].id)] == ["user"]
+        assert await data.chat_messages_max_id(seeded["talk"].id) > 0
+        assert (await data.chat(seeded["talk"].id)).title == "a real conversation"
+    finally:
+        await data.aclose()

@@ -62,6 +62,10 @@ def _is_connection_error(exc: BaseException) -> bool:
         )
     if isinstance(exc, connection_types):
         return True
+    import httpx
+
+    if isinstance(exc, httpx.TransportError):  # the daemon, for remote reads
+        return True
     if isinstance(exc, sqlite3.OperationalError):
         text = str(exc).lower()
         return "locked" in text or "disk i/o" in text or "unable to open" in text
@@ -90,6 +94,8 @@ LAST_GOOD_MAX = 256
 # A heartbeat answer later than this is an outage: the hub is single-flight, so
 # a hung request would otherwise freeze every refresh for the client's 30 s
 SNAPSHOT_TIMEOUT_S = 8.0
+# one detail read (a mission's events, its runs): same reasoning, a bit longer
+READ_TIMEOUT_S = 15.0
 
 
 class TuiData:
@@ -140,6 +146,9 @@ class TuiData:
         # ONE kept-alive client for the heartbeat (a poll every second must not
         # open a TCP connection each time); closed in aclose
         self._remote: Any | None = None
+        # the daemon-backed reader (RemoteReadStore), when a daemon is configured
+        self._reader: Any | None = None
+        self._reads_unsupported = False
 
     async def store(self) -> StateStore:
         if self._store is None:
@@ -240,10 +249,38 @@ class TuiData:
             with contextlib.suppress(Exception):
                 await index.aclose()
 
+    async def reader(self) -> Any:
+        """Where READS go: the daemon (ADR 0021 phase 3c) when one is
+        configured, so a TUI's detail views need no database connection, else
+        the store. Writes still use `store()` until they get command routes."""
+        from rework.api import client as api
+
+        if self._reads_unsupported:
+            return await self.store()
+        if self._reader is None:
+            remote = api.configured(timeout_s=READ_TIMEOUT_S)
+            if remote is None:
+                return await self.store()
+            from rework.api.remote_store import RemoteReadStore
+
+            self._reader = RemoteReadStore(remote)
+        return self._reader
+
     async def _call(self, fn: Any) -> Any:
-        """One query against the (possibly reopened) store."""
-        store = await self.store()
-        return await fn(store)
+        """One read against the daemon or the (possibly reopened) store. A
+        daemon that predates /v1/read (plain 404) is remembered, and this
+        TUI reads the store as before: mixed versions during a rollout."""
+        from rework.api import client as api
+
+        try:
+            return await fn(await self.reader())
+        except api.ApiError as exc:
+            if exc.code != "no_api" or self._reader is None:
+                raise
+            self._reads_unsupported = True
+            await self._reader.aclose()
+            self._reader = None
+            return await fn(await self.store())
 
     async def _resilient(self, key: str, call: Any, *, stale_ok: bool = True) -> Any:
         """Run one query; if the connection died, reconnect once and retry.
@@ -313,6 +350,9 @@ class TuiData:
         return self._index, self._git
 
     async def aclose(self) -> None:
+        if self._reader is not None:
+            await self._reader.aclose()
+            self._reader = None
         if self._remote is not None:
             await self._remote.aclose()
             self._remote = None
@@ -412,7 +452,7 @@ class TuiData:
 
     async def mission_spend(self, mission_id: str) -> float:
         async def _q() -> float:
-            store = await self.store()
+            store = await self.reader()
             spend = await store.mission_spend(mission_id)
             return spend.spent_usd
 
@@ -464,7 +504,7 @@ class TuiData:
         """Where the daemon says this mission's finished worktree lives (None =
         nothing to fetch). The repo_path column is daemon-local until fetch
         pulls it; the CLI fetch result lands in ~/rework/results/<id>/."""
-        store = await self.store()
+        store = await self.reader()
         mission = await store.get_mission(mission_id)
         if mission is None or not mission.repo_path:
             return None
@@ -756,7 +796,7 @@ class TuiData:
         """Exact cost of one run (sum of its charges)."""
 
         async def _q() -> float:
-            store = await self.store()
+            store = await self.reader()
             return sum(float(c.cost_usd or 0) for c in await store.run_charges(run_id))
 
         return await self._resilient(f"run_spend:{run_id}", _q)
@@ -779,7 +819,7 @@ class TuiData:
         from rework.cli import _render_md
         from rework.nodes.run_stats import attach_run_stats
 
-        store = await self.store()
+        store = await self.reader()
         mission = await store.get_mission(mission_id)
         if mission is None:
             return f"no such mission: {mission_id}"
