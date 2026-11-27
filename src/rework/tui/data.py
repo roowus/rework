@@ -149,6 +149,8 @@ class TuiData:
         # the daemon-backed reader (RemoteReadStore), when a daemon is configured
         self._reader: Any | None = None
         self._reads_unsupported = False
+        # how the last hybrid library search actually ran ("hybrid"/"keyword")
+        self.library_mode = ""
 
     async def store(self) -> StateStore:
         if self._store is None:
@@ -492,12 +494,21 @@ class TuiData:
 
     async def library_set_status(self, item_id: str, retire: bool) -> bool:
         """a / d on the library split: activate or retire the selected item."""
-        index, _git = await self.library()
+        from rework.api import client as api
         from rework.library.model import ItemStatus
 
-        changed = await index.set_status(
-            item_id, ItemStatus.RETIRED if retire else ItemStatus.ACTIVE
-        )
+        wanted = ItemStatus.RETIRED if retire else ItemStatus.ACTIVE
+        try:
+            await api.call(lambda c: c.library_status(item_id, wanted.value))
+            return True
+        except api.NoApi:
+            pass
+        except api.ApiError as exc:
+            if exc.status == 404:
+                return False
+            raise
+        index, _git = await self.library()
+        changed = await index.set_status(item_id, wanted)
         return changed is not None
 
     async def mission_result_path(self, mission_id: str) -> str | None:
@@ -683,22 +694,36 @@ class TuiData:
         model_id: str | None = None,
         effort: str | None = None,
     ) -> Any:
+        from rework.api import client as api
         from rework.kernel.state.records import Chat
 
+        fields: dict[str, Any] = {
+            "title": title,
+            "project_id": project_id,
+            "model_id": model_id,
+            "effort": effort,
+        }
+        try:  # ADR 0021 phase 3d: the daemon writes it
+            return await api.call(lambda c: c.create_chat(**fields))
+        except api.NoApi:
+            pass
         store = await self.store()
-        return await store.create_chat(
-            Chat(title=title, project_id=project_id, model_id=model_id, effort=effort)
-        )
+        return await store.create_chat(Chat(**fields))
 
     async def rename_chat(self, chat_id: str, title: str) -> Any:
-        store = await self.store()
-        return await store.update_chat(chat_id, title=title)
+        return await self.update_chat(chat_id, title=title)
 
     async def attach_chat_to_mission(self, chat_id: str, mission_id: str) -> Any:
-        store = await self.store()
-        return await store.update_chat(chat_id, mission_id=mission_id)
+        return await self.update_chat(chat_id, mission_id=mission_id)
 
     async def delete_chat(self, chat_id: str) -> None:
+        from rework.api import client as api
+
+        try:
+            await api.call(lambda c: c.delete_chat(chat_id))
+            return
+        except api.NoApi:
+            pass
         store = await self.store()
         await store.delete_chat(chat_id)
 
@@ -748,14 +773,31 @@ class TuiData:
         )
 
     async def update_chat(self, chat_id: str, **fields: Any) -> Any:
+        from rework.api import client as api
+
+        try:
+            return await api.call(lambda c: c.update_chat(chat_id, **fields))
+        except api.NoApi:
+            pass
         store = await self.store()
         return await store.update_chat(chat_id, **fields)
 
     async def append_chat_note(self, chat_id: str, display: str) -> Any:
         """A UI-only transcript row (e.g. 'launched m-…'). `body` stays empty so
         the row is never replayed into the model's history."""
+        from rework.api import client as api
         from rework.kernel.state.records import ChatMessage
 
+        try:
+            row_id = await api.call(lambda c: c.chat_note(chat_id, display))
+        except api.NoApi:
+            row_id = None
+        else:
+            # this TUI painted the note live: mark the row as its own, as the
+            # tracked local store does, so the transcript poller skips it
+            if row_id is not None:
+                self.own_chat_ids.add(int(row_id))
+            return ChatMessage(id=row_id, chat_id=chat_id, role="note", body={}, display=display)
         store = await self.store()
         return await store.append_chat_message(
             ChatMessage(chat_id=chat_id, role="note", body={}, display=display)
@@ -804,8 +846,13 @@ class TuiData:
     async def send_owner_message(self, mission_id: str, text: str) -> Any:
         """Talk to a running mission's orchestrator (ADR 0007): it is woken and
         sees the message before its next turn."""
+        from rework.api import client as api
         from rework.missions import send_owner_message
 
+        try:
+            return await api.call(lambda c: c.message(mission_id, text))
+        except api.NoApi:
+            pass
         return await send_owner_message(mission_id, text, store=await self.store())
 
     async def mission_budget(self, mission_id: str) -> Any:
@@ -847,9 +894,24 @@ class TuiData:
         is a human typing into the TUI form, choosing the type explicitly --
         the owner-trusted path (same reasoning as the CLI's --force), not an
         agent asserting its own output is a skill."""
+        from rework.api import client as api
         from rework.library.curation import contribute
         from rework.library.model import ItemType
 
+        try:
+            added: tuple[Any, str] = await api.call(
+                lambda c: c.library_add(
+                    type=type_,
+                    name=name,
+                    description=description,
+                    body=body,
+                    tags=tags,
+                    project=project,
+                )
+            )
+            return added
+        except api.NoApi:
+            pass
         index, git = await self.library()
         return await contribute(
             index,
@@ -867,6 +929,13 @@ class TuiData:
     # -- library ----------------------------------------------------------
 
     async def library_search(self, query: str) -> list[Any]:
+        from rework.api import client as api
+
+        try:
+            items, _mode = await api.call(lambda c: c.library_items(query))
+            return list(items)
+        except api.NoApi:
+            pass
         index, _ = await self.library()
         if not query.strip():
             return await index.list_items(status=None, limit=100)
@@ -876,17 +945,54 @@ class TuiData:
         """Hybrid (embeddings + keyword) when REWORK_EMBEDDINGS_* is set;
         silently keyword-only otherwise. The TUI stays alive if the embedder
         errors: HybridSearch already degrades internally."""
+        from rework.api import client as api
+
+        try:
+            items, mode = await api.call(lambda c: c.library_items(query, hybrid=True))
+            # the DAEMON's embedder decides, not this machine's env
+            self.library_mode = mode
+            return list(items)
+        except api.NoApi:
+            pass
         index, _git = await self.library()
         from rework.library.embeddings import embeddings_from_env
         from rework.library.search import HybridSearch
 
         embedder = embeddings_from_env()
+        self.library_mode = "hybrid" if embedder is not None else "keyword"
         hybrid = HybridSearch(index, embedder)
         if embedder is not None:
             await hybrid.ensure_indexed()
         return await hybrid.search(query, limit=50)
 
+    async def library_item(self, item_id: str) -> Any:
+        """One item row (None when it does not exist)."""
+        from rework.api import client as api
+
+        try:
+            return await api.call(lambda c: c.library_item(item_id))
+        except api.NoApi:
+            pass
+        except api.ApiError as exc:
+            if exc.status == 404:
+                return None
+            raise
+        index, _git = await self.library()
+        return await index.get_item(item_id)
+
     async def library_body(self, item_id: str) -> tuple[Any, str | None]:
+        from rework.api import client as api
+
+        try:
+            remote = await api.call(lambda c: c.library_item(item_id))
+            # the row carries the body (the DB is the source of truth)
+            return remote, remote.body or None
+        except api.NoApi:
+            pass
+        except api.ApiError as exc:
+            if exc.status == 404:
+                return None, None
+            raise
         index, git = await self.library()
         item = await index.get_item(item_id)
         if item is None:
@@ -902,17 +1008,16 @@ class TuiData:
         the results handling are DERIVED from the repos, never hardcoded. No
         repo means an upload project (rework keeps the files, results are
         fetched); a repo means git/push_branch."""
-        from rework.kernel.state.records import Project as ProjectRecord
-        from rework.missions import derive_transport
+        from rework.api import client as api
+        from rework.services.projects import create_project
 
         repo_list = [dict(r) for r in repos or []]
-        transport, results = derive_transport({"repos": repo_list})
-        store = await self.store()
-        project = ProjectRecord(
-            name=name,
-            settings={"transport": transport, "results": results, "repos": repo_list},
-        )
-        return await store.create_project(project)
+        try:
+            created: Project = await api.call(lambda c: c.create_project(name, repo_list))
+            return created
+        except api.NoApi:
+            pass
+        return await create_project(await self.store(), name, repo_list)
 
     async def add_project_files(self, project_id: str, paths: list[str]) -> list[str]:
         """Push local paths into a repo-less project's files area. The HTTP
@@ -924,8 +1029,21 @@ class TuiData:
         return await asyncio.to_thread(_add, project_id, paths)
 
     async def create_mission(self, **kwargs: Any) -> Mission:
+        """Created BY the daemon when one is configured (ADR 0021 phase 3d), with
+        the same rules. A local `repo` path then resolves on the daemon's
+        machine, which is where the mission runs; `repo_dir` (a client folder
+        to upload) stays a local call, because the upload starts here."""
+        from rework.api import client as api
         from rework.missions import create_mission as _create
 
+        if not kwargs.get("repo_dir"):
+            fields = {k: v for k, v in kwargs.items() if v is not None}
+            objective = fields.pop("objective")
+            try:
+                created: Mission = await api.call(lambda c: c.create_mission(objective, **fields))
+                return created
+            except api.NoApi:
+                pass
         return await _create(store=await self.store(), **kwargs)
 
 

@@ -536,3 +536,125 @@ async def test_a_tui_against_a_daemon_reads_detail_views_without_a_database(
         assert (await data.chat(seeded["talk"].id)).title == "a real conversation"
     finally:
         await data.aclose()
+
+
+@pytest.fixture
+async def api_with_library(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+    from rework.library.store import GitLibrary, open_library_store
+    from rework.library.tools import LibraryHandle
+
+    monkeypatch.setenv("REWORK_TOKEN", "secret")
+    db = str(tmp_path / "s.sqlite3")
+    store = await open_sqlite(db)
+    index = await open_library_store(db)
+    handle = LibraryHandle(index=index, git=GitLibrary(tmp_path / "lib"))
+    server = TestServer(build_workspace_app(store, tmp_path / "work", library=handle))
+    await server.start_server()
+    url = str(server.make_url("")).rstrip("/")
+    try:
+        yield {"store": store, "url": url, "library": handle}
+    finally:
+        await server.close()
+        await index.aclose()
+        await store.aclose()
+
+
+async def test_a_tui_against_a_daemon_writes_without_a_database(
+    api_with_library: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR 0021 phase 3d: with REWORK_DAEMON_URL set, every owner write the TUI
+    makes (chats, notes, missions, projects, owner messages, the Library) is
+    executed by the daemon, while opening the database or the Library index
+    from the TUI is an error. Each write is then checked on the daemon's store."""
+    from rework.tui.data import TuiData
+
+    api = api_with_library
+    store = api["store"]
+    monkeypatch.setenv("REWORK_DAEMON_URL", api["url"])
+
+    def no_database() -> Any:
+        raise AssertionError("a daemon-backed TUI must not open the database")
+
+    data = TuiData(store_factory=no_database)
+
+    async def no_library() -> Any:
+        raise AssertionError("a daemon-backed TUI must not open the Library index")
+
+    data.library = no_library  # type: ignore[method-assign]
+    try:
+        chat = await data.new_chat(title="plan a thing", model_id="fake")
+        assert (await store.get_chat(chat.id)).title == "plan a thing"
+        await data.rename_chat(chat.id, "renamed")
+        await data.update_chat(chat.id, effort="high")
+        row = await store.get_chat(chat.id)
+        assert row.title == "renamed" and row.effort == "high"
+
+        project = await data.create_project("toy", [])
+        assert (await store.get_project(project.id)).settings["transport"] == "upload"
+
+        mission = await data.create_mission(
+            objective="say hi", plan="echo", chat_id=chat.id, title="Hi", budget_usd=1.5
+        )
+        stored = await store.get_mission(mission.id)
+        assert stored.chat_id == chat.id and stored.title == "Hi"
+        await data.attach_chat_to_mission(chat.id, mission.id)
+        assert (await store.get_chat(chat.id)).mission_id == mission.id
+
+        note = await data.append_chat_note(chat.id, f"launched {mission.id}")
+        assert note.id in data.own_chat_ids, "the writer knows the note is its own"
+        assert [m.role for m in await store.chat_messages(chat.id)] == ["note"]
+
+        await data.send_owner_message(mission.id, "also say bye")
+        events = await store.events_since(0, mission_id=mission.id)
+        assert events[-1].type == EventType.OWNER_MESSAGE
+
+        item, _note = await data.library_add(
+            type_="skill", name="greet", description="say hi", body="Say hi.", tags=["x"]
+        )
+        assert (await api["library"].index.get_item(item.id)).name == "greet"
+        assert [i.id for i in await data.library_search("")] == [item.id]
+        assert await data.library_set_status(item.id, retire=True)
+        assert (await data.library_item(item.id)).status.value == "retired"
+        fetched, body = await data.library_body(item.id)
+        assert fetched.id == item.id and body == "Say hi."
+        assert await data.library_item("nope") is None
+
+        await data.delete_chat(chat.id)
+        assert await store.get_chat(chat.id) is None
+    finally:
+        await data.aclose()
+
+
+async def test_write_routes_refuse_bad_input_with_the_daemons_reason(
+    api_with_library: dict[str, Any],
+) -> None:
+    api = api_with_library
+    async with _client(api) as client:
+        for verb, path, body, status in (
+            ("POST", "/v1/missions", {"objective": "  "}, 400),
+            ("POST", "/v1/missions", {"objective": "x", "budget_usd": "lots"}, 400),
+            ("POST", "/v1/missions", {"objective": "x", "budget_usd": float("-1")}, 400),
+            ("POST", "/v1/missions", {"objective": "x", "plan": "nope"}, 400),
+            ("POST", "/v1/projects", {"name": ""}, 400),
+            ("POST", "/v1/projects", {"name": "p", "repos": "github.com/x"}, 400),
+            ("PATCH", "/v1/chats/chat-missing", {"title": "t"}, 404),
+            ("DELETE", "/v1/chats/chat-missing", None, 404),
+            ("POST", "/v1/chats/chat-missing/notes", {"display": "x"}, 404),
+            ("POST", "/v1/library/items", {"name": "n", "body": " "}, 400),
+            ("POST", "/v1/library/items/nope/status", {"status": "retired"}, 404),
+            ("POST", "/v1/library/items/nope/status", {"status": "sideways"}, 400),
+        ):
+            response = await client._http.request(verb, path, json=body)
+            assert response.status_code == status, (verb, path, body, response.text)
+        chat = await client.create_chat(title="t")
+        response = await client._http.patch(f"/v1/chats/{chat.id}", json={"id": "evil"})
+        assert response.status_code == 400, "only the patchable fields"
+    assert await api["store"].list_missions_light() == []
+
+
+async def test_the_library_routes_say_when_the_daemon_has_no_library(
+    api: dict[str, Any],
+) -> None:
+    async with _client(api) as client:
+        response = await client._http.get("/v1/library/items")
+        assert response.status_code == 409 and response.json()["code"] == "unavailable"

@@ -358,22 +358,24 @@ class Conversation:
             self.engine._context = context_note(snap, self.chat.project_id)
             return self.engine
         entry = catalog.resolve(model_id)
+        # With a daemon configured the DAEMON runs every turn (send_remote):
+        # this engine only mirrors the pending proposals for Launch/Scrap, so
+        # it gets no provider of its own and never calls a model from here,
+        # reads its history over the API and needs no Library connection
+        from rework.api import client as api
+
+        remote = api.configured() is not None
         kwargs: dict[str, Any] = {
             "effort": self.chat.effort or None,
             "context": context_note(snap, self.chat.project_id),
-            "store": await self.data.store(),
+            "store": await (self.data.reader() if remote else self.data.store()),
             "chat_id": self.id,
         }
         if _accepts(OrchestratorChat.__init__, "on_turn"):
             kwargs["on_turn"] = on_turn
-        if _accepts(OrchestratorChat.__init__, "library"):
+        if _accepts(OrchestratorChat.__init__, "library") and not remote:
             kwargs["library"] = await self._library_handle()
-        # With a daemon configured the DAEMON runs every turn (send_remote):
-        # this engine only mirrors the pending proposals for Launch/Scrap, so
-        # it gets no provider of its own and never calls a model from here
-        from rework.api import client as api
-
-        provider = _NoLocalTurns() if api.configured() is not None else build_provider(entry)
+        provider = _NoLocalTurns() if remote else build_provider(entry)
         self.engine = OrchestratorChat(provider, catalog, model_id, **kwargs)
         await self.engine.load()
         # EVERY proposal that never launched is restored, in order, so a
@@ -434,6 +436,11 @@ class Conversation:
             self.engine._provider = build_provider(
                 catalog.resolve(self.chat.model_id or default_model(catalog))
             )
+            # it was built to read over the API; a local turn WRITES the
+            # transcript, so it needs the real store (and its tools)
+            self.engine._store = await self.data.store()
+            if self.engine._toolbox is not None:
+                self.engine._toolbox._store = self.engine._store
         return await self.engine.send(text, images=images)
 
     async def launch(self, snap: Snapshot, proposal: Any) -> Any:

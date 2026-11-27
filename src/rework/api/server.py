@@ -92,6 +92,8 @@ def add_routes(
                 return _error(404, "not_found", f"not found: {exc.args[0]}")
             except ValueError as exc:
                 return _error(400, "bad_request", str(exc))
+            except LookupError as exc:  # a capability this daemon lacks
+                return _error(409, "unavailable", str(exc))
 
         return wrapped
 
@@ -324,6 +326,194 @@ def add_routes(
         response.enable_compression()
         return response
 
+    # -- owner writes (ADR 0021 phase 3d): chats, missions, projects ---------
+
+    def _opt_str(body: dict[str, Any], key: str) -> str | None:
+        value = body.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError(f"{key} must be a string")
+        return value
+
+    async def chat_create(request: web.Request) -> web.Response:
+        from rework.kernel.state.records import Chat
+
+        body = await _body(request)
+        chat = await store.create_chat(
+            Chat(
+                title=_opt_str(body, "title") or "",
+                project_id=_opt_str(body, "project_id"),
+                model_id=_opt_str(body, "model_id"),
+                effort=_opt_str(body, "effort"),
+            )
+        )
+        return web.json_response({"chat": chat.model_dump(mode="json")})
+
+    async def chat_update(request: web.Request) -> web.Response:
+        """Patch title / project / model / effort / first mission. A field that
+        is absent or null is left alone (StateStore.update_chat's contract)."""
+        body = await _body(request)
+        allowed = {"title", "project_id", "model_id", "effort", "mission_id"}
+        unknown = set(body) - allowed
+        if unknown:
+            raise ValueError(f"cannot set {sorted(unknown)[0]} on a chat")
+        chat_id = request.match_info["chat_id"]
+        if await store.get_chat(chat_id) is None:
+            raise KeyError(chat_id)
+        fields = {k: _opt_str(body, k) for k in allowed if k in body}
+        chat = await store.update_chat(chat_id, **fields)
+        assert chat is not None
+        return web.json_response({"chat": chat.model_dump(mode="json")})
+
+    async def chat_delete(request: web.Request) -> web.Response:
+        chat_id = request.match_info["chat_id"]
+        if await store.get_chat(chat_id) is None:
+            raise KeyError(chat_id)
+        await store.delete_chat(chat_id)
+        return web.json_response({"deleted": chat_id})
+
+    async def chat_note(request: web.Request) -> web.Response:
+        """A UI-only transcript row ('launched m-...'): body stays empty so it
+        is never replayed into the model's history. The reply carries the row
+        id so the writing TUI knows the row is its own (it painted it live)."""
+        from rework.kernel.state.records import ChatMessage
+
+        body = await _body(request)
+        display = _opt_str(body, "display") or ""
+        if not display.strip():
+            raise ValueError("display is required")
+        chat_id = request.match_info["chat_id"]
+        if await store.get_chat(chat_id) is None:
+            raise KeyError(chat_id)
+        saved = await store.append_chat_message(
+            ChatMessage(chat_id=chat_id, role="note", body={}, display=display)
+        )
+        return web.json_response({"id": saved.id})
+
+    async def mission_create(request: web.Request) -> web.Response:
+        """`rework new` / a launched proposal, created BY the daemon: the same
+        `missions.create_mission` (budget, plan and repo rules included). A
+        local `repo` path resolves on the daemon's machine, where the mission
+        will run; a client folder travels by the workspace upload instead."""
+        from rework.missions import create_mission
+
+        body = await _body(request)
+        objective = (_opt_str(body, "objective") or "").strip()
+        if not objective:
+            raise ValueError("objective is required")
+        kwargs: dict[str, Any] = {}
+        for key in (
+            "repo",
+            "project_id",
+            "model",
+            "effort",
+            "chat_id",
+            "orchestrator_model",
+            "orchestrator_effort",
+            "title",
+        ):
+            value = _opt_str(body, key)
+            if value is not None:
+                kwargs[key] = value
+        plan = _opt_str(body, "plan")
+        if plan is not None:
+            kwargs["plan"] = plan
+        priority = _opt_str(body, "priority")
+        if priority is not None:
+            kwargs["priority"] = priority
+        for key in ("budget_usd", "budget_step_usd"):
+            value = body.get(key)
+            if value is not None:
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    raise ValueError(f"{key} must be a number")
+                kwargs[key] = float(value)
+        mission = await create_mission(objective, store=store, **kwargs)
+        return web.json_response({"mission": mission_json(mission)})
+
+    async def project_create(request: web.Request) -> web.Response:
+        from rework.services.projects import create_project
+
+        body = await _body(request)
+        name = (_opt_str(body, "name") or "").strip()
+        if not name:
+            raise ValueError("name is required")
+        repos = body.get("repos") or []
+        if not isinstance(repos, list) or not all(isinstance(r, dict) for r in repos):
+            raise ValueError("repos must be a list of objects")
+        project = await create_project(store, name, repos)
+        return web.json_response({"project": project.model_dump(mode="json")})
+
+    def _library() -> Any:
+        if library is None:
+            raise LookupError("this daemon has no Library configured")
+        return library
+
+    async def library_items(request: web.Request) -> web.Response:
+        """The TUI's Library tab: `?q=` keyword (or hybrid with `mode=hybrid`)
+        search, empty `q` lists every status. Full items (bodies included)."""
+        lib = _library()
+        query = str(request.query.get("q") or "").strip()
+        if not query:
+            items = await lib.index.list_items(status=None, limit=100)
+            mode = ""
+        elif request.query.get("mode") == "hybrid":
+            items = await lib.search_items(query)
+            mode = "hybrid" if lib.hybrid is not None else "keyword"
+        else:
+            items = await lib.index.search(query, limit=50)
+            mode = "keyword"
+        return web.json_response(
+            {"items": [i.model_dump(mode="json") for i in items], "mode": mode}
+        )
+
+    async def library_item(request: web.Request) -> web.Response:
+        lib = _library()
+        item = await lib.index.get_item(request.match_info["item_id"])
+        if item is None:
+            raise KeyError(request.match_info["item_id"])
+        return web.json_response({"item": item.model_dump(mode="json")})
+
+    async def library_add(request: web.Request) -> web.Response:
+        """The TUI's Add form, executed on the daemon: the same curation
+        `rework library add --force` applies (owner-typed, so forced)."""
+        from rework.library.curation import contribute
+        from rework.library.model import ItemType
+
+        lib = _library()
+        body = await _body(request)
+        name = (_opt_str(body, "name") or "").strip()
+        text = _opt_str(body, "body") or ""
+        if not name or not text.strip():
+            raise ValueError("name and body are required")
+        tags = body.get("tags") or []
+        if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
+            raise ValueError("tags must be a list of strings")
+        item, note = await contribute(
+            lib.index,
+            lib.git,
+            type_=ItemType(_opt_str(body, "type") or "skill"),
+            name=name,
+            description=_opt_str(body, "description") or "",
+            body=text,
+            tags=tags,
+            mission_id=None,
+            project=_opt_str(body, "project"),
+            force=True,
+        )
+        return web.json_response({"item": item.model_dump(mode="json"), "note": note})
+
+    async def library_status(request: web.Request) -> web.Response:
+        from rework.library.model import ItemStatus
+
+        lib = _library()
+        body = await _body(request)
+        status = ItemStatus(str(body.get("status") or ""))
+        item = await lib.index.set_status(request.match_info["item_id"], status)
+        if item is None:
+            raise KeyError(request.match_info["item_id"])
+        return web.json_response({"item": item.model_dump(mode="json")})
+
     async def library_search(request: web.Request) -> web.Response:
         if library is None:
             return web.json_response({"items": [], "note": "no library on this daemon"})
@@ -352,7 +542,17 @@ def add_routes(
     app.router.add_post("/v1/read", guard(read))
     app.router.add_post("/v1/runs/{run_id}/ask", guard(run_ask))
     app.router.add_get("/v1/library/search", guard(library_search))
+    app.router.add_get("/v1/library/items", guard(library_items))
+    app.router.add_post("/v1/library/items", guard(library_add))
+    app.router.add_get("/v1/library/items/{item_id}", guard(library_item))
+    app.router.add_post("/v1/library/items/{item_id}/status", guard(library_status))
     app.router.add_post("/v1/chats/{chat_id}/messages", guard(chat_send))
+    app.router.add_post("/v1/chats", guard(chat_create))
+    app.router.add_patch("/v1/chats/{chat_id}", guard(chat_update))
+    app.router.add_delete("/v1/chats/{chat_id}", guard(chat_delete))
+    app.router.add_post("/v1/chats/{chat_id}/notes", guard(chat_note))
+    app.router.add_post("/v1/missions", guard(mission_create))
+    app.router.add_post("/v1/projects", guard(project_create))
     app.router.add_post("/v1/missions/{mission_id}/{verb:pause|resume|cancel}", guard(mission_verb))
     app.router.add_post("/v1/missions/{mission_id}/prioritize", guard(prioritize))
     app.router.add_post("/v1/missions/{mission_id}/message", guard(message))
