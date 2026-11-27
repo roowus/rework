@@ -2,7 +2,7 @@
 flake class.
 
 The engine commits a gate row in one autocommit statement and the fact a test
-then relies on (mission AWAITING_GATE, or the gated run's HALTED_ESCALATED row)
+then relies on (mission AWAITING_GATE, or the run-scoped gate's park)
 in a later one. A poll on the gate row alone therefore wins that window under
 load, and every test that cancels or restarts right after it reads the pre-park
 state. `conftest.wait_for_gate_park` waits for BOTH facts; these tests hold the
