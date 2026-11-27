@@ -451,6 +451,18 @@ class SqliteStore:
         await self._db.execute(f"UPDATE missions SET {', '.join(sets)} WHERE id = ?", tuple(params))
         return await self.get_mission(mission_id)
 
+    async def _insert_status_event(self, mission_id: str, prior: str, to: MissionStatus) -> None:
+        """STATUS_CHANGED, in the same transaction as the move (_atomic)."""
+        if prior == to.value:
+            return
+        await self.append_event(
+            EventRecord(
+                mission_id=mission_id,
+                type=EventType.STATUS_CHANGED,
+                payload={"from": prior, "to": to.value},
+            )
+        )
+
     async def transition_mission(
         self,
         mission_id: str,
@@ -462,6 +474,8 @@ class SqliteStore:
         allowed = sorted(s.value for s in (from_ if from_ is not None else sources(to)))
         if not allowed:
             return None
+        before = await self._fetch_one("SELECT status FROM missions WHERE id = ?", (mission_id,))
+        prior = str(before["status"]) if before is not None else ""
         sets = ["status = ?", "updated_at = ?"]
         params: list[Any] = [to.value, time.time()]
         if result is not None:
@@ -475,6 +489,7 @@ class SqliteStore:
         )
         if row is None:
             return None
+        await self._insert_status_event(mission_id, prior, to)
         if to in TERMINAL:
             # same transaction (_atomic): a finished mission answers nothing, so
             # its open gates close with it (see the Postgres store's note)

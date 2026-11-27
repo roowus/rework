@@ -14,6 +14,7 @@ Errors are JSON `{"error": ..., "code": ...}`:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -28,6 +29,11 @@ from rework.kernel.state.transitions import IllegalTransition
 log = logging.getLogger("rework.api")
 
 API_VERSION = 1
+# seconds between keepalive comments on an idle event stream
+KEEPALIVE_S = 15.0
+# how often the stream re-reads the events table when nothing woke it (writes
+# from other processes do not wake the in-process bus)
+TAIL_POLL_S = 1.0
 
 
 def _error(status: int, code: str, message: str) -> web.Response:
@@ -176,7 +182,64 @@ def add_routes(
         )
         return web.json_response(result)
 
+    async def events(request: web.Request) -> web.StreamResponse:
+        """Server-sent events (ADR 0021 phase 3): every event the store records,
+        in seq order, as it lands. The stream TAILS THE EVENTS TABLE rather than
+        the in-process bus, so it also carries what other processes wrote (a
+        CLI, a second store connection, a direct owner message): the store is
+        the truth (CLAUDE.md rule 3). The bus only wakes the tail early.
+
+        `?since=<seq>` resumes after a reconnect without a gap; default is "from
+        now". A comment line every KEEPALIVE_S keeps proxies from closing an
+        idle stream and lets a client notice a dead one."""
+        response = web.StreamResponse(
+            headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"}
+        )
+        await response.prepare(request)
+        try:
+            since = int(request.query.get("since") or 0)
+        except ValueError:
+            since = 0
+        if since <= 0:
+            newest = await store.events_since(0, limit=1, newest_first=True)
+            since = int(newest[-1].seq or 0) if newest else 0
+        wake = bus.subscribe()
+        try:
+            await response.write(b": connected\n\n")
+            idle = 0.0
+            while True:
+                batch = await store.events_since(since, limit=200)
+                for event in batch:
+                    since = max(since, int(event.seq or 0))
+                    data = json.dumps(
+                        {
+                            "seq": event.seq,
+                            "type": event.type.value,
+                            "mission_id": event.mission_id,
+                            "run_id": event.run_id,
+                        }
+                    )
+                    await response.write(
+                        f"id: {event.seq}\nevent: {event.type.value}\ndata: {data}\n\n".encode()
+                    )
+                if batch:
+                    idle = 0.0
+                    continue
+                try:
+                    await asyncio.wait_for(wake.get(), TAIL_POLL_S)
+                except TimeoutError:
+                    idle += TAIL_POLL_S
+                    if idle >= KEEPALIVE_S:
+                        idle = 0.0
+                        await response.write(b": keepalive\n\n")
+        except (ConnectionResetError, asyncio.CancelledError):
+            pass
+        finally:
+            bus.unsubscribe(wake)
+        return response
+
     app.router.add_get("/v1", guard(version))
+    app.router.add_get("/v1/events", guard(events))
     app.router.add_post("/v1/chats/{chat_id}/messages", guard(chat_send))
     app.router.add_post("/v1/missions/{mission_id}/{verb:pause|resume|cancel}", guard(mission_verb))
     app.router.add_post("/v1/missions/{mission_id}/prioritize", guard(prioritize))

@@ -192,3 +192,31 @@ async def test_chat_turns_run_on_the_daemon_one_at_a_time(
     assert len(seen) == 2 and len(seen[1]) == 2, seen
     users = [m.display for m in await store.chat_messages(chat.id) if m.role == "user"]
     assert sorted(users) == ["from A", "from B"]
+
+
+async def test_the_event_stream_delivers_what_the_daemon_publishes(
+    api: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR 0021 phase 3: /v1/events streams every event the daemon publishes, so
+    a TUI refreshes the moment something happens instead of on its next poll."""
+    from rework.api.client import stream_events
+
+    monkeypatch.setenv("REWORK_DAEMON_URL", api["url"])
+    store = api["store"]
+    await store.create_mission(Mission(id="m-ev", objective="x", status=MissionStatus.RUNNING))
+    got: list[dict[str, Any]] = []
+    done = asyncio.Event()
+
+    async def on_event(event: dict[str, Any]) -> None:
+        got.append(event)
+        done.set()
+
+    follower = asyncio.create_task(stream_events(on_event, stop=done.is_set))
+    await asyncio.sleep(0.3)  # let the stream connect
+    async with _client(api) as client:
+        # an owner message is written straight to the store, not the bus: the
+        # stream must carry it anyway (it tails the events table)
+        await client.message("m-ev", "ping")
+    await asyncio.wait_for(done.wait(), 5)
+    follower.cancel()
+    assert any(e["type"] == "owner_message" and e["mission_id"] == "m-ev" for e in got), got

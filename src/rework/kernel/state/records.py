@@ -99,6 +99,10 @@ class EventType(StrEnum):
     # the mission's budget cap moved (auto or owner-approved): payload old/new/
     # reason/auto. Drives the TUI toast, so a raise is never silent.
     BUDGET_RAISED = "budget_raised"
+    # the mission's status moved (any transition_mission): payload from/to.
+    # Written by the store in the same transaction as the move, so a live view
+    # (the daemon's event stream) learns of every change, from any process.
+    STATUS_CHANGED = "status_changed"
 
 
 class Mission(BaseModel):

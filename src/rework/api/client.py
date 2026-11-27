@@ -148,3 +148,36 @@ async def call(action: Any) -> Any:
         raise
     except httpx.TransportError as exc:
         raise NoApi(f"daemon unreachable: {exc}") from exc
+
+
+async def stream_events(on_event: Any, *, stop: Any = None) -> None:
+    """Follow the configured daemon's /v1/events and call `on_event(dict)` for
+    each one, reconnecting with backoff, until `stop()` is true. Returns at once
+    when no daemon is configured. Wake-ups only: the caller re-reads state."""
+    import asyncio
+    import json as _json
+
+    if not os.environ.get("REWORK_DAEMON_URL"):
+        return
+    backoff = 1.0
+    while not (stop and stop()):
+        client = DaemonClient()
+        try:
+            async with client._http.stream("GET", "/v1/events", timeout=None) as response:
+                if response.status_code != 200:
+                    return  # an older daemon without the stream: polling covers it
+                backoff = 1.0
+                async for line in response.aiter_lines():
+                    if stop and stop():
+                        return
+                    if line.startswith("data: "):
+                        try:
+                            await on_event(_json.loads(line[6:]))
+                        except Exception:
+                            pass  # one bad event never ends the stream
+        except (httpx.TransportError, httpx.HTTPError):
+            pass
+        finally:
+            await client.aclose()
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 30.0)

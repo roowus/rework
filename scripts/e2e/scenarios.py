@@ -711,3 +711,54 @@ async def same_chat_turns_on_the_daemon(world: World) -> None:
                 )
         await shot(a, world.out, "daemon-chat-a")
         await shot(b, world.out, "daemon-chat-b")
+
+
+@scenario
+async def live_updates_are_fast(world: World) -> None:
+    """ADR 0021 phase 3: with the daemon's event stream, a change made by one TUI
+    shows in the other within about a second, even with the poll timer slowed
+    to 30 s (so polling alone could not explain it)."""
+    import time as _time
+
+    from rework.tui.app import ReworkApp
+
+    # chat turns run on the daemon now (ADR 0021 2b): its script answers both
+    # the chat (proposal) and the mission orchestrator (park on a question)
+    script = _orchestrator_parks_on_owner("Which greeting?")
+    script["You are rework's orchestrator"] = [
+        {
+            "tool_calls": [
+                {
+                    "name": "propose_mission",
+                    "arguments": {
+                        "objective": "pick a greeting",
+                        "plan": "echo",
+                        "title": "Greeting",
+                    },
+                }
+            ]
+        }
+    ]
+    world.script(script)
+    world.start_daemon()
+    a = ReworkApp(poll_seconds=0.5)
+    b = ReworkApp(poll_seconds=30.0)  # B must NOT be saved by its timer
+    async with a.run_test(size=(140, 40)) as pa, b.run_test(size=(140, 40)) as pb:
+        await pa.pause(0.8)
+        await pb.pause(2.0)  # B's first poll + stream connect
+        mid = await _launch_one(world, a, pa, "pick a greeting")
+        if mid is None:
+            return
+        await until(pa, lambda: statuses(a).get(mid) == "awaiting_gate", 20)
+        await until(pb, lambda: statuses(b).get(mid) == "awaiting_gate", 40)
+        t0 = _time.monotonic()
+        async with __import__("rework.api.client", fromlist=["DaemonClient"]).DaemonClient() as c:
+            await c.mission_verb(mid, "pause")
+        seen = await until(pb, lambda: statuses(b).get(mid) == "on_hold", 10)
+        lag = _time.monotonic() - t0
+        if not seen:
+            world.finding("live", "B did not see the pause within 10 s (poll is 30 s)")
+        elif lag > 3.0:
+            world.finding("live", f"B saw the pause only after {lag:.1f}s")
+        else:
+            print(f"live update lag: {lag:.2f}s", flush=True)

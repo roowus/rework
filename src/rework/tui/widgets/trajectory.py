@@ -152,6 +152,15 @@ def event_step(ev: Any, *, show_role: bool = True) -> Step | None:
         return Step(f"[{DANGER}]✗ mission failed[/]", kind="phase")
     if kind == "cancelled":
         return Step(f"[{FAINT}]⊘ cancelled {esc(p.get('reason', ''))}[/]", kind="phase")
+    if kind == "status_changed":
+        # the engine's own running <-> awaiting_gate moves are already told by
+        # the gate lines; only an owner pause / resume reads as news here
+        to, frm = str(p.get("to") or ""), str(p.get("from") or "")
+        if to == "on_hold":
+            return Step(f"[{WARN}]‖[/] paused", kind="phase")
+        if frm == "on_hold" and to in ("running", "awaiting_gate", "pending"):
+            return Step(f"[{ACCENT}]▸[/] resumed", kind="phase")
+        return None
     if kind == "plan_created":
         return Step(f"[{MUTED}]plan ready[/]")
     # progress notes / info
