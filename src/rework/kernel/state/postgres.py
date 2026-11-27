@@ -510,6 +510,18 @@ class PostgresStore:
         return await self.get_mission(mission_id)
 
     @_serialized
+    async def _insert_status_event(self, mission_id: str, prior: str, to: MissionStatus) -> None:
+        """STATUS_CHANGED, in the same transaction as the move (committed with it)."""
+        if prior == to.value:
+            return
+        await self._insert_event(
+            EventRecord(
+                mission_id=mission_id,
+                type=EventType.STATUS_CHANGED,
+                payload={"from": prior, "to": to.value},
+            )
+        )
+
     async def transition_mission(
         self,
         mission_id: str,
@@ -521,6 +533,8 @@ class PostgresStore:
         allowed = sorted(s.value for s in (from_ if from_ is not None else sources(to)))
         if not allowed:
             return None
+        before = await self._fetch_one("SELECT status FROM missions WHERE id = %s", (mission_id,))
+        prior = str(before["status"]) if before is not None else ""
         sets = ["status = %s", "updated_at = %s"]
         params: list[Any] = [to.value, time.time()]
         if result is not None:
@@ -534,6 +548,7 @@ class PostgresStore:
         )
         if row is None:
             return None
+        await self._insert_status_event(mission_id, prior, to)
         if to in TERMINAL:
             await self._conn.execute(_CLOSE_OPEN_GATES_PG, (time.time(), mission_id))
         await self._conn.commit()

@@ -2,8 +2,8 @@
 
 ## Status
 
-Accepted (2026-11-26). Phase 1 (command API), phase 2a (TUI and CLI owner actions) and
-phase 2b (chat turns) landed; phase 3 adds the read API and event stream.
+Accepted (2026-11-26). Phases 1 (command API), 2a (owner actions), 2b (chat turns) and 3a
+(live event stream) landed; a single aggregate read (`/v1/snapshot`) is the remaining step.
 
 ## Context
 
@@ -59,4 +59,17 @@ transcript and every TUI's poller paints it. No daemon, or one without the route
 turn in the TUI as before. Verified live: two TUIs on ONE chat, the TUIs' model factory
 booby-trapped, three alternating turns; each shows once in both and every model turn sees
 the whole conversation.
+
+## Phase 3a (2026-11-26): a live event stream
+
+`GET /v1/events` is a server-sent-events stream of every event the store records, in seq
+order (`?since=` resumes after a reconnect). It tails the events TABLE, so it carries writes
+from every process, and the in-process bus only wakes it early. Every mission status move
+now writes `STATUS_CHANGED` (from/to) in the same transaction, so a pause or cancel from
+anywhere reaches the stream. The TUI follows the stream when a daemon is configured and
+refreshes on an event (at most every 0.5 s), keeping its timer as the fallback. Verified
+live: a TUI with its poll set to 30 s saw another TUI's pause in 0.35 s.
+
+The TUI still reads its data from the store after a wake; moving those reads behind one
+`/v1/snapshot` call is the step that lets a TUI run with no database access at all.
 

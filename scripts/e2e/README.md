@@ -24,3 +24,8 @@ Scenarios:
   B's Gates tab reaches the orchestrator; the badge clears in both TUIs.
 - `same_chat_two_tuis`: both TUIs on ONE chat; every turn shows in both, and
   every model turn sees the whole conversation.
+- `same_chat_turns_on_the_daemon`: both TUIs on one chat, every turn run by the daemon (the
+  TUIs' model factory is booby-trapped).
+- `live_updates_are_fast`: a TUI polling every 30 s sees another TUI's pause within
+  about a second (the daemon's event stream).
+- `tour_every_tab_and_modal`: every tab, Dashboard detail tab and menu form opens cleanly.

@@ -55,6 +55,8 @@ CODE_CHECK_SECONDS = 60.0
 # the fast rate (App.poll_interval).
 POLL_SECONDS = 2.0
 IDLE_POLL_SECONDS = 10.0
+# the fastest a daemon event may trigger a refresh
+EVENT_REFRESH_GAP_S = 0.5
 # Timer ticks land a few ms either side of their schedule: a poll counts as due
 # this fraction of one timer period early (0.1 x 2 s = 0.2 s), far more than the
 # jitter and far less than a tick, so idle polls are 10 s apart, not 10 or 12.
@@ -253,6 +255,10 @@ class ReworkApp(App[None]):
         self._paint_hints()
         self._kick()
         self.set_interval(self.poll_seconds, self._kick)
+        # with a daemon configured, its event stream wakes a refresh the moment
+        # something happens (ADR 0021 phase 3); the timer above stays the
+        # fallback and the source of truth stays the store
+        self.run_worker(self._follow_daemon_events(), group="events", exclusive=True)
         self._code_watcher = CodeChangeWatcher()
         self.set_interval(CODE_CHECK_SECONDS, self._check_code)
         self.set_interval(UPDATE_CHECK_SECONDS, self._check_update)
@@ -339,6 +345,21 @@ class ReworkApp(App[None]):
                 return
         self._last_poll = now
         self.run_worker(self._tick(), group="hub", exclusive=False)
+
+    async def _follow_daemon_events(self) -> None:
+        from rework.api.client import stream_events
+
+        last = [0.0]
+
+        async def wake(_event: dict[str, Any]) -> None:
+            # a role turn publishes several events at once: one refresh per
+            # EVENT_REFRESH_GAP_S is enough, the hub is single-flight anyway
+            now = time.monotonic()
+            if now - last[0] >= EVENT_REFRESH_GAP_S:
+                last[0] = now
+                self._kick(force=True)
+
+        await stream_events(wake, stop=lambda: self._closing)
 
     def poll_due(self, now: float) -> bool:
         """Is a poll due at monotonic time `now`? True once `poll_interval()`

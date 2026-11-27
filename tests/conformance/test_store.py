@@ -378,6 +378,24 @@ async def test_a_finished_mission_closes_its_open_gates(store: StateStore) -> No
     assert [g.id for g in await store.list_open_gates(other.id)] == ["g-other"]
 
 
+async def test_a_status_move_records_a_status_changed_event(store: StateStore) -> None:
+    """ADR 0021 phase 3: every transition writes STATUS_CHANGED in the same
+    transaction, so a live view learns of a pause made by ANY process. A refused
+    move or a same-status write records nothing."""
+    m = await store.create_mission(Mission(id="m-sc", objective="x", status=MissionStatus.RUNNING))
+    await store.transition_mission(m.id, MissionStatus.ON_HOLD)
+    await store.transition_mission(m.id, MissionStatus.ON_HOLD)  # same status
+    await store.transition_mission(
+        m.id, MissionStatus.DONE, from_={MissionStatus.RUNNING}
+    )  # refused
+    events = [
+        e
+        for e in await store.events_since(0, mission_id=m.id)
+        if e.type == EventType.STATUS_CHANGED
+    ]
+    assert [(e.payload["from"], e.payload["to"]) for e in events] == [("running", "on_hold")]
+
+
 async def test_leader_lock(store: StateStore) -> None:
     assert await store.acquire_lock("daemon-1") is True
     assert await store.acquire_lock("daemon-2") is False  # live foreign lock refused
