@@ -1128,21 +1128,31 @@ class ReworkApp(App[None]):
         await self.hub.aclose()
 
 
+_KNOWN_HOSTS = {"100.107.125.118": "rewvis"}
+
+
 def target_label() -> str:
-    """Which database this TUI is connected to, for the status bar (found
-    live: the owner's TUI pointed at production while they meant local).
-    REWORK_TARGET_NAME overrides; SQLite is 'local'; Postgres shows its host."""
+    """What this TUI is connected to, for the status bar (found live: the
+    owner's TUI pointed at production while they meant local).
+    REWORK_TARGET_NAME overrides. With a daemon configured that is the DAEMON
+    (ADR 0021: every read and write goes there, REWORK_DB is not used; found
+    live, a DB-less remote TUI showed the dead REWORK_DB's host). Otherwise
+    SQLite is 'local' and Postgres shows its host."""
     import os
     from urllib.parse import urlparse
 
     named = os.environ.get("REWORK_TARGET_NAME")
     if named:
         return named
+    daemon = os.environ.get("REWORK_DAEMON_URL", "")
+    if daemon:
+        host = urlparse(daemon).hostname or "daemon"
+        return _KNOWN_HOSTS.get(host, host)
     db = os.environ.get("REWORK_DB", "")
     if not db.startswith(("postgres://", "postgresql://")):
         return "local"
     host = urlparse(db).hostname or "postgres"
-    return {"100.107.125.118": "rewvis"}.get(host, host)
+    return _KNOWN_HOSTS.get(host, host)
 
 
 def _osa(text: str) -> str:

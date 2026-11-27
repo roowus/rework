@@ -22,6 +22,24 @@ to the same database (the owner's shell exports `REWORK_DB` and
 - The Mac runs no daemon. The last local mission (m-899f95a66990) was merged
   in a second pass; the local SQLite is a sandbox from here on.
 
+### A remote TUI needs no database credentials (since 2026-11-27, ADR 0021 phase 3)
+
+With `REWORK_DAEMON_URL` set (and `REWORK_TOKEN` when the daemon has one), the TUI
+reads and writes ONLY through the daemon's `/v1` API: the heartbeat is one
+`/v1/snapshot`, detail views use `/v1/read`, and every owner action is a command.
+`REWORK_DB` can be absent or wrong; it is not opened. The status bar names the
+daemon's host. Proven on 2026-11-27: a real TUI on the Mac with `REWORK_DB` pointed at
+a dead port, against the rewvis daemon, loaded 93 missions in 0.27 s (snapshot
+round trip 36-80 ms over the tailnet), read a finished mission's 12 runs and its
+310 KB report, the Cost tab's 14 days, the Library (56 items), created, renamed,
+noted and deleted a chat, launched an echo mission, approved its gate and saw it
+finish, with zero database or Library opens. The same run without the daemon URL
+opens the store at once (the trap works).
+
+The exception: `--repo-dir` (uploading a folder from THIS machine's disk) starts on
+the client by nature; a local `repo` path in a launched mission resolves on the
+daemon's machine.
+
 ### Targets (`~/.rework/targets.toml`)
 
 Which database and daemon a command talks to is now a NAMED TARGET, so the
