@@ -1422,12 +1422,12 @@ class MissionRunner:
         ):
             return
         try:
-            from rework.sources import poller
+            from rework.sources import client_for, poller
 
-            config = poller.plane_config()
-            if not poller.enabled(config):
+            # the source the mission came from picks its client (plane, github)
+            client = client_for(str(source.get("kind") or "plane"), source)
+            if client is None:
                 return
-            client = poller.build_client(config)
             try:
                 await asyncio.wait_for(
                     poller.write_back(client, self._store, mission_id), timeout=20
