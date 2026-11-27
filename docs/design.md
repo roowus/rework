@@ -94,8 +94,8 @@ not committed yet are legal transients: readers converge and wait for both facts
 (`conftest.wait_for_gate_park`), never for the gate row alone. The write order is
 deliberately not flipped, because status-first would move the transient to
 `awaiting_gate` with no gate row, which the daemon's repair pass and the
-`_handle_halted` wait loop (it waits for no open gate before writing `running`) both
-assume away.
+owner-gate wait (`ask_owner_gate`: it waits for no open gate before writing `running`)
+both assume away.
 RunSupervisor reconciles INTENT rows into live role asyncio tasks.
 The daemon runs one runner per mission under a semaphore, holds a leader lock, and runs a
 boot recovery pass (reopen missions, re-enumerate runs, pick up gates decided while down,

@@ -383,7 +383,7 @@ def test_mechanical_escalation_keeps_promote_as_the_last_resort(
 def test_mechanical_escalation_returns_none_on_an_empty_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An empty catalog must never raise: `_promote_and_resume` reads None as
+    """An empty catalog must never raise: `promote_asking_run` reads None as
     "no model to escalate to" and opens the human gate (audited crash:
     `promote()` -> `resolve()` raised UnknownModelError from outside the try)."""
     monkeypatch.delenv(ESCALATION_MODEL_ENV, raising=False)

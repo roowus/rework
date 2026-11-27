@@ -54,7 +54,9 @@ class MissionStatus(StrEnum):
 class RunStatus(StrEnum):
     INTENT = "intent"  # dispatched on paper, engine has not started it yet
     RUNNING = "running"
-    HALTED_ESCALATED = "halted_escalated"  # paused, waiting on orchestrator resolution
+    # LEGACY (ADR 0023): the old interrupt() pause. Nothing writes it any more;
+    # kept so rows from older databases still load and render
+    HALTED_ESCALATED = "halted_escalated"
     COMPLETED = "completed"
     FAILED = "failed"
     ABORTED = "aborted"
@@ -86,7 +88,7 @@ class EventType(StrEnum):
     ROLE_SPAWNED = "role_spawned"
     PROGRESS = "progress"
     ESCALATED = "escalated"
-    ROLE_HALTED = "role_halted"
+    ROLE_HALTED = "role_halted"  # LEGACY (ADR 0023): older event logs only
     ROLE_COMPLETED = "role_completed"
     MODEL_PROMOTED = "model_promoted"
     GATE_OPENED = "gate_opened"

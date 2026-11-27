@@ -119,7 +119,6 @@ async def test_end_to_end_with_gate_and_external_approve(world: dict) -> None:
     types = [e.type for e in await store.events_since(0, mission_id=mission.id)]
     for expected in (
         EventType.ROLE_SPAWNED,
-        EventType.ROLE_HALTED,
         EventType.GATE_OPENED,
         EventType.GATE_DECIDED,
         EventType.ROLE_COMPLETED,
@@ -139,9 +138,11 @@ async def test_crash_recovery_resumes_from_checkpoint(world: dict) -> None:
     runner1 = make_runner(world, mission.id)
     task1 = asyncio.create_task(runner1.run())
     await _wait_for(lambda: _open_gate_exists(store, mission.id), what="gate to open")
+    # ONE pause primitive (ADR 0023): the role is parked INSIDE its ask, the
+    # gate row carries for_run and the mission is AWAITING_GATE
     await _wait_for(
-        lambda: _run_status_is(store, mission.id, "halted_escalated"),
-        what="run halted",
+        lambda: _mission_is(store, mission.id, MissionStatus.AWAITING_GATE),
+        what="mission parked at the role's gate",
     )
     task1.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -215,7 +216,10 @@ async def test_recovery_of_run_stuck_running_without_checkpoint(world: dict) -> 
     assert runs[0].status.value == "completed"
 
 
-async def test_rejected_gate_aborts_run(world: dict) -> None:
+async def test_a_rejected_gate_reaches_the_role(world: dict) -> None:
+    """With one pause primitive (ADR 0023) a rejection is an ANSWER the role
+    receives, like any owner reply: echo records approved=False and finishes.
+    (The interrupt path used to abort the run instead.)"""
     store: SqliteStore = world["store"]
     mission = await store.create_mission(Mission(id=new_id("m"), objective="deny me"))
     runner = make_runner(world, mission.id)
@@ -228,7 +232,8 @@ async def test_rejected_gate_aborts_run(world: dict) -> None:
 
     await asyncio.wait_for(task, timeout=15)
     runs = await store.list_runs(mission.id)
-    assert runs[0].status.value == "aborted"
+    assert runs[0].status.value == "completed"
+    assert (runs[0].artifact or {}).get("approved") is False
     done = await store.get_mission(mission.id)
     assert done is not None and done.status == MissionStatus.DONE
 

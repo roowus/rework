@@ -46,7 +46,6 @@ class CrashySpec(RoleSpec):
 
     def build_graph(self, ctx: RoleBuildCtx):  # type: ignore[no-untyped-def]
         from langgraph.graph import END, START, StateGraph
-        from langgraph.types import interrupt
 
         async def work(state: dict) -> dict:  # type: ignore[no-untyped-def]
             return {"worked": True}
@@ -56,10 +55,14 @@ class CrashySpec(RoleSpec):
             return {"ground": True}
 
         async def gate(state: dict) -> dict:  # type: ignore[no-untyped-def]
-            decision = interrupt({"kind": "question", "detail": "finish it?"})
+            # the ONE pause primitive (ADR 0023): a run-scoped owner gate
+            from rework.nodes.escalate import ask_owner_gate
+
+            decision = await ask_owner_gate(ctx, "finish it?")
             return {
                 "artifact": {
-                    "approved": bool(decision),
+                    "approved": decision is True
+                    or (isinstance(decision, dict) and bool(decision.get("approved"))),
                     "ground": bool(state.get("ground")),
                 }
             }
@@ -238,11 +241,11 @@ async def test_gate_decided_while_down_applied_on_restart(world: dict[str, Any])
         done; wait
 
     Note the failure mode is NOT a mission-status assert (this test never makes
-    one): the gate row is committed in `_handle_halted` while the run's
-    HALTED_ESCALATED row was written earlier in `_consume_result`. The old gate
-    -row-only wait could cancel the runner before the run was parked, so the
-    restart saw an unparked run, re-fired the interrupt and opened a SECOND
-    gate, failing `len(opened) == 1`. The barrier now waits for the gate row AND
+    one): the gate row and the mission's park are separate statements. The old
+    gate-row-only wait could cancel the runner before the park landed, and the
+    restart opened a SECOND gate, failing `len(opened) == 1` (the run-scoped
+    gate is now found again by `for_run`, so a restart reuses it).
+    The barrier now waits for the gate row AND
     the run's park (conftest.wait_for_gate_park)."""
     store: SqliteStore = world["store"]
     mission = await store.create_mission(
@@ -254,8 +257,8 @@ async def test_gate_decided_while_down_applied_on_restart(world: dict[str, Any])
     )
     runner1 = _runner(world, mission.id)
     task1 = asyncio.create_task(runner1.run())
-    # BARRIER: the gate row is committed before the run's HALTED_ESCALATED row
-    # (engine._consume_result writes the park, _handle_halted opens the gate).
+    # BARRIER: the gate row is committed before the mission's park
+    # (ask_owner_gate opens the run-scoped gate, then parks the mission).
     # A kill in that window restarts an UNPARKED run, which re-fires the
     # interrupt and opens a SECOND gate; the "one gate_opened" assert below
     # then fails. Wait for the park, not for the gate row.
@@ -304,7 +307,7 @@ async def test_escalation_gate_links_to_its_run_on_the_row(world: dict[str, Any]
     Reproduces what timed out on a 3.13 CI runner: the engine used to publish
     an INFO event carrying {gate_id, for_run} AFTER committing the gate row. A
     kill between the two left a gate no one could attribute, so recovery never
-    applied the owner's answer and the run sat HALTED_ESCALATED until the test
+    applied the owner's answer and the run sat parked until the test
     window closed. Here the pointer event is deleted outright: recovery must
     still find the gate and finish."""
     store: SqliteStore = world["store"]
@@ -318,7 +321,7 @@ async def test_escalation_gate_links_to_its_run_on_the_row(world: dict[str, Any]
     runner1 = _runner(world, mission.id)
     task1 = asyncio.create_task(runner1.run())
     # BARRIER (same shape as the trio above): the gate row is committed before
-    # the run's HALTED_ESCALATED row, so a kill on the gate row alone restarts
+    # the mission's park, so a kill on the gate row alone restarts
     # an UNPARKED role. What this test relies on next is the open gate AND the
     # gated run parked, so wait for both facts in one bounded poll.
     await wait_for_gate_park(
@@ -358,9 +361,10 @@ async def test_escalation_gate_links_to_its_run_on_the_row(world: dict[str, Any]
     assert (fresh.artifact or {}).get("approved") is True
 
 
-async def test_gate_rejected_while_down_aborts_on_restart(world: dict[str, Any]) -> None:
-    """Same, but the answer is no: the run aborts from the row's decision and
-    the mission still completes (the plan moves on)."""
+async def test_gate_rejected_while_down_reaches_the_role_on_restart(world: dict[str, Any]) -> None:
+    """Same, but the answer is no: on restart the role RECEIVES the rejection
+    from the row (one pause primitive, ADR 0023: a "no" is an answer, not an
+    abort), records approved=False and the mission still completes."""
     store: SqliteStore = world["store"]
     mission = await store.create_mission(
         Mission(
@@ -399,7 +403,8 @@ async def test_gate_rejected_while_down_aborts_on_restart(world: dict[str, Any])
     task2 = asyncio.create_task(runner2.run())
     await asyncio.wait_for(task2, timeout=60)
     fresh = await store.get_run(f"{mission.id}:do:crashy:1")
-    assert fresh is not None and fresh.status.value == "aborted"
+    assert fresh is not None and fresh.status.value == "completed"
+    assert (fresh.artifact or {}).get("approved") is False
     mission_row = await store.get_mission(mission.id)
     assert mission_row is not None and mission_row.status == MissionStatus.DONE
 
@@ -592,21 +597,21 @@ async def test_typed_gate_answer_reaches_the_role(world: dict[str, Any]) -> None
     that dict (including `approved`) instead of a bare True.
     """
     from langgraph.graph import END, START, StateGraph
-    from langgraph.types import interrupt
 
+    from rework.nodes.escalate import ask_owner_gate
     from rework.roles.base import RoleSpec
 
     seen: list[Any] = []
 
     class EchoDecisionSpec(RoleSpec):
         name = "echo_decision"
-        description = "records whatever its interrupt() returned"
+        description = "records whatever its owner gate returned"
         goal = "record the decision"
         default_model = "flash"
 
         def build_graph(self, ctx):  # type: ignore[no-untyped-def]
             async def ask(state: dict) -> dict:  # type: ignore[no-untyped-def]
-                value = interrupt({"kind": "question", "detail": "how should I change it?"})
+                value = await ask_owner_gate(ctx, "how should I change it?")
                 seen.append(value)
                 return {"artifact": {"decision": value}}
 

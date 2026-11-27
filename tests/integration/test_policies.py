@@ -48,13 +48,17 @@ class EscalatingSpec(RoleSpec):
 
     def build_graph(self, ctx: RoleBuildCtx):  # type: ignore[no-untyped-def]
         from langgraph.graph import END, START, StateGraph
-        from langgraph.types import interrupt
+
+        from rework.nodes.escalate import EscalationAwareExecutor
 
         async def halt(state: dict) -> dict:  # type: ignore[no-untyped-def]
+            # the ONE pause primitive (ADR 0023): the ask on the run row
             kind = str(ctx.run.context.get("kind") or "blocked")
             detail = str(ctx.run.context.get("detail") or "need a hand")
-            decision = interrupt({"kind": kind, "detail": detail})
-            return {"artifact": {"kind": "escalating", "decision": decision}}
+            answer = await EscalationAwareExecutor(None, ctx).execute(
+                "ask_orchestrator", {"question": detail, "kind": kind}
+            )
+            return {"artifact": {"kind": "escalating", "decision": answer}}
 
         graph = StateGraph(dict)  # type: ignore[arg-type]
         graph.add_node("halt", halt)
