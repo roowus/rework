@@ -136,7 +136,8 @@ async def test_a_parked_role_does_not_hold_a_role_slot(store) -> None:
 
 
 async def test_a_parked_mission_releases_its_mission_slot(store) -> None:
-    """The other slot: the old interrupt pause (gone, ADR 0023) used to hold REWORK_CONCURRENCY while a
+    """The other slot: the old interrupt pause (gone, ADR 0023) used to hold
+    REWORK_CONCURRENCY while a
     mission sat on an escalation gate."""
     from rework.orchestrator.limits import MissionSlot, PrioritySlots
 

@@ -244,7 +244,8 @@ async def test_gate_decided_while_down_applied_on_restart(world: dict[str, Any])
     one): the gate row and the mission's park are separate statements. The old
     gate-row-only wait could cancel the runner before the park landed, and the
     restart opened a SECOND gate, failing `len(opened) == 1` (the run-scoped
-    gate is now found again by `for_run`, so a restart reuses it). The barrier now waits for the gate row AND
+    gate is now found again by `for_run`, so a restart reuses it).
+    The barrier now waits for the gate row AND
     the run's park (conftest.wait_for_gate_park)."""
     store: SqliteStore = world["store"]
     mission = await store.create_mission(
