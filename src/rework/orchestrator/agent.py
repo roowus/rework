@@ -788,6 +788,14 @@ class MissionOrchestrator:
         bind(mission=self.mid, run=self.run_id, role="orchestrator")
         log.info("orchestrator start: model=%s playbook=%s", self.entry.id, self.playbook)
         await self._load()
+        # A PAUSED mission comes back after a daemon restart (so a resume from
+        # any machine is honoured) but must not touch anything until resumed:
+        # found live on rewvis, recovery restarted the paused mission's coder
+        # and re-ran the orchestrator's interrupted tool call, and the hold
+        # check before the next turn stopped them only seconds later.
+        if await self.r._owner_signal() == "paused":
+            if await self.r._pause_until_resumed() == "cancelled":
+                return
         await self._recover_runs()
         if not self.history:
             await self._append(

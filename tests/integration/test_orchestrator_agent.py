@@ -307,6 +307,80 @@ async def test_orchestrator_resumes_after_a_kill(world: dict[str, Any]) -> None:
     )
 
 
+async def test_a_paused_mission_touches_nothing_after_a_restart(world: dict[str, Any]) -> None:
+    """Found live on rewvis: a daemon restart recovered an ON_HOLD mission and,
+    before its hold check ran, restarted the paused coder run and re-ran the
+    orchestrator's interrupted tool call. A paused mission must hold FIRST:
+    no role started, no tool call re-run, no model call, until resumed. After
+    the resume it carries on exactly once."""
+    provider: ScriptedProvider = world["provider"]
+    store: SqliteStore = world["store"]
+    provider.route(
+        MARKER,
+        [
+            turn(
+                call("spawn_role", "p1", role="coder", step="code", brief="fix add()"),
+                call("wait", "p2"),
+            ),
+            turn(
+                call("spawn_role", "p3", role="auditor", step="audit", brief="review the fix"),
+                call("wait", "p4"),
+            ),
+            turn(call("finish", "p5", outcome="done", summary="fixed the paused-restart bug")),
+        ],
+    )
+    provider.route("Find issues", _auditor_script(AUDIT_CLEAN))
+    release = asyncio.Event()
+    coder_calls: list[float] = []
+
+    class Gate(ScriptedProvider):
+        async def complete(self, request):  # type: ignore[no-untyped-def]
+            system = request.system or ""
+            if "Fulfill the task" in system and MARKER not in system:
+                coder_calls.append(asyncio.get_running_loop().time())
+                await release.wait()
+            return await super().complete(request)
+
+    gated = Gate()
+    gated._queues = provider._queues
+    gated.route("Fulfill the task", _coder_script("tests pass"))
+    world["provider"] = gated
+
+    first = asyncio.create_task(runner(world).run())
+    for _ in range(100):
+        if coder_calls:
+            break
+        await asyncio.sleep(0.05)
+    assert coder_calls, "the coder started"
+    # the owner pauses, and the daemon dies before the runner notices
+    from rework.services import missions as mission_service
+
+    await mission_service.pause(store, "mo")
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    events_before = len(await store.events_since(0, mission_id="mo"))
+    coder_calls.clear()
+    release.set()
+
+    second = asyncio.create_task(runner(world).run())
+    await asyncio.sleep(1.5)  # many hold-loop polls at 0.05 s
+    assert not second.done()
+    assert coder_calls == [], "a paused mission restarted its coder"
+    new = (await store.events_since(0, mission_id="mo"))[events_before:]
+    notes = [str((e.payload or {}).get("note") or "") for e in new]
+    assert not any("resuming after restart" in n for n in notes), notes
+    assert not any(e.type == EventType.PROGRESS for e in new), [e.payload for e in new]
+    assert (await store.get_mission("mo")).status == MissionStatus.ON_HOLD
+
+    await mission_service.resume(store, "mo")
+    await approve_next_gate(world)
+    await asyncio.wait_for(second, timeout=30)
+    runs = await store.list_runs("mo")
+    assert [r.id for r in runs] == ["mo:code:coder:1", "mo:audit:auditor:1"]
+    assert (await store.get_mission("mo")).status == MissionStatus.DONE
+
+
 async def test_owner_cancel_stops_the_orchestrator(world: dict[str, Any]) -> None:
     """The owner cancels while the orchestrator is mid-mission (here: during
     its second model call). The next owner check must end the loop with the
