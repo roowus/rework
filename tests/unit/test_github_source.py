@@ -86,3 +86,58 @@ def test_sources_are_off_unless_configured(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("REWORK_GITHUB_REPO", "me/toy")
     kinds = [s["kind"] for s in configured()]
     assert kinds == ["github"]
+
+
+async def test_status_sync_keeps_one_phase_label_and_closes_on_done() -> None:
+    fake = FakeGh([])
+    client = github.GitHubIssues("me/toy", "rework", runner=fake)
+    await client.set_status("7", "working")
+    await client.set_status("7", "done")
+    creates = [c for c in fake.calls if c[:2] == ("label", "create")]
+    assert len(creates) == 4, "the four phase labels are created once"
+    edits = [c for c in fake.calls if c[:2] == ("issue", "edit")]
+    assert "rework:working" in edits[0] and "rework:done" in edits[1]
+    removed = edits[1][edits[1].index("--remove-label") + 1]
+    assert "rework:working" in removed and "rework:done" not in removed
+    assert fake.calls[-1][:3] == ("issue", "close", "7")
+
+
+async def test_the_daemon_syncs_each_phase_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The daemon's sync loop mirrors a phase change once and records it, so the
+    next tick (or a restart) does not repeat it."""
+    import asyncio
+
+    import rework.sources as sources
+    from rework.orchestrator import daemon as daemon_mod
+
+    store = await open_sqlite(str(tmp_path / "s.sqlite3"))
+    synced: list[tuple[str, str]] = []
+
+    async def fake_sync(source: dict, status: str) -> None:
+        synced.append((source["item_id"], status))
+
+    monkeypatch.setattr(sources, "sync_status", fake_sync)
+    monkeypatch.setattr(daemon_mod, "SYNC_EVERY_S", 0.05)
+    try:
+        await store.create_mission(
+            Mission(
+                id="m-gh-1",
+                objective="x",
+                status=MissionStatus.RUNNING,
+                result={"source": {"kind": "github", "item_id": "7"}},
+            )
+        )
+        d = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
+        d._store = store
+        task = asyncio.create_task(d._sync_tracker_status())
+        await asyncio.sleep(0.3)
+        await store.transition_mission("m-gh-1", MissionStatus.AWAITING_GATE)
+        await asyncio.sleep(0.3)
+        task.cancel()
+        assert synced == [("7", "running"), ("7", "awaiting_gate")], synced
+        row = await store.get_mission("m-gh-1")
+        assert row is not None and row.result["source_phase"] == "needs_you"
+    finally:
+        await store.aclose()

@@ -111,6 +111,17 @@ class PlaneClient:
             json={"comment_html": text},
         )
 
+    async def set_status(self, item_id: str, phase: str) -> None:
+        """Move the work item to the state the owner mapped this phase to
+        (REWORK_PLANE_STATE_<PHASE>, a state id). An unmapped phase is left
+        alone: Plane states are per-project, so rework never guesses one."""
+        import os
+
+        state = os.environ.get(f"REWORK_PLANE_STATE_{phase.upper()}", "").strip()
+        if not state:
+            return
+        await self._request("PATCH", self._project_path(f"{item_id}/"), json={"state": state})
+
     async def close(self) -> None:
         if self._http is not None and hasattr(self._http, "aclose"):
             await self._http.aclose()
