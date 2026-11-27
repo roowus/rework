@@ -77,3 +77,15 @@ When a tracker is a TOOL instead (an agent reading or editing the backlog mid-mi
 belongs behind the tracker's own MCP server, opt-in per mission, writes behind gates; the
 source stays the default integration.
 
+## Amendment (2026-11-26): the work item shows the mission's phase
+
+The daemon mirrors each source-backed mission's phase onto its work item once per change
+(`sources.PHASES`: working / needs_you / done / failed; the last phase synced is kept on the
+mission's result as `source_phase`, so a restart neither repeats nor skips one). GitHub: one
+`rework:<phase>` label at a time (created on first use), and a DONE mission closes the
+issue; a failed one stays open for a human. Plane: the item moves to the state the owner
+mapped with `REWORK_PLANE_STATE_<PHASE>` (a state id); unmapped phases are left alone,
+because Plane states are per-project and rework never guesses one. Verified live on a
+throwaway repo: the issue read `rework:needs-you` while the mission waited on its question,
+then `rework:failed` when it ended failed.
+

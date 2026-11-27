@@ -61,3 +61,43 @@ def client_for(kind: str, source: dict[str, Any]) -> Any:
         repo = str(source.get("repo") or github.config()["repo"])
         return github.GitHubIssues(repo, github.config()["label"]) if repo else None
     return None
+
+
+# Mission status -> the phase a tracker shows. Coarse on purpose: a tracker
+# reader wants "is it being worked, does it need me, is it over".
+PHASES = {
+    "running": "working",
+    "pending": "working",
+    "awaiting_gate": "needs_you",
+    "on_hold": "needs_you",
+    "done": "done",
+    "failed": "failed",
+    "cancelled": "failed",
+}
+
+
+async def sync_status(source: dict[str, Any], status: str) -> None:
+    """Show a mission's phase on the work item it came from. Best-effort and
+    bounded: a tracker outage is a log line, never a mission failure."""
+    import asyncio
+    import logging
+
+    phase = PHASES.get(status)
+    kind = str(source.get("kind") or "")
+    item_id = source.get("item_id")
+    if phase is None or not item_id:
+        return
+    client = client_for(kind, source)
+    if client is None or not hasattr(client, "set_status"):
+        return
+    try:
+        await asyncio.wait_for(client.set_status(str(item_id), phase), 20)
+    except Exception as exc:
+        logging.getLogger("rework.sources").warning(
+            "%s status sync (%s) failed: %s", kind, phase, exc
+        )
+    finally:
+        try:
+            await client.close()
+        except Exception:
+            pass

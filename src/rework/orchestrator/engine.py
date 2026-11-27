@@ -1308,6 +1308,12 @@ class MissionRunner:
         source = ((current_mission.result if current_mission else None) or {}).get("source")
         if source:
             result["source"] = source
+            # the phase last mirrored onto the tracker (daemon status sync)
+            synced = ((current_mission.result if current_mission else None) or {}).get(
+                "source_phase"
+            )
+            if synced:
+                result["source_phase"] = synced
         for key in DELIVERY_RESULT_KEYS:
             value = ((current_mission.result if current_mission else None) or {}).get(key)
             if value is not None:

@@ -70,6 +70,10 @@ _REQUEUEABLE = frozenset(
 )
 
 
+# how often tracker items are brought in line with their missions' phases
+SYNC_EVERY_S = 15.0
+
+
 class DaemonLocked(Exception):
     pass
 
@@ -330,11 +334,40 @@ class Daemon:
             log.info("no issue source configured (REWORK_PLANE_* / REWORK_GITHUB_REPO): idle")
             return
         try:
-            await asyncio.gather(*(self._poll_one(src) for src in sources))
+            await asyncio.gather(
+                self._sync_tracker_status(), *(self._poll_one(src) for src in sources)
+            )
         finally:
             for src in sources:
                 with contextlib.suppress(Exception):
                     await src["client"].close()
+
+    async def _sync_tracker_status(self) -> None:
+        """Mirror each source-backed mission's phase onto its work item, once per
+        change (ADR 0016 amendment). Derived from the rows every tick: the
+        last phase synced is kept on the mission's result, so a restart neither
+        repeats nor skips a sync."""
+        from rework.sources import PHASES, sync_status
+
+        while True:
+            try:
+                for mission in await self._store.list_missions(limit=200):
+                    result = mission.result or {}
+                    source = result.get("source") or {}
+                    if not source:
+                        continue
+                    phase = PHASES.get(mission.status.value)
+                    if phase is None or result.get("source_phase") == phase:
+                        continue
+                    await sync_status(source, mission.status.value)
+                    await self._store.update_mission(
+                        mission.id, result={**result, "source_phase": phase}
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("tracker status sync failed: %s", exc)
+            await asyncio.sleep(SYNC_EVERY_S)
 
     async def _poll_one(self, src: dict[str, Any]) -> None:
         log.info("polling %s every %.0fs for work items", src["where"], src["interval_s"])

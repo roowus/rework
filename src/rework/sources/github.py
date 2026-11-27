@@ -19,6 +19,14 @@ from rework.nodes.gh import GHError
 
 KIND = "github"
 
+# one label per mission phase (sources.PHASES); created on first use
+PHASE_LABELS = {
+    "working": "rework:working",
+    "needs_you": "rework:needs-you",
+    "done": "rework:done",
+    "failed": "rework:failed",
+}
+
 
 def config() -> dict[str, Any]:
     """REWORK_GITHUB_REPO=owner/name turns the source on (absent = off)."""
@@ -73,6 +81,7 @@ class GitHubIssues:
         self.repo = repo
         self.label = label
         self._gh = runner or _gh
+        self._labels_ready = False
 
     async def list_ready(self, **_: Any) -> list[dict[str, Any]]:
         raw = await self._gh(
@@ -95,6 +104,36 @@ class GitHubIssues:
 
     async def comment(self, item_id: str, text: str) -> None:
         await self._gh("issue", "comment", str(item_id), "--repo", self.repo, "--body", text)
+
+    async def set_status(self, item_id: str, phase: str) -> None:
+        """Show the mission's phase on the issue: exactly one `rework:<phase>`
+        label at a time. A DONE mission also closes the issue (its comment says
+        what changed); a FAILED one stays open for a human."""
+        wanted = PHASE_LABELS.get(phase)
+        if wanted is None:
+            return
+        stale = [label for label in PHASE_LABELS.values() if label != wanted]
+        if not self._labels_ready:
+            # `issue edit --add-label` refuses a label the repo does not have:
+            # create the four phase labels once (--force updates an existing one)
+            for label in PHASE_LABELS.values():
+                await self._gh(
+                    "label", "create", label, "--repo", self.repo, "--color", "5319e7", "--force"
+                )
+            self._labels_ready = True
+        await self._gh(
+            "issue",
+            "edit",
+            str(item_id),
+            "--repo",
+            self.repo,
+            "--add-label",
+            wanted,
+            "--remove-label",
+            ",".join(stale),
+        )
+        if phase == "done":
+            await self._gh("issue", "close", str(item_id), "--repo", self.repo)
 
     async def close(self) -> None:
         return None
