@@ -1282,6 +1282,11 @@ class MissionRunner:
         shipped = getattr(self, "_shipped_branch", None)
         if shipped:
             result["branch"] = shipped
+        from rework.orchestrator.rails import deliverable
+
+        delivered = deliverable(runs)
+        if delivered is not None:
+            result["deliverable"] = delivered
         current = await self._store.get_mission(mission_id)
         if current is not None and current.status == MissionStatus.CANCELLED:
             # the burn gate (or an owner cancel) already set the verdict while

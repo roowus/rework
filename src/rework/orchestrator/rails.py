@@ -63,6 +63,48 @@ def latest_handoff(runs: list[Run], *, completed_only: bool = True) -> Run | Non
     return found[-1] if found else None
 
 
+def deliverable(runs: list[Run]) -> dict[str, Any] | None:
+    """What the mission DELIVERED, decided once (the report, the result and the
+    PR read this instead of each picking a coder run): the newest COMPLETED
+    code-writing handoff that committed, plus whether the last audit reviewed
+    exactly that commit. None when no code was written.
+
+    Found live (m-d69d16642add): a fix, an audit that asked for changes and a
+    revision left two coder branches, and the report listed both with nothing
+    saying which one was the result."""
+    handoff = None
+    for run in runs:  # list_runs is created_at-ordered: the last match wins
+        art = run.artifact or {}
+        if is_code_handoff(run) and run.status == RunStatus.COMPLETED and art.get("branch"):
+            handoff = run
+    if handoff is None:
+        return None
+    art = handoff.artifact or {}
+    commit = str(art.get("commit") or "")
+    audits = [r for r in runs if r.role == "auditor" and r.status == RunStatus.COMPLETED]
+    reviewed = str(((audits[-1].artifact or {}) if audits else {}).get("reviewed_sha") or "")
+    superseded = [
+        r.id
+        for r in runs
+        if r is not handoff
+        and is_code_handoff(r)
+        and (r.artifact or {}).get("branch")
+        and r.created_at <= handoff.created_at
+    ]
+    return {
+        "run": handoff.id,
+        "branch": str(art.get("branch") or ""),
+        "commit": commit,
+        "worktree": str(art.get("worktree") or ""),
+        # the last audit reviewed THIS commit (a prefix match: shas are
+        # recorded both short and full)
+        "audited": bool(commit and reviewed)
+        and (commit.startswith(reviewed) or reviewed.startswith(commit)),
+        "audit_run": audits[-1].id if audits else None,
+        "superseded": superseded,
+    }
+
+
 # -- which runs count ---------------------------------------------------------
 
 

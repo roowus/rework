@@ -177,6 +177,11 @@ async def test_orchestrator_runs_the_fix_shape(world: dict[str, Any]) -> None:
     assert "planted bug" in str(runs["code"].context.get("investigation", ""))
     assert "return a + b" in str(runs["audit"].context.get("diff", ""))
     assert runs["code"].context.get("brief") == "fix add()"
+    # ONE recorded answer to "what did this mission deliver" (rails.deliverable)
+    delivered = (mission.result or {}).get("deliverable") or {}
+    assert delivered.get("run") == "mo:code:coder:1"
+    assert delivered.get("branch") == (runs["code"].artifact or {}).get("branch")
+    assert delivered.get("audited") is True, "the audit reviewed exactly this commit"
 
     # the orchestrator is visible like a role, and it pays its own way
     events = await store.events_since(0, mission_id="mo", limit=1000)
