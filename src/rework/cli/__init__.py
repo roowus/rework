@@ -977,6 +977,44 @@ def _render_md(runs: list[tuple[Any, dict[str, Any]]], spend: Any, mission: Any)
         "",
     ]
     result = getattr(mission, "result", None) or {}
+    delivered = result.get("deliverable") or {}
+    if not delivered and mission.status.value == "done":
+        # finished before the deliverable was recorded: the same pure rule
+        # over the same runs gives the same answer
+        from rework.orchestrator.rails import deliverable
+
+        # the renderer's inputs are (run, artifact) pairs: judge THOSE artifacts
+        delivered = (
+            deliverable(
+                [
+                    run.model_copy(update={"artifact": artifact})
+                    for run, artifact in runs
+                    if hasattr(run, "model_copy")
+                ]
+            )
+            or {}
+        )
+    if delivered.get("branch"):
+        # ONE answer to "what did this mission produce", decided at synthesis
+        # (rails.deliverable); every handoff below is history
+        out += ["## Delivered", ""]
+        out.append(f"- branch: `{delivered['branch']}`")
+        if delivered.get("commit"):
+            out.append(f"- commit: `{delivered['commit']}`")
+        if result.get("pr_url"):
+            out.append(f"- pull request: {result['pr_url']}")
+        elif result.get("branch"):
+            out.append(f"- pushed to origin as `{result['branch']}`")
+        elif delivered.get("worktree"):
+            out.append(f"- on the daemon host: `{delivered['worktree']}`")
+        audit_note = (
+            "reviewed by the final audit"
+            if delivered.get("audited")
+            else "NOT the commit the final audit reviewed"
+        )
+        out.append(f"- audit: {audit_note}")
+        out.append("")
+    superseded = set(delivered.get("superseded") or [])
     accepted_section = accepted_findings_section(result.get("accepted_findings"))
     if accepted_section:
         # what the mission shipped with knowingly open, and why: same text as
@@ -993,6 +1031,12 @@ def _render_md(runs: list[tuple[Any, dict[str, Any]]], spend: Any, mission: Any)
         if artifact.get("kind") == "coder_handoff" or role == "coder":
             out.append("### Handoff")
             out.append("")
+            if run.id in superseded:
+                out.append("_superseded: a later revision is what the mission delivered_")
+                out.append("")
+            elif run.id == delivered.get("run"):
+                out.append("_this is what the mission delivered_")
+                out.append("")
             out.append(f"- branch: `{artifact.get('branch')}`")
             out.append(f"- commit: `{artifact.get('commit')}`")
             out.append("")
