@@ -239,3 +239,115 @@ async def test_investigators_proposed_tests_reach_the_coder(coder_ctx: RoleBuild
     assert "Tests the investigator proposed" in first
     assert "test_add_sums" in first and "should_fail_because" in first
     assert "watch it FAIL for the RIGHT reason" in str(fake.requests[0].system)
+
+
+async def test_a_coder_that_commits_itself_still_hands_off_its_commit(
+    coder_ctx: RoleBuildCtx,
+) -> None:
+    """Found live on rewvis (fix-pr mission m-3c3ea5148697): the coder ran
+    `git commit` with its own shell, so the handoff's mechanical commit found
+    nothing to commit and recorded commit=None. The audit rail then saw no
+    committed handoff and the orchestrator spent 8 more coder/auditor runs
+    trying to 'produce a real sha'. The branch head is what was delivered."""
+    fake = coder_ctx.provider
+    assert isinstance(fake, FakeProvider)
+    fake.push(
+        ChatResult(
+            text="fixing and committing",
+            tool_calls=[
+                ToolCall(
+                    id="t1",
+                    name="run_command",
+                    arguments={
+                        "command": "printf 'def add(a, b):\\n    return a + b\\n' > calc.py && "
+                        "git add -A && git -c user.name=me -c user.email=me@x "
+                        "commit -qm 'fix add'"
+                    },
+                )
+            ],
+            usage=Usage(input_tokens=10, output_tokens=5),
+            stop_reason="tool_calls",
+        )
+    )
+    fake.push(
+        ChatResult(
+            text="committed the fix myself. tests: 1 passed.",
+            usage=Usage(input_tokens=10, output_tokens=8),
+            stop_reason="end_turn",
+        )
+    )
+    graph = autodiscover().get("coder").build_graph(coder_ctx)
+    graph.checkpointer = InMemorySaver()
+    final = await graph.ainvoke(
+        {"objective": "fix add()"}, config={"configurable": {"thread_id": "t-self"}}
+    )
+    artifact = final["artifact"]
+    proc = await asyncio.create_subprocess_exec(
+        "git", "rev-parse", "HEAD", cwd=str(final["worktree"]), stdout=asyncio.subprocess.PIPE
+    )
+    head = (await proc.communicate())[0].decode().strip()
+    assert artifact["commit"] == head, "the handoff names the branch head the coder committed"
+    assert artifact["commit"] != artifact["base_sha"]
+    assert "+    return a + b" in artifact["diff"]
+
+
+async def test_a_coder_that_changed_nothing_still_hands_off_no_commit(
+    coder_ctx: RoleBuildCtx,
+) -> None:
+    """The other side of the same rule: no change at all is still commit=None
+    (the branch head is the base, which is not a delivery)."""
+    fake = coder_ctx.provider
+    assert isinstance(fake, FakeProvider)
+    fake.push(
+        ChatResult(
+            text="nothing to change. tests: 1 passed.",
+            usage=Usage(input_tokens=10, output_tokens=8),
+            stop_reason="end_turn",
+        )
+    )
+    graph = autodiscover().get("coder").build_graph(coder_ctx)
+    graph.checkpointer = InMemorySaver()
+    final = await graph.ainvoke(
+        {"objective": "fix add()"}, config={"configurable": {"thread_id": "t-none"}}
+    )
+    assert final["artifact"]["commit"] is None
+
+
+async def test_tool_junk_is_ignored_without_committing_a_gitignore(
+    coder_ctx: RoleBuildCtx,
+) -> None:
+    """Found live on rewvis: prepare wrote a .gitignore INTO the worktree, the
+    handoff committed it, and every real-model audit flagged an unrequested
+    file. Junk must stay out of the diff through info/exclude instead."""
+    fake = coder_ctx.provider
+    assert isinstance(fake, FakeProvider)
+    fake.push(
+        ChatResult(
+            text="fixing",
+            tool_calls=[
+                ToolCall(
+                    id="t1",
+                    name="run_command",
+                    arguments={
+                        "command": "printf 'def add(a, b):\\n    return a + b\\n' > calc.py && "
+                        "mkdir -p __pycache__ && touch __pycache__/calc.cpython-312.pyc"
+                    },
+                )
+            ],
+            usage=Usage(input_tokens=10, output_tokens=5),
+            stop_reason="tool_calls",
+        )
+    )
+    fake.push(
+        ChatResult(text="done. tests: 1 passed.", usage=Usage(input_tokens=1, output_tokens=1))
+    )
+    graph = autodiscover().get("coder").build_graph(coder_ctx)
+    graph.checkpointer = InMemorySaver()
+    final = await graph.ainvoke(
+        {"objective": "fix add()"}, config={"configurable": {"thread_id": "t-junk"}}
+    )
+    artifact = final["artifact"]
+    assert artifact["changed_files"] == ["calc.py"], artifact["changed_files"]
+    assert ".gitignore" not in artifact["diff"]
+    assert "__pycache__" not in artifact["diff"]
+    assert not (Path(final["worktree"]) / ".gitignore").exists()

@@ -28,6 +28,7 @@ from rework.nodes.git_ops import (
     diff_base,
     ensure_worktree,
     has_changes,
+    head_sha,
     stage_all,
     unstage_nested_repos,
 )
@@ -119,9 +120,13 @@ def prepare_node(ctx: RoleBuildCtx, executor: Any) -> Any:
             base_sha = str(run_ctx["base_sha"])  # resume: keep the original base
         else:
             await ctx.store.update_run(ctx.run.id, context={**run_ctx, "base_sha": base_sha})
-        gitignore = worktree / ".gitignore"
-        if not gitignore.exists():
-            await asyncio.to_thread(gitignore.write_text, DEFAULT_GITIGNORE)
+        # tool runs generate junk (pycache, caches) that must never reach the
+        # diff, but the ignore rules must not reach it either: this used to
+        # write a .gitignore INTO the worktree, the handoff committed it, and
+        # every real-model audit on rewvis flagged the unrequested file
+        # (found live: m-d69d16642add, m-3c3ea5148697 spent rounds on it).
+        # The checkout's own info/exclude is never committed.
+        await _exclude_junk(worktree)
         if hasattr(executor, "attach"):
             executor.attach(worktree)
         investigation = run_ctx.get("investigation")
@@ -181,6 +186,28 @@ def prepare_node(ctx: RoleBuildCtx, executor: Any) -> Any:
     return prepare
 
 
+async def _exclude_junk(worktree: Path) -> None:
+    """Append DEFAULT_GITIGNORE to the worktree's git info/exclude (shared by
+    every worktree of the repo: written once, idempotent)."""
+    from rework.nodes.git_ops import _run
+
+    code, path = await _run(worktree, "rev-parse", "--git-path", "info/exclude")
+    if code != 0 or not path.strip():
+        return
+    exclude = Path(path.strip())
+    if not exclude.is_absolute():
+        exclude = worktree / exclude
+
+    def write() -> None:
+        current = exclude.read_text() if exclude.exists() else ""
+        if DEFAULT_GITIGNORE.strip() in current:
+            return
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_text(f"{current.rstrip()}\n# rework: tool-run junk\n{DEFAULT_GITIGNORE}")
+
+    await asyncio.to_thread(write)
+
+
 def handoff_node(ctx: RoleBuildCtx) -> Any:
     """Commit the worktree, package the diff and the tests block, and attach run
     stats. Runs on the HOST for every coding role: a role never writes history
@@ -205,6 +232,16 @@ def handoff_node(ctx: RoleBuildCtx) -> Any:
             )
         message = commit_message(ctx.mission.title, state["objective"], ctx.run.step, ctx.run.id)
         sha = await git_commit(wt, message, author=ctx.git_author)
+        if sha is None:
+            # nothing left to commit: the coder may have committed with its own
+            # shell. The branch head is what was delivered either way. Found
+            # live (rewvis, a fix-pr mission): a coder that ran `git commit`
+            # itself handed off commit=None, the audit rail then saw no commit,
+            # and the orchestrator spent 8 more runs trying to "produce a sha".
+            head = await head_sha(wt)
+            base = str(state.get("base_sha") or "")
+            if head and head != base:
+                sha = head
         diff = await diff_base(wt, base=state.get("base_sha"))
         tests_block = parse_tests_block(state.get("final_text") or "")
         artifact = {
